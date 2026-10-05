@@ -7,6 +7,9 @@ import json
 import hashlib
 import hmac
 import base64
+import asyncio
+import shutil
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 from aiohttp import web, ClientSession
@@ -17,7 +20,7 @@ from Crypto.Hash import SHA256
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
@@ -48,7 +51,30 @@ REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
 REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "").strip()
 REQUIRED_CHANNEL_NAME = os.getenv("REQUIRED_CHANNEL_NAME", "Channel Maboyy Digital").strip()
 
-DB_PATH = "shop.db"
+# Persistent storage / backup / announcement channels
+DB_PATH = os.getenv(
+    "DB_PATH",
+    "/data/shop.db" if os.path.isdir("/data") else "shop.db"
+).strip()
+BACKUP_DIR = os.getenv(
+    "BACKUP_DIR",
+    "/data/backups" if os.path.isdir("/data") else "backups"
+).strip()
+BACKUP_INTERVAL_HOURS = max(1, int(os.getenv("BACKUP_INTERVAL_HOURS", "48")))
+BACKUP_RETENTION = max(3, int(os.getenv("BACKUP_RETENTION", "20")))
+ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "15")))
+
+STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
+
+BOT_VERSION = "2.8"
+BOT_CHANGELOG = [
+    "Backup database otomatis dan retention backup.",
+    "Database persisten melalui Railway Volume.",
+    "Migrasi database lama ke storage persisten saat pertama kali aktif.",
+    "Stok terbaru otomatis disinkronkan ke channel tanpa spam pesan baru.",
+    "Data user, saldo, order, produk, voucher, dan pengaturan tetap tersimpan saat redeploy.",
+]
+
 STORE_NAME = "Maboyy Produk Digital"
 STORE_FOOTER = "Aplikasi Premium • Since 2020"
 
@@ -58,8 +84,20 @@ START_TIME = time.time()
 
 
 # =========================
-# DATABASE
+# DATABASE / PERSISTENT STORAGE
 # =========================
+def prepare_storage():
+    db_file = Path(DB_PATH)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+
+    # First migration from old non-volume DB to the persistent DB.
+    legacy = Path("shop.db")
+    if db_file.resolve() != legacy.resolve() and not db_file.exists() and legacy.exists():
+        shutil.copy2(legacy, db_file)
+        logging.info("Legacy database migrated to persistent storage: %s", DB_PATH)
+
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -77,6 +115,7 @@ def add_column_if_missing(conn, table, column, definition):
 
 
 def init_db():
+    prepare_storage()
     conn = db()
     cur = conn.cursor()
 
@@ -190,6 +229,7 @@ def init_db():
     add_column_if_missing(conn, "products", "rating_count", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "is_popular", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "is_flash_sale", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "product_variants", "reserved_stock", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "variant_id", "INTEGER DEFAULT 0")
     add_column_if_missing(conn, "orders", "unit_price", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "payment_method", "TEXT DEFAULT 'QRIS'")
@@ -199,6 +239,9 @@ def init_db():
     add_column_if_missing(conn, "orders", "payment_total", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "provider_reference", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "provider_qr_url", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "stock_reserved", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "orders", "reserved_until", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "completed_at", "TEXT DEFAULT ''")
 
     # Default store settings (editable from /owner)
     defaults = {
@@ -208,6 +251,7 @@ def init_db():
         "unique_code_min": "1",
         "unique_code_max": "999",
         "payment_mode": "manual",
+        "min_topup": "5000",
     }
     for k, v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)", (k, v))
@@ -403,6 +447,280 @@ def topup_invoice(topup_id: int) -> str:
     return f"TOP-{topup_id:06d}"
 
 
+
+def available_stock(variant) -> int:
+    return max(0, int(variant["stock"]) - int(variant["reserved_stock"] or 0))
+
+
+def reservation_expiry_iso() -> str:
+    return (
+        datetime.now(timezone.utc).astimezone() +
+        timedelta(minutes=ORDER_RESERVATION_MINUTES)
+    ).isoformat(timespec="seconds")
+
+
+def reserve_stock_for_order(conn, variant_id: int, qty: int) -> bool:
+    row = conn.execute(
+        """SELECT stock, reserved_stock
+           FROM product_variants
+           WHERE id=? AND active=1""",
+        (variant_id,)
+    ).fetchone()
+
+    if not row:
+        return False
+
+    available = int(row["stock"]) - int(row["reserved_stock"] or 0)
+    if qty <= 0 or available < qty:
+        return False
+
+    conn.execute(
+        """UPDATE product_variants
+           SET reserved_stock=reserved_stock+?
+           WHERE id=?""",
+        (qty, variant_id)
+    )
+    return True
+
+
+def release_order_reservation(conn, order):
+    if not order or int(order["stock_reserved"] or 0) != 1:
+        return
+
+    conn.execute(
+        """UPDATE product_variants
+           SET reserved_stock=MAX(0, reserved_stock-?)
+           WHERE id=?""",
+        (order["qty"], order["variant_id"])
+    )
+    conn.execute(
+        "UPDATE orders SET stock_reserved=0 WHERE id=?",
+        (order["id"],)
+    )
+
+
+_purchase_locks = {}
+
+
+def purchase_lock(user_id: int):
+    lock = _purchase_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _purchase_locks[user_id] = lock
+    return lock
+
+
+async def cleanup_expired_orders(bot: Bot):
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+            conn = db()
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """SELECT * FROM orders
+                   WHERE status='pending'
+                     AND stock_reserved=1
+                     AND reserved_until!=''
+                     AND reserved_until < ?""",
+                (now_iso,)
+            ).fetchall()
+
+            notify = []
+            for order in rows:
+                release_order_reservation(conn, order)
+                conn.execute(
+                    """UPDATE orders
+                       SET status='expired', payment_status='expired'
+                       WHERE id=?""",
+                    (order["id"],)
+                )
+                notify.append((order["user_id"], order["id"]))
+
+            conn.commit()
+            conn.close()
+
+            if rows:
+                await sync_stock_channel(bot)
+
+            for user_id, order_id in notify:
+                try:
+                    await bot.send_message(
+                        user_id,
+                        "⌛ <b>PESANAN KADALUARSA</b>\n\n"
+                        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+                        "Waktu pembayaran habis dan stok reservasi sudah dilepas.\n"
+                        "Silakan buat pesanan baru jika masih ingin membeli.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            logging.exception("Expired order cleanup failed: %s", exc)
+
+
+
+def get_min_topup() -> int:
+    try:
+        return max(1000, int(get_setting("min_topup", "5000")))
+    except ValueError:
+        return 5000
+
+
+
+def channel_target(value: str):
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value.lstrip("-").isdigit():
+        return int(value)
+    return value
+
+
+def create_database_backup() -> Path:
+    Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = Path(BACKUP_DIR) / f"maboyydigital_{stamp}.db"
+
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(str(backup_path))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+    backups = sorted(
+        Path(BACKUP_DIR).glob("maboyydigital_*.db"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    for old_file in backups[BACKUP_RETENTION:]:
+        try:
+            old_file.unlink()
+        except Exception:
+            pass
+
+    return backup_path
+
+
+async def send_backup(bot: Bot, backup_path: Path):
+    # Backup hanya dikirim ke PM owner berdasarkan ADMIN_ID.
+    if not ADMIN_ID:
+        logging.warning("Backup dibuat tetapi ADMIN_ID belum diisi.")
+        return
+
+    try:
+        await bot.send_document(
+            ADMIN_ID,
+            document=FSInputFile(str(backup_path)),
+            caption=(
+                "🗄️ <b>BACKUP OTOMATIS MABOYY DIGITAL</b>\n\n"
+                f"📦 Versi bot: <b>v{BOT_VERSION}</b>\n"
+                f"🕒 {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}\n"
+                f"💾 Database: <code>{Path(DB_PATH).name}</code>\n\n"
+                "Backup ini dikirim langsung ke PM owner."
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        logging.warning("Failed to send backup to owner: %s", exc)
+
+
+async def backup_loop(bot: Bot):
+    # Small startup delay so polling/web server can become ready first.
+    await asyncio.sleep(15)
+    while True:
+        try:
+            backup_path = create_database_backup()
+            await send_backup(bot, backup_path)
+            logging.info("Automatic backup created: %s", backup_path)
+        except Exception as exc:
+            logging.exception("Automatic backup failed: %s", exc)
+
+        await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)
+
+
+def build_stock_text() -> str:
+    conn = db()
+    rows = conn.execute("""
+        SELECT
+            p.name AS product_name,
+            v.name AS variant_name,
+            v.stock,
+            v.reserved_stock,
+            v.price,
+            p.active,
+            v.active
+        FROM product_variants v
+        JOIN products p ON p.id=v.product_id
+        WHERE p.active=1 AND v.active=1
+        ORDER BY p.id, v.id
+    """).fetchall()
+    conn.close()
+
+    lines = [
+        "📦 <b>STOK TERBARU • MABOYY DIGITAL</b>",
+        "",
+    ]
+
+    if not rows:
+        lines.append("Belum ada produk aktif.")
+    else:
+        current_product = None
+        for row in rows:
+            if current_product != row["product_name"]:
+                current_product = row["product_name"]
+                lines.append(f"\n<b>{current_product}</b>")
+            available = max(0, int(row["stock"]) - int(row["reserved_stock"] or 0))
+            icon = "✅" if available > 0 else "❌"
+            lines.append(
+                f"{icon} {row['variant_name']} — "
+                f"<b>{available}</b> stok • {rupiah(row['price'])}"
+            )
+
+    lines.extend([
+        "",
+        f"🕒 Update: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}",
+        f"<i>{STORE_FOOTER}</i>"
+    ])
+    return "\n".join(lines)
+
+
+async def sync_stock_channel(bot: Bot):
+    target = channel_target(STOCK_CHANNEL_ID)
+    if not target:
+        return
+
+    text = build_stock_text()
+    message_id_raw = get_setting("stock_channel_message_id", "")
+    message_id = int(message_id_raw) if message_id_raw.isdigit() else None
+
+    if message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=target,
+                message_id=message_id,
+                text=text,
+                parse_mode="HTML"
+            )
+            return
+        except Exception:
+            # If message was deleted or no longer editable, send a new one.
+            pass
+
+    try:
+        msg = await bot.send_message(target, text, parse_mode="HTML")
+        set_setting("stock_channel_message_id", msg.message_id)
+    except Exception as exc:
+        logging.warning("Stock channel sync failed: %s", exc)
+
+
+async def startup_automation(bot: Bot):
+    await asyncio.sleep(5)
+    await sync_stock_channel(bot)
+
+
 def unique_code_for_order():
     if get_setting("unique_code_enabled", "1") != "1":
         return 0
@@ -563,54 +881,89 @@ async def shopeepay_generate_qr(order_id: int, amount: int):
 
 async def mark_order_paid(order_id: int, bot: Bot, paid_amount: int | None = None):
     conn = db()
+    conn.execute("BEGIN IMMEDIATE")
     order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+
     if not order:
+        conn.rollback()
         conn.close()
         return False
 
     if order["status"] == "completed":
+        conn.rollback()
         conn.close()
         return True
+
+    if order["status"] in {"expired", "cancelled", "payment_error"}:
+        conn.rollback()
+        conn.close()
+        return False
 
     variant = conn.execute(
         "SELECT * FROM product_variants WHERE id=?",
         (order["variant_id"],)
     ).fetchone()
 
-    if not variant or variant["stock"] < order["qty"]:
+    if not variant:
+        conn.rollback()
         conn.close()
         return False
 
-    conn.execute(
-        "UPDATE product_variants SET stock=stock-? WHERE id=?",
-        (order["qty"], order["variant_id"])
-    )
+    if int(order["stock_reserved"] or 0) == 1:
+        if int(variant["stock"]) < int(order["qty"]):
+            conn.rollback()
+            conn.close()
+            return False
+
+        conn.execute(
+            """UPDATE product_variants
+               SET stock=stock-?,
+                   reserved_stock=MAX(0, reserved_stock-?)
+               WHERE id=?""",
+            (order["qty"], order["qty"], order["variant_id"])
+        )
+    else:
+        if available_stock(variant) < int(order["qty"]):
+            conn.rollback()
+            conn.close()
+            return False
+        conn.execute(
+            "UPDATE product_variants SET stock=stock-? WHERE id=?",
+            (order["qty"], order["variant_id"])
+        )
+
     conn.execute(
         "UPDATE products SET sold=sold+? WHERE id=?",
         (order["qty"], order["product_id"])
     )
     conn.execute(
         """UPDATE orders
-           SET status='completed', payment_status='paid'
+           SET status='completed',
+               payment_status='paid',
+               stock_reserved=0,
+               completed_at=?
            WHERE id=?""",
-        (order_id,)
+        (datetime.now().isoformat(timespec="seconds"), order_id)
     )
     conn.commit()
     conn.close()
 
+    await sync_stock_channel(bot)
+
     try:
         await bot.send_message(
             order["user_id"],
-            "✅ <b>PEMBAYARAN OTOMATIS BERHASIL</b>\n\n"
+            "✅ <b>PEMBAYARAN BERHASIL</b>\n\n"
             f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
             f"💵 Dibayar: <b>{rupiah(paid_amount or order['payment_total'] or order['total'])}</b>\n"
             "🟢 Status: <b>Selesai</b>\n\n"
-            "Pembayaran telah dikonfirmasi otomatis.\n\n"
+            "Pesanan sudah dikonfirmasi dan stok telah diperbarui.\n\n"
             f"<i>{STORE_FOOTER}</i>",
             parse_mode="HTML"
         )
     except Exception:
         pass
+
     return True
 
 
@@ -635,6 +988,7 @@ class OwnerState(StatesGroup):
     owner_wallet_add = State()
     owner_wallet_subtract = State()
     owner_topup_verify = State()
+    owner_min_topup = State()
 
 
 # =========================
@@ -667,9 +1021,11 @@ def owner_menu():
     kb.button(text="🎁 Tambah Voucher", callback_data="owner:add_voucher")
     kb.button(text="💳 Pengaturan Pembayaran", callback_data="owner:qris_settings")
     kb.button(text="💰 Manajemen Saldo", callback_data="owner:wallet")
+    kb.button(text="🗄️ Backup Sekarang", callback_data="owner:backup_now")
+    kb.button(text="📢 Sinkron Stok Channel", callback_data="owner:sync_stock")
     kb.button(text="📊 Statistik", callback_data="owner:stats")
     kb.button(text="🏠 Menu User", callback_data="home")
-    kb.adjust(2, 2, 2, 2, 2, 2, 2)
+    kb.adjust(2, 2, 2, 2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -681,7 +1037,13 @@ def back_home():
 
 def back_owner():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Panel Owner", callback_data="owner:panel")]
+        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="owner:panel")]
+    ])
+
+
+def owner_back_button():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="owner:panel")]
     ])
 
 
@@ -702,8 +1064,9 @@ def owner_wallet_menu():
     kb.button(text="➖ Kurangi Saldo User", callback_data="owner:wallet_sub")
     kb.button(text="✅ Verifikasi Top Up", callback_data="owner:wallet_verify")
     kb.button(text="📑 Riwayat Saldo", callback_data="owner:wallet_history")
-    kb.button(text="⬅️ Panel Owner", callback_data="owner:panel")
-    kb.adjust(2, 2, 1)
+    kb.button(text="⚙️ Minimum Top Up", callback_data="owner:min_topup")
+    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -724,7 +1087,7 @@ def qris_settings_menu():
         callback_data="owner:qris_toggle_mode"
     )
     kb.button(text="🔌 Status Payment Gateway", callback_data="owner:shopeepay_status")
-    kb.button(text="⬅️ Panel Owner", callback_data="owner:panel")
+    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
     kb.adjust(2, 2, 2, 1, 1)
     return kb.as_markup()
 
@@ -755,7 +1118,7 @@ def variants_keyboard(product_id):
 
     kb = InlineKeyboardBuilder()
     for row in rows:
-        label = f"{row['name']} ({row['stock']})"
+        label = f"{row['name']} ({available_stock(row)})"
         kb.button(text=label, callback_data=f"variant:{row['id']}")
     kb.adjust(1)
     kb.row(InlineKeyboardButton(text="⬅️ Kembali", callback_data="products"))
@@ -808,7 +1171,7 @@ def variant_card(product, variant, qty=1):
         f"• Produk : <b>{product['name']}</b>\n"
         f"• Variasi : <b>{variant['name']}</b>\n"
         f"• Kode : <code>{variant['code'] or '-'}</code>\n"
-        f"• Sisa Produk : <b>{variant['stock']}</b>\n"
+        f"• Sisa Produk : <b>{available_stock(variant)}</b>\n"
         f"• Desk : {product['description'] or '-'}\n"
         "└────────────────────\n\n"
         "┌────────────────────\n"
@@ -1027,8 +1390,9 @@ async def change_qty(call: CallbackQuery):
     if not variant or not product:
         return await call.answer("Variasi tidak ditemukan.", show_alert=True)
 
-    if variant["stock"] > 0 and qty > variant["stock"]:
-        qty = variant["stock"]
+    current_available = available_stock(variant)
+    if current_available > 0 and qty > current_available:
+        qty = current_available
         await call.answer("Jumlah disesuaikan dengan stok tersedia.", show_alert=True)
     else:
         await call.answer()
@@ -1076,7 +1440,7 @@ async def confirm_order(call: CallbackQuery):
     if not variant or not product:
         return await call.answer("Produk tidak ditemukan.", show_alert=True)
 
-    if variant["stock"] < qty:
+    if available_stock(variant) < qty:
         return await call.answer("Stok tidak mencukupi.", show_alert=True)
 
     unit = effective_unit_price(variant, qty)
@@ -1154,229 +1518,258 @@ async def payment_select(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("paywallet:"))
 async def process_wallet_order(call: CallbackQuery, bot: Bot):
-    _, variant_id, qty = call.data.split(":")
-    variant_id, qty = int(variant_id), max(1, int(qty))
+    async with purchase_lock(call.from_user.id):
+        _, variant_id, qty = call.data.split(":")
+        variant_id, qty = int(variant_id), max(1, int(qty))
 
-    conn = db()
-    variant = conn.execute(
-        "SELECT * FROM product_variants WHERE id=?",
-        (variant_id,)
-    ).fetchone()
-    product = conn.execute(
-        "SELECT * FROM products WHERE id=?",
-        (variant["product_id"],)
-    ).fetchone() if variant else None
+        conn = db()
+        conn.execute("BEGIN IMMEDIATE")
+        variant = conn.execute(
+            "SELECT * FROM product_variants WHERE id=? AND active=1",
+            (variant_id,)
+        ).fetchone()
+        product = conn.execute(
+            "SELECT * FROM products WHERE id=? AND active=1",
+            (variant["product_id"],)
+        ).fetchone() if variant else None
 
-    if not variant or not product or variant["stock"] < qty:
+        if not variant or not product or available_stock(variant) < qty:
+            conn.rollback()
+            conn.close()
+            return await call.answer("Stok tidak mencukupi.", show_alert=True)
+
+        wallet = conn.execute(
+            "SELECT balance FROM wallets WHERE user_id=?",
+            (call.from_user.id,)
+        ).fetchone()
+        balance = int(wallet["balance"]) if wallet else 0
+
+        unit = effective_unit_price(variant, qty)
+        total = unit * qty
+
+        if balance < total:
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                f"Saldo tidak cukup. Saldo Kamu {rupiah(balance)}.",
+                show_alert=True
+            )
+
+        cur = conn.execute(
+            """INSERT INTO orders
+               (user_id, username, product_id, variant_id, qty, unit_price, total,
+                status, payment_method, payment_status, note, unique_code,
+                payment_total, stock_reserved, reserved_until, completed_at, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                call.from_user.id,
+                call.from_user.username or "",
+                product["id"],
+                variant_id,
+                qty,
+                unit,
+                total,
+                "completed",
+                "WALLET",
+                "paid",
+                "",
+                0,
+                total,
+                0,
+                "",
+                datetime.now().isoformat(timespec="seconds"),
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+        order_id = cur.lastrowid
+        ref = invoice(order_id)
+        new_balance = balance - total
+
+        conn.execute(
+            """INSERT OR IGNORE INTO wallets(user_id, balance, updated_at)
+               VALUES(?,?,?)""",
+            (call.from_user.id, balance, datetime.now().isoformat(timespec="seconds"))
+        )
+        conn.execute(
+            "UPDATE wallets SET balance=?, updated_at=? WHERE user_id=?",
+            (new_balance, datetime.now().isoformat(timespec="seconds"), call.from_user.id)
+        )
+        conn.execute(
+            """INSERT INTO wallet_ledger
+               (user_id, type, amount, balance_after, reference, note, created_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (
+                call.from_user.id, "PURCHASE", -total, new_balance, ref,
+                f"Pembelian {product['name']} - {variant['name']}",
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+        conn.execute(
+            "UPDATE product_variants SET stock=stock-? WHERE id=?",
+            (qty, variant_id)
+        )
+        conn.execute(
+            "UPDATE products SET sold=sold+? WHERE id=?",
+            (qty, product["id"])
+        )
+        conn.commit()
         conn.close()
-        return await call.answer("Stok tidak mencukupi.", show_alert=True)
 
-    unit = effective_unit_price(variant, qty)
-    total = unit * qty
-    balance = get_balance(call.from_user.id)
+        await sync_stock_channel(bot)
 
-    if balance < total:
-        conn.close()
-        return await call.answer(
-            f"Saldo tidak cukup. Saldo Anda {rupiah(balance)}.",
-            show_alert=True
+        await call.message.edit_text(
+            "✅ <b>PEMBAYARAN SALDO BERHASIL</b>\n\n"
+            f"🧾 Invoice: <b>{ref}</b>\n"
+            f"📦 Produk: {product['name']} — {variant['name']}\n"
+            f"💰 Total: <b>{rupiah(total)}</b>\n"
+            f"💳 Metode: <b>Saldo</b>\n"
+            f"💵 Sisa saldo: <b>{rupiah(new_balance)}</b>\n\n"
+            f"<i>{STORE_FOOTER}</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
+                [InlineKeyboardButton(text="🏠 Menu Utama", callback_data="home")]
+            ]),
+            parse_mode="HTML"
         )
-
-    cur = conn.execute(
-        """INSERT INTO orders
-           (user_id, username, product_id, variant_id, qty, unit_price, total,
-            status, payment_method, payment_status, note, unique_code,
-            payment_total, provider_reference, provider_qr_url, created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            call.from_user.id,
-            call.from_user.username or "",
-            product["id"],
-            variant_id,
-            qty,
-            unit,
-            total,
-            "pending",
-            "WALLET",
-            "unpaid",
-            "",
-            0,
-            total,
-            "",
-            "",
-            datetime.now().isoformat(timespec="seconds")
-        )
-    )
-    order_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    try:
-        new_balance = wallet_change(
-            call.from_user.id,
-            -total,
-            "PURCHASE",
-            invoice(order_id),
-            f"Pembelian {product['name']} - {variant['name']}"
-        )
-    except ValueError:
-        return await call.answer("Saldo tidak mencukupi.", show_alert=True)
-
-    # finalize order immediately
-    ok = await mark_order_paid(order_id, bot, total)
-    if not ok:
-        # refund automatically if fulfillment failed
-        wallet_change(
-            call.from_user.id,
-            total,
-            "REFUND",
-            f"REFUND-{invoice(order_id)}",
-            "Refund otomatis karena order gagal diproses."
-        )
-        return await call.message.edit_text(
-            "❌ Order gagal diproses. Saldo sudah dikembalikan otomatis.",
-            reply_markup=back_home()
-        )
-
-    await call.message.edit_text(
-        "✅ <b>PEMBAYARAN SALDO BERHASIL</b>\n\n"
-        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
-        f"📦 Produk: {product['name']} — {variant['name']}\n"
-        f"💰 Total: <b>{rupiah(total)}</b>\n"
-        f"💳 Metode: <b>Saldo</b>\n"
-        f"💵 Sisa saldo: <b>{rupiah(new_balance)}</b>\n\n"
-        f"<i>{STORE_FOOTER}</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
-            [InlineKeyboardButton(text="🏠 Menu Utama", callback_data="home")]
-        ]),
-        parse_mode="HTML"
-    )
-    await call.answer("Pembayaran berhasil.")
+        await call.answer("Pembayaran berhasil.")
 
 
 @router.callback_query(F.data.startswith("process:"))
 async def process_order(call: CallbackQuery, bot: Bot):
-    _, variant_id, qty = call.data.split(":")
-    variant_id, qty = int(variant_id), max(1, int(qty))
+    async with purchase_lock(call.from_user.id):
+        _, variant_id, qty = call.data.split(":")
+        variant_id, qty = int(variant_id), max(1, int(qty))
 
-    conn = db()
-    variant = conn.execute("SELECT * FROM product_variants WHERE id=?", (variant_id,)).fetchone()
-    product = conn.execute("SELECT * FROM products WHERE id=?", (variant["product_id"],)).fetchone() if variant else None
+        conn = db()
+        conn.execute("BEGIN IMMEDIATE")
+        variant = conn.execute(
+            "SELECT * FROM product_variants WHERE id=?",
+            (variant_id,)
+        ).fetchone()
+        product = conn.execute(
+            "SELECT * FROM products WHERE id=?",
+            (variant["product_id"],)
+        ).fetchone() if variant else None
 
-    if not variant or not product or variant["stock"] < qty:
+        if not variant or not product or not product["active"] or available_stock(variant) < qty:
+            conn.rollback()
+            conn.close()
+            return await call.answer("Stok tidak mencukupi / produk tidak aktif.", show_alert=True)
+
+        unit = effective_unit_price(variant, qty)
+        total = unit * qty
+        unique_code = unique_code_for_order()
+        payment_total = total + unique_code
+
+        if not reserve_stock_for_order(conn, variant_id, qty):
+            conn.rollback()
+            conn.close()
+            return await call.answer("Stok baru saja berubah. Silakan coba lagi.", show_alert=True)
+
+        cur = conn.execute(
+            """INSERT INTO orders
+               (user_id, username, product_id, variant_id, qty, unit_price, total,
+                status, payment_method, payment_status, note, unique_code,
+                payment_total, stock_reserved, reserved_until, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                call.from_user.id,
+                call.from_user.username or "",
+                product["id"],
+                variant_id,
+                qty,
+                unit,
+                total,
+                "pending",
+                "QRIS",
+                "unpaid",
+                "",
+                unique_code,
+                payment_total,
+                1,
+                reservation_expiry_iso(),
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+        order_id = cur.lastrowid
+        conn.commit()
         conn.close()
-        return await call.answer("Stok tidak mencukupi.", show_alert=True)
 
-    unit = effective_unit_price(variant, qty)
-    total = unit * qty
-    unique_code = unique_code_for_order()
-    payment_total = total + unique_code
+        inv = invoice(order_id)
+        kb = InlineKeyboardBuilder()
+        if ADMIN_USERNAME:
+            kb.button(text="💬 Hubungi Owner", url=f"https://t.me/{ADMIN_USERNAME}")
+        kb.button(text="🧾 Pesanan Saya", callback_data="my_orders")
+        kb.button(text="🏠 Menu Utama", callback_data="home")
+        kb.adjust(1)
 
-    cur = conn.execute(
-        """INSERT INTO orders
-           (user_id, username, product_id, variant_id, qty, unit_price, total,
-            status, payment_method, payment_status, note, unique_code,
-            payment_total, created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            call.from_user.id,
-            call.from_user.username or "",
-            product["id"],
-            variant_id,
-            qty,
-            unit,
-            total,
-            "pending",
-            "QRIS",
-            "unpaid",
-            "",
-            unique_code,
-            payment_total,
-            datetime.now().isoformat(timespec="seconds")
+        payment_note = get_setting("payment_note", DEFAULT_PAYMENT_NOTE)
+        qris_file_id = get_setting("qris_file_id", "")
+        unique_text = f"🔢 Kode unik: <b>+{unique_code}</b>\n" if unique_code > 0 else ""
+
+        payment_text = (
+            "💳 <b>TRANSAKSI PENDING</b>\n\n"
+            f"🧾 Invoice: <b>{inv}</b>\n"
+            "💠 Pembayaran: <b>QRIS Manual</b>\n"
+            f"📦 Produk: {product['name']} — {variant['name']}\n"
+            f"🔢 Jumlah: <b>{qty}</b>\n"
+            f"💰 Subtotal: <b>{rupiah(total)}</b>\n"
+            f"{unique_text}"
+            f"💵 <b>TOTAL TRANSFER: {rupiah(payment_total)}</b>\n\n"
+            f"⏳ Stok direservasi selama <b>{ORDER_RESERVATION_MINUTES} menit</b>.\n"
+            "⚠️ Transfer harus sesuai total hingga kode unik.\n"
+            f"📝 {payment_note}\n\n"
+            "Setelah pembayaran, owner akan memverifikasi transaksi.\n\n"
+            f"<i>{STORE_FOOTER}</i>"
         )
-    )
-    order_id = cur.lastrowid
-    conn.commit()
-    conn.close()
 
-    inv = invoice(order_id)
+        await sync_stock_channel(bot)
 
-    kb = InlineKeyboardBuilder()
-    if ADMIN_USERNAME:
-        kb.button(text="💬 Hubungi Owner", url=f"https://t.me/{ADMIN_USERNAME}")
-    kb.button(text="🧾 Pesanan Saya", callback_data="my_orders")
-    kb.button(text="🏠 Menu Utama", callback_data="home")
-    kb.adjust(1)
-
-    payment_note = get_setting("payment_note", DEFAULT_PAYMENT_NOTE)
-    qris_file_id = get_setting("qris_file_id", "")
-
-    unique_text = (
-        f"🔢 Kode unik: <b>+{unique_code}</b>\n"
-        if unique_code > 0 else ""
-    )
-
-    payment_text = (
-        "💳 <b>TRANSAKSI PENDING</b>\n\n"
-        f"🧾 Invoice: <b>{inv}</b>\n"
-        "💠 Pembayaran: <b>QRIS Pribadi</b>\n"
-        f"📦 Produk: {product['name']} — {variant['name']}\n"
-        f"🔢 Jumlah: <b>{qty}</b>\n"
-        f"💰 Subtotal: <b>{rupiah(total)}</b>\n"
-        f"{unique_text}"
-        f"💵 <b>TOTAL TRANSFER: {rupiah(payment_total)}</b>\n\n"
-        "⚠️ Transfer harus <b>sesuai total hingga kode unik</b> agar mudah dicocokkan.\n"
-        f"📝 {payment_note}\n\n"
-        "Setelah pembayaran, owner akan memverifikasi transaksi secara manual.\n\n"
-        f"<i>{STORE_FOOTER}</i>"
-    )
-
-    if qris_file_id:
-        try:
-            await call.message.delete()
-            await bot.send_photo(
-                call.from_user.id,
-                photo=qris_file_id,
-                caption=payment_text,
+        if qris_file_id:
+            try:
+                await call.message.delete()
+                await bot.send_photo(
+                    call.from_user.id,
+                    photo=qris_file_id,
+                    caption=payment_text,
+                    reply_markup=kb.as_markup(),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                await bot.send_message(
+                    call.from_user.id,
+                    payment_text + "\n\n⚠️ QRIS belum dapat dimuat. Hubungi owner.",
+                    reply_markup=kb.as_markup(),
+                    parse_mode="HTML"
+                )
+        else:
+            await call.message.edit_text(
+                payment_text + "\n\n⚠️ Owner belum memasang gambar QRIS.",
                 reply_markup=kb.as_markup(),
                 parse_mode="HTML"
             )
-        except Exception:
-            await bot.send_message(
-                call.from_user.id,
-                payment_text + "\n\n⚠️ QRIS belum dapat dimuat. Hubungi owner.",
-                reply_markup=kb.as_markup(),
-                parse_mode="HTML"
-            )
-    else:
-        await call.message.edit_text(
-            payment_text + "\n\n⚠️ Owner belum memasang gambar QRIS.",
-            reply_markup=kb.as_markup(),
-            parse_mode="HTML"
-        )
 
-    if ADMIN_ID:
-        try:
-            user = f"@{call.from_user.username}" if call.from_user.username else str(call.from_user.id)
-            await bot.send_message(
-                ADMIN_ID,
-                "🔔 <b>ORDER BARU / MENUNGGU BAYAR</b>\n\n"
-                f"🧾 {inv}\n"
-                f"👤 {user}\n"
-                f"📦 {product['name']} — {variant['name']}\n"
-                f"🔢 Qty: {qty}\n"
-                f"💰 Subtotal: {rupiah(total)}\n"
-                f"🔢 Kode unik: +{unique_code}\n"
-                f"💵 Transfer: {rupiah(payment_total)}\n\n"
-                "Buka /owner → ✅ Verifikasi Bayar setelah pembayaran valid.",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+        if ADMIN_ID:
+            try:
+                user = f"@{call.from_user.username}" if call.from_user.username else str(call.from_user.id)
+                await bot.send_message(
+                    ADMIN_ID,
+                    "🔔 <b>ORDER BARU / MENUNGGU BAYAR</b>\n\n"
+                    f"🧾 {inv}\n"
+                    f"👤 {user}\n"
+                    f"📦 {product['name']} — {variant['name']}\n"
+                    f"🔢 Qty: {qty}\n"
+                    f"💰 Subtotal: {rupiah(total)}\n"
+                    f"🔢 Kode unik: +{unique_code}\n"
+                    f"💵 Transfer: {rupiah(payment_total)}\n"
+                    f"⏳ Reservasi: {ORDER_RESERVATION_MINUTES} menit\n\n"
+                    "Buka /owner → ✅ Verifikasi Bayar setelah pembayaran valid.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
 
-    await call.answer("Pesanan dibuat.")
-
+        await call.answer("Pesanan dibuat dan stok direservasi.")
 
 
 @router.callback_query(F.data.startswith("processauto:"))
@@ -1387,150 +1780,151 @@ async def process_auto_order(call: CallbackQuery, bot: Bot):
             show_alert=True
         )
 
-    _, variant_id, qty = call.data.split(":")
-    variant_id, qty = int(variant_id), max(1, int(qty))
+    async with purchase_lock(call.from_user.id):
+        _, variant_id, qty = call.data.split(":")
+        variant_id, qty = int(variant_id), max(1, int(qty))
 
-    conn = db()
-    variant = conn.execute(
-        "SELECT * FROM product_variants WHERE id=?",
-        (variant_id,)
-    ).fetchone()
-    product = conn.execute(
-        "SELECT * FROM products WHERE id=?",
-        (variant["product_id"],)
-    ).fetchone() if variant else None
+        conn = db()
+        conn.execute("BEGIN IMMEDIATE")
+        variant = conn.execute(
+            "SELECT * FROM product_variants WHERE id=?",
+            (variant_id,)
+        ).fetchone()
+        product = conn.execute(
+            "SELECT * FROM products WHERE id=?",
+            (variant["product_id"],)
+        ).fetchone() if variant else None
 
-    if not variant or not product or variant["stock"] < qty:
-        conn.close()
-        return await call.answer("Stok tidak mencukupi.", show_alert=True)
+        if not variant or not product or not product["active"] or available_stock(variant) < qty:
+            conn.rollback()
+            conn.close()
+            return await call.answer("Stok tidak mencukupi.", show_alert=True)
 
-    unit = effective_unit_price(variant, qty)
-    total = unit * qty
+        unit = effective_unit_price(variant, qty)
+        total = unit * qty
 
-    cur = conn.execute(
-        """INSERT INTO orders
-           (user_id, username, product_id, variant_id, qty, unit_price, total,
-            status, payment_method, payment_status, note, unique_code,
-            payment_total, provider_reference, provider_qr_url, created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            call.from_user.id,
-            call.from_user.username or "",
-            product["id"],
-            variant_id,
-            qty,
-            unit,
-            total,
-            "pending",
-            "SHOPEEPAY_MPM",
-            "unpaid",
-            "",
-            0,
-            total,
-            "",
-            "",
-            datetime.now().isoformat(timespec="seconds")
+        if not reserve_stock_for_order(conn, variant_id, qty):
+            conn.rollback()
+            conn.close()
+            return await call.answer("Stok baru saja berubah. Silakan coba lagi.", show_alert=True)
+
+        cur = conn.execute(
+            """INSERT INTO orders
+               (user_id, username, product_id, variant_id, qty, unit_price, total,
+                status, payment_method, payment_status, note, unique_code,
+                payment_total, provider_reference, provider_qr_url,
+                stock_reserved, reserved_until, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                call.from_user.id,
+                call.from_user.username or "",
+                product["id"],
+                variant_id,
+                qty,
+                unit,
+                total,
+                "pending",
+                "AUTO_QRIS",
+                "unpaid",
+                "",
+                0,
+                total,
+                "",
+                "",
+                1,
+                reservation_expiry_iso(),
+                datetime.now().isoformat(timespec="seconds")
+            )
         )
-    )
-    order_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+        order_id = cur.lastrowid
+        conn.commit()
+        conn.close()
 
-    try:
-        qr = await shopeepay_generate_qr(order_id, total)
-    except Exception as e:
-        # Do not delete order; keep it for audit but mark failed.
+        try:
+            qr = await shopeepay_generate_qr(order_id, total)
+        except Exception as e:
+            conn = db()
+            conn.execute("BEGIN IMMEDIATE")
+            order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+            release_order_reservation(conn, order)
+            conn.execute(
+                "UPDATE orders SET status='payment_error', payment_status='error', note=? WHERE id=?",
+                (str(e)[:250], order_id)
+            )
+            conn.commit()
+            conn.close()
+            await sync_stock_channel(bot)
+
+            return await call.message.edit_text(
+                "❌ <b>QRIS OTOMATIS BELUM BERHASIL DIBUAT</b>\n\n"
+                "Stok reservasi sudah dilepas otomatis.\n"
+                "Silakan gunakan QRIS manual sementara.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="🟡 Gunakan QRIS Manual",
+                        callback_data=f"process:{variant_id}:{qty}"
+                    )],
+                    [InlineKeyboardButton(
+                        text="⬅️ Kembali",
+                        callback_data=f"variant:{variant_id}"
+                    )]
+                ]),
+                parse_mode="HTML"
+            )
+
         conn = db()
         conn.execute(
-            "UPDATE orders SET status='payment_error', note=? WHERE id=?",
-            (str(e)[:250], order_id)
+            """UPDATE orders
+               SET provider_reference=?, provider_qr_url=?
+               WHERE id=?""",
+            (qr["partner_reference"], qr["qr_url"], order_id)
         )
         conn.commit()
         conn.close()
 
-        return await call.message.edit_text(
-            "❌ <b>QRIS SHOPEEPAY BELUM BERHASIL DIBUAT</b>\n\n"
-            "Pembayaran otomatis belum siap atau credential/API belum valid.\n"
-            "Silakan kembali dan gunakan QRIS pribadi sementara.\n\n"
-            f"<code>{str(e)[:180]}</code>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="🟡 Gunakan QRIS Manual",
-                    callback_data=f"process:{variant_id}:{qty}"
-                )],
-                [InlineKeyboardButton(
-                    text="⬅️ Kembali",
-                    callback_data=f"variant:{variant_id}"
-                )]
-            ]),
-            parse_mode="HTML"
+        await sync_stock_channel(bot)
+
+        caption = (
+            "⚡ <b>QRIS OTOMATIS</b>\n\n"
+            f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+            f"📦 {product['name']} — {variant['name']}\n"
+            f"🔢 Qty: <b>{qty}</b>\n"
+            f"💵 Total: <b>{rupiah(total)}</b>\n"
+            f"⏳ Stok direservasi <b>{ORDER_RESERVATION_MINUTES} menit</b>.\n\n"
+            "Setelah pembayaran sukses dan callback tervalidasi, status order berubah otomatis.\n\n"
+            f"<i>{STORE_FOOTER}</i>"
         )
 
-    conn = db()
-    conn.execute(
-        """UPDATE orders
-           SET provider_reference=?, provider_qr_url=?
-           WHERE id=?""",
-        (qr["partner_reference"], qr["qr_url"], order_id)
-    )
-    conn.commit()
-    conn.close()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
+            [InlineKeyboardButton(text="🏠 Menu Utama", callback_data="home")]
+        ])
 
-    caption = (
-        "⚡ <b>QRIS OTOMATIS</b>\n\n"
-        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
-        f"📦 {product['name']} — {variant['name']}\n"
-        f"🔢 Qty: <b>{qty}</b>\n"
-        f"💵 Total: <b>{rupiah(total)}</b>\n\n"
-        "QR ini dibuat khusus untuk transaksi ini.\n"
-        "Setelah pembayaran sukses dan callback tervalidasi, status order akan berubah otomatis.\n\n"
-        f"<i>{STORE_FOOTER}</i>"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
-        [InlineKeyboardButton(text="🏠 Menu Utama", callback_data="home")]
-    ])
-
-    if qr["qr_url"]:
-        try:
-            await call.message.delete()
-            await bot.send_photo(
-                call.from_user.id,
-                qr["qr_url"],
-                caption=caption,
+        if qr["qr_url"]:
+            try:
+                await call.message.delete()
+                await bot.send_photo(
+                    call.from_user.id,
+                    qr["qr_url"],
+                    caption=caption,
+                    reply_markup=kb,
+                    parse_mode="HTML"
+                )
+            except Exception:
+                await bot.send_message(
+                    call.from_user.id,
+                    caption + f"\n\nQR URL:\n{qr['qr_url']}",
+                    reply_markup=kb,
+                    parse_mode="HTML"
+                )
+        else:
+            await call.message.edit_text(
+                caption + "\n\nQR image URL tidak tersedia.",
                 reply_markup=kb,
                 parse_mode="HTML"
             )
-        except Exception:
-            await bot.send_message(
-                call.from_user.id,
-                caption + f"\n\nQR URL:\n{qr['qr_url']}",
-                reply_markup=kb,
-                parse_mode="HTML"
-            )
-    else:
-        await call.message.edit_text(
-            caption + "\n\nQR image URL tidak tersedia dari API.",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
 
-    if ADMIN_ID:
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                "⚡ <b>ORDER QRIS OTOMATIS</b>\n\n"
-                f"🧾 {invoice(order_id)}\n"
-                f"💰 {rupiah(total)}\n"
-                f"🔗 Reference: <code>{qr['partner_reference']}</code>\n"
-                "⏳ Menunggu callback pembayaran.",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-    await call.answer("QR Payment Gateway berhasil dibuat.")
+        await call.answer("QR otomatis berhasil dibuat.")
 
 
 @router.callback_query(F.data == "my_orders")
@@ -1552,7 +1946,14 @@ async def my_orders(call: CallbackQuery):
     else:
         lines = ["🧾 <b>PESANAN SAYA</b>\n"]
         for row in rows:
-            icon = "✅" if row["status"] == "completed" else "🟡"
+            status_icons = {
+                "completed": "✅",
+                "pending": "🟡",
+                "expired": "⌛",
+                "cancelled": "❌",
+                "payment_error": "⚠️",
+            }
+            icon = status_icons.get(row["status"], "🔵")
             lines.append(
                 f"{icon} <b>{invoice(row['id'])}</b>\n"
                 f"   {row['product_name']} — {row['variant_name'] or 'Standard'}\n"
@@ -1570,7 +1971,7 @@ async def my_orders(call: CallbackQuery):
 async def stock_report(call: CallbackQuery):
     conn = db()
     rows = conn.execute("""
-        SELECT p.name AS product_name, v.name AS variant_name, v.stock
+        SELECT p.name AS product_name, v.name AS variant_name, v.stock, v.reserved_stock
         FROM product_variants v
         JOIN products p ON p.id=v.product_id
         WHERE p.active=1 AND v.active=1
@@ -1580,8 +1981,9 @@ async def stock_report(call: CallbackQuery):
 
     lines = ["📁 <b>LAPORAN STOK</b>\n"]
     for row in rows:
-        icon = "✅" if row["stock"] > 0 else "❌"
-        lines.append(f"{icon} {row['product_name']} — {row['variant_name']}: <b>{row['stock']}</b>")
+        available = max(0, int(row["stock"]) - int(row["reserved_stock"] or 0))
+        icon = "✅" if available > 0 else "❌"
+        lines.append(f"{icon} {row['product_name']} — {row['variant_name']}: <b>{available}</b>")
     lines.append(f"\n<i>{STORE_FOOTER}</i>")
 
     await call.message.edit_text("\n".join(lines), reply_markup=back_home(), parse_mode="HTML")
@@ -1623,7 +2025,8 @@ async def wallet_home(call: CallbackQuery, state: FSMContext):
         "💰 <b>SALDO KAMU</b>\n\n"
         f"Saldo tersedia: <b>{rupiah(balance)}</b>\n"
         f"Total top up: <b>{rupiah(topup_total)}</b>\n"
-        f"Total digunakan: <b>{rupiah(spend_total)}</b>\n\n"
+        f"Total digunakan: <b>{rupiah(spend_total)}</b>\n"
+        f"Minimum top up: <b>{rupiah(get_min_topup())}</b>\n\n"
         f"<i>{STORE_FOOTER}</i>",
         reply_markup=wallet_menu(),
         parse_mode="HTML"
@@ -1672,6 +2075,7 @@ async def wallet_topup(call: CallbackQuery, state: FSMContext):
     await state.set_state(OwnerState.topup_amount)
     await call.message.edit_text(
         "➕ <b>TOP UP SALDO</b>\n\n"
+        f"Minimum top up: <b>{rupiah(get_min_topup())}</b>\n\n"
         "Kirim nominal top up dalam angka.\n"
         "Contoh: <code>50000</code>\n\n"
         "Top up sementara menggunakan QRIS manual + kode unik.",
@@ -1687,10 +2091,13 @@ async def wallet_topup(call: CallbackQuery, state: FSMContext):
 async def wallet_topup_amount(message: Message, state: FSMContext, bot: Bot):
     try:
         amount = int((message.text or "").strip())
-        if amount < 1000:
+        min_topup = get_min_topup()
+        if amount < min_topup:
             raise ValueError
     except Exception:
-        return await message.answer("❌ Minimal top up Rp1.000 dan harus berupa angka.")
+        return await message.answer(
+            f"❌ Minimum top up adalah {rupiah(get_min_topup())} dan nominal harus berupa angka."
+        )
 
     code = unique_code_for_order()
     payment_total = amount + code
@@ -1961,6 +2368,44 @@ async def owner_wallet_verify_input(message: Message, state: FSMContext, bot: Bo
         )
     except Exception:
         pass
+
+
+
+@router.callback_query(F.data == "owner:min_topup")
+async def owner_min_topup(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    await state.set_state(OwnerState.owner_min_topup)
+    await call.message.edit_text(
+        "⚙️ <b>MINIMUM TOP UP</b>\n\n"
+        f"Minimum saat ini: <b>{rupiah(get_min_topup())}</b>\n\n"
+        "Kirim nominal minimum baru.\n"
+        "Contoh: <code>5000</code>",
+        reply_markup=back_owner(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(OwnerState.owner_min_topup)
+async def owner_min_topup_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    try:
+        amount = int((message.text or "").strip())
+        if amount < 1000:
+            raise ValueError
+    except Exception:
+        return await message.answer("❌ Minimum top up paling rendah Rp1.000.")
+
+    set_setting("min_topup", amount)
+    await state.clear()
+    await message.answer(
+        f"✅ Minimum top up diubah menjadi {rupiah(amount)}.",
+        reply_markup=owner_wallet_menu()
+    )
 
 
 @router.callback_query(F.data == "owner:wallet_history")
@@ -2254,6 +2699,35 @@ async def owner_qris_preview(call: CallbackQuery, bot: Bot):
     await call.answer("Preview dikirim.")
 
 
+
+@router.callback_query(F.data == "owner:backup_now")
+async def owner_backup_now(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    try:
+        backup_path = create_database_backup()
+        await send_backup(bot, backup_path)
+        await call.answer("✅ Backup berhasil dibuat.", show_alert=True)
+    except Exception as exc:
+        await call.answer(f"❌ Backup gagal: {str(exc)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "owner:sync_stock")
+async def owner_sync_stock(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    if not STOCK_CHANNEL_ID:
+        return await call.answer(
+            "STOCK_CHANNEL_ID belum diisi di Railway.",
+            show_alert=True
+        )
+
+    await sync_stock_channel(bot)
+    await call.answer("✅ Stok channel disinkronkan.", show_alert=True)
+
+
 @router.callback_query(F.data == "owner:stats")
 async def owner_stats(call: CallbackQuery):
     if not is_owner(call.from_user.id):
@@ -2359,6 +2833,7 @@ async def owner_add_product_input(message: Message, state: FSMContext):
         conn.commit()
         conn.close()
         await state.clear()
+        await sync_stock_channel(message.bot)
         await message.answer("✅ Produk berhasil ditambahkan.", reply_markup=owner_menu())
     except Exception:
         await message.answer("❌ Format salah. Gunakan: Nama | Harga | Stok | Deskripsi")
@@ -2392,6 +2867,7 @@ async def owner_add_variant_input(message: Message, state: FSMContext):
         conn.commit()
         conn.close()
         await state.clear()
+        await sync_stock_channel(message.bot)
         await message.answer("✅ Variasi berhasil ditambahkan.", reply_markup=owner_menu())
     except Exception:
         await message.answer("❌ Format variasi tidak valid.")
@@ -2430,6 +2906,7 @@ async def owner_set_stock_input(message: Message, state: FSMContext, bot: Bot):
 
         conn.close()
         await state.clear()
+        await sync_stock_channel(bot)
         await message.answer("✅ Stok berhasil diperbarui.", reply_markup=owner_menu())
 
         if subscribers:
@@ -2475,6 +2952,7 @@ async def owner_set_price_input(message: Message, state: FSMContext):
         conn.commit()
         conn.close()
         await state.clear()
+        await sync_stock_channel(message.bot)
         await message.answer("✅ Harga berhasil diperbarui.", reply_markup=owner_menu())
     except Exception:
         await message.answer("❌ Format salah.")
@@ -2500,6 +2978,7 @@ async def owner_delete_product_input(message: Message, state: FSMContext):
         conn.commit()
         conn.close()
         await state.clear()
+        await sync_stock_channel(message.bot)
         await message.answer("✅ Produk dinonaktifkan.", reply_markup=owner_menu())
     except Exception:
         await message.answer("❌ ID produk tidak valid.")
@@ -2601,62 +3080,45 @@ async def owner_complete_order_input(message: Message, state: FSMContext, bot: B
     try:
         raw = message.text.strip().upper().replace("MBY-", "")
         order_id = int(raw)
-        conn = db()
-        order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    except Exception:
+        return await message.answer("❌ ID order tidak valid.")
 
-        if not order:
-            conn.close()
-            return await message.answer("❌ Order tidak ditemukan.")
+    conn = db()
+    order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    conn.close()
 
-        if order["status"] == "completed":
-            conn.close()
-            await state.clear()
-            return await message.answer("ℹ️ Order sudah selesai.", reply_markup=owner_menu())
+    if not order:
+        return await message.answer("❌ Order tidak ditemukan.")
 
-        variant = conn.execute("SELECT * FROM product_variants WHERE id=?", (order["variant_id"],)).fetchone()
-        if not variant or variant["stock"] < order["qty"]:
-            conn.close()
-            return await message.answer("❌ Stok variasi tidak cukup.")
-
-        conn.execute(
-            "UPDATE product_variants SET stock=stock-? WHERE id=?",
-            (order["qty"], order["variant_id"])
-        )
-        conn.execute(
-            "UPDATE products SET sold=sold+? WHERE id=?",
-            (order["qty"], order["product_id"])
-        )
-        conn.execute(
-            """UPDATE orders
-               SET status='completed', payment_status='paid'
-               WHERE id=?""",
-            (order_id,)
-        )
-        conn.commit()
-        conn.close()
-
+    if order["status"] == "completed":
         await state.clear()
-        await message.answer(
-            f"✅ {invoice(order_id)} berhasil diverifikasi.\n"
-            "Stok otomatis berkurang dan angka terjual bertambah.",
+        return await message.answer("ℹ️ Order sudah selesai.", reply_markup=owner_menu())
+
+    if order["status"] in {"expired", "cancelled", "payment_error"}:
+        await state.clear()
+        return await message.answer(
+            f"❌ Order berstatus {order['status']} dan tidak dapat diverifikasi.",
             reply_markup=owner_menu()
         )
 
-        try:
-            await bot.send_message(
-                order["user_id"],
-                "✅ <b>PEMBAYARAN BERHASIL</b>\n\n"
-                f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
-                f"💵 Dibayar: <b>{rupiah(order['payment_total'] or order['total'])}</b>\n"
-                "🟢 Status: <b>Selesai</b>\n\n"
-                "Terima kasih telah berbelanja di Maboyy Produk Digital.\n\n"
-                f"<i>{STORE_FOOTER}</i>",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-    except Exception:
-        await message.answer("❌ ID order tidak valid.")
+    ok = await mark_order_paid(
+        order_id,
+        bot,
+        int(order["payment_total"] or order["total"])
+    )
+
+    await state.clear()
+    if ok:
+        await message.answer(
+            f"✅ {invoice(order_id)} berhasil diverifikasi.\n"
+            "Stok dan status transaksi sudah diperbarui.",
+            reply_markup=owner_menu()
+        )
+    else:
+        await message.answer(
+            "❌ Order gagal diselesaikan. Periksa stok/status transaksi.",
+            reply_markup=owner_menu()
+        )
 
 
 # =========================
@@ -2783,13 +3245,20 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Railway web endpoint for health check + Payment Gateway callback.
+    # Railway web endpoint for health check + payment callback.
     runner = await start_web_server(bot)
+
+    automation_task = asyncio.create_task(startup_automation(bot))
+    backup_task = asyncio.create_task(backup_loop(bot))
+    cleanup_task = asyncio.create_task(cleanup_expired_orders(bot))
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
+        automation_task.cancel()
+        backup_task.cancel()
+        cleanup_task.cancel()
         await runner.cleanup()
 
 
