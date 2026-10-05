@@ -22,7 +22,8 @@ from Crypto.Hash import SHA256
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile,
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
@@ -70,7 +71,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "3.8"
+BOT_VERSION = "4.2"
 BOT_CHANGELOG = [
     "Backup database otomatis dan retention backup.",
     "Database persisten melalui Railway Volume.",
@@ -268,6 +269,7 @@ def init_db():
     add_column_if_missing(conn, "products", "is_popular", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "is_flash_sale", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "product_variants", "reserved_stock", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "product_variants", "button_label", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "variant_id", "INTEGER DEFAULT 0")
     add_column_if_missing(conn, "orders", "unit_price", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "payment_method", "TEXT DEFAULT 'QRIS'")
@@ -560,10 +562,14 @@ async def show_main_menu_message(message: Message):
     await message.answer(
         f"🛍️ <b>{STORE_NAME}</b>\n\n"
         "Selamat datang.\n"
-        "Silakan pilih menu:\n\n"
+        "Gunakan tombol menu di bawah untuk akses cepat.\n\n"
         f"<i>{STORE_FOOTER}</i>",
-        reply_markup=main_menu(),
+        reply_markup=user_reply_menu(),
         parse_mode="HTML"
+    )
+    await message.answer(
+        "Atau pilih menu berikut:",
+        reply_markup=main_menu()
     )
 
 
@@ -665,6 +671,16 @@ def topup_invoice(topup_id: int) -> str:
 
 def available_stock(variant) -> int:
     return max(0, int(variant["stock"]) - int(variant["reserved_stock"] or 0))
+
+
+
+def variant_button_label(variant) -> str:
+    custom = ""
+    try:
+        custom = (variant["button_label"] or "").strip()
+    except Exception:
+        custom = ""
+    return custom or variant["name"]
 
 
 
@@ -1768,6 +1784,7 @@ class OwnerState(StatesGroup):
     owner_wallet_subtract = State()
     owner_topup_verify = State()
     owner_min_topup = State()
+    variant_button_name = State()
 
 
 # =========================
@@ -1786,11 +1803,39 @@ def main_menu():
     return kb.as_markup()
 
 
+def user_reply_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="🏷️ List Produk"),
+                KeyboardButton(text="🎁 Voucher"),
+                KeyboardButton(text="📁 Laporan Stok"),
+            ],
+            [
+                KeyboardButton(text="🔥 Produk Populer"),
+                KeyboardButton(text="⚡ Flash Sale"),
+            ],
+            [
+                KeyboardButton(text="🧾 Pesanan Saya"),
+                KeyboardButton(text="💰 Saldo Kamu"),
+            ],
+            [
+                KeyboardButton(text="❓ Cara Order"),
+                KeyboardButton(text="💬 Hubungi Owner"),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Pilih menu Maboyy Digital"
+    )
+
+
 def owner_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Tambah Produk", callback_data="owner:add_product")
     kb.button(text="🧩 Tambah Variasi", callback_data="owner:add_variant")
     kb.button(text="📦 Atur Stok", callback_data="owner:set_stock")
+    kb.button(text="🏷️ Nama Tombol Variasi", callback_data="owner:variant_button_name")
     kb.button(text="💰 Atur Harga", callback_data="owner:set_price")
     kb.button(text="🗑️ Hapus Produk", callback_data="owner:delete_product")
     kb.button(text="🧾 Pesanan", callback_data="owner:orders")
@@ -2120,21 +2165,86 @@ async def flash(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("product:"))
 async def product_detail(call: CallbackQuery):
-    product_id = int(call.data.split(":")[1])
+    try:
+        product_id = int(call.data.split(":")[1])
+    except Exception:
+        return await call.answer("Produk tidak valid.", show_alert=True)
+
     conn = db()
-    product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    product = conn.execute(
+        "SELECT * FROM products WHERE id=? AND active=1",
+        (product_id,)
+    ).fetchone()
+
+    variants = conn.execute(
+        """SELECT *
+           FROM product_variants
+           WHERE product_id=? AND active=1
+           ORDER BY id""",
+        (product_id,)
+    ).fetchall()
     conn.close()
 
     if not product:
-        return await call.answer("Produk tidak ditemukan.", show_alert=True)
+        return await call.answer("Produk tidak ditemukan / sudah tidak aktif.", show_alert=True)
+
+    sold = int(product["sold"] or 0)
+
+    text = (
+        "╭────────────────────╮\n"
+        f"• <b>Produk:</b> {html.escape(product['name'])}\n"
+        f"• <b>Terjual:</b> {sold}\n"
+        f"• <b>Deskripsi:</b> {html.escape(product['description'] or '-')}\n"
+        "╰────────────────────╯\n\n"
+        "╭────────────────────╮\n"
+        "📦 <b>VARIASI • HARGA • STOK</b>\n"
+    )
+
+    if variants:
+        for index, variant in enumerate(variants, start=1):
+            stock = available_stock(variant)
+            stock_icon = "✅" if stock > 0 else "❌"
+            text += (
+                f"\n{index}. <b>{html.escape(variant['name'])}</b>\n"
+                f"   💰 Harga: <b>{rupiah(variant['price'])}</b>\n"
+                f"   {stock_icon} Stok: <b>{stock}</b>\n"
+            )
+    else:
+        text += "\n<i>Belum ada variasi aktif.</i>\n"
+
+    text += (
+        "\n╰────────────────────╯\n\n"
+        f"<i>{STORE_FOOTER}</i>\n\n"
+        "Pilih variasi:"
+    )
+
+    kb = InlineKeyboardBuilder()
+
+    for variant in variants:
+        stock = available_stock(variant)
+        if stock > 0:
+            button_text = (
+                f"{variant_button_label(variant)} ({stock})"
+            )
+        else:
+            button_text = (
+                f"{variant_button_label(variant)} (0)"
+            )
+
+        kb.button(
+            text=button_text,
+            callback_data=f"variant:{variant['id']}"
+        )
+
+    kb.button(text="⬅️ Kembali", callback_data="products")
+    kb.adjust(1)
 
     await call.message.edit_text(
-        product_card(product) + "\n\nPilih variasi:",
-        reply_markup=variants_keyboard(product_id),
+        text,
+        reply_markup=kb.as_markup(),
         parse_mode="HTML"
     )
     await call.answer()
-
 
 @router.callback_query(F.data.startswith("back_product:"))
 async def back_product(call: CallbackQuery):
@@ -4378,6 +4488,185 @@ async def owner_stock_fulfill_pending(call: CallbackQuery, bot: Bot):
     await call.answer("✅ Pesanan pending sudah dicek.", show_alert=True)
 
 
+def owner_variant_button_products_keyboard():
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, name FROM products WHERE active=1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    kb = InlineKeyboardBuilder()
+    for row in rows:
+        kb.button(
+            text=f"📦 {row['name']}",
+            callback_data=f"ownerbtnname:product:{row['id']}"
+        )
+    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@router.callback_query(F.data == "owner:variant_button_name")
+async def owner_variant_button_name(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    await state.clear()
+    await call.message.edit_text(
+        "🏷️ <b>NAMA TOMBOL VARIASI</b>\n\n"
+        "Pilih produk.\n\n"
+        "Nama ini hanya mengubah tulisan pada tombol variasi. "
+        "Stok tetap ditampilkan otomatis dari database.",
+        reply_markup=owner_variant_button_products_keyboard(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ownerbtnname:product:"))
+async def owner_variant_button_product(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    product_id = int(call.data.split(":")[2])
+    conn = db()
+    product = conn.execute(
+        "SELECT * FROM products WHERE id=? AND active=1",
+        (product_id,)
+    ).fetchone()
+    rows = conn.execute(
+        """SELECT * FROM product_variants
+           WHERE product_id=? AND active=1
+           ORDER BY id""",
+        (product_id,)
+    ).fetchall()
+    conn.close()
+
+    if not product:
+        return await call.answer("Produk tidak ditemukan.", show_alert=True)
+
+    kb = InlineKeyboardBuilder()
+    for row in rows:
+        label = variant_button_label(row)
+        kb.button(
+            text=f"🏷️ {label} ({available_stock(row)})",
+            callback_data=f"ownerbtnname:variant:{row['id']}"
+        )
+    kb.button(text="⬅️ Pilih Produk", callback_data="owner:variant_button_name")
+    kb.adjust(1)
+
+    await call.message.edit_text(
+        f"🏷️ <b>{product['name']}</b>\n\n"
+        "Pilih variasi yang nama tombolnya ingin diubah:",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ownerbtnname:variant:"))
+async def owner_variant_button_variant(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    variant_id = int(call.data.split(":")[2])
+    conn = db()
+    variant = conn.execute(
+        """SELECT v.*, p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=?""",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    if not variant:
+        return await call.answer("Variasi tidak ditemukan.", show_alert=True)
+
+    await state.update_data(button_name_variant_id=variant_id)
+    await state.set_state(OwnerState.variant_button_name)
+
+    current = variant_button_label(variant)
+    await call.message.edit_text(
+        "🏷️ <b>UBAH NAMA TOMBOL VARIASI</b>\n\n"
+        f"Produk: <b>{variant['product_name']}</b>\n"
+        f"Nama variasi asli: <b>{variant['name']}</b>\n"
+        f"Nama tombol saat ini: <b>{html.escape(current)}</b>\n"
+        f"Stok otomatis: <b>{available_stock(variant)}</b>\n\n"
+        "Kirim nama tombol baru.\n"
+        "Contoh: <code>1 Bulan</code>, <code>Private</code>, atau <code>Sharing 1P2U</code>.\n\n"
+        "Kirim <code>RESET</code> untuk memakai nama variasi asli.",
+        reply_markup=back_owner(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(OwnerState.variant_button_name)
+async def owner_variant_button_name_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    variant_id = int(data.get("button_name_variant_id", 0))
+    value = (message.text or "").strip()
+
+    if not variant_id:
+        await state.clear()
+        return await message.answer(
+            "❌ Variasi tidak ditemukan.",
+            reply_markup=owner_menu()
+        )
+
+    if not value:
+        return await message.answer("❌ Nama tombol tidak boleh kosong.")
+
+    if len(value) > 40:
+        return await message.answer(
+            "❌ Nama tombol terlalu panjang. Maksimal 40 karakter."
+        )
+
+    button_label = "" if value.upper() == "RESET" else value
+
+    conn = db()
+    variant = conn.execute(
+        "SELECT * FROM product_variants WHERE id=?",
+        (variant_id,)
+    ).fetchone()
+
+    if not variant:
+        conn.close()
+        await state.clear()
+        return await message.answer(
+            "❌ Variasi tidak ditemukan.",
+            reply_markup=owner_menu()
+        )
+
+    conn.execute(
+        "UPDATE product_variants SET button_label=? WHERE id=?",
+        (button_label, variant_id)
+    )
+    conn.commit()
+
+    updated = conn.execute(
+        "SELECT * FROM product_variants WHERE id=?",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>NAMA TOMBOL BERHASIL DIPERBARUI</b>\n\n"
+        f"Nama tombol: <b>{html.escape(variant_button_label(updated))}</b>\n"
+        f"Stok otomatis: <b>{available_stock(updated)}</b>\n\n"
+        "Tombol user akan tampil seperti:\n"
+        f"<code>{html.escape(variant_button_label(updated))} ({available_stock(updated)})</code>",
+        reply_markup=owner_menu(),
+        parse_mode="HTML"
+    )
+
+
 @router.callback_query(F.data == "owner:set_price")
 async def owner_set_price(call: CallbackQuery, state: FSMContext):
     await prompt_state(
@@ -4746,6 +5035,246 @@ async def owner_complete_order_input(message: Message, state: FSMContext, bot: B
         await message.answer(
             "❌ Order gagal diselesaikan. Periksa stok/status transaksi.",
             reply_markup=owner_menu()
+        )
+
+
+
+# =========================
+# PERSISTENT USER MENU
+# =========================
+@router.message(F.text == "🏷️ List Produk")
+async def reply_menu_products(message: Message, bot: Bot):
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    mark_user_verified(message.from_user.id, message.from_user.username or "")
+
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM products WHERE active=1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return await message.answer(
+            f"🏷️ <b>LIST PRODUK</b>\n\nBelum ada produk aktif.\n\n<i>{STORE_FOOTER}</i>",
+            reply_markup=user_reply_menu(),
+            parse_mode="HTML"
+        )
+
+    lines = ["🏷️ <b>LIST PRODUK</b>", ""]
+    for i, row in enumerate(rows, 1):
+        lines.append(f"{i}. {html.escape(row['name'])}")
+    lines.append("\nPilih produk melalui tombol berikut.")
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=products_keyboard(""),
+        parse_mode="HTML"
+    )
+
+
+@router.message(F.text == "🔥 Produk Populer")
+async def reply_menu_popular(message: Message, bot: Bot):
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM products WHERE active=1 AND is_popular=1 ORDER BY sold DESC, id"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return await message.answer(
+            "🔥 <b>PRODUK POPULER</b>\n\nBelum ada produk populer.",
+            reply_markup=user_reply_menu(),
+            parse_mode="HTML"
+        )
+
+    kb = InlineKeyboardBuilder()
+    lines = ["🔥 <b>PRODUK POPULER</b>", ""]
+    for i, row in enumerate(rows, 1):
+        lines.append(f"{i}. {html.escape(row['name'])}")
+        kb.button(text=row["name"], callback_data=f"product:{row['id']}")
+    kb.adjust(1)
+
+    await message.answer("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
+
+
+@router.message(F.text == "⚡ Flash Sale")
+async def reply_menu_flash(message: Message, bot: Bot):
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM products WHERE active=1 AND is_flash_sale=1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return await message.answer(
+            "⚡ <b>FLASH SALE</b>\n\nBelum ada produk Flash Sale.",
+            reply_markup=user_reply_menu(),
+            parse_mode="HTML"
+        )
+
+    kb = InlineKeyboardBuilder()
+    lines = ["⚡ <b>FLASH SALE</b>", ""]
+    for i, row in enumerate(rows, 1):
+        lines.append(f"{i}. {html.escape(row['name'])}")
+        kb.button(text=row["name"], callback_data=f"product:{row['id']}")
+    kb.adjust(1)
+
+    await message.answer("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
+
+
+@router.message(F.text == "🎁 Voucher")
+async def reply_menu_voucher(message: Message, bot: Bot):
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    await message.answer(
+        "🎁 <b>VOUCHER</b>\n\n"
+        "Voucher dapat digunakan saat checkout jika tersedia.\n"
+        "Pilih produk terlebih dahulu untuk memulai pesanan.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏷️ Lihat Produk", callback_data="products")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@router.message(F.text == "📁 Laporan Stok")
+async def reply_menu_stock(message: Message, bot: Bot):
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    conn = db()
+    rows = conn.execute(
+        """SELECT p.name AS product_name, v.name AS variant_name,
+                  v.stock, v.reserved_stock
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE p.active=1 AND v.active=1
+           ORDER BY p.id, v.id"""
+    ).fetchall()
+    conn.close()
+
+    lines = ["📁 <b>LAPORAN STOK</b>", ""]
+    if not rows:
+        lines.append("Belum ada stok aktif.")
+    else:
+        for row in rows:
+            stock = max(0, int(row["stock"]) - int(row["reserved_stock"] or 0))
+            icon = "✅" if stock > 0 else "❌"
+            lines.append(
+                f"{icon} {html.escape(row['product_name'])} — "
+                f"{html.escape(row['variant_name'])}: <b>{stock}</b>"
+            )
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=user_reply_menu(),
+        parse_mode="HTML"
+    )
+
+
+@router.message(F.text == "🧾 Pesanan Saya")
+async def reply_menu_orders(message: Message, bot: Bot):
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    conn = db()
+    rows = conn.execute(
+        """SELECT * FROM orders
+           WHERE user_id=?
+           ORDER BY id DESC
+           LIMIT 10""",
+        (message.from_user.id,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return await message.answer(
+            "🧾 <b>PESANAN SAYA</b>\n\nBelum ada pesanan.",
+            reply_markup=user_reply_menu(),
+            parse_mode="HTML"
+        )
+
+    lines = ["🧾 <b>PESANAN SAYA</b>", ""]
+    for row in rows:
+        icon = "✅" if row["status"] == "completed" else "🟡"
+        lines.append(
+            f"{icon} <b>{invoice(row['id'])}</b>\n"
+            f"   Status: {html.escape(row['status'])}\n"
+            f"   Total: {rupiah(row['payment_total'] or row['total'])}"
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📩 Kirim Ulang Akun Terakhir", callback_data="resend:last")]
+    ])
+
+    await message.answer("\n\n".join(lines), reply_markup=kb, parse_mode="HTML")
+
+
+@router.message(F.text == "💰 Saldo Kamu")
+async def reply_menu_wallet(message: Message, bot: Bot):
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    balance = get_balance(message.from_user.id)
+
+    await message.answer(
+        "💰 <b>SALDO KAMU</b>\n\n"
+        f"Saldo tersedia: <b>{rupiah(balance)}</b>\n\n"
+        "Gunakan menu saldo untuk top up atau melihat riwayat.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Buka Saldo Kamu", callback_data="wallet")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@router.message(F.text == "❓ Cara Order")
+async def reply_menu_howto(message: Message):
+    await message.answer(
+        "❓ <b>CARA ORDER</b>\n\n"
+        "1. Pilih List Produk.\n"
+        "2. Pilih produk dan variasi.\n"
+        "3. Tentukan jumlah.\n"
+        "4. Isi catatan jika diperlukan.\n"
+        "5. Pilih metode pembayaran.\n"
+        "6. Selesaikan pembayaran.\n"
+        "7. Setelah pembayaran valid, akun premium dikirim otomatis.\n\n"
+        f"<i>{STORE_FOOTER}</i>",
+        reply_markup=user_reply_menu(),
+        parse_mode="HTML"
+    )
+
+
+@router.message(F.text == "💬 Hubungi Owner")
+async def reply_menu_owner_contact(message: Message):
+    if ADMIN_USERNAME:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Chat Owner",
+                    url=f"https://t.me/{ADMIN_USERNAME}"
+                )
+            ]
+        ])
+        await message.answer(
+            "💬 <b>HUBUNGI OWNER</b>\n\n"
+            "Tekan tombol di bawah untuk menghubungi owner.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "💬 Username owner belum dikonfigurasi.",
+            reply_markup=user_reply_menu()
         )
 
 
