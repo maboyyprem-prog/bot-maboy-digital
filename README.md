@@ -1,65 +1,57 @@
-# Maboyy Digital — Telegram Premium Digital Shop
+# Maboyy Produk Digital — Telegram Bot
 
-**Author/Brand:** Maboyy Digital  
-**Since:** 2020  
+**Brand:** Maboyy Produk Digital  
+**Footer:** Aplikasi Premium • Since 2020  
+**Version:** v1.5
 
-Bot toko produk digital sederhana dengan tampilan seperti contoh:
-- `/start` menampilkan menu utama.
-- Tombol List Produk.
-- Tombol Voucher.
-- Tombol Laporan Stok.
-- Produk ditampilkan bernomor 1, 2, 3, dst.
-- Detail harga dan stok.
-- Checkout/order manual.
-- Notifikasi order ke admin.
-- Panel admin.
-- SQLite, jadi tidak perlu database eksternal untuk awal.
+Versi ini dibuat lebih sederhana untuk pengguna dan owner.
 
-> Gunakan bot hanya untuk produk, voucher, lisensi, atau akses digital yang legal dan sesuai syarat layanan platform terkait.
+## Command yang tersedia
 
-## File
+Hanya 3 command:
 
-Upload file berikut ke GitHub:
+- `/start` — membuka menu utama
+- `/owner` — membuka panel owner
+- `/ping` — mengecek status bot
 
-1. `bot.py`
-2. `requirements.txt`
-3. `.env.example`
-4. `README.md`
+Semua pengaturan toko dilakukan melalui tombol di `/owner`.
 
-JANGAN upload file `.env` karena berisi token rahasia.
+## Fitur User
 
-## Setup BotFather
+- List produk
+- Detail produk
+- Stok produk
+- Order
+- Invoice `MBY-000001`
+- Pesanan Saya
+- Laporan stok
+- Tombol hubungi owner
+- Status pembayaran/order
 
-1. Buka `@BotFather`
-2. Jalankan `/newbot`
-3. Buat nama bot
-4. Salin token
-5. Buat file `.env` dari `.env.example`
-6. Isi:
-   - `BOT_TOKEN`
-   - `ADMIN_ID`
-   - `ADMIN_USERNAME`
+## Panel Owner Berbasis Tombol
 
-## Mengetahui ADMIN_ID
+- Tambah produk
+- Atur stok
+- Atur harga
+- Hapus/nonaktifkan produk
+- Lihat pesanan
+- Selesaikan order
+- Tambah voucher
+- Statistik toko
 
-Anda bisa memakai bot Telegram seperti `@userinfobot` untuk melihat ID Telegram Anda.
+Owner tidak perlu lagi menghafal command seperti `/setstok`, `/setharga`, `/orders`, dan lain-lain.
 
-## Menjalankan lokal
-
-```bash
-pip install -r requirements.txt
-python bot.py
-```
-
-## Deploy Railway
-
-Gunakan variables:
+## Railway Variables
 
 ```env
-BOT_TOKEN=token_bot_anda
+BOT_TOKEN=token_dari_botfather
 ADMIN_ID=id_telegram_owner
 ADMIN_USERNAME=username_telegram_owner
 ```
+
+Jangan upload token asli ke GitHub.
+
+## Deploy Railway
 
 Start command:
 
@@ -67,54 +59,11 @@ Start command:
 python bot.py
 ```
 
-## Menu pengguna
+File yang di-upload ke GitHub:
 
-- `/start` — menu utama
-- `/pm` — hubungi admin
-- `/voucher KODE` — cek voucher
+1. `bot.py`
+2. `requirements.txt`
+3. `.env.example`
+4. `README.md`
 
-## Menu admin
-
-- `/admin`
-- `/addproduk Nama | Harga | Stok | Deskripsi`
-- `/setstok ID JUMLAH`
-- `/setharga ID HARGA`
-- `/hapusproduk ID`
-- `/orders`
-- `/addvoucher KODE DISKON`
-- `/selesai ID_ORDER`
-
-### Contoh tambah produk
-
-```text
-/addproduk Canva Pro Invite | 25000 | 10 | Invite legal ke team.
-```
-
-### Contoh ubah stok
-
-```text
-/setstok 1 20
-```
-
-### Contoh buat voucher
-
-```text
-/addvoucher HEMAT10 10000
-```
-
-## Catatan pengembangan berikutnya
-
-Versi awal ini sengaja dibuat simpel. Untuk versi lebih profesional bisa ditambah:
-- QRIS/payment gateway otomatis.
-- Invoice otomatis.
-- Pengiriman produk otomatis setelah pembayaran.
-- Kategori produk.
-- Riwayat pembelian user.
-- Dashboard admin berbasis tombol, tanpa command.
-- Statistik penjualan.
-- Anti-spam/rate limit.
-- Backup database.
-
-
----
-Since 2020
+Aplikasi Premium • Since 2020
