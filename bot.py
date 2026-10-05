@@ -7,10 +7,12 @@ import json
 import hashlib
 import hmac
 import base64
+import html
 import asyncio
 import shutil
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 
 from aiohttp import web, ClientSession
 from Crypto.PublicKey import RSA
@@ -28,6 +30,7 @@ from aiogram.fsm.context import FSMContext
 from dotenv import load_dotenv
 
 load_dotenv()
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -66,17 +69,18 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "2.8"
+BOT_VERSION = "3.4"
 BOT_CHANGELOG = [
     "Backup database otomatis dan retention backup.",
     "Database persisten melalui Railway Volume.",
     "Migrasi database lama ke storage persisten saat pertama kali aktif.",
-    "Stok terbaru otomatis disinkronkan ke channel tanpa spam pesan baru.",
+    "Informasi stok channel hanya disinkronkan manual oleh owner.",
     "Data user, saldo, order, produk, voucher, dan pengaturan tetap tersimpan saat redeploy.",
 ]
 
 STORE_NAME = "Maboyy Produk Digital"
 STORE_FOOTER = "Aplikasi Premium • Since 2020"
+
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -213,6 +217,18 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS inventory_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            variant_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'available',
+            order_id INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            delivered_at TEXT DEFAULT ''
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS restock_subscriptions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -242,6 +258,24 @@ def init_db():
     add_column_if_missing(conn, "orders", "stock_reserved", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "reserved_until", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "completed_at", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "fulfillment_status", "TEXT DEFAULT 'pending'")
+    add_column_if_missing(conn, "orders", "delivery_text", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "orders", "last_delivery_error", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "delivery_sent_at", "TEXT DEFAULT ''")
+
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_inventory_variant_status "
+        "ON inventory_items(variant_id, status)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_orders_user_created "
+        "ON orders(user_id, created_at)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_orders_variant_fulfillment "
+        "ON orders(variant_id, payment_status, fulfillment_status)"
+    )
 
     # Default store settings (editable from /owner)
     defaults = {
@@ -286,6 +320,7 @@ def init_db():
                 (p["id"], "Standard", f"P{p['id']}", p["price"], p["stock"], 0, 0)
             )
 
+    reconcile_all_inventory_stock(conn)
     conn.commit()
     conn.close()
 
@@ -452,11 +487,377 @@ def available_stock(variant) -> int:
     return max(0, int(variant["stock"]) - int(variant["reserved_stock"] or 0))
 
 
+
+def inventory_counts(conn, variant_id: int):
+    row = conn.execute(
+        """SELECT
+             SUM(CASE WHEN status='available' THEN 1 ELSE 0 END) AS available,
+             SUM(CASE WHEN status='sold' THEN 1 ELSE 0 END) AS sold
+           FROM inventory_items
+           WHERE variant_id=?""",
+        (variant_id,)
+    ).fetchone()
+    return {
+        "available": int(row["available"] or 0),
+        "sold": int(row["sold"] or 0),
+    }
+
+
+def inventory_mode(conn, variant_id: int) -> bool:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM inventory_items WHERE variant_id=?",
+        (variant_id,)
+    ).fetchone()
+    return int(row["n"] or 0) > 0
+
+
+def sync_variant_stock_from_inventory(conn, variant_id: int):
+    # Physical stock for account-based products equals credentials not yet sold.
+    row = conn.execute(
+        """SELECT COUNT(*) AS n
+           FROM inventory_items
+           WHERE variant_id=? AND status='available'""",
+        (variant_id,)
+    ).fetchone()
+    available_items = int(row["n"] or 0)
+    # Physical stock equals credentials that have not been sold.
+    # reserved_stock is subtracted separately by available_stock().
+    conn.execute(
+        "UPDATE product_variants SET stock=? WHERE id=?",
+        (available_items, variant_id)
+    )
+
+
+
+def reconcile_all_inventory_stock(conn):
+    """Make actual account inventory the source of truth for stock."""
+    variants = conn.execute("SELECT id FROM product_variants").fetchall()
+    for row in variants:
+        sync_variant_stock_from_inventory(conn, row["id"])
+
+
+async def notify_fulfillment_pending(bot: Bot, order, missing: int):
+    try:
+        await bot.send_message(
+            order["user_id"],
+            "🟡 <b>PEMBAYARAN SUDAH DITERIMA</b>\n\n"
+            f"🧾 Invoice: <b>{invoice(order['id'])}</b>\n"
+            "Pembayaran sudah tercatat, tetapi stok akun premium belum mencukupi.\n"
+            "Pesanan <b>tidak perlu dibayar ulang</b>.\n\n"
+            "Akun akan dikirim otomatis setelah owner menambah stok akun.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "⚠️ <b>PESANAN SUDAH DIBAYAR — STOK AKUN KURANG</b>\n\n"
+                f"🧾 Invoice: <b>{invoice(order['id'])}</b>\n"
+                f"📦 Variant ID: <code>{order['variant_id']}</code>\n"
+                f"🔢 Qty: <b>{order['qty']}</b>\n"
+                f"❗ Kekurangan akun: <b>{missing}</b>\n\n"
+                "Buka /owner → 📦 Atur Stok → pilih produk/variasi → ➕ Tambah Akun.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+
+def split_delivery_text(delivery_text: str, max_chars: int = 3200):
+    lines = [line for line in (delivery_text or "").splitlines() if line.strip()]
+    chunks, current = [], []
+    size = 0
+
+    for line in lines:
+        extra = len(line) + 1
+        if current and size + extra > max_chars:
+            chunks.append("\n".join(current))
+            current = []
+            size = 0
+        current.append(line)
+        size += extra
+
+    if current:
+        chunks.append("\n".join(current))
+
+    return chunks or [""]
+
+
+async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_text: str):
+    chunks = split_delivery_text(delivery_text)
+
+    await bot.send_message(
+        user_id,
+        "🎁 <b>AKUN PREMIUM ANDA</b>\n\n"
+        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+        f"📦 Total data: <b>{len((delivery_text or '').splitlines())}</b>\n\n"
+        "Data akun dikirim di bawah ini:",
+        parse_mode="HTML"
+    )
+
+    for chunk in chunks:
+        await bot.send_message(
+            user_id,
+            f"<pre>{html.escape(chunk)}</pre>",
+            parse_mode="HTML"
+        )
+
+    await bot.send_message(
+        user_id,
+        "✅ <b>PESANAN SELESAI</b>\n\n"
+        "Simpan data akun dengan aman dan jangan membagikannya kepada orang lain.\n\n"
+        f"<i>{STORE_FOOTER}</i>",
+        parse_mode="HTML"
+    )
+
+
+async def fulfill_order(order_id: int, bot: Bot) -> bool:
+    """
+    Safe fulfillment:
+    1) allocate exact credentials to the order
+    2) save them in the order
+    3) send Telegram messages
+    4) only after successful send mark delivered/sold
+
+    If Telegram fails, the same allocated credentials are retried later.
+    """
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+
+    if not order:
+        conn.rollback()
+        conn.close()
+        return False
+
+    if order["fulfillment_status"] == "delivered":
+        conn.rollback()
+        conn.close()
+        return True
+
+    if order["payment_status"] != "paid":
+        conn.rollback()
+        conn.close()
+        return False
+
+    qty = int(order["qty"])
+
+    # Reuse credentials already allocated to this order.
+    allocated = conn.execute(
+        """SELECT * FROM inventory_items
+           WHERE order_id=? AND status='allocated'
+           ORDER BY id ASC""",
+        (order_id,)
+    ).fetchall()
+
+    if allocated:
+        items = allocated
+    else:
+        items = conn.execute(
+            """SELECT * FROM inventory_items
+               WHERE variant_id=? AND status='available'
+               ORDER BY id ASC
+               LIMIT ?""",
+            (order["variant_id"], qty)
+        ).fetchall()
+
+        if len(items) < qty:
+            missing = qty - len(items)
+            was_pending = order["status"] == "paid_pending_delivery"
+            conn.execute(
+                """UPDATE orders
+                   SET status='paid_pending_delivery',
+                       fulfillment_status='pending'
+                   WHERE id=?""",
+                (order_id,)
+            )
+            conn.commit()
+            conn.close()
+            if not was_pending:
+                await notify_fulfillment_pending(bot, order, missing)
+            return False
+
+        # Allocate, don't mark sold yet.
+        item_ids = [item["id"] for item in items]
+        placeholders = ",".join("?" for _ in item_ids)
+        conn.execute(
+            f"""UPDATE inventory_items
+                SET status='allocated', order_id=?
+                WHERE id IN ({placeholders}) AND status='available'""",
+            (order_id, *item_ids)
+        )
+
+        # Convert reservation into allocated credentials.
+        if int(order["stock_reserved"] or 0) == 1:
+            conn.execute(
+                """UPDATE product_variants
+                   SET reserved_stock=MAX(0, reserved_stock-?)
+                   WHERE id=?""",
+                (qty, order["variant_id"])
+            )
+
+        delivery_text = "\n".join(
+            f"{idx}. {item['content']}" for idx, item in enumerate(items, start=1)
+        )
+
+        sync_variant_stock_from_inventory(conn, order["variant_id"])
+        conn.execute(
+            """UPDATE orders
+               SET fulfillment_status='sending',
+                   stock_reserved=0,
+                   delivery_text=?,
+                   last_delivery_error=''
+               WHERE id=?""",
+            (delivery_text, order_id)
+        )
+        conn.commit()
+        conn.close()
+
+        # Re-open below using stored delivery_text.
+        conn = db()
+        order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        conn.close()
+
+    delivery_text = order["delivery_text"] or "\n".join(
+        f"{idx}. {item['content']}" for idx, item in enumerate(allocated, start=1)
+    )
+
+    # If allocated existed from a previous failed send and legacy delivery_text was empty.
+    if not order["delivery_text"] and delivery_text:
+        conn = db()
+        conn.execute(
+            "UPDATE orders SET delivery_text=?, fulfillment_status='sending' WHERE id=?",
+            (delivery_text, order_id)
+        )
+        conn.commit()
+        conn.close()
+
+    try:
+        await send_delivery_payload(bot, order["user_id"], order_id, delivery_text)
+    except Exception as exc:
+        conn = db()
+        conn.execute(
+            """UPDATE orders
+               SET status='paid_pending_delivery',
+                   fulfillment_status='send_failed',
+                   delivery_attempts=delivery_attempts+1,
+                   last_delivery_error=?
+               WHERE id=?""",
+            (str(exc)[:500], order_id)
+        )
+        conn.commit()
+        conn.close()
+
+        logging.exception("Delivery send failed for order %s: %s", order_id, exc)
+
+        if ADMIN_ID:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    "⚠️ <b>PENGIRIMAN AKUN GAGAL</b>\n\n"
+                    f"🧾 {invoice(order_id)}\n"
+                    "Akun sudah dialokasikan dan <b>tidak akan diberikan ke user lain</b>.\n"
+                    "Gunakan Pesanan Saya / kirim ulang setelah koneksi Telegram normal.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        return False
+
+    # Telegram delivery succeeded. Finalize exactly this allocated inventory.
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    fresh = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+
+    if fresh and fresh["fulfillment_status"] != "delivered":
+        conn.execute(
+            """UPDATE inventory_items
+               SET status='sold', delivered_at=?
+               WHERE order_id=? AND status='allocated'""",
+            (datetime.now().isoformat(timespec="seconds"), order_id)
+        )
+        conn.execute(
+            "UPDATE products SET sold=sold+? WHERE id=?",
+            (qty, fresh["product_id"])
+        )
+        sent_at = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """UPDATE orders
+               SET status='completed',
+                   fulfillment_status='delivered',
+                   delivery_attempts=delivery_attempts+1,
+                   last_delivery_error='',
+                   delivery_sent_at=?,
+                   completed_at=?
+               WHERE id=?""",
+            (sent_at, sent_at, order_id)
+        )
+        sync_variant_stock_from_inventory(conn, fresh["variant_id"])
+
+    conn.commit()
+    conn.close()
+    return True
+
+
+async def fulfill_pending_for_variant(variant_id: int, bot: Bot):
+    conn = db()
+    rows = conn.execute(
+        """SELECT id FROM orders
+           WHERE variant_id=?
+             AND payment_status='paid'
+             AND fulfillment_status!='delivered'
+           ORDER BY id ASC""",
+        (variant_id,)
+    ).fetchall()
+    conn.close()
+
+    for row in rows:
+        await fulfill_order(row["id"], bot)
+
+
 def reservation_expiry_iso() -> str:
     return (
         datetime.now(timezone.utc).astimezone() +
         timedelta(minutes=ORDER_RESERVATION_MINUTES)
     ).isoformat(timespec="seconds")
+
+
+def recent_duplicate_checkout(
+    conn,
+    user_id: int,
+    variant_id: int,
+    qty: int,
+    payment_method: str,
+    seconds: int = 12,
+):
+    row = conn.execute(
+        """SELECT *
+           FROM orders
+           WHERE user_id=?
+             AND variant_id=?
+             AND qty=?
+             AND payment_method=?
+           ORDER BY id DESC
+           LIMIT 1""",
+        (user_id, variant_id, qty, payment_method)
+    ).fetchone()
+
+    if not row:
+        return None
+
+    try:
+        created = datetime.fromisoformat(row["created_at"])
+        now = datetime.now(created.tzinfo) if created.tzinfo else datetime.now()
+        age = (now - created).total_seconds()
+    except Exception:
+        return None
+
+    if 0 <= age <= seconds:
+        return row
+    return None
 
 
 def reserve_stock_for_order(conn, variant_id: int, qty: int) -> bool:
@@ -539,9 +940,6 @@ async def cleanup_expired_orders(bot: Bot):
 
             conn.commit()
             conn.close()
-
-            if rows:
-                await sync_stock_channel(bot)
 
             for user_id, order_id in notify:
                 try:
@@ -628,17 +1026,17 @@ async def send_backup(bot: Bot, backup_path: Path):
 
 
 async def backup_loop(bot: Bot):
-    # Small startup delay so polling/web server can become ready first.
-    await asyncio.sleep(15)
+    # Jangan membuat backup saat bot baru start/redeploy.
+    # Backup pertama baru dibuat setelah interval penuh.
     while True:
+        await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)
+
         try:
             backup_path = create_database_backup()
             await send_backup(bot, backup_path)
             logging.info("Automatic backup created: %s", backup_path)
         except Exception as exc:
             logging.exception("Automatic backup failed: %s", exc)
-
-        await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)
 
 
 def build_stock_text() -> str:
@@ -717,8 +1115,10 @@ async def sync_stock_channel(bot: Bot):
 
 
 async def startup_automation(bot: Bot):
-    await asyncio.sleep(5)
-    await sync_stock_channel(bot)
+    # Startup/redeploy tidak boleh mengubah pesan stok channel.
+    # Sinkronisasi hanya terjadi saat data stok/transaksi berubah
+    # atau owner menjalankan sinkron manual.
+    return
 
 
 def unique_code_for_order():
@@ -889,80 +1289,43 @@ async def mark_order_paid(order_id: int, bot: Bot, paid_amount: int | None = Non
         conn.close()
         return False
 
-    if order["status"] == "completed":
-        conn.rollback()
-        conn.close()
-        return True
-
-    if order["status"] in {"expired", "cancelled", "payment_error"}:
+    # A confirmed payment must never be discarded just because the local
+    # reservation already expired. Only an explicitly cancelled order is rejected.
+    if order["status"] == "cancelled":
         conn.rollback()
         conn.close()
         return False
 
-    variant = conn.execute(
-        "SELECT * FROM product_variants WHERE id=?",
-        (order["variant_id"],)
-    ).fetchone()
-
-    if not variant:
-        conn.rollback()
-        conn.close()
-        return False
-
-    if int(order["stock_reserved"] or 0) == 1:
-        if int(variant["stock"]) < int(order["qty"]):
-            conn.rollback()
-            conn.close()
-            return False
-
+    # Idempotent payment handling: never charge/process the same order twice.
+    if order["payment_status"] != "paid":
         conn.execute(
-            """UPDATE product_variants
-               SET stock=stock-?,
-                   reserved_stock=MAX(0, reserved_stock-?)
+            """UPDATE orders
+               SET payment_status='paid',
+                   status='paid_pending_delivery'
                WHERE id=?""",
-            (order["qty"], order["qty"], order["variant_id"])
-        )
-    else:
-        if available_stock(variant) < int(order["qty"]):
-            conn.rollback()
-            conn.close()
-            return False
-        conn.execute(
-            "UPDATE product_variants SET stock=stock-? WHERE id=?",
-            (order["qty"], order["variant_id"])
+            (order_id,)
         )
 
-    conn.execute(
-        "UPDATE products SET sold=sold+? WHERE id=?",
-        (order["qty"], order["product_id"])
-    )
-    conn.execute(
-        """UPDATE orders
-           SET status='completed',
-               payment_status='paid',
-               stock_reserved=0,
-               completed_at=?
-           WHERE id=?""",
-        (datetime.now().isoformat(timespec="seconds"), order_id)
-    )
     conn.commit()
     conn.close()
 
-    await sync_stock_channel(bot)
+    # Account delivery is a separate, idempotent fulfillment step.
+    delivered = await fulfill_order(order_id, bot)
 
-    try:
-        await bot.send_message(
-            order["user_id"],
-            "✅ <b>PEMBAYARAN BERHASIL</b>\n\n"
-            f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
-            f"💵 Dibayar: <b>{rupiah(paid_amount or order['payment_total'] or order['total'])}</b>\n"
-            "🟢 Status: <b>Selesai</b>\n\n"
-            "Pesanan sudah dikonfirmasi dan stok telah diperbarui.\n\n"
-            f"<i>{STORE_FOOTER}</i>",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
+    if delivered:
+        try:
+            await bot.send_message(
+                order["user_id"],
+                "✅ <b>PEMBAYARAN BERHASIL</b>\n\n"
+                f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+                f"💵 Dibayar: <b>{rupiah(paid_amount or order['payment_total'] or order['total'])}</b>\n"
+                "🟢 Status: <b>Selesai</b>\n\n"
+                "Data akun premium telah dikirim pada pesan sebelumnya.\n\n"
+                f"<i>{STORE_FOOTER}</i>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
     return True
 
@@ -974,6 +1337,8 @@ class OwnerState(StatesGroup):
     add_product = State()
     add_variant = State()
     set_stock = State()
+    stock_add_items = State()
+    stock_set_number = State()
     set_price = State()
     delete_product = State()
     add_voucher = State()
@@ -1524,6 +1889,18 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot):
 
         conn = db()
         conn.execute("BEGIN IMMEDIATE")
+
+        duplicate = recent_duplicate_checkout(
+            conn, call.from_user.id, variant_id, qty, "WALLET"
+        )
+        if duplicate:
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                "Pesanan yang sama baru saja diproses. Cek Pesanan Saya.",
+                show_alert=True
+            )
+
         variant = conn.execute(
             "SELECT * FROM product_variants WHERE id=? AND active=1",
             (variant_id,)
@@ -1555,11 +1932,17 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot):
                 show_alert=True
             )
 
+        if not reserve_stock_for_order(conn, variant_id, qty):
+            conn.rollback()
+            conn.close()
+            return await call.answer("Stok baru saja berubah. Silakan coba lagi.", show_alert=True)
+
         cur = conn.execute(
             """INSERT INTO orders
                (user_id, username, product_id, variant_id, qty, unit_price, total,
                 status, payment_method, payment_status, note, unique_code,
-                payment_total, stock_reserved, reserved_until, completed_at, created_at)
+                payment_total, stock_reserved, reserved_until,
+                fulfillment_status, created_at)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 call.from_user.id,
@@ -1569,15 +1952,15 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot):
                 qty,
                 unit,
                 total,
-                "completed",
+                "paid_pending_delivery",
                 "WALLET",
                 "paid",
                 "",
                 0,
                 total,
-                0,
+                1,
                 "",
-                datetime.now().isoformat(timespec="seconds"),
+                "pending",
                 datetime.now().isoformat(timespec="seconds")
             )
         )
@@ -1604,27 +1987,31 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot):
                 datetime.now().isoformat(timespec="seconds")
             )
         )
-        conn.execute(
-            "UPDATE product_variants SET stock=stock-? WHERE id=?",
-            (qty, variant_id)
-        )
-        conn.execute(
-            "UPDATE products SET sold=sold+? WHERE id=?",
-            (qty, product["id"])
-        )
         conn.commit()
         conn.close()
 
-        await sync_stock_channel(bot)
+        delivered = await fulfill_order(order_id, bot)
+
+        if delivered:
+            text = (
+                "✅ <b>PEMBAYARAN SALDO BERHASIL</b>\n\n"
+                f"🧾 Invoice: <b>{ref}</b>\n"
+                f"📦 Produk: {product['name']} — {variant['name']}\n"
+                f"💰 Total: <b>{rupiah(total)}</b>\n"
+                f"💵 Sisa saldo: <b>{rupiah(new_balance)}</b>\n\n"
+                "🎁 Data akun premium sudah dikirim otomatis."
+            )
+        else:
+            text = (
+                "🟡 <b>PEMBAYARAN SALDO BERHASIL</b>\n\n"
+                f"🧾 Invoice: <b>{ref}</b>\n"
+                f"💰 Total: <b>{rupiah(total)}</b>\n"
+                f"💵 Sisa saldo: <b>{rupiah(new_balance)}</b>\n\n"
+                "Pembayaran sudah tercatat. Akun premium sedang disiapkan dan akan dikirim otomatis."
+            )
 
         await call.message.edit_text(
-            "✅ <b>PEMBAYARAN SALDO BERHASIL</b>\n\n"
-            f"🧾 Invoice: <b>{ref}</b>\n"
-            f"📦 Produk: {product['name']} — {variant['name']}\n"
-            f"💰 Total: <b>{rupiah(total)}</b>\n"
-            f"💳 Metode: <b>Saldo</b>\n"
-            f"💵 Sisa saldo: <b>{rupiah(new_balance)}</b>\n\n"
-            f"<i>{STORE_FOOTER}</i>",
+            text + f"\n\n<i>{STORE_FOOTER}</i>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
                 [InlineKeyboardButton(text="🏠 Menu Utama", callback_data="home")]
@@ -1642,6 +2029,17 @@ async def process_order(call: CallbackQuery, bot: Bot):
 
         conn = db()
         conn.execute("BEGIN IMMEDIATE")
+
+        duplicate = recent_duplicate_checkout(
+            conn, call.from_user.id, variant_id, qty, "QRIS"
+        )
+        if duplicate:
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                "Pesanan QRIS yang sama baru saja dibuat. Cek Pesanan Saya.",
+                show_alert=True
+            )
         variant = conn.execute(
             "SELECT * FROM product_variants WHERE id=?",
             (variant_id,)
@@ -1723,8 +2121,6 @@ async def process_order(call: CallbackQuery, bot: Bot):
             f"<i>{STORE_FOOTER}</i>"
         )
 
-        await sync_stock_channel(bot)
-
         if qris_file_id:
             try:
                 await call.message.delete()
@@ -1786,6 +2182,17 @@ async def process_auto_order(call: CallbackQuery, bot: Bot):
 
         conn = db()
         conn.execute("BEGIN IMMEDIATE")
+
+        duplicate = recent_duplicate_checkout(
+            conn, call.from_user.id, variant_id, qty, "AUTO_QRIS"
+        )
+        if duplicate:
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                "QR pembayaran yang sama baru saja dibuat. Cek Pesanan Saya.",
+                show_alert=True
+            )
         variant = conn.execute(
             "SELECT * FROM product_variants WHERE id=?",
             (variant_id,)
@@ -1853,7 +2260,6 @@ async def process_auto_order(call: CallbackQuery, bot: Bot):
             )
             conn.commit()
             conn.close()
-            await sync_stock_channel(bot)
 
             return await call.message.edit_text(
                 "❌ <b>QRIS OTOMATIS BELUM BERHASIL DIBUAT</b>\n\n"
@@ -1881,8 +2287,6 @@ async def process_auto_order(call: CallbackQuery, bot: Bot):
         )
         conn.commit()
         conn.close()
-
-        await sync_stock_channel(bot)
 
         caption = (
             "⚡ <b>QRIS OTOMATIS</b>\n\n"
@@ -1963,8 +2367,46 @@ async def my_orders(call: CallbackQuery):
         lines.append(f"<i>{STORE_FOOTER}</i>")
         text = "\n".join(lines)
 
-    await call.message.edit_text(text, reply_markup=back_home(), parse_mode="HTML")
+    kb = InlineKeyboardBuilder()
+    has_delivery = any((row["delivery_text"] or "").strip() for row in rows) if rows else False
+    if has_delivery:
+        kb.button(text="📩 Kirim Ulang Akun Terakhir", callback_data="resend:last")
+    kb.button(text="⬅️ Menu Utama", callback_data="home")
+    kb.adjust(1)
+
+    await call.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
     await call.answer()
+
+
+@router.callback_query(F.data == "resend:last")
+async def resend_last_delivery(call: CallbackQuery, bot: Bot):
+    conn = db()
+    order = conn.execute(
+        """SELECT * FROM orders
+           WHERE user_id=?
+             AND delivery_text!=''
+           ORDER BY id DESC
+           LIMIT 1""",
+        (call.from_user.id,)
+    ).fetchone()
+    conn.close()
+
+    if not order:
+        return await call.answer("Belum ada akun yang bisa dikirim ulang.", show_alert=True)
+
+    try:
+        await send_delivery_payload(
+            bot,
+            call.from_user.id,
+            order["id"],
+            order["delivery_text"]
+        )
+        await call.answer("✅ Akun dikirim ulang.")
+    except Exception:
+        await call.answer(
+            "Pengiriman ulang gagal. Silakan coba lagi beberapa saat.",
+            show_alert=True
+        )
 
 
 @router.callback_query(F.data == "stock_report")
@@ -2833,7 +3275,6 @@ async def owner_add_product_input(message: Message, state: FSMContext):
         conn.commit()
         conn.close()
         await state.clear()
-        await sync_stock_channel(message.bot)
         await message.answer("✅ Produk berhasil ditambahkan.", reply_markup=owner_menu())
     except Exception:
         await message.answer("❌ Format salah. Gunakan: Nama | Harga | Stok | Deskripsi")
@@ -2867,63 +3308,249 @@ async def owner_add_variant_input(message: Message, state: FSMContext):
         conn.commit()
         conn.close()
         await state.clear()
-        await sync_stock_channel(message.bot)
         await message.answer("✅ Variasi berhasil ditambahkan.", reply_markup=owner_menu())
     except Exception:
         await message.answer("❌ Format variasi tidak valid.")
 
 
+def owner_stock_products_keyboard():
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, name FROM products WHERE active=1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    kb = InlineKeyboardBuilder()
+    for row in rows:
+        kb.button(
+            text=f"📦 {row['name']}",
+            callback_data=f"ownerstock:product:{row['id']}"
+        )
+    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def owner_stock_variants_keyboard(product_id: int):
+    conn = db()
+    product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    rows = conn.execute(
+        """SELECT * FROM product_variants
+           WHERE product_id=? AND active=1
+           ORDER BY id""",
+        (product_id,)
+    ).fetchall()
+    conn.close()
+
+    kb = InlineKeyboardBuilder()
+    for row in rows:
+        kb.button(
+            text=f"{row['name']} • stok {available_stock(row)}",
+            callback_data=f"ownerstock:variant:{row['id']}"
+        )
+    kb.button(text="⬅️ Pilih Produk", callback_data="owner:set_stock")
+    kb.adjust(1)
+    return (product, kb.as_markup())
+
+
+def owner_stock_variant_actions(variant_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Tambah Akun", callback_data=f"ownerstock:add:{variant_id}")
+    kb.button(text="📤 Kirim Pending", callback_data=f"ownerstock:fulfill:{variant_id}")
+    kb.button(text="⬅️ Kembali", callback_data=f"ownerstock:backvariant:{variant_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 @router.callback_query(F.data == "owner:set_stock")
 async def owner_set_stock(call: CallbackQuery, state: FSMContext):
-    await prompt_state(
-        call, state, OwnerState.set_stock,
-        "📦 <b>ATUR STOK VARIASI</b>\n\n"
-        "Kirim:\n<code>ID VARIASI | STOK BARU</code>\n\nContoh: <code>1 | 100</code>"
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+    await state.clear()
+    await call.message.edit_text(
+        "📦 <b>ATUR STOK</b>\n\n"
+        "Pilih produk yang ingin diatur.\n"
+        "Tidak perlu mengetik ID produk/variasi.",
+        reply_markup=owner_stock_products_keyboard(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ownerstock:product:"))
+async def owner_stock_product(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    product_id = int(call.data.split(":")[2])
+    product, markup = owner_stock_variants_keyboard(product_id)
+
+    if not product:
+        return await call.answer("Produk tidak ditemukan.", show_alert=True)
+
+    await call.message.edit_text(
+        f"📦 <b>{product['name']}</b>\n\nPilih variasi:",
+        reply_markup=markup,
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ownerstock:variant:"))
+async def owner_stock_variant(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    variant_id = int(call.data.split(":")[2])
+    conn = db()
+    variant = conn.execute(
+        """SELECT v.*, p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=?""",
+        (variant_id,)
+    ).fetchone()
+    counts = inventory_counts(conn, variant_id) if variant else {"available": 0, "sold": 0}
+    conn.close()
+
+    if not variant:
+        return await call.answer("Variasi tidak ditemukan.", show_alert=True)
+
+    await call.message.edit_text(
+        "📦 <b>DETAIL STOK</b>\n\n"
+        f"Produk: <b>{variant['product_name']}</b>\n"
+        f"Variasi: <b>{variant['name']}</b>\n"
+        f"Stok tersedia: <b>{available_stock(variant)}</b>\n"
+        f"Akun siap kirim: <b>{counts['available']}</b>\n"
+        f"Akun sudah terjual: <b>{counts['sold']}</b>\n\n"
+        "Gunakan <b>➕ Tambah Akun</b>. Jumlah stok mengikuti jumlah akun yang benar-benar tersedia.",
+        reply_markup=owner_stock_variant_actions(variant_id),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("ownerstock:backvariant:"))
+async def owner_stock_back_variant(call: CallbackQuery):
+    variant_id = int(call.data.split(":")[2])
+    conn = db()
+    row = conn.execute("SELECT product_id FROM product_variants WHERE id=?", (variant_id,)).fetchone()
+    conn.close()
+    if not row:
+        return await call.answer("Variasi tidak ditemukan.", show_alert=True)
+    call.data = f"ownerstock:product:{row['product_id']}"
+    await owner_stock_product(call)
+
+
+@router.callback_query(F.data.startswith("ownerstock:add:"))
+async def owner_stock_add(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    variant_id = int(call.data.split(":")[2])
+    await state.update_data(stock_variant_id=variant_id)
+    await state.set_state(OwnerState.stock_add_items)
+
+    await call.message.edit_text(
+        "➕ <b>TAMBAH AKUN PREMIUM</b>\n\n"
+        "Kirim <b>1 akun per baris</b>.\n\n"
+        "Contoh:\n"
+        "<code>email1@gmail.com | password1\n"
+        "email2@gmail.com | password2\n"
+        "email3@gmail.com | password3</code>\n\n"
+        "Setiap baris akan dianggap sebagai 1 stok yang dapat dikirim otomatis.",
+        reply_markup=back_owner(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.message(OwnerState.stock_add_items)
+async def owner_stock_add_input(message: Message, state: FSMContext, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    variant_id = int(data.get("stock_variant_id", 0))
+    items = [line.strip() for line in (message.text or "").splitlines() if line.strip()]
+
+    if not variant_id or not items:
+        return await message.answer("❌ Tidak ada akun yang dapat ditambahkan.")
+
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    variant = conn.execute(
+        "SELECT * FROM product_variants WHERE id=?",
+        (variant_id,)
+    ).fetchone()
+
+    if not variant:
+        conn.rollback()
+        conn.close()
+        await state.clear()
+        return await message.answer("❌ Variasi tidak ditemukan.", reply_markup=owner_menu())
+
+    now = datetime.now().isoformat(timespec="seconds")
+    added = 0
+    for content in items:
+        # Prevent accidental exact duplicate credentials in the same variant.
+        exists = conn.execute(
+            """SELECT id FROM inventory_items
+               WHERE variant_id=? AND content=?""",
+            (variant_id, content)
+        ).fetchone()
+        if exists:
+            continue
+
+        conn.execute(
+            """INSERT INTO inventory_items
+               (variant_id, content, status, created_at)
+               VALUES(?,?,'available',?)""",
+            (variant_id, content, now)
+        )
+        added += 1
+
+    sync_variant_stock_from_inventory(conn, variant_id)
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await fulfill_pending_for_variant(variant_id, bot)
+
+    conn = db()
+    variant_after = conn.execute("SELECT * FROM product_variants WHERE id=?", (variant_id,)).fetchone()
+    conn.close()
+
+    await message.answer(
+        "✅ <b>STOK AKUN BERHASIL DITAMBAHKAN</b>\n\n"
+        f"Ditambahkan: <b>{added}</b> akun\n"
+        f"Stok tersedia sekarang: <b>{available_stock(variant_after)}</b>\n\n"
+        "Pesanan yang sudah dibayar tetapi menunggu akun juga sudah dicek otomatis.",
+        reply_markup=owner_menu(),
+        parse_mode="HTML"
     )
 
 
-@router.message(OwnerState.set_stock)
-async def owner_set_stock_input(message: Message, state: FSMContext, bot: Bot):
-    if not is_owner(message.from_user.id):
-        return
-    try:
-        vid, stock = [x.strip() for x in message.text.split("|", 1)]
-        vid, stock = int(vid), int(stock)
-        conn = db()
-        variant = conn.execute("SELECT * FROM product_variants WHERE id=?", (vid,)).fetchone()
-        old_stock = variant["stock"] if variant else 0
-        conn.execute("UPDATE product_variants SET stock=? WHERE id=?", (stock, vid))
-        conn.commit()
+@router.callback_query(F.data.startswith("ownerstock:number:"))
+async def owner_stock_number(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
 
-        subscribers = []
-        if old_stock <= 0 and stock > 0 and variant:
-            subscribers = conn.execute(
-                "SELECT * FROM restock_subscriptions WHERE variant_id=?",
-                (vid,)
-            ).fetchall()
-            conn.execute("DELETE FROM restock_subscriptions WHERE variant_id=?", (vid,))
-            conn.commit()
+    await state.clear()
+    await call.answer(
+        "Set stok angka dinonaktifkan untuk mencegah stok tanpa akun. Gunakan ➕ Tambah Akun.",
+        show_alert=True
+    )
 
-        conn.close()
-        await state.clear()
-        await sync_stock_channel(bot)
-        await message.answer("✅ Stok berhasil diperbarui.", reply_markup=owner_menu())
 
-        if subscribers:
-            for sub in subscribers:
-                try:
-                    await bot.send_message(
-                        sub["user_id"],
-                        "🔔 <b>RESTOCK!</b>\n\n"
-                        f"Variasi yang Anda tunggu sudah tersedia kembali.\n"
-                        f"Stok sekarang: <b>{stock}</b>\n\n"
-                        "Buka /start untuk membeli.",
-                        parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
-    except Exception:
-        await message.answer("❌ Format salah. Contoh: 1 | 100")
+@router.callback_query(F.data.startswith("ownerstock:fulfill:"))
+async def owner_stock_fulfill_pending(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    variant_id = int(call.data.split(":")[2])
+    await fulfill_pending_for_variant(variant_id, bot)
+    await call.answer("✅ Pesanan pending sudah dicek.", show_alert=True)
 
 
 @router.callback_query(F.data == "owner:set_price")
@@ -2952,7 +3579,6 @@ async def owner_set_price_input(message: Message, state: FSMContext):
         conn.commit()
         conn.close()
         await state.clear()
-        await sync_stock_channel(message.bot)
         await message.answer("✅ Harga berhasil diperbarui.", reply_markup=owner_menu())
     except Exception:
         await message.answer("❌ Format salah.")
@@ -2978,7 +3604,6 @@ async def owner_delete_product_input(message: Message, state: FSMContext):
         conn.commit()
         conn.close()
         await state.clear()
-        await sync_stock_channel(message.bot)
         await message.answer("✅ Produk dinonaktifkan.", reply_markup=owner_menu())
     except Exception:
         await message.answer("❌ ID produk tidak valid.")
@@ -3090,14 +3715,14 @@ async def owner_complete_order_input(message: Message, state: FSMContext, bot: B
     if not order:
         return await message.answer("❌ Order tidak ditemukan.")
 
-    if order["status"] == "completed":
+    if order["status"] == "completed" and order["fulfillment_status"] == "delivered":
         await state.clear()
-        return await message.answer("ℹ️ Order sudah selesai.", reply_markup=owner_menu())
+        return await message.answer("ℹ️ Order sudah selesai dan akun sudah dikirim.", reply_markup=owner_menu())
 
-    if order["status"] in {"expired", "cancelled", "payment_error"}:
+    if order["status"] == "cancelled":
         await state.clear()
         return await message.answer(
-            f"❌ Order berstatus {order['status']} dan tidak dapat diverifikasi.",
+            "❌ Order sudah dibatalkan dan tidak dapat diverifikasi.",
             reply_markup=owner_menu()
         )
 
@@ -3171,8 +3796,8 @@ async def shopeepay_callback(request: web.Request):
     amount_value = amount_obj.get("value", "0")
 
     try:
-        paid_amount = int(float(amount_value))
-    except Exception:
+        paid_amount = int(Decimal(str(amount_value)))
+    except (InvalidOperation, ValueError, TypeError):
         paid_amount = 0
 
     # Expected reference format MBY-000001
@@ -3207,7 +3832,12 @@ async def shopeepay_callback(request: web.Request):
     # Payment Gateway status "00" is successful for notify flow
     if latest_status == "00":
         bot = request.app["bot"]
-        await mark_order_paid(order_id, bot, paid_amount)
+        ok = await mark_order_paid(order_id, bot, paid_amount)
+        if not ok:
+            logging.warning(
+                "Payment confirmed but order %s needs manual review/fulfillment.",
+                order_id
+            )
 
     return web.json_response(
         {"responseCode": "2005600", "responseMessage": "Successful"}
@@ -3248,7 +3878,6 @@ async def main():
     # Railway web endpoint for health check + payment callback.
     runner = await start_web_server(bot)
 
-    automation_task = asyncio.create_task(startup_automation(bot))
     backup_task = asyncio.create_task(backup_loop(bot))
     cleanup_task = asyncio.create_task(cleanup_expired_orders(bot))
 
@@ -3256,7 +3885,6 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
-        automation_task.cancel()
         backup_task.cancel()
         cleanup_task.cancel()
         await runner.cleanup()
