@@ -1,69 +1,93 @@
 # Maboyy Produk Digital — Telegram Bot
 
-**Brand:** Maboyy Produk Digital  
-**Footer:** Aplikasi Premium • Since 2020  
-**Version:** v1.5
+**Version:** v2.0  
+**Footer:** Aplikasi Premium • Since 2020
 
-Versi ini dibuat lebih sederhana untuk pengguna dan owner.
+## Command
 
-## Command yang tersedia
+Tetap hanya:
 
-Hanya 3 command:
+- `/start`
+- `/owner`
+- `/ping`
 
-- `/start` — membuka menu utama
-- `/owner` — membuka panel owner
-- `/ping` — mengecek status bot
+## Update v2.0 — Saldo Kamu
 
-Semua pengaturan toko dilakukan melalui tombol di `/owner`.
+### Fitur User
 
-## Fitur User
+- 💰 Saldo Kamu
+- ➕ Top Up Saldo
+- 📑 Riwayat Saldo
+- 🛒 Bayar langsung menggunakan Saldo Kamu
+- Saldo otomatis berkurang saat pembelian berhasil
+- Refund otomatis ke saldo jika proses order gagal
+- Top up melalui QRIS manual + kode unik
 
-- List produk
-- Detail produk
-- Stok produk
-- Order
-- Invoice `MBY-000001`
-- Pesanan Saya
-- Laporan stok
-- Tombol hubungi owner
-- Status pembayaran/order
+### Fitur Owner
 
-## Panel Owner Berbasis Tombol
+`/owner → 💰 Manajemen Saldo`
 
-- Tambah produk
-- Atur stok
-- Atur harga
-- Hapus/nonaktifkan produk
-- Lihat pesanan
-- Selesaikan order
-- Tambah voucher
-- Statistik toko
+Tersedia:
 
-Owner tidak perlu lagi menghafal command seperti `/setstok`, `/setharga`, `/orders`, dan lain-lain.
+- Tambah saldo user
+- Kurangi saldo user
+- Verifikasi top up
+- Riwayat transaksi saldo
+- Total saldo tersimpan
+- Jumlah top up pending
+
+Semua perubahan saldo dicatat dalam ledger sehingga lebih mudah diaudit.
+
+## Pembayaran
+
+Tampilan customer menggunakan nama generik:
+
+- 💰 Saldo Kamu
+- 🟡 QRIS Manual
+- ⚡ QRIS Otomatis
+
+Nama provider/payment gateway tidak ditampilkan ke customer.
+
+Integrasi otomatis tetap dipersiapkan di backend dan dapat diaktifkan setelah credential resmi tersedia.
+
+## Keamanan Saldo
+
+- Saldo tidak boleh minus
+- Setiap transaksi mempunyai reference
+- Ledger transaksi mencegah transaksi yang sama diproses dua kali
+- Top up yang sudah diverifikasi tidak dapat dikreditkan dua kali
+- Pembelian menggunakan saldo langsung ditandai paid jika berhasil
+- Jika fulfillment gagal, saldo direfund otomatis
 
 ## Railway Variables
 
+Variable lama tetap:
+
 ```env
-BOT_TOKEN=token_dari_botfather
-ADMIN_ID=id_telegram_owner
-ADMIN_USERNAME=username_telegram_owner
+BOT_TOKEN=
+ADMIN_ID=
+ADMIN_USERNAME=
+PAYMENT_NOTE=QRIS Maboyy Digital
 ```
 
-Jangan upload token asli ke GitHub.
+Variable Payment Gateway otomatis tetap opsional dan tidak perlu diaktifkan sekarang.
 
-## Deploy Railway
-
-Start command:
+## Start Command
 
 ```bash
 python bot.py
 ```
 
-File yang di-upload ke GitHub:
+## File v2.0
 
-1. `bot.py`
-2. `requirements.txt`
-3. `.env.example`
-4. `README.md`
+File yang berubah dan perlu diganti di GitHub:
+
+- bot.py
+- README.md
+
+File yang tidak berubah dari v1.8:
+
+- requirements.txt
+- .env.example
 
 Aplikasi Premium • Since 2020
