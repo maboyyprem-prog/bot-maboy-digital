@@ -71,7 +71,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "4.2"
+BOT_VERSION = "4.4"
 BOT_CHANGELOG = [
     "Backup database otomatis dan retention backup.",
     "Database persisten melalui Railway Volume.",
@@ -562,7 +562,7 @@ async def show_main_menu_message(message: Message):
     await message.answer(
         f"🛍️ <b>{STORE_NAME}</b>\n\n"
         "Selamat datang.\n"
-        "Gunakan tombol menu di bawah untuk akses cepat.\n\n"
+        "Gunakan tombol menu atau nomor produk di bawah untuk akses cepat.\n\n"
         f"<i>{STORE_FOOTER}</i>",
         reply_markup=user_reply_menu(),
         parse_mode="HTML"
@@ -1804,31 +1804,48 @@ def main_menu():
 
 
 def user_reply_menu():
+    conn = db()
+    products = conn.execute(
+        "SELECT id, name FROM products WHERE active=1 ORDER BY id LIMIT 25"
+    ).fetchall()
+    conn.close()
+
+    keyboard = [
+        [
+            KeyboardButton(text="🏷️ List Produk"),
+            KeyboardButton(text="🎁 Voucher"),
+            KeyboardButton(text="📁 Laporan Stok"),
+        ]
+    ]
+
+    # Product shortcuts: 1..N, five buttons per row.
+    # Number follows the same order shown in List Produk.
+    number_row = []
+    for index, _product in enumerate(products, start=1):
+        number_row.append(KeyboardButton(text=str(index)))
+        if len(number_row) == 5:
+            keyboard.append(number_row)
+            number_row = []
+
+    if number_row:
+        keyboard.append(number_row)
+
+    keyboard.append([
+        KeyboardButton(text="💰 Isi Saldo"),
+        KeyboardButton(text="❓ Cara Order"),
+    ])
+
+    keyboard.append([
+        KeyboardButton(text="🧾 Pesanan Saya"),
+        KeyboardButton(text="💬 Hubungi Owner"),
+    ])
+
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="🏷️ List Produk"),
-                KeyboardButton(text="🎁 Voucher"),
-                KeyboardButton(text="📁 Laporan Stok"),
-            ],
-            [
-                KeyboardButton(text="🔥 Produk Populer"),
-                KeyboardButton(text="⚡ Flash Sale"),
-            ],
-            [
-                KeyboardButton(text="🧾 Pesanan Saya"),
-                KeyboardButton(text="💰 Saldo Kamu"),
-            ],
-            [
-                KeyboardButton(text="❓ Cara Order"),
-                KeyboardButton(text="💬 Hubungi Owner"),
-            ],
-        ],
+        keyboard=keyboard,
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Pilih menu Maboyy Digital"
+        input_field_placeholder="Pilih menu atau nomor produk"
     )
-
 
 def owner_menu():
     kb = InlineKeyboardBuilder()
@@ -1876,9 +1893,87 @@ def owner_back_button():
 
 
 
+def topup_amount_keyboard(amount: int | None = None):
+    minimum = get_min_topup()
+    amount = max(minimum, int(amount or minimum))
+
+    presets = [5000, 10000, 20000, 50000, 100000, 200000]
+    presets = sorted({value for value in presets if value >= minimum})
+
+    kb = InlineKeyboardBuilder()
+    for value in presets:
+        prefix = "✅ " if value == amount else ""
+        kb.button(
+            text=f"{prefix}{rupiah(value)}",
+            callback_data=f"topup:set:{value}"
+        )
+    kb.adjust(2)
+
+    step = 5000
+    minus_value = max(minimum, amount - step)
+    plus_value = amount + step
+
+    kb.row(
+        InlineKeyboardButton(
+            text="➖ Rp5.000",
+            callback_data=f"topup:set:{minus_value}"
+        ),
+        InlineKeyboardButton(
+            text=f"💰 {rupiah(amount)}",
+            callback_data="noop"
+        ),
+        InlineKeyboardButton(
+            text="➕ Rp5.000",
+            callback_data=f"topup:set:{plus_value}"
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="✏️ Nominal Custom",
+            callback_data="topup:custom"
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="✅ Lanjut Pembayaran",
+            callback_data=f"topup:confirm:{amount}"
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="⬅️ Saldo Kamu",
+            callback_data="wallet"
+        )
+    )
+    return kb.as_markup()
+
+
+def topup_confirm_keyboard(amount: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🟡 Buat Invoice QRIS",
+                callback_data=f"topup:pay:{amount}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ Ubah Nominal",
+                callback_data=f"topup:set:{amount}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Batal",
+                callback_data="wallet"
+            )
+        ]
+    ])
+
+
 def wallet_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Top Up Saldo", callback_data="wallet:topup")
+    kb.button(text="➕ Isi Saldo", callback_data="wallet:topup")
     kb.button(text="📑 Riwayat Saldo", callback_data="wallet:history")
     kb.button(text="🛒 Belanja", callback_data="products")
     kb.button(text="⬅️ Menu Utama", callback_data="home")
@@ -1954,14 +2049,77 @@ def variants_keyboard(product_id):
 
 
 def qty_keyboard(variant_id, qty):
+    conn = db()
+    variant = conn.execute(
+        "SELECT * FROM product_variants WHERE id=?",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    stock = available_stock(variant) if variant else 0
+    stock = max(0, stock)
+    qty = max(1, min(qty, stock if stock > 0 else 1))
+
     kb = InlineKeyboardBuilder()
-    kb.button(text="➖", callback_data=f"qty:{variant_id}:{max(1, qty-1)}")
-    kb.button(text=f"{qty}", callback_data="noop")
-    kb.button(text="➕", callback_data=f"qty:{variant_id}:{qty+1}")
-    kb.button(text="🛒 Beli Sekarang", callback_data=f"confirm:{variant_id}:{qty}")
-    kb.button(text="🔔 Notif Restock", callback_data=f"restock:{variant_id}")
-    kb.button(text="⬅️ Kembali", callback_data=f"back_product:{variant_id}")
-    kb.adjust(3, 1, 1, 1)
+
+    # Quick stock/quantity buttons.
+    # Show up to 20 direct choices; if stock is higher, add MAX.
+    quick_max = min(stock, 20)
+    for number in range(1, quick_max + 1):
+        prefix = "✅ " if number == qty else ""
+        kb.button(
+            text=f"{prefix}{number}",
+            callback_data=f"qty:{variant_id}:{number}"
+        )
+
+    if quick_max > 0:
+        kb.adjust(5)
+
+    if stock > 20:
+        kb.row(
+            InlineKeyboardButton(
+                text=f"📦 MAX {stock}",
+                callback_data=f"qty:{variant_id}:{stock}"
+            )
+        )
+
+    # Fine adjustment.
+    kb.row(
+        InlineKeyboardButton(
+            text="➖",
+            callback_data=f"qty:{variant_id}:{max(1, qty-1)}"
+        ),
+        InlineKeyboardButton(
+            text=f"Jumlah: {qty}",
+            callback_data="noop"
+        ),
+        InlineKeyboardButton(
+            text="➕",
+            callback_data=f"qty:{variant_id}:{min(stock, qty+1) if stock else qty}"
+        )
+    )
+
+    if stock > 0:
+        kb.row(
+            InlineKeyboardButton(
+                text="🛒 Lanjut Beli",
+                callback_data=f"confirm:{variant_id}:{qty}"
+            )
+        )
+    else:
+        kb.row(
+            InlineKeyboardButton(
+                text="🔔 Notif Restock",
+                callback_data=f"restock:{variant_id}"
+            )
+        )
+
+    kb.row(
+        InlineKeyboardButton(
+            text="⬅️ Kembali",
+            callback_data=f"back_product:{variant_id}"
+        )
+    )
     return kb.as_markup()
 
 
@@ -3165,15 +3323,53 @@ async def wallet_history(call: CallbackQuery):
 
 @router.callback_query(F.data == "wallet:topup")
 async def wallet_topup(call: CallbackQuery, state: FSMContext):
-    await state.set_state(OwnerState.topup_amount)
+    await state.clear()
+    minimum = get_min_topup()
+
     await call.message.edit_text(
-        "➕ <b>TOP UP SALDO</b>\n\n"
-        f"Minimum top up: <b>{rupiah(get_min_topup())}</b>\n\n"
-        "Kirim nominal top up dalam angka.\n"
-        "Contoh: <code>50000</code>\n\n"
-        "Top up sementara menggunakan QRIS manual + kode unik.",
+        "➕ <b>ISI SALDO</b>\n\n"
+        f"Saldo minimum: <b>{rupiah(minimum)}</b>\n\n"
+        "Pilih nominal cepat, gunakan tombol tambah/kurang, "
+        "atau masukkan nominal custom.",
+        reply_markup=topup_amount_keyboard(minimum),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("topup:set:"))
+async def wallet_topup_set(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+
+    try:
+        amount = int(call.data.split(":")[2])
+    except Exception:
+        return await call.answer("Nominal tidak valid.", show_alert=True)
+
+    amount = max(get_min_topup(), amount)
+
+    await call.message.edit_text(
+        "➕ <b>ISI SALDO</b>\n\n"
+        f"Nominal dipilih: <b>{rupiah(amount)}</b>\n"
+        f"Minimum: <b>{rupiah(get_min_topup())}</b>\n\n"
+        "Atur nominal lalu lanjutkan ke pembayaran.",
+        reply_markup=topup_amount_keyboard(amount),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "topup:custom")
+async def wallet_topup_custom(call: CallbackQuery, state: FSMContext):
+    await state.set_state(OwnerState.topup_amount)
+
+    await call.message.edit_text(
+        "✏️ <b>NOMINAL CUSTOM</b>\n\n"
+        f"Minimum isi saldo: <b>{rupiah(get_min_topup())}</b>\n\n"
+        "Kirim nominal dalam angka.\n"
+        "Contoh: <code>75000</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Saldo Kamu", callback_data="wallet")]
+            [InlineKeyboardButton(text="⬅️ Kembali", callback_data="wallet:topup")]
         ]),
         parse_mode="HTML"
     )
@@ -3181,28 +3377,108 @@ async def wallet_topup(call: CallbackQuery, state: FSMContext):
 
 
 @router.message(OwnerState.topup_amount)
-async def wallet_topup_amount(message: Message, state: FSMContext, bot: Bot):
+async def wallet_topup_custom_input(message: Message, state: FSMContext):
     try:
-        amount = int((message.text or "").strip())
-        min_topup = get_min_topup()
-        if amount < min_topup:
+        raw = (message.text or "").replace(".", "").replace(",", "").strip()
+        amount = int(raw)
+        if amount < get_min_topup():
             raise ValueError
     except Exception:
         return await message.answer(
-            f"❌ Minimum top up adalah {rupiah(get_min_topup())} dan nominal harus berupa angka."
+            f"❌ Nominal tidak valid. Minimum isi saldo adalah {rupiah(get_min_topup())}."
         )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>NOMINAL DIPILIH</b>\n\n"
+        f"Isi saldo: <b>{rupiah(amount)}</b>\n\n"
+        "Periksa nominal sebelum membuat invoice.",
+        reply_markup=topup_confirm_keyboard(amount),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("topup:confirm:"))
+async def wallet_topup_confirm(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+
+    try:
+        amount = int(call.data.split(":")[2])
+    except Exception:
+        return await call.answer("Nominal tidak valid.", show_alert=True)
+
+    if amount < get_min_topup():
+        return await call.answer(
+            f"Minimum isi saldo {rupiah(get_min_topup())}.",
+            show_alert=True
+        )
+
+    balance = get_balance(call.from_user.id)
+
+    await call.message.edit_text(
+        "🧾 <b>KONFIRMASI ISI SALDO</b>\n\n"
+        f"Saldo sekarang: <b>{rupiah(balance)}</b>\n"
+        f"Nominal isi saldo: <b>{rupiah(amount)}</b>\n"
+        f"Perkiraan saldo setelah berhasil: <b>{rupiah(balance + amount)}</b>\n\n"
+        "Invoice baru dibuat setelah Anda menekan tombol pembayaran.",
+        reply_markup=topup_confirm_keyboard(amount),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("topup:pay:"))
+async def wallet_topup_pay(call: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+
+    try:
+        amount = int(call.data.split(":")[2])
+    except Exception:
+        return await call.answer("Nominal tidak valid.", show_alert=True)
+
+    if amount < get_min_topup():
+        return await call.answer(
+            f"Minimum isi saldo {rupiah(get_min_topup())}.",
+            show_alert=True
+        )
+
+    # Anti double-click: reuse/reject a same pending topup created very recently.
+    conn = db()
+    recent = conn.execute(
+        """SELECT * FROM topups
+           WHERE user_id=? AND amount=? AND status='pending'
+           ORDER BY id DESC
+           LIMIT 1""",
+        (call.from_user.id, amount)
+    ).fetchone()
+
+    if recent:
+        try:
+            created = datetime.fromisoformat(recent["created_at"])
+            now = datetime.now(created.tzinfo) if created.tzinfo else datetime.now()
+            age = (now - created).total_seconds()
+        except Exception:
+            age = 999
+
+        if 0 <= age <= 30:
+            conn.close()
+            return await call.answer(
+                f"Invoice {topup_invoice(recent['id'])} baru saja dibuat. Jangan buat dua kali.",
+                show_alert=True
+            )
 
     code = unique_code_for_order()
     payment_total = amount + code
 
-    conn = db()
     cur = conn.execute(
         """INSERT INTO topups
-           (user_id, username, amount, unique_code, payment_total, payment_method, status, created_at)
+           (user_id, username, amount, unique_code, payment_total,
+            payment_method, status, created_at)
            VALUES(?,?,?,?,?,?,?,?)""",
         (
-            message.from_user.id,
-            message.from_user.username or "",
+            call.from_user.id,
+            call.from_user.username or "",
             amount,
             code,
             payment_total,
@@ -3215,70 +3491,68 @@ async def wallet_topup_amount(message: Message, state: FSMContext, bot: Bot):
     conn.commit()
     conn.close()
 
-    await state.clear()
-
     qris_file_id = get_setting("qris_file_id", "")
     payment_note = get_setting("payment_note", DEFAULT_PAYMENT_NOTE)
+
     caption = (
-        "➕ <b>TOP UP SALDO</b>\n\n"
+        "💰 <b>INVOICE ISI SALDO</b>\n\n"
         f"🧾 Invoice: <b>{topup_invoice(topup_id)}</b>\n"
-        f"💰 Nominal saldo: <b>{rupiah(amount)}</b>\n"
+        f"💵 Isi saldo: <b>{rupiah(amount)}</b>\n"
         f"🔢 Kode unik: <b>+{code}</b>\n"
-        f"💵 TOTAL TRANSFER: <b>{rupiah(payment_total)}</b>\n\n"
-        "Transfer harus sesuai nominal sampai kode unik.\n"
+        f"💳 TOTAL TRANSFER: <b>{rupiah(payment_total)}</b>\n\n"
+        "⚠️ Transfer harus sesuai total sampai kode unik.\n"
         f"📝 {payment_note}\n\n"
-        "Setelah pembayaran masuk, owner akan memverifikasi top up."
+        "Setelah pembayaran diterima dan diverifikasi owner, "
+        "saldo akan masuk ke Saldo Kamu."
     )
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Saldo Kamu", callback_data="wallet")],
+        [InlineKeyboardButton(text="📑 Riwayat Saldo", callback_data="wallet:history")]
+    ])
+
     if qris_file_id:
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+
         await bot.send_photo(
-            message.from_user.id,
+            call.from_user.id,
             qris_file_id,
             caption=caption,
-            reply_markup=wallet_menu(),
+            reply_markup=kb,
             parse_mode="HTML"
         )
     else:
-        await message.answer(
+        await call.message.edit_text(
             caption + "\n\n⚠️ QRIS belum dipasang owner.",
-            reply_markup=wallet_menu(),
+            reply_markup=kb,
             parse_mode="HTML"
         )
 
     if ADMIN_ID:
         try:
-            user = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
+            user = (
+                f"@{call.from_user.username}"
+                if call.from_user.username
+                else str(call.from_user.id)
+            )
             await bot.send_message(
                 ADMIN_ID,
-                "💰 <b>TOP UP BARU</b>\n\n"
+                "💰 <b>ISI SALDO BARU</b>\n\n"
                 f"🧾 {topup_invoice(topup_id)}\n"
                 f"👤 {user}\n"
-                f"💰 Saldo: {rupiah(amount)}\n"
-                f"💵 Transfer: {rupiah(payment_total)}\n\n"
+                f"💵 Saldo: {rupiah(amount)}\n"
+                f"🔢 Kode unik: +{code}\n"
+                f"💳 Transfer: {rupiah(payment_total)}\n\n"
                 "Buka /owner → 💰 Manajemen Saldo → ✅ Verifikasi Top Up.",
                 parse_mode="HTML"
             )
         except Exception:
             pass
 
-
-
-# =========================
-# OWNER PANEL
-# =========================
-@router.callback_query(F.data == "owner:panel")
-async def owner_panel(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
-    await state.clear()
-    await call.message.edit_text(
-        f"🛠️ <b>PANEL OWNER • {STORE_NAME}</b>\n\n"
-        "Pilih pengaturan toko:\n\n"
-        f"<i>{STORE_FOOTER}</i>",
-        reply_markup=owner_menu(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+    await call.answer("Invoice isi saldo berhasil dibuat.")
 
 
 
@@ -5065,7 +5339,7 @@ async def reply_menu_products(message: Message, bot: Bot):
     lines = ["🏷️ <b>LIST PRODUK</b>", ""]
     for i, row in enumerate(rows, 1):
         lines.append(f"{i}. {html.escape(row['name'])}")
-    lines.append("\nPilih produk melalui tombol berikut.")
+    lines.append("\nTekan nomor produk di keyboard bawah atau pilih tombol produk berikut.")
 
     await message.answer(
         "\n".join(lines),
@@ -5219,20 +5493,122 @@ async def reply_menu_orders(message: Message, bot: Bot):
     await message.answer("\n\n".join(lines), reply_markup=kb, parse_mode="HTML")
 
 
-@router.message(F.text == "💰 Saldo Kamu")
+@router.message(F.text == "💰 Isi Saldo")
 async def reply_menu_wallet(message: Message, bot: Bot):
     if not await is_channel_member(bot, message.from_user.id):
         return await send_join_required(message)
 
+    mark_user_verified(
+        message.from_user.id,
+        message.from_user.username or ""
+    )
+
     balance = get_balance(message.from_user.id)
+    minimum = get_min_topup()
 
     await message.answer(
-        "💰 <b>SALDO KAMU</b>\n\n"
-        f"Saldo tersedia: <b>{rupiah(balance)}</b>\n\n"
-        "Gunakan menu saldo untuk top up atau melihat riwayat.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Buka Saldo Kamu", callback_data="wallet")]
-        ]),
+        "💰 <b>ISI SALDO</b>\n\n"
+        f"Saldo Kamu: <b>{rupiah(balance)}</b>\n"
+        f"Minimum isi saldo: <b>{rupiah(minimum)}</b>\n\n"
+        "Pilih nominal cepat atau atur nominal sendiri:",
+        reply_markup=topup_amount_keyboard(minimum),
+        parse_mode="HTML"
+    )
+
+
+@router.message(F.text.regexp(r"^\d{1,2}$"))
+async def reply_menu_product_number(message: Message, bot: Bot):
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    mark_user_verified(
+        message.from_user.id,
+        message.from_user.username or ""
+    )
+
+    try:
+        index = int((message.text or "").strip())
+    except Exception:
+        return
+
+    if index < 1:
+        return await message.answer(
+            "❌ Nomor produk tidak valid.",
+            reply_markup=user_reply_menu()
+        )
+
+    conn = db()
+    products = conn.execute(
+        "SELECT id, name FROM products WHERE active=1 ORDER BY id LIMIT 25"
+    ).fetchall()
+
+    if index > len(products):
+        conn.close()
+        return await message.answer(
+            "❌ Nomor produk tidak tersedia. Tekan 🏷️ List Produk untuk melihat daftar terbaru.",
+            reply_markup=user_reply_menu()
+        )
+
+    product_id = int(products[index - 1]["id"])
+    product = conn.execute(
+        "SELECT * FROM products WHERE id=? AND active=1",
+        (product_id,)
+    ).fetchone()
+    variants = conn.execute(
+        """SELECT *
+           FROM product_variants
+           WHERE product_id=? AND active=1
+           ORDER BY id""",
+        (product_id,)
+    ).fetchall()
+    conn.close()
+
+    if not product:
+        return await message.answer(
+            "❌ Produk sudah tidak tersedia.",
+            reply_markup=user_reply_menu()
+        )
+
+    text = (
+        "╭────────────────────╮\n"
+        f"• <b>Produk:</b> {html.escape(product['name'])}\n"
+        f"• <b>Terjual:</b> {int(product['sold'] or 0)}\n"
+        f"• <b>Deskripsi:</b> {html.escape(product['description'] or '-')}\n"
+        "╰────────────────────╯\n\n"
+        "╭────────────────────╮\n"
+        "📦 <b>VARIASI • HARGA • STOK</b>\n"
+    )
+
+    kb = InlineKeyboardBuilder()
+
+    if variants:
+        for idx, variant in enumerate(variants, start=1):
+            stock = available_stock(variant)
+            icon = "✅" if stock > 0 else "❌"
+            text += (
+                f"\n{idx}. <b>{html.escape(variant['name'])}</b>\n"
+                f"   💰 Harga: <b>{rupiah(variant['price'])}</b>\n"
+                f"   {icon} Stok: <b>{stock}</b>\n"
+            )
+
+            kb.button(
+                text=f"{variant_button_label(variant)} ({stock})",
+                callback_data=f"variant:{variant['id']}"
+            )
+    else:
+        text += "\n<i>Belum ada variasi aktif.</i>\n"
+
+    text += (
+        "\n╰────────────────────╯\n\n"
+        f"<i>{STORE_FOOTER}</i>\n\n"
+        "Pilih variasi:"
+    )
+
+    kb.adjust(1)
+
+    await message.answer(
+        text,
+        reply_markup=kb.as_markup(),
         parse_mode="HTML"
     )
 
