@@ -44,6 +44,10 @@ SHOPEEPAY_PUBLIC_KEY = os.getenv("SHOPEEPAY_PUBLIC_KEY", "").replace("\\n", "\n"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "8080"))
 
+REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
+REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "").strip()
+REQUIRED_CHANNEL_NAME = os.getenv("REQUIRED_CHANNEL_NAME", "Channel Maboyy Digital").strip()
+
 DB_PATH = "shop.db"
 STORE_NAME = "Maboyy Produk Digital"
 STORE_FOOTER = "Aplikasi Premium • Since 2020"
@@ -248,6 +252,60 @@ def rupiah(value: int) -> str:
 
 def is_owner(user_id: int) -> bool:
     return user_id == ADMIN_ID
+
+
+
+async def is_channel_member(bot: Bot, user_id: int) -> bool:
+    if not REQUIRED_CHANNEL_ID:
+        return True
+
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
+        return member.status in {"member", "administrator", "creator"}
+    except Exception:
+        return False
+
+
+def join_required_keyboard():
+    rows = []
+    if REQUIRED_CHANNEL_URL:
+        rows.append([
+            InlineKeyboardButton(
+                text="📢 Join Channel",
+                url=REQUIRED_CHANNEL_URL
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            text="✅ Saya Sudah Join",
+            callback_data="verify_join"
+        )
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_join_required(target_message: Message):
+    await target_message.answer(
+        "🔐 <b>VERIFIKASI CHANNEL</b>\n\n"
+        f"Untuk menggunakan <b>{STORE_NAME}</b>, silakan join terlebih dahulu:\n"
+        f"📢 <b>{REQUIRED_CHANNEL_NAME}</b>\n\n"
+        "Setelah join, tekan tombol <b>✅ Saya Sudah Join</b>.\n"
+        "Bot akan memverifikasi otomatis.",
+        reply_markup=join_required_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+async def show_main_menu_message(message: Message):
+    await message.answer(
+        f"🛍️ <b>{STORE_NAME}</b>\n\n"
+        "Selamat datang.\n"
+        "Silakan pilih menu:\n\n"
+        f"<i>{STORE_FOOTER}</i>",
+        reply_markup=main_menu(),
+        parse_mode="HTML"
+    )
 
 
 def effective_unit_price(variant, qty):
@@ -769,15 +827,11 @@ def variant_card(product, variant, qty=1):
 # PUBLIC COMMANDS (ONLY 3)
 # =========================
 @router.message(Command("start"))
-async def start(message: Message):
-    await message.answer(
-        f"🛍️ <b>{STORE_NAME}</b>\n\n"
-        "Selamat datang.\n"
-        "Silakan pilih menu:\n\n"
-        f"<i>{STORE_FOOTER}</i>",
-        reply_markup=main_menu(),
-        parse_mode="HTML"
-    )
+async def start(message: Message, bot: Bot):
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    await show_main_menu_message(message)
 
 
 @router.message(Command("owner"))
@@ -817,14 +871,44 @@ async def ping(message: Message):
 # =========================
 # USER FLOW
 # =========================
+
+@router.callback_query(F.data == "verify_join")
+async def verify_join(call: CallbackQuery, bot: Bot):
+    if await is_channel_member(bot, call.from_user.id):
+        await call.answer("✅ Terverifikasi!", show_alert=True)
+        await call.message.edit_text(
+            f"🛍️ <b>{STORE_NAME}</b>\n\n"
+            "✅ Verifikasi berhasil.\n"
+            "Silakan pilih menu:\n\n"
+            f"<i>{STORE_FOOTER}</i>",
+            reply_markup=main_menu(),
+            parse_mode="HTML"
+        )
+    else:
+        await call.answer(
+            "❌ Belum terdeteksi join channel. Silakan join lalu coba lagi.",
+            show_alert=True
+        )
+
+
 @router.callback_query(F.data == "noop")
 async def noop(call: CallbackQuery):
     await call.answer()
 
 
 @router.callback_query(F.data == "home")
-async def cb_home(call: CallbackQuery, state: FSMContext):
+async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
     await state.clear()
+
+    if not await is_channel_member(bot, call.from_user.id):
+        await call.message.edit_text(
+            "🔐 <b>VERIFIKASI CHANNEL</b>\n\n"
+            f"Silakan join <b>{REQUIRED_CHANNEL_NAME}</b> terlebih dahulu.",
+            reply_markup=join_required_keyboard(),
+            parse_mode="HTML"
+        )
+        return await call.answer()
+
     await call.message.edit_text(
         f"🛍️ <b>{STORE_NAME}</b>\n\n"
         "Selamat datang.\n"

@@ -1,6 +1,6 @@
 # Maboyy Produk Digital — Telegram Bot
 
-**Version:** v2.0  
+**Version:** v2.1  
 **Footer:** Aplikasi Premium • Since 2020
 
 ## Command
@@ -91,3 +91,49 @@ File yang tidak berubah dari v1.8:
 - .env.example
 
 Aplikasi Premium • Since 2020
+
+
+## Update v2.1 — Verifikasi Join Channel
+
+Saat user menjalankan `/start`, bot akan mengecek apakah user sudah join channel wajib.
+
+Jika belum join:
+
+```text
+🔐 VERIFIKASI CHANNEL
+
+Untuk menggunakan Maboyy Produk Digital,
+silakan join channel terlebih dahulu.
+
+[ 📢 Join Channel ]
+[ ✅ Saya Sudah Join ]
+```
+
+Setelah user menekan `✅ Saya Sudah Join`, bot memeriksa membership menggunakan Telegram API.
+
+Jika sudah join:
+- status otomatis terverifikasi
+- menu utama langsung dibuka
+
+Jika belum:
+- muncul notifikasi untuk join terlebih dahulu
+- user dapat mencoba lagi tanpa mengetik command baru
+
+### Railway Variables
+
+Tambahkan:
+
+```env
+REQUIRED_CHANNEL_ID=@usernamechannel
+REQUIRED_CHANNEL_URL=https://t.me/usernamechannel
+REQUIRED_CHANNEL_NAME=Maboyy Digital
+```
+
+Untuk channel private, `REQUIRED_CHANNEL_ID` dapat menggunakan numeric chat ID, misalnya:
+
+```env
+REQUIRED_CHANNEL_ID=-1001234567890
+```
+
+Agar bot dapat mengecek membership dengan stabil, tambahkan bot ke channel sebagai admin.
+
