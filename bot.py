@@ -81,7 +81,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "9.2"
+BOT_VERSION = "9.3"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -415,6 +415,7 @@ def init_db():
     """)
 
     # migrations from previous versions
+    add_column_if_missing(conn, "products", "created_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "products", "sold", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "rating", "REAL NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "rating_count", "INTEGER NOT NULL DEFAULT 0")
@@ -9309,52 +9310,117 @@ async def create_product_from_wizard(state: FSMContext, owner_id: int, price: in
         return None
 
     conn=db()
-    conn.execute("BEGIN IMMEDIATE")
-    now=datetime.now().isoformat(timespec="seconds")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now=datetime.now().isoformat(timespec="seconds")
 
-    cur=conn.execute(
-        """INSERT INTO products(name,description,active,created_at)
-           VALUES(?,?,1,?)""",
-        (name,description,now)
-    )
-    product_id=cur.lastrowid
+        product_columns={
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(products)").fetchall()
+        }
 
-    code=f"P{product_id}"
-    vcur=conn.execute(
-        """INSERT INTO product_variants
-           (product_id,name,code,price,stock,wholesale10,wholesale20,active,reserved_stock,button_label)
-           VALUES(?,?,?,?,0,0,0,1,0,'')""",
-        (product_id,variant_name,code,price)
-    )
-    variant_id=vcur.lastrowid
-    conn.commit()
-    conn.close()
+        if "created_at" in product_columns:
+            cur=conn.execute(
+                """INSERT INTO products(name,description,active,created_at)
+                   VALUES(?,?,1,?)""",
+                (name,description,now)
+            )
+        else:
+            cur=conn.execute(
+                """INSERT INTO products(name,description,active)
+                   VALUES(?,?,1)""",
+                (name,description)
+            )
+
+        product_id=cur.lastrowid
+        code=f"P{product_id}"
+
+        vcur=conn.execute(
+            """INSERT INTO product_variants
+               (product_id,name,code,price,stock,wholesale10,wholesale20,active,reserved_stock,button_label)
+               VALUES(?,?,?,?,0,0,0,1,0,'')""",
+            (product_id,variant_name,code,price)
+        )
+        variant_id=vcur.lastrowid
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     await state.clear()
     return product_id,variant_id,name,variant_name,price
 
 
+
 @router.callback_query(F.data.startswith("newprodprice:"))
 async def owner_new_product_price_button(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
     value=call.data.split(":")[1]
+
     if value=="custom":
         await state.set_state(OwnerState.add_product_variant_price)
         await safe_edit_or_answer(
             call,
-            "💰 <b>HARGA CUSTOM</b>\n\nKirim angka harga saja.\nContoh: <code>15000</code>",
+            "💰 <b>HARGA CUSTOM</b>\n\n"
+            "Kirim nominal harga. Format berikut diterima:\n"
+            "<code>15000</code>\n"
+            "<code>15.000</code>\n"
+            "<code>Rp15.000</code>",
             reply_markup=back_owner("owner:back_products"),
             parse_mode="HTML"
         )
-        return await call.answer()
+        await safe_callback_notice(call)
+        return
 
-    result=await create_product_from_wizard(state,call.from_user.id,int(value))
+    try:
+        price=int(value)
+        result=await create_product_from_wizard(
+            state,
+            call.from_user.id,
+            price
+        )
+    except Exception as exc:
+        logging.exception("Create product preset price failed: %s", exc)
+        try:
+            log_system_error(
+                "PRODUCT_WIZARD",
+                str(exc),
+                reference=f"owner:{call.from_user.id}",
+                severity="error",
+                recovered=False
+            )
+        except Exception:
+            pass
+
+        await safe_edit_or_answer(
+            call,
+            "❌ <b>GAGAL MEMBUAT PRODUK</b>\n\n"
+            f"Error: <code>{html.escape(str(exc)[:400])}</code>\n\n"
+            "Data produk belum disimpan. Silakan coba lagi.",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+        return
+
     if not result:
-        return await call.answer("Data produk tidak lengkap.",show_alert=True)
+        await safe_edit_or_answer(
+            call,
+            "❌ <b>DATA PRODUK TIDAK LENGKAP</b>\n\n"
+            "Ulangi Tambah Produk dari awal.",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+        return
 
     product_id,variant_id,name,variant_name,price=result
+
     await safe_edit_or_answer(
         call,
         "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
@@ -9379,7 +9445,8 @@ async def owner_new_product_price_button(call: CallbackQuery, state: FSMContext)
         ]),
         parse_mode="HTML"
     )
-    await call.answer("Produk dibuat.")
+    await safe_callback_notice(call)
+
 
 
 @router.message(OwnerState.add_product_variant_price)
@@ -9399,11 +9466,41 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
             parse_mode="HTML"
         )
 
-    result=await create_product_from_wizard(state,message.from_user.id,price)
+    try:
+        result=await create_product_from_wizard(
+            state,
+            message.from_user.id,
+            price
+        )
+    except Exception as exc:
+        logging.exception("Create product custom price failed: %s", exc)
+        try:
+            log_system_error(
+                "PRODUCT_WIZARD",
+                str(exc),
+                reference=f"owner:{message.from_user.id}",
+                severity="error",
+                recovered=False
+            )
+        except Exception:
+            pass
+
+        return await message.answer(
+            "❌ <b>GAGAL MEMBUAT PRODUK</b>\n\n"
+            f"Error: <code>{html.escape(str(exc)[:400])}</code>\n\n"
+            "Data produk belum disimpan.",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
+        )
+
     if not result:
-        return await message.answer("❌ Data produk tidak lengkap.",reply_markup=owner_products_menu())
+        return await message.answer(
+            "❌ Data produk tidak lengkap.",
+            reply_markup=owner_products_menu()
+        )
 
     product_id,_,name,variant_name,price=result
+
     await message.answer(
         "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
         f"📦 {html.escape(name)}\n"
@@ -9427,6 +9524,7 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
         ]),
         parse_mode="HTML"
     )
+
 
 
 @router.callback_query(F.data == "owner:add_variant")
