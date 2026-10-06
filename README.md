@@ -1,23 +1,25 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v12.1  
+**Versi aktif:** v12.2  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Update Terbaru — v12.1 Deployment Fingerprint
-- Memastikan `import re` tersedia dan parser tetap memiliki local fallback import.
-- Startup menjalankan source-integrity + dependency self-test sebelum polling.
-- Railway log sekarang mencetak banner `MABOYY DIGITAL STARTUP v12.1`.
-- Log startup mencetak Deployment ID, Replica ID, commit GitHub, environment, source file, dan DB path.
-- `/ping` menampilkan versi kode yang BENAR-BENAR sedang berjalan.
-- `/health` menampilkan `bot_version`, deployment ID, replica ID, commit, environment, dan DB path.
-- Diagnostik Sistem menampilkan Bot Version + Railway Deployment ID + commit.
-- Jika Railway masih menjalankan deployment lama, sekarang langsung terlihat tanpa menebak dari log.
-- Semua hardening v12.0 tetap dipertahankan.
-- Tidak ada Railway Variable baru; fingerprint memakai variable bawaan Railway.
+## Update Terbaru — v12.2 Railway Entrypoint Fix
+- Menambahkan `main.py` root launcher khusus Railway/Railpack.
+- Railway yang otomatis memilih `main.py` sekarang tetap menjalankan `bot.py` terbaru.
+- `main.py` memeriksa bahwa `bot.py` benar-benar versi v12.2 sebelum bot dijalankan.
+- Jika `main.py` baru tetapi `bot.py` masih lama, deployment gagal dengan pesan `bot.py version mismatch` yang jelas.
+- Launcher juga mengetes parser `Rp2.500 -> 2500` sebelum polling.
+- Startup log menampilkan `main.py -> bot.py v12.2`, Railway Deployment ID, dan commit SHA.
+- `bot.py` tetap memiliki global `import re` + local fallback `_re`.
+- Semua hardening v12.1/v12.0 tetap dipertahankan.
+- Tidak ada Railway Variable baru.
+
+## WAJIB DI-UPLOAD KE ROOT GITHUB
+`main.py` dan `bot.py` harus di-upload bersama. Jangan hanya mengganti `bot.py`.
 
 ## Command
 User: `/start` • `/demo`  
 Owner: `/owner` • `/ping` • `/demo`
 
 ## File Project
-`bot.py` • `requirements.txt` • `.env.example` • `README.md` • `VARIABLE_RAILWAY.md`
+`main.py` • `bot.py` • `requirements.txt` • `.env.example` • `README.md` • `VARIABLE_RAILWAY.md`

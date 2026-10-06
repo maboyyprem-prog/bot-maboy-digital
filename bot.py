@@ -89,7 +89,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "12.1"
+BOT_VERSION = "12.2"
 
 RAILWAY_DEPLOYMENT_ID = os.getenv("RAILWAY_DEPLOYMENT_ID","").strip()
 RAILWAY_REPLICA_ID = os.getenv("RAILWAY_REPLICA_ID","").strip()
@@ -125,6 +125,11 @@ def log_startup_banner():
         os.path.abspath(__file__),
         getattr(re,"__file__","builtin"),
         DB_PATH,
+    )
+    logging.info(
+        "ENTRYPOINT FILE • bot.py • VERSION=%s • EXPECTED=%s",
+        BOT_VERSION,
+        EXPECTED_SOURCE_VERSION,
     )
 
 
@@ -16035,7 +16040,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "12.1"
+EXPECTED_SOURCE_VERSION = "12.2"
 
 
 def source_integrity_self_test():
