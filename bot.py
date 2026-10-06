@@ -89,7 +89,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "12.2"
+BOT_VERSION = "12.3"
 
 RAILWAY_DEPLOYMENT_ID = os.getenv("RAILWAY_DEPLOYMENT_ID","").strip()
 RAILWAY_REPLICA_ID = os.getenv("RAILWAY_REPLICA_ID","").strip()
@@ -6025,8 +6025,8 @@ def cleanup_confirm_keyboard(kind: str):
 
 
 DEMO_CALLBACK_PREFIX = "userdemo:"
-DEMO_FAKE_PRODUCT_NAME = DEMO_FAKE_PRODUCT_NAME
-DEMO_FAKE_VARIANT_NAME = DEMO_FAKE_VARIANT_NAME
+DEMO_FAKE_PRODUCT_NAME = "Produk Demo Maboyy"
+DEMO_FAKE_VARIANT_NAME = "1 Bulan Demo"
 DEMO_FAKE_PRICE = 2500
 DEMO_FAKE_ACCOUNT = "demo@example.com | DEMO123"
 
@@ -16040,7 +16040,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "12.2"
+EXPECTED_SOURCE_VERSION = "12.3"
 
 
 def source_integrity_self_test():
@@ -16054,6 +16054,12 @@ def source_integrity_self_test():
 
     if parse_rupiah_input("Rp2.500") != 2500:
         raise RuntimeError("Parser harga gagal self-test.")
+
+    if not DEMO_FAKE_PRODUCT_NAME or not DEMO_FAKE_VARIANT_NAME:
+        raise RuntimeError("Konstanta demo tidak valid.")
+
+    if DEMO_FAKE_PRICE <= 0 or not DEMO_FAKE_ACCOUNT:
+        raise RuntimeError("Payload demo tidak valid.")
 
     return True
 
