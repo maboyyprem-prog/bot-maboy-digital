@@ -90,7 +90,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "13.2"
+BOT_VERSION = "13.7"
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1495,6 +1495,38 @@ def topup_invoice(topup_id: int) -> str:
 
 def available_stock(variant) -> int:
     return max(0, int(variant["stock"]) - int(variant["reserved_stock"] or 0))
+
+
+def product_stock_map(conn, filter_sql: str = "") -> dict[int, int]:
+    rows = conn.execute(
+        f"""SELECT p.id AS product_id,
+                     COALESCE(SUM(
+                        CASE
+                            WHEN v.active=1 THEN
+                                CASE
+                                    WHEN (COALESCE(v.stock,0) - COALESCE(v.reserved_stock,0)) > 0
+                                    THEN (COALESCE(v.stock,0) - COALESCE(v.reserved_stock,0))
+                                    ELSE 0
+                                END
+                            ELSE 0
+                        END
+                     ), 0) AS total_stock
+              FROM products p
+              LEFT JOIN product_variants v ON v.product_id=p.id
+              WHERE p.active=1 {filter_sql}
+              GROUP BY p.id
+              ORDER BY p.id"""
+    ).fetchall()
+    return {int(row["product_id"]): int(row["total_stock"] or 0) for row in rows}
+
+
+def product_stock_label(total_stock: int) -> str:
+    return f"Stok {max(0, int(total_stock))}"
+
+
+def product_stock_button_label(product_name: str,total_stock: int) -> str:
+    return f"{product_name} ({max(0, int(total_stock))})"
+
 
 
 
@@ -7020,11 +7052,16 @@ def products_keyboard(filter_sql=""):
     rows = conn.execute(
         f"SELECT * FROM products WHERE active=1 {filter_sql} ORDER BY id"
     ).fetchall()
+    stock_map = product_stock_map(conn, filter_sql)
     conn.close()
 
     kb = InlineKeyboardBuilder()
     for row in rows:
-        kb.button(text=row["name"], callback_data=f"product:{row['id']}")
+        total_stock = stock_map.get(int(row["id"]), 0)
+        kb.button(
+            text=product_stock_button_label(row["name"],total_stock),
+            callback_data=f"product:{row['id']}"
+        )
     kb.adjust(2)
     kb.row(
         InlineKeyboardButton(text="🔎 Cari", callback_data="shop:search"),
@@ -8209,16 +8246,20 @@ async def show_product_list(call, title, filter_sql=""):
     rows = conn.execute(
         f"SELECT * FROM products WHERE active=1 {filter_sql} ORDER BY id"
     ).fetchall()
+    stock_map = product_stock_map(conn, filter_sql)
     conn.close()
 
     if not rows:
         text = f"{title}\n\nBelum ada produk.\n\n<i>{STORE_FOOTER}</i>"
     else:
-        lines = [title, ""]
+        lines_text = [title, ""]
         for i, row in enumerate(rows, 1):
-            lines.append(f"[{i}] {row['name']}")
-        lines.append(f"\nPilih produk di bawah.\n\n<i>{STORE_FOOTER}</i>")
-        text = "\n".join(lines)
+            total_stock = stock_map.get(int(row["id"]), 0)
+            lines_text.append(f"[{i}] {row['name']} — {product_stock_label(total_stock)}")
+        lines_text.append(
+            f"\nPilih produk di bawah.\n\n<i>{STORE_FOOTER}</i>"
+        )
+        text = "\n".join(lines_text)
 
     await safe_edit_or_answer(
         call,
@@ -8537,12 +8578,11 @@ async def checkout_note_add(call: CallbackQuery, state: FSMContext):
 
     await safe_edit_or_answer(call, 
         "📝 <b>ISI CATATAN PESANAN</b>\n\n"
-        "Kirim catatan yang ingin disertakan pada pesanan.\n\n"
+        "Kirim catatan tambahan jika ada permintaan khusus untuk pesanan ini.\n\n"
         "Contoh:\n"
-        "<code>Email tujuan: nama@email.com\n"
-        "Profil: Anak\n"
-        "Catatan: jangan ubah password</code>\n\n"
-        "Maksimal 500 karakter.",
+        "<i>Mohon gunakan profil nomor 2 jika tersedia.\n"
+        "Jika ada pilihan region, pilih Indonesia.</i>\n\n"
+        "Catatan ini bersifat opsional dan maksimal 500 karakter.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(
@@ -9305,7 +9345,9 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
                     f"💵 Transfer: {rupiah(payment_total)}\n"
                     f"📝 Catatan: {checkout_note or '-'}\n"
                     f"⏳ Reservasi: {ORDER_RESERVATION_MINUTES} menit\n\n"
-                    "Buka /owner → ✅ Verifikasi Bayar setelah pembayaran valid.",
+                    "⏳ Menunggu bukti pembayaran dari user.\n"
+                    "Jika user mengirim bukti, bot akan mengirimkannya ke PM owner "
+                    "dengan tombol ✅ Konfirmasi / ❌ Tolak / ⏳ Pending.",
                     parse_mode="HTML"
                 )
             except Exception:
@@ -11497,19 +11539,23 @@ async def owner_verify_payments(call: CallbackQuery):
            LEFT JOIN product_variants v ON v.id=o.variant_id
            WHERE o.payment_status!='paid'
              AND (
-                 o.proof_file_id IS NOT NULL AND o.proof_file_id!=''
-                 OR o.status IN ('pending_payment','waiting_payment')
+                 (o.payment_proof_file_id IS NOT NULL AND o.payment_proof_file_id!='')
+                 OR (o.proof_file_id IS NOT NULL AND o.proof_file_id!='')
              )
            ORDER BY o.id DESC
            LIMIT 30"""
     ).fetchall()
     conn.close()
 
-    lines=["✅ <b>VERIFIKASI PEMBAYARAN</b>",""]
+    lines=["✅ <b>VERIFIKASI PEMBAYARAN</b>","<i>Fallback untuk bukti yang sudah dikirim user.</i>",""]
     keyboard=[]
 
     if not rows:
-        lines.append("✅ Tidak ada pembayaran yang menunggu verifikasi.")
+        lines.append(
+            "✅ Tidak ada bukti pembayaran yang menunggu verifikasi.\n\n"
+            "Jalur utama: user tekan <b>📤 Kirim Bukti Pembayaran</b> → "
+            "bukti masuk ke PM owner → konfirmasi langsung dari tombol pada bukti."
+        )
     else:
         for row in rows:
             proof_type=row["proof_file_type"] or "-"
@@ -14325,6 +14371,7 @@ async def reply_menu_products(message: Message, bot: Bot):
     rows = conn.execute(
         "SELECT * FROM products WHERE active=1 ORDER BY id"
     ).fetchall()
+    stock_map = product_stock_map(conn)
     conn.close()
 
     if not rows:
@@ -14334,13 +14381,16 @@ async def reply_menu_products(message: Message, bot: Bot):
             parse_mode="HTML"
         )
 
-    lines = ["🏷️ <b>LIST PRODUK</b>", ""]
+    lines_text = ["🏷️ <b>LIST PRODUK</b>", ""]
     for i, row in enumerate(rows, 1):
-        lines.append(f"{i}. {html.escape(row['name'])}")
-    lines.append("\nTekan nomor produk di keyboard bawah atau pilih tombol produk berikut.")
+        total_stock = stock_map.get(int(row["id"]), 0)
+        lines_text.append(f"{i}. {html.escape(row['name'])} — {html.escape(product_stock_label(total_stock))}")
+    lines_text.append(
+        "\nTekan nomor produk di keyboard bawah atau pilih tombol produk berikut."
+    )
 
     await message.answer(
-        "\n".join(lines),
+        "\n".join(lines_text),
         reply_markup=products_keyboard(""),
         parse_mode="HTML"
     )
@@ -14365,13 +14415,20 @@ async def reply_menu_popular(message: Message, bot: Bot):
         )
 
     kb = InlineKeyboardBuilder()
-    lines = ["🔥 <b>PRODUK POPULER</b>", ""]
+    conn2 = db()
+    stock_map = product_stock_map(conn2, "AND is_popular=1")
+    conn2.close()
+    lines_text = ["🔥 <b>PRODUK POPULER</b>", ""]
     for i, row in enumerate(rows, 1):
-        lines.append(f"{i}. {html.escape(row['name'])}")
-        kb.button(text=row["name"], callback_data=f"product:{row['id']}")
+        total_stock = stock_map.get(int(row["id"]), 0)
+        lines_text.append(f"{i}. {html.escape(row['name'])} — {html.escape(product_stock_label(total_stock))}")
+        kb.button(
+            text=product_stock_button_label(row["name"],total_stock),
+            callback_data=f"product:{row['id']}"
+        )
     kb.adjust(1)
 
-    await message.answer("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
+    await message.answer("\n".join(lines_text), reply_markup=kb.as_markup(), parse_mode="HTML")
 
 
 @router.message(F.text == "⚡ Flash Sale")
@@ -14393,13 +14450,20 @@ async def reply_menu_flash(message: Message, bot: Bot):
         )
 
     kb = InlineKeyboardBuilder()
-    lines = ["⚡ <b>FLASH SALE</b>", ""]
+    conn2 = db()
+    stock_map = product_stock_map(conn2, "AND is_flash_sale=1")
+    conn2.close()
+    lines_text = ["⚡ <b>FLASH SALE</b>", ""]
     for i, row in enumerate(rows, 1):
-        lines.append(f"{i}. {html.escape(row['name'])}")
-        kb.button(text=row["name"], callback_data=f"product:{row['id']}")
+        total_stock = stock_map.get(int(row["id"]), 0)
+        lines_text.append(f"{i}. {html.escape(row['name'])} — {html.escape(product_stock_label(total_stock))}")
+        kb.button(
+            text=product_stock_button_label(row["name"],total_stock),
+            callback_data=f"product:{row['id']}"
+        )
     kb.adjust(1)
 
-    await message.answer("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
+    await message.answer("\n".join(lines_text), reply_markup=kb.as_markup(), parse_mode="HTML")
 
 
 @router.message(F.text == "🎁 Voucher")
@@ -16297,7 +16361,9 @@ async def owner_proof_info(call: CallbackQuery):
         call,
         "📥 <b>VERIFIKASI PEMBAYARAN</b>\n\n"
         "Pembayaran manual sekarang diverifikasi langsung dari "
-        "<b>PM bukti pembayaran</b> yang dikirim bot ke owner.\n\n"
+        "<b>PM bukti pembayaran</b> adalah jalur utama verifikasi.\n\n"
+        "User mengirim bukti dari tombol 📤 Kirim Bukti Pembayaran, lalu bot "
+        "mengirim bukti ke PM owner dengan tombol ✅ Konfirmasi / ❌ Tolak / ⏳ Pending.\n\n"
         "Di PM bukti tersedia:\n"
         "✅ Konfirmasi\n"
         "❌ Tolak\n"
@@ -17415,7 +17481,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "13.2"
+EXPECTED_SOURCE_VERSION = "13.7"
 
 
 def source_integrity_self_test():
