@@ -1058,3 +1058,19 @@ Indikator warna stok dihapus. List Produk tetap menampilkan jumlah stok per prod
 ## v13.7 — Alur Verifikasi Bukti Pembayaran
 - Tidak ada Railway Variable baru.
 - Perubahan hanya pada routing/pesan verifikasi bukti dan filter menu verifikasi.
+
+
+## v13.8 — User Flow & Reliability Upgrade
+- Detail Pesanan Saya + cek status + cancel unpaid.
+- Notifikasi status bukti/pembayaran.
+- Dashboard owner diperluas.
+- Rating toko publik.
+- Metadata backup project + info backup terakhir.
+- Conservative cleanup 6 jam untuk support-data lama.
+- Startup self-test owner report.
+- Tidak ada Railway Variable baru.
+
+
+## v13.9 — Repair Semua Menu Hapus Data
+- Semua preview/confirm cleanup disinkronkan.
+- Tidak ada Railway Variable baru.

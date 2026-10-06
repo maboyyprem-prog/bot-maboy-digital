@@ -90,7 +90,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "13.7"
+BOT_VERSION = "13.9"
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -2865,6 +2865,91 @@ async def cleanup_expired_orders(bot: Bot):
             logging.exception("Expired payment cleanup failed: %s", exc)
 
 
+
+def conservative_cleanup_old_data():
+    """
+    Safe housekeeping only:
+    - terminal/stale proof sessions
+    - recovered error logs >30 days
+    - owner audit logs >90 days
+    - daily report history >180 days
+    Never deletes paid/completed orders, reviews, wallet balances, or inventory.
+    """
+    now=datetime.now()
+    error_cutoff=(now-timedelta(days=30)).isoformat(timespec="seconds")
+    audit_cutoff=(now-timedelta(days=90)).isoformat(timespec="seconds")
+    report_cutoff=(now-timedelta(days=180)).isoformat(timespec="seconds")
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+    result={"proofs":0,"errors":0,"audit":0,"reports":0}
+    try:
+        proof_rows=conn.execute(
+            "SELECT user_id,entity_type,entity_id FROM payment_proof_sessions"
+        ).fetchall()
+
+        for row in proof_rows:
+            terminal=False
+            if row["entity_type"]=="order":
+                obj=conn.execute(
+                    "SELECT status,payment_status FROM orders WHERE id=?",
+                    (row["entity_id"],)
+                ).fetchone()
+                terminal=(not obj) or obj["payment_status"]=="paid" or obj["status"] in {"completed","expired","cancelled"}
+            elif row["entity_type"]=="topup":
+                obj=conn.execute(
+                    "SELECT status FROM topups WHERE id=?",
+                    (row["entity_id"],)
+                ).fetchone()
+                terminal=(not obj) or obj["status"] in {"completed","expired","cancelled"}
+            else:
+                terminal=True
+
+            if terminal:
+                cur=conn.execute(
+                    "DELETE FROM payment_proof_sessions WHERE user_id=?",
+                    (row["user_id"],)
+                )
+                result["proofs"]+=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            "DELETE FROM system_errors WHERE recovered=1 AND created_at<?",
+            (error_cutoff,)
+        )
+        result["errors"]=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            "DELETE FROM owner_audit_logs WHERE created_at<?",
+            (audit_cutoff,)
+        )
+        result["audit"]=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            "DELETE FROM daily_report_history WHERE created_at<?",
+            (report_cutoff,)
+        )
+        result["reports"]=max(0,int(cur.rowcount or 0))
+
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+async def periodic_safe_cleanup_loop():
+    # Run every 6 hours. It only removes old/terminal support data.
+    while True:
+        await asyncio.sleep(6*3600)
+        try:
+            result=conservative_cleanup_old_data()
+            logging.info("Safe cleanup: %s",result)
+        except Exception:
+            logging.exception("Safe cleanup cycle failed")
+
+
 def setting_int(key: str, default: int) -> int:
     try:
         return int(get_setting(key, str(default)))
@@ -5010,8 +5095,105 @@ async def process_payment_proof_message(
     return False, error or "Gagal meneruskan bukti ke owner."
 
 
+
+def order_user_status_label(order) -> str:
+    payment_status=str(order["payment_status"] or "")
+    fulfillment=str(order["fulfillment_status"] or "")
+    status=str(order["status"] or "")
+    review_status=str(order["payment_review_status"] or "")
+
+    if status=="completed" and fulfillment=="delivered":
+        return "✅ Selesai • Akun Terkirim"
+    if payment_status=="paid" and fulfillment!="delivered":
+        return "💰 Pembayaran Dikonfirmasi • Menunggu Akun"
+    if review_status=="reviewing":
+        return "⏳ Bukti Sedang Diperiksa"
+    if review_status=="rejected":
+        return "❌ Bukti Ditolak"
+    if status=="expired" or payment_status=="expired":
+        return "⌛ Pesanan Kadaluwarsa"
+    if status=="cancelled" or payment_status=="cancelled":
+        return "❌ Pesanan Dibatalkan"
+    if (order["payment_proof_file_id"] or order["proof_file_id"] or ""):
+        return "📤 Bukti Terkirim • Menunggu Verifikasi"
+    return "🟡 Menunggu Pembayaran"
+
+
+def order_detail_text(order) -> str:
+    product_name=order["product_name"] or "Produk lama"
+    variant_name=order["variant_name"] or "Standard"
+    created=order["created_at"] or "-"
+    completed=order["completed_at"] or "-"
+    note=order["note"] or "-"
+    method=order["payment_method"] or "-"
+    total=int(order["payment_total"] or order["total"] or 0)
+    reject_reason=(order["payment_reject_reason"] or "").strip()
+
+    lines=[
+        "🧾 <b>DETAIL PESANAN</b>",
+        "",
+        f"Invoice: <b>{invoice(int(order['id']))}</b>",
+        f"📦 Produk: <b>{html.escape(str(product_name))}</b>",
+        f"🧩 Varian: <b>{html.escape(str(variant_name))}</b>",
+        f"🔢 Qty: <b>{int(order['qty'] or 0)}</b>",
+        f"💳 Metode: <b>{html.escape(str(method))}</b>",
+        f"💰 Total: <b>{rupiah(total)}</b>",
+        f"📌 Status: <b>{html.escape(order_user_status_label(order))}</b>",
+        f"📝 Catatan: <b>{html.escape(str(note))}</b>",
+        f"🕒 Dibuat: <code>{html.escape(str(created))}</code>",
+    ]
+    if completed and completed!="-":
+        lines.append(f"✅ Selesai: <code>{html.escape(str(completed))}</code>")
+    if reject_reason:
+        lines.append(f"❌ Alasan: <b>{html.escape(reject_reason)}</b>")
+    lines += ["", f"<i>{STORE_FOOTER}</i>"]
+    return "\n".join(lines)
+
+
+def order_detail_keyboard(order):
+    rows=[]
+
+    if order["status"]=="completed" and order["fulfillment_status"]=="delivered":
+        rows.append([
+            InlineKeyboardButton(
+                text="⭐ Nilai Toko",
+                callback_data=f"reviewopen:{order['id']}"
+            )
+        ])
+    elif order["payment_status"]!="paid" and order["status"] not in {"expired","cancelled"}:
+        rows.append([
+            InlineKeyboardButton(
+                text="📤 Kirim Bukti",
+                callback_data=f"proofsubmit:order:{order['id']}"
+            ),
+            InlineKeyboardButton(
+                text="🔄 Cek Status",
+                callback_data=f"statuscheck:order:{order['id']}"
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                text="❌ Batalkan Pesanan",
+                callback_data=f"usercancel:{order['id']}"
+            )
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(
+                text="🔄 Cek Status",
+                callback_data=f"statuscheck:order:{order['id']}"
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Pesanan Saya", callback_data="my_orders"),
+        InlineKeyboardButton(text="🏠 Menu", callback_data="home")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def payment_proof_keyboard(entity: str, entity_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows=[
         [
             InlineKeyboardButton(
                 text="📤 Kirim Bukti Pembayaran",
@@ -5019,10 +5201,30 @@ def payment_proof_keyboard(entity: str, entity_id: int):
             )
         ],
         [
-            InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders"),
-            InlineKeyboardButton(text="🏠 Menu Utama", callback_data="home")
+            InlineKeyboardButton(
+                text="🔄 Cek Status",
+                callback_data=f"statuscheck:{entity}:{entity_id}"
+            )
         ]
-    ])
+    ]
+
+    if entity=="order":
+        rows.append([
+            InlineKeyboardButton(
+                text="❌ Batalkan Pesanan",
+                callback_data=f"usercancel:{entity_id}"
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders"),
+            InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def owner_payment_proof_keyboard(entity: str, entity_id: int):
@@ -5632,6 +5834,19 @@ async def mark_order_paid(
             int(order["discount_amount"] or 0)
         )
 
+    if first_payment:
+        try:
+            await bot.send_message(
+                int(order["user_id"]),
+                "✅ <b>PEMBAYARAN DIKONFIRMASI</b>\n\n"
+                f"🧾 {invoice(order_id)}\n"
+                "Pembayaran Anda sudah dikonfirmasi. "
+                "Akun sedang diproses dan akan dikirim otomatis.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            logging.exception("Payment confirmation user notification failed order=%s",order_id)
+
     delivered = await fulfill_order(order_id, bot)
 
     return True
@@ -5868,6 +6083,7 @@ def main_menu():
     kb.button(text="🎁 Voucher", callback_data="voucher_info")
     kb.button(text="💰 Isi Saldo", callback_data="wallet")
     kb.button(text="🧾 Pesanan Saya", callback_data="my_orders")
+    kb.button(text="⭐ Rating Toko", callback_data="store:rating")
 
     if ADMIN_USERNAME:
         kb.button(
@@ -6275,6 +6491,25 @@ def purge_paid_pending_orders(conn, product_id: int | None = None):
     }
 
 
+CLEANUP_KINDS = {
+    "paid_pending",
+    "orders",
+    "pending",
+    "topups",
+    "proofs",
+    "errors",
+    "audit_logs",
+    "daily_reports",
+    "ops_logs",
+    "demo",
+    "safe",
+}
+
+
+def cleanup_kind_valid(kind: str) -> bool:
+    return str(kind or "") in CLEANUP_KINDS
+
+
 def cleanup_data_counts():
     conn = db()
     now = datetime.now().isoformat(timespec="seconds")
@@ -6459,8 +6694,9 @@ def cleanup_preview_text(kind: str):
         ),
         "safe": (
             "🧹 PEMBERSIHAN DATA AMAN",
-            counts["expired_orders"] + counts["expired_topups"] + counts["proof_sessions"],
-            "Order expired belum bayar, top up expired, dan session bukti akan dibersihkan sekaligus."
+            counts["expired_orders"] + counts["expired_topups"],
+            "Membersihkan order expired belum bayar, top up expired, dan session bukti terminal/orphan. "
+            "Session bukti aktif tidak ikut dihapus."
         ),
     }
     return mapping.get(kind)
@@ -6773,20 +7009,23 @@ def seed_all_demo_data(owner_id: int):
 def cleanup_execute(kind: str):
     conn=db()
     now=datetime.now().isoformat(timespec="seconds")
-    result={"orders":0,"topups":0,"proofs":0,"errors":0}
+    result={
+        "orders":0,"topups":0,"proofs":0,"errors":0,
+        "audit_logs":0,"daily_reports":0,
+        "payment_events":0,"integrity_events":0,"inventory_logs":0,
+        "demo_records":0,"paid_pending_deleted":0,
+        "restored_inventory":0,"released_reservations":0
+    }
 
     try:
         conn.execute("BEGIN IMMEDIATE")
 
 
         if kind=="paid_pending":
-            result=purge_paid_pending_orders(conn)
-            conn.commit()
-            return (
-                f"Paid belum terkirim dihapus: {result['deleted']}\n"
-                f"Allocated account dikembalikan: {result['restored_inventory']}\n"
-                f"Reservasi dilepas: {result['released_reservations']}"
-            )
+            purge=purge_paid_pending_orders(conn)
+            result["paid_pending_deleted"]=int(purge.get("deleted",0) or 0)
+            result["restored_inventory"]=int(purge.get("restored_inventory",0) or 0)
+            result["released_reservations"]=int(purge.get("released_reservations",0) or 0)
 
         if kind=="pending":
             rows=conn.execute(
@@ -6855,9 +7094,37 @@ def cleanup_execute(kind: str):
                 conn.execute(f"DELETE FROM topups WHERE id IN ({marks})", ids)
             result["topups"]=len(ids)
 
-        if kind in {"proofs","safe"}:
+        if kind=="proofs":
             cur=conn.execute("DELETE FROM payment_proof_sessions")
             result["proofs"]=max(0,int(cur.rowcount or 0))
+
+        if kind=="safe":
+            proof_rows=conn.execute(
+                "SELECT user_id,entity_type,entity_id FROM payment_proof_sessions"
+            ).fetchall()
+            for proof in proof_rows:
+                terminal=False
+                if proof["entity_type"]=="order":
+                    obj=conn.execute(
+                        "SELECT status,payment_status FROM orders WHERE id=?",
+                        (proof["entity_id"],)
+                    ).fetchone()
+                    terminal=(not obj) or obj["payment_status"]=="paid" or obj["status"] in {"completed","expired","cancelled"}
+                elif proof["entity_type"]=="topup":
+                    obj=conn.execute(
+                        "SELECT status FROM topups WHERE id=?",
+                        (proof["entity_id"],)
+                    ).fetchone()
+                    terminal=(not obj) or obj["status"] in {"completed","paid","expired","cancelled"}
+                else:
+                    terminal=True
+
+                if terminal:
+                    cur=conn.execute(
+                        "DELETE FROM payment_proof_sessions WHERE user_id=?",
+                        (proof["user_id"],)
+                    )
+                    result["proofs"]+=max(0,int(cur.rowcount or 0))
 
         if kind=="errors":
             cur=conn.execute("DELETE FROM system_errors")
@@ -6891,6 +7158,57 @@ def cleanup_execute(kind: str):
         conn.close()
 
 
+
+def cleanup_result_text(kind: str, result: dict) -> str:
+    if kind=="paid_pending":
+        return (
+            "✅ <b>PAID BELUM TERKIRIM DIBERSIHKAN</b>\n\n"
+            f"🗑️ Order dihapus: <b>{result['paid_pending_deleted']}</b>\n"
+            f"📦 Akun dikembalikan: <b>{result['restored_inventory']}</b>\n"
+            f"🔓 Reservasi dilepas: <b>{result['released_reservations']}</b>"
+        )
+    if kind in {"orders","pending"}:
+        title="ORDER EXPIRED" if kind=="orders" else "PESANAN PENDING"
+        return f"✅ <b>{title} DIBERSIHKAN</b>\n\n🧾 Order dihapus: <b>{result['orders']}</b>"
+    if kind=="topups":
+        return f"✅ <b>TOP UP EXPIRED DIBERSIHKAN</b>\n\n💰 Top up dihapus: <b>{result['topups']}</b>"
+    if kind=="proofs":
+        return f"✅ <b>SESSION BUKTI DIBERSIHKAN</b>\n\n📎 Session dihapus: <b>{result['proofs']}</b>"
+    if kind=="errors":
+        return f"✅ <b>LOG ERROR DIBERSIHKAN</b>\n\n🧯 Log dihapus: <b>{result['errors']}</b>"
+    if kind=="audit_logs":
+        return f"✅ <b>AUDIT OWNER DIBERSIHKAN</b>\n\n🛡️ Log dihapus: <b>{result['audit_logs']}</b>"
+    if kind=="daily_reports":
+        return f"✅ <b>RIWAYAT LAPORAN DIBERSIHKAN</b>\n\n📅 Riwayat dihapus: <b>{result['daily_reports']}</b>"
+    if kind=="ops_logs":
+        total=result['payment_events']+result['integrity_events']+result['inventory_logs']
+        return (
+            "✅ <b>LOG OPERASIONAL DIBERSIHKAN</b>\n\n"
+            f"🧾 Payment events: <b>{result['payment_events']}</b>\n"
+            f"🧬 Integrity events: <b>{result['integrity_events']}</b>\n"
+            f"📦 Inventory logs: <b>{result['inventory_logs']}</b>\n"
+            f"Total: <b>{total}</b>"
+        )
+    if kind=="demo":
+        return f"✅ <b>DATA DEMO DIBERSIHKAN</b>\n\n🧪 Record demo dihapus: <b>{result['demo_records']}</b>"
+    if kind=="safe":
+        return (
+            "✅ <b>PEMBERSIHAN AMAN SELESAI</b>\n\n"
+            f"🧾 Order expired: <b>{result['orders']}</b>\n"
+            f"💰 Top up expired: <b>{result['topups']}</b>\n"
+            f"📎 Session terminal/orphan: <b>{result['proofs']}</b>\n\n"
+            "🔒 Data paid/completed, saldo, review, dan akun terjual tetap aman."
+        )
+    return "✅ <b>PEMBERSIHAN SELESAI</b>"
+
+
+def cleanup_menu_self_test() -> list[tuple[str,bool,str]]:
+    checks=[]
+    for kind in sorted(CLEANUP_KINDS):
+        preview=cleanup_preview_text(kind)
+        checks.append((f"cleanup:{kind}",preview is not None,"registered" if preview else "missing"))
+    return checks
+
 def owner_system_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🩺 Diagnostik Sistem", callback_data="owner:diagnostics")
@@ -6903,6 +7221,7 @@ def owner_system_menu():
     kb.button(text="🔧 Maintenance", callback_data="owner:maintenance")
     kb.button(text="🗄️ Backup Database", callback_data="owner:backup_now")
     kb.button(text="📦 Backup Project", callback_data="owner:backup_project")
+    kb.button(text="ℹ️ Backup Terakhir", callback_data="owner:backup_last")
     kb.button(text="📢 Sinkron Stok Channel", callback_data="owner:sync_stock")
     kb.button(text="📅 Laporan Harian", callback_data="owner:daily_report")
     kb.button(text="🗑️ Hapus Data", callback_data="owner:cleanup_data")
@@ -8270,6 +8589,47 @@ async def show_product_list(call, title, filter_sql=""):
     await call.answer()
 
 
+
+@router.callback_query(F.data == "store:rating")
+async def public_store_rating(call: CallbackQuery):
+    conn=db()
+    summary=store_rating_summary(conn)
+    rows=conn.execute(
+        """SELECT rating,comment,created_at
+           FROM reviews
+           WHERE COALESCE(comment,'')!=''
+           ORDER BY id DESC
+           LIMIT 5"""
+    ).fetchall()
+    conn.close()
+
+    lines=[
+        "⭐ <b>RATING TOKO MABOYY DIGITAL</b>",
+        "",
+        f"⭐ Rata-rata: <b>{summary['average']:.1f}/5</b>",
+        f"📊 Total penilaian: <b>{summary['count']}</b>",
+        f"🌟 Rating 5: <b>{summary['five_star']}</b>",
+    ]
+
+    if rows:
+        lines += ["","💬 <b>ULASAN TERBARU</b>"]
+        for row in rows:
+            stars=max(1,min(5,int(row["rating"] or 0)))
+            comment=html.escape(str(row["comment"] or "")[:180])
+            lines.append(f"{'⭐'*stars} <i>{comment}</i>")
+    else:
+        lines += ["","Belum ada ulasan tertulis."]
+
+    lines += ["",f"<i>{STORE_FOOTER}</i>"]
+    await safe_edit_or_answer(
+        call,
+        "\n\n".join(lines),
+        reply_markup=back_home(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
 @router.callback_query(F.data == "products")
 async def products(call: CallbackQuery):
     await safe_callback_notice(call)
@@ -9566,7 +9926,7 @@ async def my_orders(call: CallbackQuery):
                    SELECT 1 FROM reviews r WHERE r.order_id=o.id
                ) AS reviewed
         FROM orders o
-        JOIN products p ON p.id=o.product_id
+        LEFT JOIN products p ON p.id=o.product_id
         LEFT JOIN product_variants v ON v.id=o.variant_id
         WHERE o.user_id=?
         ORDER BY o.id DESC
@@ -9588,23 +9948,26 @@ async def my_orders(call: CallbackQuery):
                 "paid_pending_delivery": "💰",
             }
             icon = status_icons.get(row["status"], "🔵")
-            if row["payment_status"]=="paid" and row["fulfillment_status"]!="delivered":
-                display_status="Pembayaran Berhasil • Menunggu Akun"
-            elif row["status"]=="completed" and row["fulfillment_status"]=="delivered":
-                display_status="Sukses • Selesai"
-            else:
-                display_status=row["status"].replace("_"," ").title()
+            display_status=order_user_status_label(row)
 
             lines.append(
                 f"{icon} <b>{invoice(row['id'])}</b>\n"
-                f"   {row['product_name']} — {row['variant_name'] or 'Standard'}\n"
-                f"   Qty {row['qty']} • {rupiah(row['total'])}\n"
-                f"   Status: {display_status}\n"
+                f"   {html.escape(row['product_name'] or 'Produk lama')} — "
+                f"{html.escape(row['variant_name'] or 'Standard')}\n"
+                f"   Qty {row['qty']} • {rupiah(row['payment_total'] or row['total'])}\n"
+                f"   Status: {html.escape(display_status)}\n"
             )
         lines.append(f"<i>{STORE_FOOTER}</i>")
         text = "\n".join(lines)
 
     kb = InlineKeyboardBuilder()
+
+    # Direct detail access for recent invoices.
+    for row in rows[:5] if rows else []:
+        kb.button(
+            text=f"📄 {invoice(row['id'])}",
+            callback_data=f"orderdetail:{row['id']}"
+        )
 
     # Fallback review entry in case the automatic post-delivery prompt was missed.
     pending_reviews=[
@@ -9629,6 +9992,156 @@ async def my_orders(call: CallbackQuery):
 
     await safe_edit_or_answer(call, text, reply_markup=kb.as_markup(), parse_mode="HTML")
     await call.answer()
+
+
+
+@router.callback_query(F.data.startswith("orderdetail:"))
+async def user_order_detail(call: CallbackQuery):
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Invoice tidak valid.",show_alert=True)
+
+    conn=db()
+    order=conn.execute(
+        """SELECT o.*,p.name AS product_name,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=? AND o.user_id=?""",
+        (order_id,call.from_user.id)
+    ).fetchone()
+    conn.close()
+
+    if not order:
+        return await call.answer("Pesanan tidak ditemukan.",show_alert=True)
+
+    await safe_edit_or_answer(
+        call,
+        order_detail_text(order),
+        reply_markup=order_detail_keyboard(order),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("statuscheck:"))
+async def user_check_transaction_status(call: CallbackQuery):
+    try:
+        _,entity,raw_id=call.data.split(":")
+        entity_id=int(raw_id)
+    except Exception:
+        return await call.answer("Transaksi tidak valid.",show_alert=True)
+
+    if not recent_action_allowed(f"statuscheck:{entity}:{entity_id}:{call.from_user.id}",2):
+        return await call.answer("Status baru saja dicek.",show_alert=True)
+
+    conn=db()
+    if entity=="order":
+        row=conn.execute(
+            """SELECT o.*,p.name AS product_name,v.name AS variant_name
+               FROM orders o
+               LEFT JOIN products p ON p.id=o.product_id
+               LEFT JOIN product_variants v ON v.id=o.variant_id
+               WHERE o.id=? AND o.user_id=?""",
+            (entity_id,call.from_user.id)
+        ).fetchone()
+    elif entity=="topup":
+        row=conn.execute(
+            "SELECT * FROM topups WHERE id=? AND user_id=?",
+            (entity_id,call.from_user.id)
+        ).fetchone()
+    else:
+        row=None
+    conn.close()
+
+    if not row:
+        return await call.answer("Transaksi tidak ditemukan.",show_alert=True)
+
+    if entity=="order":
+        await call.message.answer(
+            order_detail_text(row),
+            reply_markup=order_detail_keyboard(row),
+            parse_mode="HTML"
+        )
+    else:
+        status=str(row["status"] or "pending").replace("_"," ").title()
+        review_status=str(row["payment_review_status"] or "")
+        if review_status=="reviewing":
+            status="Bukti Sedang Diperiksa"
+        elif row["status"]=="completed":
+            status="Selesai"
+        await call.message.answer(
+            "💰 <b>STATUS TOP UP</b>\\n\\n"
+            f"🧾 {topup_invoice(entity_id)}\\n"
+            f"💵 Nominal: <b>{rupiah(row['amount'])}</b>\\n"
+            f"📌 Status: <b>{html.escape(status)}</b>",
+            parse_mode="HTML"
+        )
+
+    await call.answer("Status diperbarui.")
+
+
+@router.callback_query(F.data.startswith("usercancel:"))
+async def user_cancel_order(call: CallbackQuery,bot: Bot):
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Invoice tidak valid.",show_alert=True)
+
+    if not recent_action_allowed(f"usercancel:{order_id}:{call.from_user.id}",3):
+        return await call.answer("Sedang diproses. Jangan tekan dua kali.",show_alert=True)
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+    order=conn.execute(
+        "SELECT * FROM orders WHERE id=? AND user_id=?",
+        (order_id,call.from_user.id)
+    ).fetchone()
+
+    if not order:
+        conn.rollback(); conn.close()
+        return await call.answer("Pesanan tidak ditemukan.",show_alert=True)
+
+    if order["payment_status"]=="paid":
+        conn.rollback(); conn.close()
+        return await call.answer(
+            "Pesanan sudah dibayar dan tidak dapat dibatalkan.",
+            show_alert=True
+        )
+
+    if order["status"] in {"cancelled","expired","completed"}:
+        conn.rollback(); conn.close()
+        return await call.answer(
+            f"Pesanan sudah berstatus {order['status']}.",
+            show_alert=True
+        )
+
+    release_order_reservation(conn,order)
+    conn.execute(
+        """UPDATE orders
+           SET status='cancelled',
+               payment_status='cancelled',
+               payment_review_status=''
+           WHERE id=?""",
+        (order_id,)
+    )
+    conn.commit(); conn.close()
+
+    clear_payment_proof_session(call.from_user.id)
+    record_payment_event(
+        "order",order_id,"cancelled",0,call.from_user.id,"Cancelled by user"
+    )
+
+    await safe_edit_or_answer(
+        call,
+        "❌ <b>PESANAN DIBATALKAN</b>\\n\\n"
+        f"🧾 {invoice(order_id)}\\n"
+        "Reservasi stok sudah dilepas kembali.",
+        reply_markup=back_home(),
+        parse_mode="HTML"
+    )
+    await call.answer("Pesanan dibatalkan.",show_alert=True)
 
 
 @router.callback_query(F.data == "resend:last")
@@ -11193,13 +11706,20 @@ async def owner_backup_project(call: CallbackQuery,bot: Bot):
         if not zip_path.exists():
             raise RuntimeError("ZIP backup project tidak berhasil dibuat.")
 
+        backup_size=int(zip_path.stat().st_size)
+        backup_time=datetime.now(JAKARTA_TZ).strftime('%d/%m/%Y • %H:%M:%S WIB')
+        set_setting("last_project_backup_name",zip_path.name)
+        set_setting("last_project_backup_size",str(backup_size))
+        set_setting("last_project_backup_time",backup_time)
+
         await bot.send_document(
             ADMIN_ID,
             document=FSInputFile(str(zip_path)),
             caption=(
                 "📦 <b>BACKUP PROJECT MABOYY DIGITAL</b>\n\n"
                 f"🤖 Versi: <b>v{BOT_VERSION}</b>\n"
-                f"📅 {datetime.now(JAKARTA_TZ).strftime('%d/%m/%Y • %H:%M:%S WIB')}\n"
+                f"📅 {backup_time}\n"
+                f"💾 Ukuran: <b>{backup_size/1024:.1f} KB</b>\n"
                 "📁 Isi ZIP: <b>6 file project + 1 database</b>\n"
                 "🔐 <code>.env</code> dan secret Railway tidak disertakan.\n\n"
                 "File project:\n"
@@ -11227,6 +11747,32 @@ async def owner_backup_project(call: CallbackQuery,bot: Bot):
 
     except Exception as exc:
         await owner_system_error_view(call,"Backup Project",exc)
+
+
+
+@router.callback_query(F.data == "owner:backup_last")
+async def owner_last_backup_info(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    name=get_setting("last_project_backup_name","-")
+    time_text=get_setting("last_project_backup_time","Belum pernah")
+    try:
+        size=int(get_setting("last_project_backup_size","0") or 0)
+    except Exception:
+        size=0
+
+    await safe_edit_or_answer(
+        call,
+        "ℹ️ <b>BACKUP PROJECT TERAKHIR</b>\\n\\n"
+        f"📦 File: <code>{html.escape(name)}</code>\\n"
+        f"📅 Waktu: <b>{html.escape(time_text)}</b>\\n"
+        f"💾 Ukuran: <b>{size/1024:.1f} KB</b>\\n\\n"
+        "Backup otomatis 48 jam tetap khusus database.",
+        reply_markup=owner_system_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data == "owner:sync_stock")
@@ -11325,6 +11871,28 @@ async def owner_stats(call: CallbackQuery):
     reviews = conn.execute(
         "SELECT COUNT(*) AS n FROM reviews"
     ).fetchone()["n"]
+    rating_summary=store_rating_summary(conn)
+    waiting_proofs = conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE payment_status!='paid'
+             AND (
+               COALESCE(payment_proof_file_id,'')!=''
+               OR COALESCE(proof_file_id,'')!=''
+             )
+             AND COALESCE(payment_review_status,'') NOT IN ('verified','rejected')"""
+    ).fetchone()["n"]
+    low_threshold=low_stock_threshold()
+    low_stock = conn.execute(
+        """SELECT COUNT(*) AS n
+           FROM product_variants
+           WHERE active=1
+             AND MAX(0,stock-COALESCE(reserved_stock,0))<=?
+             AND MAX(0,stock-COALESCE(reserved_stock,0))>0""",
+        (int(low_threshold),)
+    ).fetchone()["n"] if low_threshold>0 else 0
+    unresolved_errors = conn.execute(
+        "SELECT COUNT(*) AS n FROM system_errors WHERE recovered=0"
+    ).fetchone()["n"]
     top_product = conn.execute(
         """SELECT name, sold FROM products
            WHERE active=1 ORDER BY sold DESC LIMIT 1"""
@@ -11341,16 +11909,19 @@ async def owner_stats(call: CallbackQuery):
         f"🧾 Total order: <b>{orders}</b>\n"
         f"✅ Selesai: <b>{completed}</b>\n"
         f"⏳ Pending bayar: <b>{pending}</b>\n"
-        f"⚠️ Pending delivery: <b>{paid_pending}</b>\n\n"
+        f"⚠️ Pending delivery: <b>{paid_pending}</b>\n"
+        f"📤 Bukti menunggu verifikasi: <b>{waiting_proofs}</b>\n\n"
         "📦 <b>Inventori</b>\n"
         f"Produk aktif: <b>{products}</b>\n"
         f"Variasi aktif: <b>{variants}</b>\n"
         f"Akun siap jual: <b>{stock}</b>\n"
+        f"🔔 Stok menipis: <b>{low_stock}</b>\n"
         f"🔥 Terlaris: <b>{html.escape(top_product['name']) if top_product else '-'}</b>\n\n"
         "👥 <b>User & Saldo</b>\n"
         f"User terverifikasi: <b>{users}</b>\n"
         f"Total Saldo Kamu: <b>{rupiah(wallet_total)}</b>\n"
-        f"⭐ Total ulasan: <b>{reviews}</b>\n\n"
+        f"⭐ Rating toko: <b>{rating_summary['average']:.1f}/5</b> ({rating_summary['count']})\n"
+        f"🧯 Error belum pulih: <b>{unresolved_errors}</b>\n\n"
         f"<i>{STORE_FOOTER}</i>",
         reply_markup=back_owner(),
         parse_mode="HTML"
@@ -16105,7 +16676,7 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
 
 
 @router.callback_query(F.data.startswith("proofpending:"))
-async def owner_proof_pending(call: CallbackQuery):
+async def owner_proof_pending(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
@@ -16145,6 +16716,19 @@ async def owner_proof_pending(call: CallbackQuery):
         )
     except Exception:
         pass
+
+    try:
+        inv=invoice(entity_id) if entity=="order" else topup_invoice(entity_id)
+        await call.bot.send_message(
+            int(row["user_id"]),
+            "⏳ <b>BUKTI SEDANG DIPERIKSA</b>\n\n"
+            f"🧾 {inv}\n"
+            "Owner sedang memeriksa bukti pembayaran Anda. "
+            "Tidak perlu mengirim bukti berulang kali.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        logging.exception("Pending proof user notification failed entity=%s id=%s",entity,entity_id)
 
     await call.answer("Ditandai pending.", show_alert=True)
 
@@ -16484,6 +17068,8 @@ async def owner_cleanup_preview(call: CallbackQuery):
 
     try:
         kind=call.data.split(":")[-1]
+        if not cleanup_kind_valid(kind):
+            return await call.answer("Jenis data tidak valid.", show_alert=True)
         data=cleanup_preview_text(kind)
         if not data:
             return await call.answer("Jenis data tidak valid.", show_alert=True)
@@ -16510,19 +17096,14 @@ async def owner_cleanup_confirm(call: CallbackQuery):
         return await deny_owner_callback(call)
 
     kind=call.data.split(":")[-1]
-    if kind not in {"orders","pending","topups","proofs","errors","safe"}:
+    if not cleanup_kind_valid(kind):
         return await call.answer("Jenis data tidak valid.", show_alert=True)
 
     try:
         result=cleanup_execute(kind)
         await safe_edit_or_answer(
             call,
-            "✅ <b>PEMBERSIHAN SELESAI</b>\n\n"
-            f"🧾 Order expired: <b>{result['orders']}</b>\n"
-            f"💰 Top up expired: <b>{result['topups']}</b>\n"
-            f"📎 Session bukti: <b>{result['proofs']}</b>\n"
-            f"🧯 Log error: <b>{result['errors']}</b>\n\n"
-            "Data paid/completed dan akun terjual tetap aman.",
+            cleanup_result_text(kind,result),
             reply_markup=cleanup_data_keyboard(),
             parse_mode="HTML"
         )
@@ -17450,12 +18031,18 @@ async def silent_recovery_loop(bot: Bot):
     await asyncio.sleep(20)
     try:
         results = await startup_recovery_audit(bot)
+        txchecks=await transaction_self_test()
+        failed_checks=[name for name,ok,detail in txchecks if not ok]
 
         if ADMIN_ID:
             try:
                 await bot.send_message(
                     ADMIN_ID,
-                    "♻️ <b>STARTUP RECOVERY</b>\n\n"
+                    "🩺 <b>STARTUP CHECK • MABOYY DIGITAL</b>\n\n"
+                    f"{'✅ Sistem siap' if not failed_checks else '⚠️ Perlu pemeriksaan'}\n"
+                    f"🧪 Self-test: <b>{len(txchecks)-len(failed_checks)}/{len(txchecks)} lolos</b>\n"
+                    + (f"❌ Gagal: <b>{html.escape(', '.join(failed_checks))}</b>\n" if failed_checks else "")
+                    + "\n♻️ <b>Recovery</b>\n"
                     f"✅ Order recovered: <b>{results['recovered_orders']}</b>\n"
                     f"📦 Paid belum terkirim: <b>{results['pending_orders']}</b>\n"
                     f"📦 Inventory mismatch: <b>{results['inventory_mismatch']}</b>\n"
@@ -17481,7 +18068,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "13.7"
+EXPECTED_SOURCE_VERSION = "13.9"
 
 
 def source_integrity_self_test():
@@ -17531,6 +18118,9 @@ def runtime_dependency_self_test():
     checks.append(("demo_isolation_self_test", callable(demo_isolation_self_test)))
     checks.append(("send_review_prompt_if_needed", callable(send_review_prompt_if_needed)))
     checks.append(("store_rating_summary", callable(store_rating_summary)))
+    checks.append(("order_user_status_label", callable(order_user_status_label)))
+    checks.append(("conservative_cleanup_old_data", callable(conservative_cleanup_old_data)))
+    checks.append(("cleanup_menu_self_test", callable(cleanup_menu_self_test)))
 
     failed=[name for name,ok in checks if not ok]
     if failed:
@@ -17569,6 +18159,7 @@ async def main():
         asyncio.create_task(periodic_auto_recovery(bot), name="periodic_auto_recovery"),
         asyncio.create_task(silent_recovery_loop(bot), name="silent_recovery_loop"),
         asyncio.create_task(periodic_operations_loop(bot), name="periodic_operations_loop"),
+        asyncio.create_task(periodic_safe_cleanup_loop(), name="periodic_safe_cleanup_loop"),
     ]
 
     try:
