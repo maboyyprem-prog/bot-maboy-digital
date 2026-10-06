@@ -1093,3 +1093,22 @@ Indikator warna stok dihapus. List Produk tetap menampilkan jumlah stok per prod
 - unique_code_min otomatis menjadi 200.
 - unique_code_max tetap 500.
 - Tidak ada Railway Variable baru.
+
+
+## v14.3 — Bulk Stok Private/Unique
+- Tidak ada Railway Variable baru.
+- Preset jumlah: +5 / +10 / +20 / +50.
+- Custom: 2–500.
+- Akun dimasukkan satu per satu dan wajib berbeda.
+- Staging disimpan di database sebelum finalisasi inventory.
+
+
+## v14.4 — Terjual Persisten
+- Tidak ada Railway Variable baru.
+- `Terjual` direbuild dari order history saat startup.
+- Railway Volume `/data` harus tetap aktif agar histori tidak hilang saat redeploy.
+
+
+## v15.0 — Major Reliability & Owner Tools
+- Tidak ada Railway Variable baru.
+- Menambah riwayat akun terjual, dashboard stok, claim log, payment reconciliation, customer profile, dan audit owner.

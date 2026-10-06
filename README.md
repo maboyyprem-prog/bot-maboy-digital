@@ -1,16 +1,52 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v14.2  
+**Versi aktif:** v15.0  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Update Terbaru — v14.2 Kode Unik Rp200–Rp500
-- Kode unik pembayaran sekarang selalu berada di rentang `+Rp200` sampai `+Rp500`.
-- Kode tidak pernah di bawah Rp200 dan tidak pernah lebih dari Rp500.
-- Setelah mencapai 500, sistem berputar kembali ke 200.
-- Kode yang sedang dipakai transaksi aktif tidak akan dipakai ulang.
-- Setting lama otomatis dimigrasikan ke `min=200` dan `max=500`.
-- Berlaku untuk order dan top up.
-- Tidak ada Railway Variable baru.
+## Update Besar v15.0
+### 📚 Riwayat Akun Terjual
+- Menampilkan akun yang benar-benar sudah berstatus `sold`.
+- Terhubung ke order ID, user ID, produk, varian, dan waktu delivery.
+- Histori tetap tersimpan di SQLite.
 
-## File Project
-`main.py` • `bot.py` • `requirements.txt` • `.env.example` • `README.md` • `VARIABLE_RAILWAY.md`
+### 📊 Dashboard Stok Pintar
+- Total varian aktif.
+- Total available, reserved, sold.
+- Stok rendah dan stok kosong.
+- Produk terlaris.
+- Daftar varian yang perlu restock.
+
+### ♻️ Refund & Replacement
+- Menambahkan tabel klaim support agar kasus refund/replacement dapat dicatat terpisah dari order.
+- Menu owner tersedia untuk melihat histori klaim.
+
+### 🧾 Order Detail Profesional
+- Struktur detail order diperjelas.
+- Status pembayaran, fulfillment, produk, varian, qty dan histori tetap dipertahankan.
+
+### 🔐 Payment Reconciliation
+- Audit order aktif dan kode unik pembayaran Rp200–Rp500.
+- Deteksi kode unik bentrok pada transaksi aktif.
+- Tabel event reconciliation tersedia untuk pengembangan integrasi pembayaran otomatis berikutnya.
+
+### 👤 Customer Profile
+- Helper profil customer menyediakan total order, sukses, batal, total belanja, saldo, dan order terakhir.
+- Menu customer profile ditambahkan di panel owner.
+
+### 🛡️ Audit & Anti Double Order
+- Audit log owner diperkuat.
+- Guard checkout aktif dipertahankan dan pesan dibuat lebih jelas.
+- Stock source-of-truth tetap `inventory_items`.
+- Fulfillment tetap menggunakan jalur aman existing.
+
+### Fitur sebelumnya yang tetap dipertahankan
+- Bulk stok Private/Unique.
+- Sharing qty guard.
+- OWNER_FREE.
+- Kode unik pembayaran Rp200–Rp500.
+- Terjual persisten dari order history.
+- Backup database/project.
+- Recovery order.
+- Payment proof PM owner.
+
+Tidak ada Railway Variable baru.

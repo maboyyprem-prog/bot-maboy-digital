@@ -90,7 +90,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "14.2"
+BOT_VERSION = "15.0"
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -496,6 +496,55 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS stock_bulk_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            variant_id INTEGER NOT NULL,
+            target_qty INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'collecting',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stock_bulk_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(session_id, content)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS support_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            claim_type TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            resolution TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            resolved_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS payment_reconcile_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER DEFAULT 0,
+            topup_id INTEGER DEFAULT 0,
+            amount INTEGER NOT NULL DEFAULT 0,
+            unique_code INTEGER NOT NULL DEFAULT 0,
+            result TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS inventory_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             variant_id INTEGER NOT NULL,
@@ -877,6 +926,7 @@ def init_db():
     )
 
     reconcile_all_inventory_stock(conn)
+    sync_all_product_sold_from_history(conn)
     conn.commit()
     conn.close()
 
@@ -1546,6 +1596,121 @@ def variant_button_label(variant) -> str:
 
 
 
+
+
+def smart_stock_summary(conn):
+    return conn.execute(
+        """SELECT
+               COUNT(*) AS total_variants,
+               SUM(CASE WHEN COALESCE(v.stock,0)=0 THEN 1 ELSE 0 END) AS empty_variants,
+               SUM(CASE WHEN COALESCE(v.stock,0) BETWEEN 1 AND 3 THEN 1 ELSE 0 END) AS low_variants,
+               SUM(COALESCE(v.stock,0)) AS available_total,
+               SUM(CASE WHEN ii.status='reserved' THEN 1 ELSE 0 END) AS reserved_total,
+               SUM(CASE WHEN ii.status='sold' THEN 1 ELSE 0 END) AS sold_items
+           FROM product_variants v
+           LEFT JOIN inventory_items ii ON ii.variant_id=v.id
+           WHERE v.active=1"""
+    ).fetchone()
+
+
+def sold_inventory_history(conn, limit: int = 30):
+    return conn.execute(
+        """SELECT ii.id,ii.content,ii.delivered_at,ii.order_id,
+                  v.name AS variant_name,p.name AS product_name,
+                  o.user_id,o.qty,o.completed_at
+           FROM inventory_items ii
+           JOIN product_variants v ON v.id=ii.variant_id
+           JOIN products p ON p.id=v.product_id
+           LEFT JOIN orders o ON o.id=ii.order_id
+           WHERE ii.status='sold'
+           ORDER BY COALESCE(ii.delivered_at,o.completed_at,ii.created_at) DESC
+           LIMIT ?""",
+        (int(limit),)
+    ).fetchall()
+
+
+def customer_profile_data(conn, user_id: int):
+    orders = conn.execute(
+        """SELECT
+               COUNT(*) AS total_orders,
+               SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_orders,
+               SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled_orders,
+               COALESCE(SUM(CASE WHEN status='completed' AND COALESCE(payment_method,'')!='OWNER_FREE'
+                                 THEN total ELSE 0 END),0) AS total_spent,
+               MAX(COALESCE(completed_at,created_at)) AS last_order_at
+           FROM orders
+           WHERE user_id=?""",
+        (int(user_id),)
+    ).fetchone()
+    wallet = conn.execute(
+        "SELECT balance FROM wallets WHERE user_id=?",
+        (int(user_id),)
+    ).fetchone()
+    return orders, int(wallet["balance"] or 0) if wallet else 0
+
+
+def record_payment_reconcile(conn, *, order_id=0, topup_id=0, amount=0,
+                             unique_code=0, result="", note=""):
+    conn.execute(
+        """INSERT INTO payment_reconcile_events
+           (order_id,topup_id,amount,unique_code,result,note,created_at)
+           VALUES(?,?,?,?,?,?,?)""",
+        (
+            int(order_id or 0), int(topup_id or 0), int(amount or 0),
+            int(unique_code or 0), str(result), str(note),
+            datetime.now().isoformat(timespec="seconds")
+        )
+    )
+
+
+def owner_action_log(action: str, detail: str = "", owner_id: int = 0):
+    try:
+        conn=db()
+        conn.execute(
+            """INSERT INTO owner_audit_logs(owner_id,action,detail,created_at)
+               VALUES(?,?,?,?)""",
+            (
+                int(owner_id or ADMIN_ID or 0),
+                str(action),
+                str(detail)[:1000],
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logging.exception("owner_action_log failed")
+
+
+def historical_product_sold(conn, product_id: int) -> int:
+    """Hitung total penjualan customer dari histori order yang selesai."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(qty),0) AS total_sold
+           FROM orders
+           WHERE product_id=?
+             AND status='completed'
+             AND COALESCE(account_sent,0)=1
+             AND COALESCE(payment_method,'')!='OWNER_FREE'""",
+        (int(product_id),)
+    ).fetchone()
+    return int(row["total_sold"] or 0)
+
+
+def sync_product_sold_from_history(conn, product_id: int) -> int:
+    sold = historical_product_sold(conn, product_id)
+    conn.execute(
+        "UPDATE products SET sold=? WHERE id=?",
+        (sold, int(product_id))
+    )
+    return sold
+
+
+def sync_all_product_sold_from_history(conn):
+    rows = conn.execute("SELECT id FROM products").fetchall()
+    for row in rows:
+        sync_product_sold_from_history(conn, int(row["id"]))
+
+
 def inventory_counts(conn, variant_id: int):
     row = conn.execute(
         """SELECT
@@ -2149,10 +2314,6 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
                WHERE order_id=? AND status='allocated'""",
             (datetime.now().isoformat(timespec="seconds"), order_id)
         )
-        conn.execute(
-            "UPDATE products SET sold=sold+? WHERE id=?",
-            (qty, fresh["product_id"])
-        )
         sent_at = datetime.now().isoformat(timespec="seconds")
         conn.execute(
             """UPDATE orders
@@ -2165,6 +2326,7 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
                WHERE id=?""",
             (sent_at, sent_at, order_id)
         )
+        sync_product_sold_from_history(conn, int(fresh["product_id"]))
         sync_variant_stock_from_inventory(conn, fresh["variant_id"])
 
     conn.commit()
@@ -5948,6 +6110,8 @@ class OwnerState(StatesGroup):
     stock_add_items = State()
     stock_duplicate_count = State()
     stock_duplicate_content = State()
+    stock_bulk_unique_count = State()
+    stock_bulk_unique_collect = State()
     set_price = State()
     mark_popular = State()
     mark_flash = State()
@@ -6252,6 +6416,86 @@ def owner_stock_variants_keyboard(product_id: int):
     return kb.as_markup()
 
 
+def owner_stock_bulk_unique_qty_keyboard(variant_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="+5", callback_data=f"ownerstockbulkqty:{variant_id}:5"),
+            InlineKeyboardButton(text="+10", callback_data=f"ownerstockbulkqty:{variant_id}:10"),
+        ],
+        [
+            InlineKeyboardButton(text="+20", callback_data=f"ownerstockbulkqty:{variant_id}:20"),
+            InlineKeyboardButton(text="+50", callback_data=f"ownerstockbulkqty:{variant_id}:50"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Custom", callback_data=f"ownerstockbulkcustom:{variant_id}")
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Kembali", callback_data=f"ownerstockvar:{variant_id}")
+        ]
+    ])
+
+
+def stock_bulk_session_start(owner_id: int, variant_id: int, target_qty: int) -> int:
+    target_qty = int(target_qty)
+    if target_qty < 2 or target_qty > 500:
+        raise ValueError("Jumlah stok harus 2 sampai 500.")
+
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        old_rows = conn.execute(
+            """SELECT id FROM stock_bulk_sessions
+               WHERE owner_id=? AND status='collecting'""",
+            (int(owner_id),)
+        ).fetchall()
+        for row in old_rows:
+            conn.execute(
+                "DELETE FROM stock_bulk_items WHERE session_id=?",
+                (int(row["id"]),)
+            )
+        conn.execute(
+            """UPDATE stock_bulk_sessions
+               SET status='cancelled', updated_at=?
+               WHERE owner_id=? AND status='collecting'""",
+            (datetime.now().isoformat(timespec="seconds"), int(owner_id))
+        )
+
+        now = datetime.now().isoformat(timespec="seconds")
+        cur = conn.execute(
+            """INSERT INTO stock_bulk_sessions
+               (owner_id, variant_id, target_qty, status, created_at, updated_at)
+               VALUES(?,?,?,'collecting',?,?)""",
+            (int(owner_id), int(variant_id), target_qty, now, now)
+        )
+        session_id = int(cur.lastrowid)
+        conn.commit()
+        return session_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def stock_bulk_session_get(session_id: int, owner_id: int):
+    conn = db()
+    row = conn.execute(
+        """SELECT * FROM stock_bulk_sessions
+           WHERE id=? AND owner_id=? AND status='collecting'""",
+        (int(session_id), int(owner_id))
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def stock_bulk_session_count(conn, session_id: int) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM stock_bulk_items WHERE session_id=?",
+        (int(session_id),)
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
 def owner_stock_duplicate_qty_keyboard(variant_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -6372,6 +6616,8 @@ def owner_products_menu():
     kb.button(text="⚡ Flash Sale", callback_data="owner:mark_flash")
     kb.button(text="🎁 Paket / Bundle", callback_data="owner:bundles")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.button(text="📚 Riwayat Akun Terjual",callback_data="owner:sold_accounts")
+    kb.button(text="📊 Dashboard Stok",callback_data="owner:stock_dashboard")
     kb.adjust(2, 2, 2, 2, 2, 1, 1)
     return kb.as_markup()
 
@@ -6390,6 +6636,8 @@ def owner_orders_menu():
     kb.button(text="📨 Kirim Ulang Akun", callback_data="owner:resend_order")
     kb.button(text="❌ Batalkan Order", callback_data="owner:cancel_order")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.button(text="♻️ Refund & Replacement",callback_data="owner:claims")
+    kb.button(text="🔐 Payment Reconciliation",callback_data="owner:payment_reconcile")
     kb.adjust(2, 2, 2, 2, 2)
     return kb.as_markup()
 
@@ -6403,6 +6651,7 @@ def owner_customers_menu():
     kb.button(text="⭐ Rating Toko & Ulasan", callback_data="owner:reviews")
     kb.button(text="🛡️ Anti-Fraud", callback_data="owner:security")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.button(text="👤 Customer Profile",callback_data="owner:customer_profile")
     kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
@@ -9203,12 +9452,14 @@ async def product_detail(call: CallbackQuery):
            ORDER BY id""",
         (product_id,)
     ).fetchall()
-    conn.close()
 
     if not product:
+        conn.close()
         return await call.answer("Produk tidak ditemukan / sudah tidak aktif.", show_alert=True)
 
-    sold = int(product["sold"] or 0)
+    sold = sync_product_sold_from_history(conn, int(product["id"]))
+    conn.commit()
+    conn.close()
 
     text = (
         "╭────────────────────╮\n"
@@ -17897,7 +18148,11 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
                 callback_data=f"ownerstockadd:{variant_id}"
             )],
             [InlineKeyboardButton(
-                text="🔁 Duplikat Akun / Stok Banyak",
+                text="📥 Tambah Stok Banyak",
+                callback_data=f"ownerstockbulk:{variant_id}"
+            )],
+            [InlineKeyboardButton(
+                text="🔁 Duplikat Akun Sharing",
                 callback_data=f"ownerstockdup:{variant_id}"
             )],
             [InlineKeyboardButton(
@@ -17909,6 +18164,519 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
     )
     await safe_callback_notice(call)
 
+
+
+
+@router.callback_query(F.data.startswith("ownerstockbulk:"))
+async def owner_stock_bulk_begin(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id = int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.", show_alert=True)
+
+    conn = db()
+    row = conn.execute(
+        """SELECT v.id,v.name,v.sharing_mode,p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Varian tidak ditemukan.", show_alert=True)
+
+    await state.clear()
+    await state.update_data(stock_variant_id=variant_id)
+
+    await safe_edit_or_answer(
+        call,
+        "📥 <b>TAMBAH STOK BANYAK • PRIVATE</b>\n\n"
+        f"📦 Produk: <b>{html.escape(row['product_name'])}</b>\n"
+        f"🧩 Varian: <b>{html.escape(row['name'])}</b>\n\n"
+        "Pilih jumlah akun berbeda yang ingin ditambahkan.\n"
+        "Setelah itu bot akan meminta akun <b>satu per satu</b>.\n\n"
+        "🔐 Setiap akun = 1 stok = 1 pembeli.\n"
+        "🚫 Akun yang sama tidak boleh digunakan dua kali.",
+        reply_markup=owner_stock_bulk_unique_qty_keyboard(variant_id),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstockbulkqty:"))
+async def owner_stock_bulk_qty(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        _, variant_raw, qty_raw = call.data.split(":")
+        variant_id = int(variant_raw)
+        qty = int(qty_raw)
+    except Exception:
+        return await call.answer("Jumlah tidak valid.", show_alert=True)
+
+    if qty < 2 or qty > 500:
+        return await call.answer("Jumlah harus 2–500.", show_alert=True)
+
+    conn = db()
+    variant = conn.execute(
+        """SELECT v.id,v.name,p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+    if not variant:
+        return await call.answer("Varian tidak ditemukan.", show_alert=True)
+
+    session_id = stock_bulk_session_start(
+        call.from_user.id,
+        variant_id,
+        qty
+    )
+
+    await state.clear()
+    await state.update_data(
+        stock_variant_id=variant_id,
+        stock_bulk_session_id=session_id,
+        stock_bulk_target_qty=qty
+    )
+    await state.set_state(OwnerState.stock_bulk_unique_collect)
+
+    await safe_edit_or_answer(
+        call,
+        "📥 <b>MASUKKAN AKUN 1/{}</b>\n\n"
+        "Kirim akun pertama sekarang.\n"
+        "Format bebas dan boleh multi-baris.\n\n"
+        "Setiap <b>pesan</b> yang Anda kirim dihitung sebagai <b>1 akun / 1 stok</b>.\n\n"
+        "🚫 Akun duplikat akan ditolak.".format(qty),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="❌ Batalkan Tambah Stok",
+                callback_data=f"ownerstockbulkcancel:{session_id}"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstockbulkcustom:"))
+async def owner_stock_bulk_custom(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id = int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.", show_alert=True)
+
+    await state.clear()
+    await state.update_data(stock_variant_id=variant_id)
+    await state.set_state(OwnerState.stock_bulk_unique_count)
+
+    await safe_edit_or_answer(
+        call,
+        "✏️ <b>CUSTOM JUMLAH STOK</b>\n\n"
+        "Kirim jumlah akun berbeda yang ingin ditambahkan.\n"
+        "Batas: <b>2–500</b>.\n\n"
+        "Contoh: <code>7</code>, <code>13</code>, atau <code>100</code>.",
+        reply_markup=back_owner(f"ownerstockbulk:{variant_id}"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstockbulkcancel:"))
+async def owner_stock_bulk_cancel(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        session_id = int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Session tidak valid.", show_alert=True)
+
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        session = conn.execute(
+            """SELECT * FROM stock_bulk_sessions
+               WHERE id=? AND owner_id=? AND status='collecting'""",
+            (session_id, call.from_user.id)
+        ).fetchone()
+        variant_id = int(session["variant_id"]) if session else 0
+
+        if session:
+            conn.execute(
+                "DELETE FROM stock_bulk_items WHERE session_id=?",
+                (session_id,)
+            )
+            conn.execute(
+                """UPDATE stock_bulk_sessions
+                   SET status='cancelled', updated_at=?
+                   WHERE id=?""",
+                (datetime.now().isoformat(timespec="seconds"), session_id)
+            )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+
+    await state.clear()
+    await call.answer("Tambah stok dibatalkan.", show_alert=True)
+
+    if variant_id:
+        return await safe_edit_or_answer(
+            call,
+            "❌ <b>TAMBAH STOK DIBATALKAN</b>\n\n"
+            "Akun sementara tidak dimasukkan ke stok.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="📦 Kembali ke Varian",
+                    callback_data=f"ownerstockvar:{variant_id}"
+                )]
+            ]),
+            parse_mode="HTML"
+        )
+
+
+@router.message(OwnerState.stock_bulk_unique_count)
+async def owner_stock_bulk_custom_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        return await message.answer("❌ Kirim angka antara 2–500.")
+
+    qty = int(raw)
+    if qty < 2 or qty > 500:
+        return await message.answer("❌ Jumlah harus antara 2–500.")
+
+    data = await state.get_data()
+    variant_id = int(data.get("stock_variant_id", 0) or 0)
+    if not variant_id:
+        await state.clear()
+        return await message.answer("❌ Varian stok tidak valid.")
+
+    conn = db()
+    variant = conn.execute(
+        "SELECT id FROM product_variants WHERE id=? AND active=1",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+    if not variant:
+        await state.clear()
+        return await message.answer("❌ Varian tidak ditemukan.")
+
+    session_id = stock_bulk_session_start(
+        message.from_user.id,
+        variant_id,
+        qty
+    )
+
+    await state.clear()
+    await state.update_data(
+        stock_variant_id=variant_id,
+        stock_bulk_session_id=session_id,
+        stock_bulk_target_qty=qty
+    )
+    await state.set_state(OwnerState.stock_bulk_unique_collect)
+
+    await message.answer(
+        "📥 <b>MASUKKAN AKUN 1/{}</b>\n\n"
+        "Kirim akun pertama sekarang.\n"
+        "Setiap pesan = <b>1 akun / 1 stok</b>.\n\n"
+        "🚫 Akun duplikat akan ditolak.".format(qty),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="❌ Batalkan Tambah Stok",
+                callback_data=f"ownerstockbulkcancel:{session_id}"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@router.message(OwnerState.stock_bulk_unique_collect)
+async def owner_stock_bulk_collect(message: Message, state: FSMContext, bot: Bot):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    session_id = int(data.get("stock_bulk_session_id", 0) or 0)
+    variant_id = int(data.get("stock_variant_id", 0) or 0)
+    target_qty = int(data.get("stock_bulk_target_qty", 0) or 0)
+
+    if not session_id or not variant_id or target_qty < 2:
+        await state.clear()
+        return await message.answer(
+            "❌ Session tambah stok tidak valid. Silakan mulai ulang dari menu Atur Stok."
+        )
+
+    content = (message.text or message.caption or "").strip()
+    if not content:
+        return await message.answer(
+            "❌ Data akun kosong. Kirim teks akun yang ingin dimasukkan."
+        )
+
+    conn = db()
+    conn.execute("BEGIN IMMEDIATE")
+
+    try:
+        session = conn.execute(
+            """SELECT * FROM stock_bulk_sessions
+               WHERE id=? AND owner_id=? AND variant_id=?
+                 AND status='collecting'""",
+            (session_id, message.from_user.id, variant_id)
+        ).fetchone()
+
+        if not session:
+            conn.rollback()
+            conn.close()
+            await state.clear()
+            return await message.answer(
+                "❌ Session tambah stok sudah tidak aktif. Silakan mulai ulang."
+            )
+
+        # Never allow same account already present in this product variant,
+        # regardless of available/reserved/sold state.
+        existing = conn.execute(
+            """SELECT id FROM inventory_items
+               WHERE variant_id=? AND content=? LIMIT 1""",
+            (variant_id, content)
+        ).fetchone()
+        if existing:
+            conn.rollback()
+            conn.close()
+            current_conn = db()
+            accepted = stock_bulk_session_count(current_conn, session_id)
+            current_conn.close()
+            return await message.answer(
+                "❌ <b>AKUN DUPLIKAT</b>\n\n"
+                "Akun yang sama sudah pernah tersimpan pada varian ini.\n"
+                f"Progress tetap: <b>{accepted}/{target_qty}</b>.\n\n"
+                "Silakan kirim akun berbeda untuk slot berikutnya.",
+                parse_mode="HTML"
+            )
+
+        staged = conn.execute(
+            """SELECT id FROM stock_bulk_items
+               WHERE session_id=? AND content=? LIMIT 1""",
+            (session_id, content)
+        ).fetchone()
+        if staged:
+            conn.rollback()
+            conn.close()
+            current_conn = db()
+            accepted = stock_bulk_session_count(current_conn, session_id)
+            current_conn.close()
+            return await message.answer(
+                "❌ <b>AKUN DUPLIKAT</b>\n\n"
+                "Akun ini sudah dimasukkan dalam proses stok saat ini.\n"
+                f"Progress tetap: <b>{accepted}/{target_qty}</b>.\n\n"
+                "Silakan kirim akun yang berbeda.",
+                parse_mode="HTML"
+            )
+
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO stock_bulk_items(session_id,content,created_at)
+               VALUES(?,?,?)""",
+            (session_id, content, now)
+        )
+        conn.execute(
+            """UPDATE stock_bulk_sessions
+               SET updated_at=?
+               WHERE id=?""",
+            (now, session_id)
+        )
+
+        accepted = stock_bulk_session_count(conn, session_id)
+
+        if accepted < target_qty:
+            conn.commit()
+            conn.close()
+
+            await message.answer(
+                "✅ <b>AKUN {}/{}</b> tersimpan sementara.\n\n"
+                "Sekarang kirim akun berikutnya: <b>{}/{}</b>.\n\n"
+                "📦 Stok produk belum berubah sampai semua akun lengkap.".format(
+                    accepted, target_qty, accepted + 1, target_qty
+                ),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="❌ Batalkan Tambah Stok",
+                        callback_data=f"ownerstockbulkcancel:{session_id}"
+                    )]
+                ]),
+                parse_mode="HTML"
+            )
+            return
+
+        # Finalization is atomic: re-check every staged item against
+        # inventory, then insert all credentials in one transaction.
+        staged_items = conn.execute(
+            """SELECT content FROM stock_bulk_items
+               WHERE session_id=?
+               ORDER BY id ASC""",
+            (session_id,)
+        ).fetchall()
+
+        if len(staged_items) != target_qty:
+            raise RuntimeError(
+                f"Jumlah staging tidak sesuai target ({len(staged_items)}/{target_qty})"
+            )
+
+        variant = conn.execute(
+            """SELECT v.*,p.name AS product_name
+               FROM product_variants v
+               JOIN products p ON p.id=v.product_id
+               WHERE v.id=? AND v.active=1 AND p.active=1""",
+            (variant_id,)
+        ).fetchone()
+
+        if not variant:
+            raise RuntimeError("Varian tidak ditemukan atau sudah nonaktif.")
+
+        old_available = available_stock(variant)
+
+        for item in staged_items:
+            duplicate = conn.execute(
+                """SELECT id FROM inventory_items
+                   WHERE variant_id=? AND content=? LIMIT 1""",
+                (variant_id, item["content"])
+            ).fetchone()
+            if duplicate:
+                raise RuntimeError(
+                    "Ada akun staging yang sudah tersimpan di inventory. "
+                    "Batalkan dan mulai ulang agar tidak terjadi duplikat."
+                )
+
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.executemany(
+            """INSERT INTO inventory_items
+               (variant_id,content,status,created_at)
+               VALUES(?,?,'available',?)""",
+            [(variant_id, item["content"], now) for item in staged_items]
+        )
+
+        # This flow is explicitly Private/Unique.
+        conn.execute(
+            "UPDATE product_variants SET sharing_mode=0 WHERE id=?",
+            (variant_id,)
+        )
+        sync_variant_stock_from_inventory(conn, variant_id)
+
+        conn.execute(
+            """UPDATE stock_bulk_sessions
+               SET status='completed', updated_at=?
+               WHERE id=?""",
+            (now, session_id)
+        )
+        conn.execute(
+            "DELETE FROM stock_bulk_items WHERE session_id=?",
+            (session_id,)
+        )
+
+        product_id = int(variant["product_id"])
+        product_name = str(variant["product_name"])
+        variant_name = str(variant["name"])
+
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        logging.exception("Bulk unique stock finalize failed: %s", exc)
+        return await message.answer(
+            "❌ <b>STOK BELUM DITAMBAHKAN</b>\n\n"
+            "Semua akun tetap aman dan tidak ada stok parsial yang dibuat.\n"
+            f"Error: <code>{html.escape(str(exc)[:400])}</code>\n\n"
+            "Gunakan tombol batal lalu ulangi proses jika diperlukan.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="❌ Batalkan & Ulangi",
+                    callback_data=f"ownerstockbulkcancel:{session_id}"
+                )]
+            ]),
+            parse_mode="HTML"
+        )
+
+    conn.close()
+    await state.clear()
+
+    owner_action_log("RESTOCK_BULK_UNIQUE", f"variant={variant_id} qty={target_qty}", message.from_user.id)
+
+    inventory_log(
+        variant_id,
+        "RESTOCK_BULK_UNIQUE",
+        target_qty,
+        "OWNER",
+        f"Tambah {target_qty} akun Private/Unique"
+    )
+
+    # Give paid-pending orders first chance to consume the newly inserted stock.
+    try:
+        await fulfill_pending_for_variant(variant_id, bot)
+    except Exception:
+        logging.exception(
+            "Fulfill pending after bulk restock failed variant=%s",
+            variant_id
+        )
+
+    conn = db()
+    variant_after = conn.execute(
+        "SELECT * FROM product_variants WHERE id=?",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    new_available = available_stock(variant_after) if variant_after else 0
+
+    if old_available <= 0 and new_available > 0:
+        asyncio.create_task(
+            notify_restock_subscribers(
+                bot, product_id, variant_id, new_available
+            )
+        )
+        asyncio.create_task(
+            broadcast_restock_to_verified(
+                bot, product_id, variant_id, new_available
+            )
+        )
+
+    await message.answer(
+        "✅ <b>STOK BANYAK BERHASIL DITAMBAHKAN</b>\n\n"
+        f"📦 Produk: <b>{html.escape(product_name)}</b>\n"
+        f"🧩 Varian: <b>{html.escape(variant_name)}</b>\n"
+        f"📥 Akun masuk: <b>{target_qty}</b>\n"
+        f"📊 Stok tersedia sekarang: <b>{new_available}</b>\n"
+        "🔐 Mode: <b>Private / Unique</b>\n\n"
+        "Setiap pembelian mengambil <b>1 akun berbeda</b> dan stok berkurang 1.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📥 Tambah Stok Banyak Lagi",
+                callback_data=f"ownerstockbulk:{variant_id}"
+            )],
+            [InlineKeyboardButton(
+                text="📦 Kembali ke Varian",
+                callback_data=f"ownerstockvar:{variant_id}"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data.startswith("ownerstockdup:"))
@@ -17939,7 +18707,7 @@ async def owner_stock_duplicate_begin(call: CallbackQuery, state: FSMContext):
 
     await safe_edit_or_answer(
         call,
-        "🔁 <b>DUPLIKAT AKUN / STOK BANYAK</b>\n\n"
+        "🔁 <b>DUPLIKAT AKUN SHARING</b>\n\n"
         f"📦 Produk: <b>{html.escape(row['product_name'])}</b>\n"
         f"🧩 Varian: <b>{html.escape(row['name'])}</b>\n\n"
         "Pilih akun yang sama ingin dijadikan berapa stok.\n\n"
@@ -18356,6 +19124,194 @@ async def demo_namespace_safety_net(call: CallbackQuery):
     )
 
 
+
+@router.callback_query(F.data == "owner:sold_accounts")
+async def owner_sold_accounts(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    rows=sold_inventory_history(conn,30)
+    conn.close()
+
+    if not rows:
+        return await safe_edit_or_answer(
+            call,
+            "📚 <b>RIWAYAT AKUN TERJUAL</b>\n\nBelum ada akun yang berstatus terjual.",
+            reply_markup=back_owner("owner:back_products"),
+            parse_mode="HTML"
+        )
+
+    lines=["📚 <b>RIWAYAT AKUN TERJUAL</b>",""]
+    for row in rows:
+        account_preview=str(row["content"] or "").replace("\n"," ")[:45]
+        when=row["delivered_at"] or row["completed_at"] or "-"
+        lines.append(
+            f"🧾 #{row['order_id']} • {html.escape(row['product_name'])} / "
+            f"{html.escape(row['variant_name'])}\n"
+            f"👤 User: <code>{int(row['user_id'] or 0)}</code>\n"
+            f"🔐 Akun: <code>{html.escape(account_preview)}</code>\n"
+            f"🕒 {html.escape(str(when))}\n"
+        )
+
+    await safe_edit_or_answer(
+        call,
+        "\n".join(lines)[:3900],
+        reply_markup=back_owner("owner:back_products"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:stock_dashboard")
+async def owner_stock_dashboard(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    summary=smart_stock_summary(conn)
+    top=conn.execute(
+        """SELECT p.name,COALESCE(p.sold,0) AS sold
+           FROM products p
+           WHERE p.active=1
+           ORDER BY sold DESC,p.id DESC
+           LIMIT 5"""
+    ).fetchall()
+    low=conn.execute(
+        """SELECT p.name AS product_name,v.name AS variant_name,COALESCE(v.stock,0) AS stock
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE p.active=1 AND v.active=1 AND COALESCE(v.stock,0)<=3
+           ORDER BY v.stock ASC,p.name
+           LIMIT 10"""
+    ).fetchall()
+    conn.close()
+
+    lines=[
+        "📊 <b>DASHBOARD STOK</b>","",
+        f"📦 Varian aktif: <b>{int(summary['total_variants'] or 0)}</b>",
+        f"✅ Available: <b>{int(summary['available_total'] or 0)}</b>",
+        f"🟡 Reserved: <b>{int(summary['reserved_total'] or 0)}</b>",
+        f"📚 Item sold: <b>{int(summary['sold_items'] or 0)}</b>",
+        f"⚠️ Stok rendah: <b>{int(summary['low_variants'] or 0)}</b>",
+        f"❌ Stok kosong: <b>{int(summary['empty_variants'] or 0)}</b>",
+        "",
+        "🔥 <b>Produk Terlaris</b>"
+    ]
+    for r in top:
+        lines.append(f"• {html.escape(r['name'])}: <b>{int(r['sold'] or 0)}</b> terjual")
+
+    if low:
+        lines += ["","⚠️ <b>Perlu Restock</b>"]
+        for r in low:
+            lines.append(
+                f"• {html.escape(r['product_name'])} / {html.escape(r['variant_name'])}: "
+                f"<b>{int(r['stock'] or 0)}</b>"
+            )
+
+    await safe_edit_or_answer(
+        call,
+        "\n".join(lines)[:3900],
+        reply_markup=back_owner("owner:back_products"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:customer_profile")
+async def owner_customer_profile_prompt(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.clear()
+    await state.set_state(OwnerState.search_order_user)
+    await safe_edit_or_answer(
+        call,
+        "👤 <b>CUSTOMER PROFILE</b>\n\nKirim Telegram user ID customer.",
+        reply_markup=back_owner("owner:back_customers"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:payment_reconcile")
+async def owner_payment_reconcile(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    active_orders=conn.execute(
+        """SELECT id,total,unique_code,status,payment_status,created_at
+           FROM orders
+           WHERE payment_status NOT IN ('paid','cancelled','expired')
+             AND status NOT IN ('completed','cancelled','expired')
+           ORDER BY id DESC LIMIT 20"""
+    ).fetchall()
+    duplicate_codes=conn.execute(
+        """SELECT unique_code,COUNT(*) AS n
+           FROM orders
+           WHERE unique_code BETWEEN 200 AND 500
+             AND payment_status NOT IN ('paid','cancelled','expired')
+             AND status NOT IN ('completed','cancelled','expired')
+           GROUP BY unique_code HAVING COUNT(*)>1"""
+    ).fetchall()
+    conn.close()
+
+    lines=[
+        "🔐 <b>PAYMENT RECONCILIATION</b>","",
+        f"⏳ Order aktif menunggu pembayaran: <b>{len(active_orders)}</b>",
+        f"⚠️ Kode unik bentrok: <b>{len(duplicate_codes)}</b>",
+        "",
+        "Kode unik aktif menggunakan rentang <b>Rp200–Rp500</b>."
+    ]
+    if duplicate_codes:
+        lines += ["","❌ <b>Kode Bentrok</b>"]
+        for r in duplicate_codes[:10]:
+            lines.append(f"• +Rp{int(r['unique_code'])}: {int(r['n'])} transaksi")
+
+    await safe_edit_or_answer(
+        call,
+        "\n".join(lines),
+        reply_markup=back_owner("owner:back_orders"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:claims")
+async def owner_claims(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    rows=conn.execute(
+        """SELECT c.*,o.product_name_snapshot,o.variant_name_snapshot
+           FROM support_claims c
+           LEFT JOIN orders o ON o.id=c.order_id
+           ORDER BY c.id DESC LIMIT 30"""
+    ).fetchall()
+    conn.close()
+
+    lines=["♻️ <b>REFUND & REPLACEMENT</b>",""]
+    if not rows:
+        lines.append("Belum ada klaim tercatat.")
+    else:
+        for r in rows:
+            lines.append(
+                f"#{r['id']} • Order #{r['order_id']} • <b>{html.escape(r['status'])}</b>\n"
+                f"{html.escape(r['product_name_snapshot'] or '-')} / "
+                f"{html.escape(r['variant_name_snapshot'] or '-')}\n"
+                f"Alasan: {html.escape((r['reason'] or '-')[:100])}\n"
+            )
+
+    await safe_edit_or_answer(
+        call,
+        "\n".join(lines)[:3900],
+        reply_markup=back_owner("owner:back_orders"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
 @router.callback_query()
 async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
     """
@@ -18614,7 +19570,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "14.2"
+EXPECTED_SOURCE_VERSION = "15.0"
 
 
 def source_integrity_self_test():
