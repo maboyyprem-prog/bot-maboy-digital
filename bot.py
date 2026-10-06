@@ -34,7 +34,12 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    Image = ImageDraw = ImageFont = None
+    PIL_AVAILABLE = False
 
 load_dotenv()
 
@@ -76,7 +81,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "7.0"
+BOT_VERSION = "7.4"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -551,6 +556,26 @@ def rupiah(value: int) -> str:
 
 def is_owner(user_id: int) -> bool:
     return user_id == ADMIN_ID
+
+
+
+def owner_access_denied_text() -> str:
+    return (
+        "⛔ <b>AKSES DITOLAK</b>\n\n"
+        "Command / fitur ini <b>khusus owner</b> dan tidak dapat digunakan oleh user.\n"
+        "Silakan gunakan /start untuk kembali ke menu toko."
+    )
+
+
+async def deny_owner_callback(call: CallbackQuery):
+    try:
+        await call.answer(
+            "⛔ Fitur ini khusus owner.",
+            show_alert=True
+        )
+    except Exception:
+        pass
+
 
 
 
@@ -2341,6 +2366,9 @@ def draw_wrapped(draw, text: str, xy, font, fill, max_width: int, line_gap: int 
 
 
 def create_success_invoice_images(order_id: int, delivery_text: str):
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow belum terpasang; gunakan fallback invoice teks.")
+
     """
     Invoice image only.
     Account credentials are intentionally NOT rendered into the image.
@@ -2588,6 +2616,12 @@ async def run_system_self_test(bot: Bot):
         results.append(("QRIS Manual", qris, "Terpasang" if qris else "Belum dipasang"))
     except Exception as exc:
         results.append(("QRIS Manual", False, str(exc)[:100]))
+
+    results.append((
+        "Invoice Image",
+        PIL_AVAILABLE,
+        "Pillow aktif" if PIL_AVAILABLE else "Fallback teks aktif"
+    ))
 
     try:
         conn = db()
@@ -5034,7 +5068,7 @@ async def payment_proof_invalid(message: Message):
 async def owner(message: Message, state: FSMContext):
     await state.clear()
     if not is_owner(message.from_user.id):
-        return await message.answer("⛔ Panel owner hanya dapat diakses pemilik bot.")
+        return await message.answer(owner_access_denied_text(), parse_mode="HTML")
 
     await message.answer(
         f"🛠️ <b>PANEL OWNER • {STORE_NAME}</b>\n\n"
@@ -8266,6 +8300,9 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "owner:add_variant")
 async def owner_add_variant(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
     await prompt_state(
         call, state, OwnerState.add_variant,
         "🧩 <b>TAMBAH VARIASI</b>\n\n"
@@ -8417,6 +8454,9 @@ async def owner_stock_variant(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("ownerstock:backvariant:"))
 async def owner_stock_back_variant(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
     variant_id = int(call.data.split(":")[2])
     conn = db()
     row = conn.execute("SELECT product_id FROM product_variants WHERE id=?", (variant_id,)).fetchone()
@@ -8814,6 +8854,9 @@ async def owner_variant_button_name_input(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "owner:set_price")
 async def owner_set_price(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
     await prompt_state(
         call, state, OwnerState.set_price,
         "💰 <b>ATUR HARGA VARIASI</b>\n\n"
@@ -9048,6 +9091,9 @@ async def owner_delete_confirm(call: CallbackQuery):
 
 @router.callback_query(F.data == "owner:mark_popular")
 async def owner_mark_popular(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
     await prompt_state(
         call, state, OwnerState.mark_popular,
         "🔥 <b>PRODUK POPULER</b>\n\n"
@@ -9074,6 +9120,9 @@ async def owner_mark_popular_input(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "owner:mark_flash")
 async def owner_mark_flash(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
     await prompt_state(
         call, state, OwnerState.mark_flash,
         "⚡ <b>FLASH SALE</b>\n\n"
@@ -10476,8 +10525,26 @@ async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
     """
     data = call.data or ""
 
-    # Old owner/navigation buttons should never remain unresponsive.
-    if is_owner(call.from_user.id) and data.startswith("owner:"):
+    # Every old/stale admin button remains protected.
+    admin_prefixes = (
+        "owner:",
+        "ownerstock:",
+        "ownerresend:",
+        "ownercancel:",
+        "ownerdelete:",
+        "ownerbtnname:",
+        "proofapprove:",
+        "proofreject:",
+        "proofrejectreason:",
+        "proofpending:",
+        "topupverify:",
+        "topuprejectreason:",
+    )
+
+    if data.startswith(admin_prefixes):
+        if not is_owner(call.from_user.id):
+            return await deny_owner_callback(call)
+
         await state.clear()
         await safe_edit_or_answer(
             call,
@@ -10885,13 +10952,32 @@ async def owner_proof_info(call: CallbackQuery):
 # =========================
 @router.message()
 async def fallback(message: Message):
-    if message.text and message.text.startswith("/"):
-        await message.answer(
-            "ℹ️ Command yang tersedia hanya:\n"
+    text = (message.text or "").strip()
+
+    if text.startswith("/"):
+        command = text.split()[0].split("@")[0].lower()
+
+        if command == "/owner" and not is_owner(message.from_user.id):
+            return await message.answer(
+                owner_access_denied_text(),
+                parse_mode="HTML"
+            )
+
+        if is_owner(message.from_user.id):
+            return await message.answer(
+                "ℹ️ Command tersedia:\n"
+                "/start — Menu utama\n"
+                "/owner — Panel owner\n"
+                "/ping — Status bot"
+            )
+
+        return await message.answer(
+            "ℹ️ Command tersedia:\n"
             "/start — Menu utama\n"
-            "/owner — Panel owner\n"
-            "/ping — Status bot"
+            "/ping — Status bot\n\n"
+            "🔒 /owner khusus pemilik bot."
         )
+
 
 
 
