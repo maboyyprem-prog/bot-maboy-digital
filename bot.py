@@ -93,7 +93,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.2"
+BOT_VERSION = "16.6"
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -2887,6 +2887,43 @@ def expired_invoice_hide_cutoff_iso(minutes: int | None = None) -> str:
     ).isoformat(timespec="seconds")
 
 
+
+USER_FINAL_ORDER_VISIBLE_HOURS = 24
+
+
+def user_final_order_cutoff_iso() -> str:
+    return (
+        datetime.now(timezone.utc).astimezone()
+        - timedelta(hours=USER_FINAL_ORDER_VISIBLE_HOURS)
+    ).isoformat(timespec="seconds")
+
+
+def user_order_visible_sql(alias: str = "o") -> str:
+    """
+    UI retention only. Historical transaction rows remain in the database.
+    Final/rejected orders are shown to users for 24 hours.
+    """
+    p = f"{alias}." if alias else ""
+    return f"""
+        (
+            {p}status NOT IN ('completed','cancelled','expired')
+            AND COALESCE({p}payment_review_status,'')!='rejected'
+        )
+        OR (
+            (
+                {p}status IN ('completed','cancelled','expired')
+                OR COALESCE({p}payment_review_status,'')='rejected'
+            )
+            AND COALESCE(
+                NULLIF({p}completed_at,''),
+                NULLIF({p}payment_proof_submitted_at,''),
+                {p}created_at
+            ) >= ?
+        )
+    """
+
+
+
 def format_expiry_time(value: str) -> str:
     if not value:
         return "-"
@@ -5104,6 +5141,11 @@ async def smart_owner_alert_loop(bot: Bot):
     await asyncio.sleep(180)
     while True:
         try:
+            # Default OFF. Persistent setting only becomes ON when owner enables it.
+            if get_setting("smart_alert_enabled","0") != "1":
+                await asyncio.sleep(900)
+                continue
+
             if ADMIN_ID:
                 conn=db()
                 signature,data=smart_alert_signature(conn)
@@ -5133,6 +5175,7 @@ async def smart_owner_alert_loop(bot: Bot):
         except Exception:
             logging.exception("smart_owner_alert_loop crashed")
         await asyncio.sleep(900)
+
 
 
 async def startup_recovery_audit(bot: Bot):
@@ -5194,6 +5237,84 @@ async def transaction_self_test():
         checks.append(("Inventory", len(mismatches)==0, f"{len(mismatches)} mismatch"))
     except Exception as exc:
         checks.append(("Inventory", False, str(exc)[:100]))
+
+    # Smart Alert default/persistence
+    try:
+        smart_alert_value=get_setting("smart_alert_enabled","0")
+        checks.append((
+            "Smart Alert Config",
+            smart_alert_value in {"0","1"},
+            "ON" if smart_alert_value=="1" else "OFF"
+        ))
+    except Exception as exc:
+        checks.append(("Smart Alert Config",False,str(exc)[:100]))
+
+    # User order retention policy
+    try:
+        cutoff=user_final_order_cutoff_iso()
+        conn=db()
+        stale_hidden=int(conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM orders
+               WHERE (
+                   status IN ('completed','cancelled','expired')
+                   OR COALESCE(payment_review_status,'')='rejected'
+               )
+               AND COALESCE(
+                   NULLIF(completed_at,''),
+                   NULLIF(payment_proof_submitted_at,''),
+                   created_at
+               ) < ?""",
+            (cutoff,)
+        ).fetchone()["n"] or 0)
+        conn.close()
+        checks.append((
+            "User Order Retention",
+            True,
+            f"{stale_hidden} hidden history"
+        ))
+    except Exception as exc:
+        checks.append(("User Order Retention",False,str(exc)[:100]))
+
+    # Payment proof fallback visibility
+    try:
+        conn=db()
+        hidden_forward_failed=int(conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM orders
+               WHERE payment_status!='paid'
+                 AND status NOT IN ('cancelled','expired','completed')
+                 AND payment_review_status='forward_failed'
+                 AND COALESCE(payment_proof_file_id,'')='' 
+                 AND COALESCE(proof_file_id,'')=''"""
+        ).fetchone()["n"] or 0)
+        conn.close()
+        checks.append((
+            "Proof Fallback",
+            hidden_forward_failed==0,
+            f"{hidden_forward_failed} missing proof"
+        ))
+    except Exception as exc:
+        checks.append(("Proof Fallback",False,str(exc)[:100]))
+
+    # One-proof-per-invoice policy
+    try:
+        conn=db()
+        rejected_with_session=int(conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM payment_proof_sessions s
+               JOIN orders o
+                 ON s.entity_type='order' AND s.entity_id=o.id
+               WHERE COALESCE(o.payment_review_status,'')='rejected'"""
+        ).fetchone()["n"] or 0)
+        conn.close()
+        checks.append((
+            "Proof Once Policy",
+            rejected_with_session==0,
+            f"{rejected_with_session} rejected session"
+        ))
+    except Exception as exc:
+        checks.append(("Proof Once Policy",False,str(exc)[:100]))
 
     # SQLite write-path sanity
     try:
@@ -5755,6 +5876,12 @@ async def process_payment_proof_message(
             conn.close()
             return False, "Invoice tidak ditemukan."
 
+        if proof_locked_status(row):
+            conn.close()
+            clear_payment_proof_session(message.from_user.id)
+            await state.clear()
+            return False, "Bukti pembayaran untuk invoice ini sudah pernah dikirim."
+
         if order_payment_terminal(row):
             conn.close()
             clear_payment_proof_session(message.from_user.id)
@@ -5786,6 +5913,12 @@ async def process_payment_proof_message(
         if not row:
             conn.close()
             return False, "Invoice top up tidak ditemukan."
+
+        if proof_locked_status(row):
+            conn.close()
+            clear_payment_proof_session(message.from_user.id)
+            await state.clear()
+            return False, "Bukti top up untuk invoice ini sudah pernah dikirim."
 
         if topup_payment_terminal(row):
             conn.close()
@@ -5821,7 +5954,7 @@ async def process_payment_proof_message(
         await state.clear()
         return True, ""
 
-    # Owner PM failed: mark as retryable, not as waiting for review.
+    # Proof is already stored. Do not allow a second upload.
     conn=db()
     if entity=="order":
         conn.execute(
@@ -5838,8 +5971,12 @@ async def process_payment_proof_message(
     conn.commit()
     conn.close()
 
-    set_payment_proof_session(message.from_user.id, entity, entity_id)
-    return False, error or "Gagal meneruskan bukti ke owner."
+    clear_payment_proof_session(message.from_user.id)
+    await state.clear()
+    return False, (
+        "Bukti sudah tersimpan, tetapi notifikasi ke owner belum berhasil. "
+        "Tidak perlu mengirim bukti lagi."
+    )
 
 
 
@@ -5932,11 +6069,56 @@ def order_detail_text(order) -> str:
     return "\n".join(lines)
 
 
+def payment_proof_already_used(row) -> bool:
+    if not row:
+        return False
+    keys=set(row.keys()) if hasattr(row,"keys") else set()
+    for key in ("payment_proof_file_id","proof_file_id","payment_proof_submitted_at"):
+        if key in keys and str(row[key] or "").strip():
+            return True
+    return False
+
+
+def proof_locked_status(row) -> bool:
+    if not row:
+        return False
+    keys=set(row.keys()) if hasattr(row,"keys") else set()
+    review=str(row["payment_review_status"] or "").strip() if "payment_review_status" in keys else ""
+    return payment_proof_already_used(row) or review in {
+        "submitted","reviewing","rejected","forward_failed","verified"
+    }
+
+
+def proof_rejected_keyboard(entity: str, entity_id: int):
+    rows=[
+        [InlineKeyboardButton(
+            text="🔄 Cek Status",
+            callback_data=f"statuscheck:{entity}:{entity_id}"
+        )]
+    ]
+    if entity=="order":
+        rows.append([
+            InlineKeyboardButton(
+                text="❌ Batalkan Pesanan",
+                callback_data=f"usercancel:{entity_id}"
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders"),
+            InlineKeyboardButton(text="🏠 Menu",callback_data="home")
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="🏠 Menu",callback_data="home")
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def order_detail_keyboard(order):
     rows=[]
     status=str(order["status"] or "")
     payment_status=str(order["payment_status"] or "")
-    review_status=str(order["payment_review_status"] or "")
+    proof_used=proof_locked_status(order)
 
     if status=="completed" and order["fulfillment_status"]=="delivered":
         rows.append([
@@ -5946,35 +6128,26 @@ def order_detail_keyboard(order):
             )
         ])
     elif payment_status!="paid" and status not in {"expired","cancelled","completed"}:
-        if review_status in {"submitted","reviewing"}:
+        if not proof_used:
             rows.append([
                 InlineKeyboardButton(
-                    text="🔄 Cek Status",
-                    callback_data=f"statuscheck:order:{order['id']}"
-                )
-            ])
-        else:
-            proof_label = (
-                "📤 Kirim Ulang Bukti"
-                if review_status in {"rejected","forward_failed"}
-                else "📤 Kirim Bukti"
-            )
-            rows.append([
-                InlineKeyboardButton(
-                    text=proof_label,
+                    text="📤 Kirim Bukti",
                     callback_data=f"proofsubmit:order:{order['id']}"
                 )
             ])
-            rows.append([
-                InlineKeyboardButton(
-                    text="🔄 Cek Status",
-                    callback_data=f"statuscheck:order:{order['id']}"
-                ),
-                InlineKeyboardButton(
-                    text="❌ Batalkan",
-                    callback_data=f"usercancel:{order['id']}"
-                )
-            ])
+
+        rows.append([
+            InlineKeyboardButton(
+                text="🔄 Cek Status",
+                callback_data=f"statuscheck:order:{order['id']}"
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                text="❌ Batalkan Pesanan",
+                callback_data=f"usercancel:{order['id']}"
+            )
+        ])
     else:
         rows.append([
             InlineKeyboardButton(
@@ -6931,6 +7104,10 @@ def user_reply_menu():
     keyboard.append([
         KeyboardButton(text="🧾 Pesanan Saya"),
         KeyboardButton(text="💬 Hubungi Owner"),
+    ])
+
+    keyboard.append([
+        KeyboardButton(text="🏠 Menu Utama"),
     ])
 
     return ReplyKeyboardMarkup(
@@ -8228,6 +8405,28 @@ def cleanup_menu_self_test() -> list[tuple[str,bool,str]]:
         checks.append((f"cleanup:{kind}",preview is not None,"registered" if preview else "missing"))
     return checks
 
+def owner_smart_alert_menu():
+    enabled=get_setting("smart_alert_enabled","0")=="1"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=("✅ Aktif" if enabled else "▶️ Aktifkan"),
+                callback_data="owner:smart_alert_on"
+            ),
+            InlineKeyboardButton(
+                text=("⏸️ Nonaktif" if not enabled else "⏹️ Nonaktifkan"),
+                callback_data="owner:smart_alert_off"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ Sistem",
+                callback_data="owner:back_system"
+            )
+        ]
+    ])
+
+
 def owner_system_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🩺 Diagnostik", callback_data="owner:diagnostics")
@@ -9096,10 +9295,9 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
                 "Waktu pembayaran sudah habis. Buat pesanan baru agar stok aman.",
                 show_alert=True
             )
-        review_status=str(row["payment_review_status"] or "")
-        if review_status in {"submitted","reviewing"}:
+        if proof_locked_status(row):
             return await call.answer(
-                "Bukti sudah dikirim dan sedang menunggu pemeriksaan owner.",
+                "Bukti pembayaran hanya dapat dikirim 1 kali untuk setiap invoice.",
                 show_alert=True
             )
 
@@ -9109,10 +9307,9 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
                 "Top up ini sudah final dan tidak menerima bukti lagi.",
                 show_alert=True
             )
-        review_status=str(row["payment_review_status"] or "")
-        if review_status in {"submitted","reviewing"}:
+        if proof_locked_status(row):
             return await call.answer(
-                "Bukti top up sudah dikirim dan sedang diperiksa.",
+                "Bukti top up hanya dapat dikirim 1 kali untuk setiap invoice.",
                 show_alert=True
             )
 
@@ -9161,7 +9358,7 @@ async def payment_proof_photo(message: Message, state: FSMContext, bot: Bot):
         return await message.answer(
             "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
             f"{html.escape(error)}\n\n"
-            "Silakan coba kirim ulang. Jika tetap gagal, owner perlu membuka/start chat bot terlebih dahulu.",
+            "Silakan cek status transaksi melalui Pesanan Saya.",
             parse_mode="HTML"
         )
 
@@ -9210,7 +9407,7 @@ async def payment_proof_document(message: Message, state: FSMContext, bot: Bot):
         return await message.answer(
             "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
             f"{html.escape(error)}\n\n"
-            "Silakan coba kirim ulang. Jika tetap gagal, owner perlu membuka/start chat bot terlebih dahulu.",
+            "Silakan cek status transaksi melalui Pesanan Saya.",
             parse_mode="HTML"
         )
 
@@ -9227,10 +9424,79 @@ async def payment_proof_document(message: Message, state: FSMContext, bot: Bot):
 
 
 
+@router.message(
+    CheckoutState.waiting_payment_proof,
+    F.text.in_({
+        "🏷️ List Produk",
+        "🎁 Voucher",
+        "📁 Laporan Stok",
+        "💰 Isi Saldo",
+        "❓ Cara Order",
+        "🧾 Pesanan Saya",
+        "💬 Hubungi Owner",
+        "🏠 Menu Utama",
+    })
+)
+async def payment_proof_exit_to_menu(message: Message, state: FSMContext, bot: Bot):
+    """Reply-keyboard navigation must exit proof-upload mode instead of being treated as proof."""
+    text=(message.text or "").strip()
+
+    clear_payment_proof_session(message.from_user.id)
+    await state.clear()
+
+    if text=="🏷️ List Produk":
+        return await reply_menu_products(message, bot)
+    if text=="🎁 Voucher":
+        return await reply_menu_voucher(message, bot)
+    if text=="📁 Laporan Stok":
+        return await reply_menu_stock(message, bot)
+    if text=="💰 Isi Saldo":
+        return await reply_menu_wallet(message, bot)
+    if text=="❓ Cara Order":
+        return await reply_menu_howto(message)
+    if text=="🧾 Pesanan Saya":
+        return await reply_menu_orders(message, bot)
+    if text=="💬 Hubungi Owner":
+        return await reply_menu_owner_contact(message)
+    if text=="🏠 Menu Utama":
+        return await reply_menu_home(message, bot, state)
+
+
+@router.message(
+    CheckoutState.waiting_payment_proof,
+    F.text.regexp(r"^\d{1,2}$")
+)
+async def payment_proof_exit_to_product_number(message: Message, state: FSMContext, bot: Bot):
+    """Product shortcut numbers also exit proof-upload mode safely."""
+    clear_payment_proof_session(message.from_user.id)
+    await state.clear()
+    return await reply_menu_product_number(message, bot)
+
+
+@router.message(
+    CheckoutState.waiting_payment_proof,
+    F.text.regexp(r"^/start(?:\s|$)")
+)
+async def payment_proof_exit_to_start(message: Message, state: FSMContext, bot: Bot):
+    clear_payment_proof_session(message.from_user.id)
+    await state.clear()
+
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    mark_user_verified(
+        message.from_user.id,
+        message.from_user.username or ""
+    )
+    await show_main_menu_message(message)
+
+
 @router.message(CheckoutState.waiting_payment_proof)
 async def payment_proof_invalid(message: Message):
     await message.answer(
-        "❌ Kirim bukti pembayaran sebagai foto/screenshot atau file gambar."
+        "❌ Kirim bukti pembayaran sebagai foto/screenshot atau file gambar.\n\n"
+        "Jika ingin keluar dari pengiriman bukti, tekan 🏠 Menu Utama.",
+        reply_markup=user_reply_menu()
     )
 
 
@@ -11565,7 +11831,9 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
 @router.callback_query(F.data == "my_orders")
 async def my_orders(call: CallbackQuery):
     conn = db()
-    rows = conn.execute("""
+    cutoff=user_final_order_cutoff_iso()
+    rows = conn.execute(
+        f"""
         SELECT o.*, p.name AS product_name, v.name AS variant_name,
                EXISTS(
                    SELECT 1 FROM reviews r WHERE r.order_id=o.id
@@ -11574,9 +11842,12 @@ async def my_orders(call: CallbackQuery):
         LEFT JOIN products p ON p.id=o.product_id
         LEFT JOIN product_variants v ON v.id=o.variant_id
         WHERE o.user_id=?
+          AND ({user_order_visible_sql('o')})
         ORDER BY o.id DESC
         LIMIT 10
-    """, (call.from_user.id,)).fetchall()
+        """,
+        (call.from_user.id, cutoff)
+    ).fetchall()
     conn.close()
 
     if not rows:
@@ -11602,6 +11873,10 @@ async def my_orders(call: CallbackQuery):
                 f"   Qty {row['qty']} • {rupiah(row['payment_total'] or row['total'])}\n"
                 f"   Status: {html.escape(display_status)}\n"
             )
+        lines.append(
+            f"<i>Pesanan selesai/ditolak otomatis hilang dari daftar setelah "
+            f"{USER_FINAL_ORDER_VISIBLE_HOURS} jam.</i>"
+        )
         lines.append(f"<i>{STORE_FOOTER}</i>")
         text = "\n".join(lines)
 
@@ -11660,6 +11935,29 @@ async def user_order_detail(call: CallbackQuery):
 
     if not order:
         return await call.answer("Pesanan tidak ditemukan.",show_alert=True)
+
+    is_final=(
+        order["status"] in {"completed","cancelled","expired"}
+        or str(order["payment_review_status"] or "")=="rejected"
+    )
+    if is_final:
+        stamp=(
+            order["completed_at"]
+            or order["payment_proof_submitted_at"]
+            or order["created_at"]
+            or ""
+        )
+        try:
+            dt=datetime.fromisoformat(stamp)
+            now=datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+            age=(now-dt).total_seconds()
+        except Exception:
+            age=0
+        if age > USER_FINAL_ORDER_VISIBLE_HOURS * 3600:
+            return await call.answer(
+                "Pesanan lama sudah disembunyikan dari daftar.",
+                show_alert=True
+            )
 
     await safe_edit_or_answer(
         call,
@@ -13748,7 +14046,7 @@ async def owner_pending_order_cancel(call: CallbackQuery):
         return await call.answer("Order tidak valid.",show_alert=True)
 
     conn=db()
-    conn.execute("BEGIN IMMEDIATE")
+    begin_immediate_retry(conn)
     order=conn.execute("SELECT * FROM orders WHERE id=?",(order_id,)).fetchone()
 
     if not order:
@@ -13762,10 +14060,14 @@ async def owner_pending_order_cancel(call: CallbackQuery):
     release_order_reservation(conn,order)
     conn.execute(
         """UPDATE orders
-           SET status='cancelled', payment_status='cancelled'
+           SET status='cancelled',
+               payment_status='cancelled',
+               payment_review_status='',
+               reserved_until=''
            WHERE id=?""",
         (order_id,)
     )
+    sync_variant_reserved_stock(conn, int(order["variant_id"] or 0))
     conn.commit()
     conn.close()
 
@@ -13787,7 +14089,7 @@ async def owner_verify_payments(call: CallbackQuery):
            LEFT JOIN product_variants v ON v.id=o.variant_id
            WHERE o.payment_status!='paid'
              AND o.status NOT IN ('cancelled','expired','completed')
-             AND COALESCE(o.payment_review_status,'') NOT IN ('rejected','forward_failed')
+             AND COALESCE(o.payment_review_status,'')!='rejected'
              AND (
                  (o.payment_proof_file_id IS NOT NULL AND o.payment_proof_file_id!='')
                  OR (o.proof_file_id IS NOT NULL AND o.proof_file_id!='')
@@ -13808,14 +14110,19 @@ async def owner_verify_payments(call: CallbackQuery):
         )
     else:
         for row in rows:
-            proof_type=row["proof_file_type"] or "-"
+            proof_type=(
+                row["payment_proof_type"]
+                or row["proof_file_type"]
+                or "-"
+            )
             lines.append(
                 f"<b>{invoice(row['id'])}</b>\n"
                 f"👤 <code>{int(row['user_id'])}</code>\n"
                 f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
                 f"{html.escape(row['variant_name'] or 'Varian lama')}\n"
                 f"💰 {rupiah(row['payment_total'] or row['total'])}\n"
-                f"📎 Bukti: <b>{html.escape(proof_type)}</b>"
+                f"📎 Bukti: <b>{html.escape(proof_type)}</b>\n"
+                f"🔎 Review: <b>{html.escape(row['payment_review_status'] or '-')}</b>"
             )
 
             keyboard.append([
@@ -13865,6 +14172,12 @@ async def owner_verify_payment_view(call: CallbackQuery, bot: Bot):
     if not row:
         return await call.answer("Order tidak ditemukan.",show_alert=True)
 
+    if row["payment_status"]=="paid" or row["status"] in {"cancelled","expired","completed"}:
+        return await call.answer(
+            "Order sudah final dan tidak perlu diverifikasi lagi.",
+            show_alert=True
+        )
+
     text=(
         "✅ <b>VERIFIKASI PEMBAYARAN</b>\n\n"
         f"🧾 {invoice(order_id)}\n"
@@ -13873,7 +14186,9 @@ async def owner_verify_payment_view(call: CallbackQuery, bot: Bot):
         f"{html.escape(row['variant_name'] or 'Varian lama')}\n"
         f"🔢 {int(row['qty'] or 0)}\n"
         f"💰 Tagihan: <b>{rupiah(row['payment_total'] or row['total'])}</b>\n"
-        f"💳 Status: <b>{html.escape(row['payment_status'] or '-')}</b>"
+        f"💳 Status: <b>{html.escape(row['payment_status'] or '-')}</b>\n"
+        f"📎 Bukti: <b>{html.escape((row['payment_proof_type'] or row['proof_file_type'] or '-'))}</b>\n"
+        f"🔎 Review: <b>{html.escape(row['payment_review_status'] or '-')}</b>"
     )
 
     kb=InlineKeyboardMarkup(inline_keyboard=[
@@ -13902,8 +14217,16 @@ async def owner_verify_payment_view(call: CallbackQuery, bot: Bot):
     ])
 
     # Send proof separately if available; keep action screen as text.
-    proof_id=row["proof_file_id"]
-    proof_type=(row["proof_file_type"] or "").lower()
+    proof_id=(
+        row["payment_proof_file_id"]
+        or row["proof_file_id"]
+        or ""
+    )
+    proof_type=(
+        row["payment_proof_type"]
+        or row["proof_file_type"]
+        or ""
+    ).lower()
 
     if proof_id:
         try:
@@ -16719,6 +17042,21 @@ async def reply_menu_flash(message: Message, bot: Bot):
     await message.answer("\n".join(lines_text), reply_markup=kb.as_markup(), parse_mode="HTML")
 
 
+@router.message(F.text == "🏠 Menu Utama")
+async def reply_menu_home(message: Message, bot: Bot, state: FSMContext):
+    clear_payment_proof_session(message.from_user.id)
+    await state.clear()
+
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    mark_user_verified(
+        message.from_user.id,
+        message.from_user.username or ""
+    )
+    await show_main_menu_message(message)
+
+
 @router.message(F.text == "🎁 Voucher")
 async def reply_menu_voucher(message: Message, bot: Bot):
     if not await is_channel_member(bot, message.from_user.id):
@@ -16776,16 +17114,14 @@ async def reply_menu_orders(message: Message, bot: Bot):
         return await send_join_required(message)
 
     conn = db()
+    cutoff=user_final_order_cutoff_iso()
     rows = conn.execute(
-        """SELECT * FROM orders
-           WHERE user_id=?
-             AND NOT (
-               status IN ('expired','cancelled')
-               AND created_at < ?
-             )
-           ORDER BY id DESC
-           LIMIT 10""",
-        (message.from_user.id, expired_invoice_hide_cutoff_iso())
+        f"""SELECT * FROM orders
+            WHERE user_id=?
+              AND ({user_order_visible_sql('')})
+            ORDER BY id DESC
+            LIMIT 10""",
+        (message.from_user.id, cutoff)
     ).fetchall()
     conn.close()
 
@@ -16798,22 +17134,51 @@ async def reply_menu_orders(message: Message, bot: Bot):
 
     lines = ["🧾 <b>PESANAN SAYA</b>", ""]
     for row in rows:
-        icon = "✅" if row["status"] == "completed" else "🟡"
+        display_status=order_user_status_label(row)
+
+        if row["status"]=="completed":
+            icon="✅"
+        elif row["status"] in {"cancelled","expired"} or str(row["payment_review_status"] or "")=="rejected":
+            icon="❌"
+        elif row["payment_status"]=="paid":
+            icon="💰"
+        else:
+            icon="🟡"
+
         expiry_line = ""
         if row["status"] == "pending" and row["reserved_until"]:
             expiry_line = f"\n   ⏳ {format_expiry_time(row['reserved_until'])}"
+
         lines.append(
             f"{icon} <b>{invoice(row['id'])}</b>\n"
-            f"   Status: {html.escape(row['status'])}\n"
+            f"   Status: {html.escape(display_status)}\n"
             f"   Total: {rupiah(row['payment_total'] or row['total'])}"
             f"{expiry_line}"
         )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📩 Kirim Ulang Akun Terakhir", callback_data="resend:last")]
+    kb_rows=[]
+    if any(
+        row["status"]=="completed"
+        and row["fulfillment_status"]=="delivered"
+        and (row["delivery_text"] or "").strip()
+        for row in rows
+    ):
+        kb_rows.append([
+            InlineKeyboardButton(
+                text="📩 Kirim Ulang Akun Terakhir",
+                callback_data="resend:last"
+            )
+        ])
+
+    kb_rows.append([
+        InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")
     ])
 
-    await message.answer("\n\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    await message.answer(
+        "\n\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        parse_mode="HTML"
+    )
 
 
 @router.message(F.text == "💰 Isi Saldo")
@@ -18429,8 +18794,8 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
             "❌ <b>BUKTI PEMBAYARAN DITOLAK</b>\n\n"
             f"🧾 {inv}\n"
             f"Alasan: <b>{html.escape(reason)}</b>\n\n"
-            "Silakan kirim ulang bukti yang benar selama invoice masih berlaku.",
-            reply_markup=payment_proof_keyboard(entity, entity_id),
+            "Bukti pembayaran untuk invoice ini tidak dapat dikirim ulang.",
+            reply_markup=proof_rejected_keyboard(entity, entity_id),
             parse_mode="HTML"
         )
     except Exception:
@@ -18557,6 +18922,7 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
         f"• Duplicate paid event: <b>{payment['duplicate_paid_events']}</b>",
         "",
         f"• Auto Recovery: <b>{'ON' if get_setting('auto_recovery_enabled','1') == '1' else 'OFF'}</b>",
+        f"• Smart Alert: <b>{'ON' if get_setting('smart_alert_enabled','0') == '1' else 'OFF'}</b>",
         "• FSM Storage: <b>SQLite Persistent</b>",
         "• Drop Pending Updates: <b>OFF</b>",
         "• Event Isolation: <b>ON</b>",
@@ -20807,21 +21173,48 @@ async def owner_selftest_v2(call: CallbackQuery,bot: Bot):
 async def owner_smart_alert_status(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
+
     conn=db()
     _signature,data=smart_alert_signature(conn)
     conn.close()
+    enabled=get_setting("smart_alert_enabled","0")=="1"
+
     await safe_edit_or_answer(
         call,
         "🔔 <b>SMART ALERT OWNER</b>\n\n"
+        f"Status otomatis: <b>{'ON' if enabled else 'OFF'}</b>\n\n"
         f"💰 Paid belum terkirim: <b>{data['paid_pending']}</b>\n"
         f"📨 Delivery gagal: <b>{data['failed_delivery']}</b>\n"
         f"⚠️ Stok rendah: <b>{data['low']}</b>\n"
         f"❌ Stok kosong: <b>{data['empty']}</b>\n"
         f"📎 Bukti menunggu: <b>{data['proofs']}</b>\n\n"
-        "Notifikasi otomatis hanya dikirim saat kondisi berubah.",
-        reply_markup=owner_system_menu(),parse_mode="HTML"
+        "Smart Alert <b>tidak aktif otomatis saat deploy/redeploy</b>.",
+        reply_markup=owner_smart_alert_menu(),
+        parse_mode="HTML"
     )
     await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:smart_alert_on")
+async def owner_smart_alert_enable(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    set_setting("smart_alert_enabled","1")
+    # Reset signature so owner gets the next meaningful state once, not stale spam.
+    set_setting("smart_alert_signature","")
+    await call.answer("Smart Alert diaktifkan.",show_alert=True)
+    await owner_smart_alert_status(call)
+
+
+@router.callback_query(F.data == "owner:smart_alert_off")
+async def owner_smart_alert_disable(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    set_setting("smart_alert_enabled","0")
+    await call.answer("Smart Alert dinonaktifkan.",show_alert=True)
+    await owner_smart_alert_status(call)
 
 
 
@@ -20975,9 +21368,11 @@ async def owner_recovery_smart_alert(call: CallbackQuery):
     conn=db()
     _sig,data=smart_alert_signature(conn)
     conn.close()
+    enabled=get_setting("smart_alert_enabled","0")=="1"
     await safe_edit_or_answer(
         call,
         "🔔 <b>SMART ALERT • RECOVERY</b>\n\n"
+        f"Status otomatis: <b>{'ON' if enabled else 'OFF'}</b>\n\n"
         f"💰 Paid belum terkirim: <b>{data['paid_pending']}</b>\n"
         f"📨 Delivery gagal: <b>{data['failed_delivery']}</b>\n"
         f"⚠️ Stok rendah: <b>{data['low']}</b>\n"
@@ -21277,7 +21672,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.2"
+EXPECTED_SOURCE_VERSION = "16.6"
 
 
 def source_integrity_self_test():
