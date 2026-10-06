@@ -13,6 +13,7 @@ import hmac
 import base64
 import html
 import asyncio
+import ast
 import shutil
 import tempfile
 from pathlib import Path
@@ -26,7 +27,7 @@ from Crypto.Signature import pkcs1_15
 from Crypto.Hash import SHA256
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramBadRequest
+from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramBadRequest, TelegramConflictError
 from aiogram.utils.backoff import BackoffConfig
 from aiogram.filters import Command, Filter
 from aiogram.types import (
@@ -88,7 +89,45 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "11.7"
+BOT_VERSION = "12.1"
+
+RAILWAY_DEPLOYMENT_ID = os.getenv("RAILWAY_DEPLOYMENT_ID","").strip()
+RAILWAY_REPLICA_ID = os.getenv("RAILWAY_REPLICA_ID","").strip()
+RAILWAY_GIT_COMMIT_SHA = os.getenv("RAILWAY_GIT_COMMIT_SHA","").strip()
+RAILWAY_ENVIRONMENT_NAME = os.getenv("RAILWAY_ENVIRONMENT_NAME","").strip()
+RAILWAY_SERVICE_NAME = os.getenv("RAILWAY_SERVICE_NAME","").strip()
+
+
+def deployment_fingerprint():
+    return {
+        "version": BOT_VERSION,
+        "deployment_id": RAILWAY_DEPLOYMENT_ID or "-",
+        "replica_id": RAILWAY_REPLICA_ID or "-",
+        "commit": (RAILWAY_GIT_COMMIT_SHA[:12] if RAILWAY_GIT_COMMIT_SHA else "-"),
+        "environment": RAILWAY_ENVIRONMENT_NAME or "-",
+        "service": RAILWAY_SERVICE_NAME or "-",
+    }
+
+
+def log_startup_banner():
+    fp=deployment_fingerprint()
+    logging.info(
+        "=== MABOYY DIGITAL STARTUP v%s | deploy=%s | replica=%s | commit=%s | env=%s | service=%s ===",
+        fp["version"],
+        fp["deployment_id"],
+        fp["replica_id"],
+        fp["commit"],
+        fp["environment"],
+        fp["service"],
+    )
+    logging.info(
+        "Runtime source=%s | re_module=%s | db=%s",
+        os.path.abspath(__file__),
+        getattr(re,"__file__","builtin"),
+        DB_PATH,
+    )
+
+
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -523,6 +562,17 @@ def init_db():
 
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ok',
+            detail TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS system_errors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             module TEXT NOT NULL,
@@ -653,6 +703,8 @@ def init_db():
     add_column_if_missing(conn, "topups", "verified_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "verified_by", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "topups", "expires_at", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "topups", "updated_at", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "topups", "payment_review_status", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "cashback_applied", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "payment_verified_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "payment_verified_by", "INTEGER NOT NULL DEFAULT 0")
@@ -661,6 +713,12 @@ def init_db():
     add_column_if_missing(conn, "orders", "payment_proof_type", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "payment_proof_submitted_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "payment_reject_reason", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "delivery_intro_sent", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "orders", "delivery_chunks_sent", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "orders", "account_sent", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "orders", "invoice_sent", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "orders", "delivery_footer_sent", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "orders", "payment_review_status", "TEXT DEFAULT ''")
 
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_inventory_variant_status "
@@ -1489,66 +1547,129 @@ def split_delivery_text(delivery_text: str, max_chars: int = 3200):
 
 
 async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_text: str):
-    temp_paths = []
+    """
+    Resume-safe delivery:
+    - account credentials first
+    - per-chunk progress persisted
+    - invoice only after account delivery completes
+    - recovery resumes from the next unsent chunk
+    """
+    conn=db()
+    order=conn.execute("SELECT * FROM orders WHERE id=?",(order_id,)).fetchone()
+    conn.close()
+    if not order:
+        raise RuntimeError("Order tidak ditemukan saat delivery.")
 
-    # 1) Send professional PAID invoice image.
-    try:
-        temp_paths = create_success_invoice_images(order_id, delivery_text)
-        if temp_paths:
-            await bot.send_photo(
-                user_id,
-                FSInputFile(str(temp_paths[0])),
-                caption=(
-                    "✅ <b>PEMBAYARAN BERHASIL</b>\n"
-                    f"🧾 Invoice: <b>{invoice(order_id)}</b>\n\n"
-                    "Invoice pembayaran berhasil terlampir."
-                ),
-                parse_mode="HTML"
-            )
-    except Exception as exc:
-        logging.exception("Invoice image render failed for order %s: %s", order_id, exc)
-        try:
-            await bot.send_message(
-                user_id,
-                professional_invoice_for_order(order_id)
-                + "\n\n✅ <b>Pembayaran berhasil.</b>",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-    finally:
-        for path in temp_paths:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+    chunks=split_delivery_text(delivery_text)
 
-    # 2) Send account data separately as text.
-    chunks = split_delivery_text(delivery_text)
+    if int(order["delivery_intro_sent"] or 0)==0:
+        await bot.send_message(
+            user_id,
+            "🎁 <b>DETAIL AKUN PREMIUM</b>\n\n"
+            f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+            f"📦 Total bagian: <b>{len(chunks)}</b>\n\n"
+            "Data akun dikirim terpisah dari invoice:",
+            parse_mode="HTML"
+        )
+        conn=db()
+        conn.execute(
+            "UPDATE orders SET delivery_intro_sent=1 WHERE id=?",
+            (order_id,)
+        )
+        conn.commit(); conn.close()
 
-    await bot.send_message(
-        user_id,
-        "🎁 <b>DETAIL AKUN PREMIUM</b>\n\n"
-        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
-        f"📦 Total data: <b>{len([line for line in (delivery_text or '').splitlines() if line.strip()])}</b>\n\n"
-        "Data akun dikirim terpisah dari invoice:",
-        parse_mode="HTML"
-    )
+    conn=db()
+    current=conn.execute("SELECT delivery_chunks_sent FROM orders WHERE id=?",(order_id,)).fetchone()
+    conn.close()
+    sent_count=int(current["delivery_chunks_sent"] or 0) if current else 0
 
-    for chunk in chunks:
+    for index,chunk in enumerate(chunks):
+        if index < sent_count:
+            continue
         await bot.send_message(
             user_id,
             f"<pre>{html.escape(chunk)}</pre>",
             parse_mode="HTML"
         )
+        conn=db()
+        conn.execute(
+            """UPDATE orders
+               SET delivery_chunks_sent=?
+               WHERE id=? AND delivery_chunks_sent<?""",
+            (index+1,order_id,index+1)
+        )
+        conn.commit(); conn.close()
 
-    await bot.send_message(
-        user_id,
-        "🔒 Simpan akun dengan aman dan jangan membagikannya kepada orang lain.\n\n"
-        f"<i>{STORE_FOOTER}</i>",
-        parse_mode="HTML"
+    conn=db()
+    conn.execute(
+        "UPDATE orders SET account_sent=1 WHERE id=?",
+        (order_id,)
     )
+    conn.commit(); conn.close()
 
+    # Invoice is best-effort and never controls account fulfillment success.
+    conn=db()
+    fresh=conn.execute("SELECT invoice_sent FROM orders WHERE id=?",(order_id,)).fetchone()
+    conn.close()
+    if fresh and int(fresh["invoice_sent"] or 0)==0:
+        temp_paths=[]
+        invoice_ok=False
+        try:
+            temp_paths=create_success_invoice_images(order_id,delivery_text)
+            if temp_paths:
+                await bot.send_photo(
+                    user_id,
+                    FSInputFile(str(temp_paths[0])),
+                    caption=(
+                        "✅ <b>PEMBAYARAN BERHASIL</b>\n"
+                        f"🧾 Invoice: <b>{invoice(order_id)}</b>"
+                    ),
+                    parse_mode="HTML"
+                )
+                invoice_ok=True
+            else:
+                await bot.send_message(
+                    user_id,
+                    professional_invoice_for_order(order_id)
+                    + "\n\n✅ <b>Pembayaran berhasil.</b>",
+                    parse_mode="HTML"
+                )
+                invoice_ok=True
+        except Exception as exc:
+            logging.exception("Invoice send failed order %s: %s",order_id,exc)
+        finally:
+            for path in temp_paths:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+        if invoice_ok:
+            conn=db()
+            conn.execute("UPDATE orders SET invoice_sent=1 WHERE id=?",(order_id,))
+            conn.commit(); conn.close()
+
+    # Footer is cosmetic but tracked too, so retry does not duplicate it.
+    conn=db()
+    footer_state=conn.execute(
+        "SELECT delivery_footer_sent FROM orders WHERE id=?",
+        (order_id,)
+    ).fetchone()
+    conn.close()
+
+    if footer_state and int(footer_state["delivery_footer_sent"] or 0)==0:
+        await bot.send_message(
+            user_id,
+            "🔒 Simpan akun dengan aman dan jangan membagikannya kepada orang lain.\n\n"
+            f"<i>{STORE_FOOTER}</i>",
+            parse_mode="HTML"
+        )
+        conn=db()
+        conn.execute(
+            "UPDATE orders SET delivery_footer_sent=1 WHERE id=?",
+            (order_id,)
+        )
+        conn.commit(); conn.close()
 
 
 
@@ -1675,6 +1796,14 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
 
     try:
         await send_delivery_payload(bot, order["user_id"], order_id, delivery_text)
+        conn=db()
+        delivery_state=conn.execute(
+            "SELECT account_sent FROM orders WHERE id=?",
+            (order_id,)
+        ).fetchone()
+        conn.close()
+        if not delivery_state or int(delivery_state["account_sent"] or 0)!=1:
+            raise RuntimeError("Account delivery belum selesai.")
     except Exception as exc:
         conn = db()
         conn.execute(
@@ -1766,6 +1895,128 @@ async def fulfill_pending_for_variant(variant_id: int, bot: Bot):
     for row in rows:
         await fulfill_order(row["id"], bot)
 
+
+
+
+def database_health_report():
+    conn=db()
+    try:
+        integrity=str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+        fk_rows=conn.execute("PRAGMA foreign_key_check").fetchall()
+
+        orphan_inventory=conn.execute(
+            """SELECT COUNT(*) AS n FROM inventory_items i
+               LEFT JOIN product_variants v ON v.id=i.variant_id
+               WHERE v.id IS NULL"""
+        ).fetchone()["n"]
+
+        allocated_no_order=conn.execute(
+            """SELECT COUNT(*) AS n FROM inventory_items i
+               LEFT JOIN orders o ON o.id=i.order_id
+               WHERE i.status='allocated'
+                 AND (i.order_id IS NULL OR o.id IS NULL)"""
+        ).fetchone()["n"]
+
+        paid_no_variant=conn.execute(
+            """SELECT COUNT(*) AS n FROM orders o
+               LEFT JOIN product_variants v ON v.id=o.variant_id
+               WHERE o.payment_status='paid'
+                 AND o.fulfillment_status!='delivered'
+                 AND v.id IS NULL"""
+        ).fetchone()["n"]
+
+        completed_not_delivered=conn.execute(
+            """SELECT COUNT(*) AS n FROM orders
+               WHERE status='completed'
+                 AND fulfillment_status!='delivered'"""
+        ).fetchone()["n"]
+
+        negative_reserved=conn.execute(
+            "SELECT COUNT(*) AS n FROM product_variants WHERE reserved_stock<0"
+        ).fetchone()["n"]
+
+        return {
+            "integrity":integrity,
+            "foreign_key_issues":len(fk_rows),
+            "orphan_inventory":int(orphan_inventory or 0),
+            "allocated_no_order":int(allocated_no_order or 0),
+            "paid_no_variant":int(paid_no_variant or 0),
+            "completed_not_delivered":int(completed_not_delivered or 0),
+            "negative_reserved":int(negative_reserved or 0),
+        }
+    finally:
+        conn.close()
+
+
+def repair_database_health():
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+    repaired={
+        "allocated_returned":0,
+        "reserved_fixed":0,
+        "completed_fixed":0,
+        "stock_synced":0,
+    }
+    try:
+        cur=conn.execute(
+            """UPDATE inventory_items
+               SET status='available', order_id=NULL
+               WHERE status='allocated'
+                 AND (
+                    order_id IS NULL
+                    OR NOT EXISTS(SELECT 1 FROM orders o WHERE o.id=inventory_items.order_id)
+                 )"""
+        )
+        repaired["allocated_returned"]=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            "UPDATE product_variants SET reserved_stock=0 WHERE reserved_stock<0"
+        )
+        repaired["reserved_fixed"]=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            """UPDATE orders
+               SET fulfillment_status='delivered'
+               WHERE status='completed'
+                 AND account_sent=1
+                 AND fulfillment_status!='delivered'"""
+        )
+        repaired["completed_fixed"]=max(0,int(cur.rowcount or 0))
+
+        variants=conn.execute("SELECT id FROM product_variants").fetchall()
+        for row in variants:
+            sync_variant_stock_from_inventory(conn,int(row["id"]))
+        repaired["stock_synced"]=len(variants)
+
+        conn.commit()
+        return repaired
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def demo_isolation_self_test():
+    """Static/runtime invariants: demo must not create production entities."""
+    forbidden={
+        "mark_order_paid","fulfill_order","verify_topup_atomic",
+        "create_product_from_wizard","create_variant_from_wizard",
+        "sync_variant_stock_from_inventory"
+    }
+    source=Path(__file__).read_text(encoding="utf-8")
+    tree=ast.parse(source)
+    issues=[]
+    for node in tree.body:
+        if isinstance(node,ast.AsyncFunctionDef) and node.name.startswith("user_demo_"):
+            calls={
+                sub.func.id for sub in ast.walk(node)
+                if isinstance(sub,ast.Call) and isinstance(sub.func,ast.Name)
+            }
+            leak=sorted(calls & forbidden)
+            if leak:
+                issues.append(f"{node.name}: {','.join(leak)}")
+    return len(issues)==0,issues
 
 
 def system_health_snapshot():
@@ -3298,9 +3549,9 @@ def verify_topup_atomic(topup_id: int, actor_id: int):
     now = datetime.now().isoformat(timespec="seconds")
     updated = conn.execute(
         """UPDATE topups
-           SET status='processing', verified_at=?, verified_by=?
+           SET status='processing', verified_at=?, verified_by=?, updated_at=?
            WHERE id=? AND status IN ('pending','expired')""",
-        (now, actor_id, topup_id)
+        (now, actor_id, now, topup_id)
     ).rowcount
 
     if updated != 1:
@@ -3337,9 +3588,9 @@ def verify_topup_atomic(topup_id: int, actor_id: int):
 
     conn.execute(
         """UPDATE topups
-           SET status='completed'
+           SET status='completed', updated_at=?
            WHERE id=? AND status='processing'""",
-        (topup_id,)
+        (now, topup_id)
     )
 
     conn.commit()
@@ -3739,15 +3990,22 @@ async def auto_recovery_cycle(bot: Bot, source: str = "periodic"):
             report["inventory_mismatch"] = len(mismatches)
             report["inventory_repaired"] = repaired
 
-        # 3) Reset topups stuck in processing.
+        # 3) Reset ONLY genuinely stale topups stuck in processing.
+        # Fresh verification in progress must never be reverted by periodic recovery.
+        processing_cutoff=(datetime.now() - timedelta(minutes=15)).isoformat(timespec="seconds")
         conn = db()
         stuck = conn.execute(
-            "SELECT id FROM topups WHERE status='processing'"
+            """SELECT id FROM topups
+               WHERE status='processing'
+                 AND COALESCE(NULLIF(updated_at,''), created_at) < ?""",
+            (processing_cutoff,)
         ).fetchall()
         for row in stuck:
             conn.execute(
-                "UPDATE topups SET status='pending' WHERE id=? AND status='processing'",
-                (row["id"],)
+                """UPDATE topups
+                   SET status='pending', updated_at=?
+                   WHERE id=? AND status='processing'""",
+                (datetime.now().isoformat(timespec="seconds"),row["id"])
             )
         conn.commit()
         conn.close()
@@ -3963,6 +4221,24 @@ async def transaction_self_test():
         checks.append(("Wallet", int(negative)==0, f"{negative} negative"))
     except Exception as exc:
         checks.append(("Wallet", False, str(exc)[:100]))
+
+    # Database consistency
+    try:
+        health=database_health_report()
+        ok=(
+            str(health["integrity"]).lower()=="ok"
+            and health["allocated_no_order"]==0
+            and health["negative_reserved"]==0
+        )
+        checks.append(("Database Health",ok,f"orphan_alloc={health['allocated_no_order']}"))
+    except Exception as exc:
+        checks.append(("Database Health",False,str(exc)[:100]))
+
+    try:
+        demo_ok,demo_issues=demo_isolation_self_test()
+        checks.append(("Demo Isolation",demo_ok,"AMAN" if demo_ok else "; ".join(demo_issues)[:100]))
+    except Exception as exc:
+        checks.append(("Demo Isolation",False,str(exc)[:100]))
 
     # Payment config
     checks.append(("QRIS", bool(get_setting("qris_file_id","")), "configured" if get_setting("qris_file_id","") else "not set"))
@@ -4910,6 +5186,7 @@ async def mark_order_paid(
                    status='paid_pending_delivery',
                    payment_verified_at=?,
                    payment_verified_by=?,
+                   payment_review_status='verified',
                    payment_error=''
                WHERE id=?
                  AND payment_status!='paid'
@@ -4969,6 +5246,8 @@ class BundleState(StatesGroup):
 
 class OwnerState(StatesGroup):
     add_product = State()
+    search_order = State()
+    search_product = State()
     add_product_variant_price = State()
     add_product_variant_name = State()
     add_product_description = State()
@@ -5319,6 +5598,7 @@ def owner_stock_variant_actions(variant_id: int):
 def owner_products_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Tambah Produk", callback_data="owner:add_product")
+    kb.button(text="🔎 Cari Produk", callback_data="owner:search_products")
     kb.button(text="📦 Atur Stok", callback_data="owner:set_stock")
     kb.button(text="🔔 Alert Stok", callback_data="owner:low_stock")
     kb.button(text="📚 Riwayat Stok", callback_data="owner:inventory_log")
@@ -5336,6 +5616,7 @@ def owner_products_menu():
 def owner_orders_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🧾 Pesanan", callback_data="owner:orders")
+    kb.button(text="🔎 Cari Order/User", callback_data="owner:search_orders")
     kb.button(text="⏳ Order Pending", callback_data="owner:pending_orders")
     kb.button(text="✅ Verifikasi Pembayaran", callback_data="owner:verify_payments")
     kb.button(text="📥 Verifikasi via Bukti PM", callback_data="owner:proof_info")
@@ -5579,6 +5860,9 @@ def cleanup_data_counts():
             "system_errors": count(
                 "SELECT COUNT(*) AS n FROM system_errors"
             ),
+            "owner_audit_logs": count(
+                "SELECT COUNT(*) AS n FROM owner_audit_logs"
+            ),
             "daily_reports": count(
                 "SELECT COUNT(*) AS n FROM daily_report_history"
             ),
@@ -5627,6 +5911,10 @@ def cleanup_data_keyboard():
         [InlineKeyboardButton(
             text=f"🧯 Log Error ({counts['system_errors']})",
             callback_data="cleanup:preview:errors"
+        )],
+        [InlineKeyboardButton(
+            text=f"🛡️ Audit Owner ({counts['owner_audit_logs']})",
+            callback_data="cleanup:preview:audit_logs"
         )],
         [InlineKeyboardButton(
             text=f"📅 Riwayat Laporan ({counts['daily_reports']})",
@@ -5685,6 +5973,11 @@ def cleanup_preview_text(kind: str):
             "🧯 LOG ERROR SISTEM",
             counts["system_errors"],
             "Riwayat log error sistem. Transaksi user tidak ikut dihapus."
+        ),
+        "audit_logs": (
+            "🛡️ AUDIT OWNER",
+            counts["owner_audit_logs"],
+            "Riwayat aksi owner. Menghapus log ini tidak mengubah produk, order, saldo, atau stok."
         ),
         "daily_reports": (
             "📅 RIWAYAT LAPORAN HARIAN",
@@ -6107,6 +6400,10 @@ def cleanup_execute(kind: str):
             cur=conn.execute("DELETE FROM system_errors")
             result["errors"]=max(0,int(cur.rowcount or 0))
 
+        if kind=="audit_logs":
+            cur=conn.execute("DELETE FROM owner_audit_logs")
+            result["audit_logs"]=max(0,int(cur.rowcount or 0))
+
         if kind=="daily_reports":
             cur=conn.execute("DELETE FROM daily_report_history")
             result["daily_reports"]=max(0,int(cur.rowcount or 0))
@@ -6134,6 +6431,7 @@ def cleanup_execute(kind: str):
 def owner_system_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🩺 Diagnostik Sistem", callback_data="owner:diagnostics")
+    kb.button(text="🧬 Database Health", callback_data="owner:db_health")
     kb.button(text="📨 Test PM Owner", callback_data="owner:test_pm")
     kb.button(text="📢 Test Channel", callback_data="owner:test_channel")
     kb.button(text="🛟 Safe Mode", callback_data="owner:safe_mode")
@@ -6434,6 +6732,56 @@ def variant_card(product, variant, qty=1):
 # =========================
 # PUBLIC COMMANDS (ONLY 3)
 # =========================
+
+
+def owner_audit(owner_id: int, action: str, status: str = "ok", detail: str = ""):
+    try:
+        conn=db()
+        conn.execute(
+            """INSERT INTO owner_audit_logs(owner_id,action,status,detail,created_at)
+               VALUES(?,?,?,?,?)""",
+            (
+                int(owner_id),
+                str(action)[:180],
+                str(status)[:30],
+                str(detail)[:500],
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logging.exception("Owner audit log failed.")
+
+
+class OwnerAuditMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user_id=int(getattr(getattr(event,"from_user",None),"id",0) or 0)
+        callback_data=str(getattr(event,"data","") or "")
+
+        if user_id and is_owner(user_id):
+            # Any navigation away from QRIS upload clears the old image-upload flag.
+            if callback_data != "owner:qris_set":
+                try:
+                    set_setting("qris_upload_pending","0")
+                except Exception:
+                    pass
+
+            try:
+                result=await handler(event,data)
+                owner_audit(user_id,callback_data or "callback","ok")
+                return result
+            except Exception as exc:
+                owner_audit(
+                    user_id,
+                    callback_data or "callback",
+                    "error",
+                    f"{type(exc).__name__}: {str(exc)[:350]}"
+                )
+                raise
+
+        return await handler(event,data)
+
 
 class CallbackTraceMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -7010,6 +7358,7 @@ async def payment_proof_invalid(message: Message):
 
 @router.message(Command("owner"))
 async def owner(message: Message, state: FSMContext):
+    set_setting("qris_upload_pending","0")
     await state.clear()
     if not is_owner(message.from_user.id):
         return await message.answer(owner_access_denied_text(), parse_mode="HTML")
@@ -7209,82 +7558,29 @@ async def demo_command(message: Message):
 
 
 @router.message(Command("ping"))
-async def ping(message: Message, bot: Bot):
+async def ping_command(message: Message):
     if not is_owner(message.from_user.id):
-        return await message.answer(
-            "⛔ <b>AKSES DITOLAK</b>\n\n"
-            "Command <code>/ping</code> khusus owner.",
-            parse_mode="HTML"
-        )
+        return await message.answer("⛔ Command /ping khusus owner.")
 
-    ready, checks, blockers = await launch_readiness_report(bot)
-
-    now = jakarta_now()
-    uptime_seconds = int(time.time() - START_TIME)
-    uptime_text = format_uptime_detail(uptime_seconds)
-
-    hari_indonesia = {
-        "Monday": "Senin",
-        "Tuesday": "Selasa",
-        "Wednesday": "Rabu",
-        "Thursday": "Kamis",
-        "Friday": "Jumat",
-        "Saturday": "Sabtu",
-        "Sunday": "Minggu",
-    }
-
-    bulan_indonesia = {
-        1: "Januari", 2: "Februari", 3: "Maret", 4: "April",
-        5: "Mei", 6: "Juni", 7: "Juli", 8: "Agustus",
-        9: "September", 10: "Oktober", 11: "November", 12: "Desember"
-    }
-
-    day_name = hari_indonesia.get(now.strftime("%A"), now.strftime("%A"))
-    now_date = f"{day_name}, {now.day} {bulan_indonesia[now.month]} {now.year}"
-    now_time = now.strftime("%H:%M:%S WIB")
-
-
-    lines = [
-        ("🟢" if ready else "🔴")
-        + f" <b>STATUS BOT: {'SIAP' if ready else 'PERLU DICEK'}</b>",
-        "",
-        "🤖 <b>INFORMASI BOT</b>",
-        f"• Versi: <b>v{BOT_VERSION}</b>",
-        f"• Tanggal: <b>{now_date}</b>",
-        f"• Jam: <b>{now_time}</b>",
-        f"• Runtime: <b>{uptime_text}</b>",
-        "",
-        "🩺 <b>STATUS SISTEM</b>",
-    ]
-
-    for name, ok, detail in checks:
-        lines.append(
-            f"{'✅' if ok else '❌'} <b>{html.escape(name)}</b>: "
-            f"{html.escape(str(detail))}"
-        )
-
-    if blockers:
-        lines += [
-            "",
-            "⚠️ <b>Yang perlu diperbaiki:</b>",
-            *[f"• {html.escape(name)}" for name in blockers]
-        ]
-    else:
-        lines += [
-            "",
-            "✅ <b>Tidak ada blocker utama terdeteksi.</b>"
-        ]
+    fp=deployment_fingerprint()
+    re_ok=False
+    try:
+        re_ok=parse_rupiah_input("Rp2.500")==2500
+    except Exception:
+        re_ok=False
 
     await message.answer(
-        "\n".join(lines),
+        "🏓 <b>MABOYY DIGITAL STATUS</b>\n\n"
+        f"Versi aktif: <b>v{html.escape(BOT_VERSION)}</b>\n"
+        f"Deployment: <code>{html.escape(fp['deployment_id'])}</code>\n"
+        f"Replica: <code>{html.escape(fp['replica_id'])}</code>\n"
+        f"Commit: <code>{html.escape(fp['commit'])}</code>\n"
+        f"Environment: <b>{html.escape(fp['environment'])}</b>\n"
+        f"Parser harga/re: <b>{'OK' if re_ok else 'ERROR'}</b>\n"
+        f"Database: <code>{html.escape(DB_PATH)}</code>\n\n"
+        "Jika versi di sini bukan versi ZIP terbaru, Railway masih menjalankan deployment lama.",
         parse_mode="HTML"
     )
-
-
-
-# =========================
-# USER FLOW
-# =========================
 
 @router.callback_query(F.data == "verify_join")
 async def verify_join(call: CallbackQuery, bot: Bot, state: FSMContext):
@@ -10456,7 +10752,11 @@ async def owner_pending_orders(call: CallbackQuery):
                 f"<b>{invoice(row['id'])}</b> • {status_label}\n"
                 f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
                 f"{html.escape(row['variant_name'] or 'Varian lama')}\n"
-                f"🔢 {int(row['qty'] or 0)} • 👤 <code>{int(row['user_id'])}</code>"
+                f"🔢 {int(row['qty'] or 0)} • 👤 <code>{int(row['user_id'])}</code>\n"
+                f"💳 Payment: <b>{html.escape(row['payment_status'] or '-')}</b> • "
+                f"Fulfillment: <b>{html.escape(row['fulfillment_status'] or '-')}</b>\n"
+                f"💰 {rupiah(row['payment_total'] or row['total'])} • "
+                f"🕒 {html.escape((row['created_at'] or '-')[:19])}"
             )
 
             if paid and int(row["variant_id"] or 0):
@@ -10474,6 +10774,13 @@ async def owner_pending_orders(call: CallbackQuery):
                         )
                     ])
             elif not paid:
+                if (row["proof_file_id"] or row["payment_proof_file_id"]):
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            text=f"✅ Verifikasi {invoice(row['id'])}",
+                            callback_data=f"verifypay:view:{row['id']}"
+                        )
+                    ])
                 keyboard.append([
                     InlineKeyboardButton(
                         text=f"❌ Batalkan {invoice(row['id'])}",
@@ -12961,6 +13268,137 @@ async def owner_verify_order_button(call: CallbackQuery, bot: Bot):
 # =========================
 # PERSISTENT USER MENU
 # =========================
+
+@router.callback_query(F.data == "owner:search_orders")
+async def owner_search_orders_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.set_state(OwnerState.search_order)
+    await safe_edit_or_answer(
+        call,
+        "🔎 <b>CARI ORDER / USER</b>\n\n"
+        "Kirim salah satu:\n"
+        "• nomor invoice, contoh <code>12</code> atau <code>INV-000012</code>\n"
+        "• Telegram user ID\n"
+        "• username tanpa @",
+        reply_markup=back_owner("owner:menu_orders"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.search_order)
+async def owner_search_orders_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    q=(message.text or "").strip()
+    if not q:
+        return await message.answer("Kata pencarian kosong.")
+
+    numeric=re.sub(r"[^0-9]","",q)
+    conn=db()
+    params=[]
+    clauses=[]
+
+    if numeric:
+        value=int(numeric)
+        clauses.extend(["o.id=?","o.user_id=?"])
+        params.extend([value,value])
+
+    username=q.lstrip("@").strip()
+    if username:
+        clauses.append("LOWER(COALESCE(o.username,''))=LOWER(?)")
+        params.append(username)
+
+    sql="""SELECT o.*,p.name AS product_name,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE """ + (" OR ".join(clauses) if clauses else "0") + """
+           ORDER BY o.id DESC LIMIT 20"""
+    rows=conn.execute(sql,tuple(params)).fetchall()
+    conn.close()
+    await state.clear()
+
+    lines=["🔎 <b>HASIL PENCARIAN ORDER</b>",""]
+    if not rows:
+        lines.append("Tidak ditemukan.")
+    else:
+        for row in rows:
+            lines.append(
+                f"<b>{invoice(row['id'])}</b> • {html.escape(row['status'])}\n"
+                f"👤 @{html.escape(row['username'] or '-')} • <code>{row['user_id']}</code>\n"
+                f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
+                f"{html.escape(row['variant_name'] or '-')}\n"
+                f"💰 {rupiah(row['payment_total'] or row['total'])}"
+            )
+
+    await message.answer(
+        "\n\n".join(lines),
+        reply_markup=owner_orders_menu(),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "owner:search_products")
+async def owner_search_products_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.set_state(OwnerState.search_product)
+    await safe_edit_or_answer(
+        call,
+        "🔎 <b>CARI PRODUK</b>\n\nKirim nama produk atau bagian namanya.",
+        reply_markup=back_owner("owner:back_products"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.search_product)
+async def owner_search_products_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    q=(message.text or "").strip()
+    if not q:
+        return await message.answer("Nama produk kosong.")
+
+    conn=db()
+    rows=conn.execute(
+        """SELECT p.id,p.name,p.active,p.sold,
+                  COUNT(DISTINCT v.id) AS variants,
+                  COALESCE(SUM(CASE WHEN i.status='available' THEN 1 ELSE 0 END),0) AS stock
+           FROM products p
+           LEFT JOIN product_variants v ON v.product_id=p.id
+           LEFT JOIN inventory_items i ON i.variant_id=v.id
+           WHERE LOWER(p.name) LIKE LOWER(?)
+           GROUP BY p.id,p.name,p.active,p.sold
+           ORDER BY p.active DESC,p.id DESC LIMIT 20""",
+        (f"%{q}%",)
+    ).fetchall()
+    conn.close()
+    await state.clear()
+
+    lines=["🔎 <b>HASIL PENCARIAN PRODUK</b>",""]
+    if not rows:
+        lines.append("Produk tidak ditemukan.")
+    else:
+        for row in rows:
+            lines.append(
+                f"• <b>{html.escape(row['name'])}</b> "
+                f"({'AKTIF' if int(row['active'] or 0) else 'NONAKTIF'})\n"
+                f"  ID {row['id']} • Terjual {int(row['sold'] or 0)} • "
+                f"Varian {int(row['variants'] or 0)} • Stok {int(row['stock'] or 0)}"
+            )
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=owner_products_menu(),
+        parse_mode="HTML"
+    )
+
+
 @router.message(F.text == "🏷️ List Produk")
 async def reply_menu_products(message: Message, bot: Bot):
     if not await is_channel_member(bot, message.from_user.id):
@@ -14065,6 +14503,23 @@ async def global_error_handler(event: ErrorEvent):
     exc=event.exception
     update=event.update
 
+    if isinstance(exc, TelegramConflictError):
+        logging.critical(
+            "Telegram polling conflict: another bot instance is using the same token: %s",
+            exc
+        )
+        try:
+            log_system_error(
+                "POLLING_CONFLICT",
+                str(exc),
+                reference="single-instance",
+                severity="critical",
+                recovered=False
+            )
+        except Exception:
+            pass
+        return True
+
     if isinstance(exc, TelegramRetryAfter):
         wait_seconds=max(1,int(getattr(exc,"retry_after",1) or 1))
         logging.warning("Telegram rate limit: retry_after=%s", wait_seconds)
@@ -14270,7 +14725,7 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
         row = conn.execute("SELECT * FROM orders WHERE id=?", (entity_id,)).fetchone()
         if row:
             conn.execute(
-                "UPDATE orders SET payment_reject_reason=? WHERE id=?",
+                "UPDATE orders SET payment_reject_reason=?, payment_review_status='rejected' WHERE id=?",
                 (reason, entity_id)
             )
     else:
@@ -14328,6 +14783,21 @@ async def owner_proof_pending(call: CallbackQuery):
     if not row:
         return await call.answer("Transaksi tidak ditemukan.", show_alert=True)
 
+    if entity=="order":
+        conn=db()
+        conn.execute(
+            "UPDATE orders SET payment_review_status='reviewing' WHERE id=?",
+            (entity_id,)
+        )
+        conn.commit(); conn.close()
+    elif entity=="topup":
+        conn=db()
+        conn.execute(
+            "UPDATE topups SET payment_review_status='reviewing', updated_at=? WHERE id=?",
+            (datetime.now().isoformat(timespec="seconds"),entity_id)
+        )
+        conn.commit(); conn.close()
+
     try:
         await call.message.edit_caption(
             caption=payment_proof_caption(entity, row) + "\n\n⏳ <b>MENUNGGU PEMERIKSAAN</b>",
@@ -14351,6 +14821,9 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
     icon = "🟢" if score >= 90 else "🟡" if score >= 70 else "🔴"
     lines = [
         f"{icon} <b>DIAGNOSTIK SISTEM • {score}%</b>",
+        f"• Bot Version: <b>v{html.escape(BOT_VERSION)}</b>",
+        f"• Deployment ID: <code>{html.escape(RAILWAY_DEPLOYMENT_ID or '-')}</code>",
+        f"• Commit: <code>{html.escape((RAILWAY_GIT_COMMIT_SHA[:12] if RAILWAY_GIT_COMMIT_SHA else '-'))}</code>",
         "",
         "📊 <b>Ringkasan</b>",
         f"• Produk aktif: <b>{snap['active_products']}</b>",
@@ -14424,6 +14897,107 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
         reply_markup=owner_system_menu(),
         parse_mode="HTML"
     )
+
+
+
+@router.callback_query(F.data == "owner:db_health")
+async def owner_db_health(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    report=database_health_report()
+    demo_ok,demo_issues=demo_isolation_self_test()
+
+    lines=[
+        "🩺 <b>DATABASE HEALTH</b>","",
+        f"SQLite integrity: <b>{html.escape(report['integrity'])}</b>",
+        f"Foreign key issues: <b>{report['foreign_key_issues']}</b>",
+        f"Orphan inventory: <b>{report['orphan_inventory']}</b>",
+        f"Allocated tanpa order: <b>{report['allocated_no_order']}</b>",
+        f"Paid tanpa variant: <b>{report['paid_no_variant']}</b>",
+        f"Completed belum delivered: <b>{report['completed_not_delivered']}</b>",
+        f"Negative reserved: <b>{report['negative_reserved']}</b>",
+        f"Demo isolation: <b>{'AMAN' if demo_ok else 'BERMASALAH'}</b>",
+    ]
+    if demo_issues:
+        lines.extend([""]+[f"• {html.escape(x)}" for x in demo_issues[:5]])
+
+    await safe_edit_or_answer(
+        call,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔧 Repair Aman",callback_data="owner:db_repair")],
+            [InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:back_system")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:db_repair")
+async def owner_db_repair(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    repaired=repair_database_health()
+    owner_audit(call.from_user.id,"database_repair","ok",json.dumps(repaired))
+
+    await safe_edit_or_answer(
+        call,
+        "✅ <b>REPAIR DATABASE SELESAI</b>\n\n"
+        f"Allocated dikembalikan: <b>{repaired['allocated_returned']}</b>\n"
+        f"Reserved diperbaiki: <b>{repaired['reserved_fixed']}</b>\n"
+        f"Completed diperbaiki: <b>{repaired['completed_fixed']}</b>\n"
+        f"Variant stock disinkronkan: <b>{repaired['stock_synced']}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🩺 Cek Lagi",callback_data="owner:db_health")],
+            [InlineKeyboardButton(text="⬅️ Sistem",callback_data="owner:back_system")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+
+@router.callback_query(F.data == "owner:product_stats")
+async def owner_product_stats(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    rows=conn.execute(
+        """SELECT p.id,p.name,p.sold,
+                  COUNT(DISTINCT v.id) AS variants,
+                  COALESCE(SUM(CASE WHEN i.status='available' THEN 1 ELSE 0 END),0) AS available
+           FROM products p
+           LEFT JOIN product_variants v ON v.product_id=p.id
+           LEFT JOIN inventory_items i ON i.variant_id=v.id
+           WHERE p.active=1
+           GROUP BY p.id,p.name,p.sold
+           ORDER BY p.sold DESC,p.id
+           LIMIT 20"""
+    ).fetchall()
+    conn.close()
+
+    lines=["📈 <b>STATISTIK PRODUK</b>",""]
+    if not rows:
+        lines.append("Belum ada produk aktif.")
+    else:
+        for idx,row in enumerate(rows,1):
+            lines.append(
+                f"{idx}. <b>{html.escape(row['name'])}</b>\\n"
+                f"   Terjual: {int(row['sold'] or 0)} • "
+                f"Varian: {int(row['variants'] or 0)} • "
+                f"Stok akun: {int(row['available'] or 0)}"
+            )
+
+    await safe_edit_or_answer(
+        call,
+        "\\n".join(lines),
+        reply_markup=back_owner("owner:back_products"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data == "owner:diagnostics")
@@ -15396,10 +15970,17 @@ async def shopeepay_callback(request: web.Request):
 
 
 async def health(request: web.Request):
+    fp=deployment_fingerprint()
     return web.json_response({
         "status": "ok",
         "service": STORE_NAME,
-        "shopeepay_ready": shopeepay_ready()
+        "bot_version": BOT_VERSION,
+        "deployment_id": fp["deployment_id"],
+        "replica_id": fp["replica_id"],
+        "commit": fp["commit"],
+        "environment": fp["environment"],
+        "shopeepay_ready": shopeepay_ready(),
+        "db_path": DB_PATH,
     })
 
 
@@ -15453,6 +16034,25 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
+
+EXPECTED_SOURCE_VERSION = "12.1"
+
+
+def source_integrity_self_test():
+    if BOT_VERSION != EXPECTED_SOURCE_VERSION:
+        raise RuntimeError(
+            f"Source/version mismatch: BOT_VERSION={BOT_VERSION}, expected={EXPECTED_SOURCE_VERSION}"
+        )
+
+    if not callable(parse_rupiah_input):
+        raise RuntimeError("parse_rupiah_input tidak tersedia.")
+
+    if parse_rupiah_input("Rp2.500") != 2500:
+        raise RuntimeError("Parser harga gagal self-test.")
+
+    return True
+
+
 def runtime_dependency_self_test():
     """
     Fail fast before polling if critical runtime symbols/modules are unavailable.
@@ -15462,14 +16062,21 @@ def runtime_dependency_self_test():
 
     try:
         sample=re.sub(r"[^0-9]","","Rp2.500")
-        checks.append(("re", sample=="2500"))
+        checks.append(("re_global", sample=="2500"))
     except Exception:
-        checks.append(("re",False))
+        checks.append(("re_global",False))
+
+    try:
+        checks.append(("re_parser", parse_rupiah_input("Rp2.500")==2500))
+    except Exception:
+        checks.append(("re_parser",False))
 
     checks.append(("JAKARTA_TZ", str(JAKARTA_TZ)=="Asia/Jakarta"))
     checks.append(("main_menu", callable(main_menu)))
     checks.append(("parse_rupiah_input", callable(parse_rupiah_input)))
     checks.append(("fulfill_order", callable(fulfill_order)))
+    checks.append(("database_health_report", callable(database_health_report)))
+    checks.append(("demo_isolation_self_test", callable(demo_isolation_self_test)))
 
     failed=[name for name,ok in checks if not ok]
     if failed:
@@ -15484,7 +16091,9 @@ async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN belum diisi.")
 
+    source_integrity_self_test()
     runtime_dependency_self_test()
+    log_startup_banner()
     init_db()
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(
@@ -15492,16 +16101,21 @@ async def main():
         events_isolation=SimpleEventIsolation(),
     )
     dp.callback_query.outer_middleware(CallbackTraceMiddleware())
+    dp.callback_query.outer_middleware(OwnerAuditMiddleware())
     dp.include_router(router)
+
+    logging.info("STARTUP READY • MaboyyDigital v%s • deployment=%s", BOT_VERSION, RAILWAY_DEPLOYMENT_ID or "-")
 
     # Railway web endpoint for health check + payment callback.
     runner = await start_web_server(bot)
 
-    backup_task = asyncio.create_task(backup_loop(bot))
-    cleanup_task = asyncio.create_task(cleanup_expired_orders(bot))
-    asyncio.create_task(periodic_auto_recovery(bot))
-    recovery_task = asyncio.create_task(silent_recovery_loop(bot))
-    operations_task = asyncio.create_task(periodic_operations_loop(bot))
+    background_tasks = [
+        asyncio.create_task(backup_loop(bot), name="backup_loop"),
+        asyncio.create_task(cleanup_expired_orders(bot), name="cleanup_expired_orders"),
+        asyncio.create_task(periodic_auto_recovery(bot), name="periodic_auto_recovery"),
+        asyncio.create_task(silent_recovery_loop(bot), name="silent_recovery_loop"),
+        asyncio.create_task(periodic_operations_loop(bot), name="periodic_operations_loop"),
+    ]
 
     try:
         await bot.delete_webhook(drop_pending_updates=False)
@@ -15518,16 +16132,41 @@ async def main():
                 jitter=0.2
             ),
         )
+    except TelegramConflictError as exc:
+        logging.critical(
+            "BOT INSTANCE CONFLICT — pastikan Railway replica hanya 1: %s",
+            exc
+        )
+        try:
+            log_system_error(
+                "POLLING_CONFLICT",
+                str(exc),
+                reference="railway-single-instance",
+                severity="critical",
+                recovered=False
+            )
+        except Exception:
+            pass
+        raise
     finally:
-        backup_task.cancel()
-        cleanup_task.cancel()
-        recovery_task.cancel()
-        operations_task.cancel()
-        await runner.cleanup()
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+
+        try:
+            await runner.cleanup()
+        except Exception:
+            logging.exception("Web runner cleanup failed.")
+
         try:
             await dp.storage.close()
         except Exception:
-            pass
+            logging.exception("FSM storage close failed.")
+
+        try:
+            await bot.session.close()
+        except Exception:
+            logging.exception("Bot session close failed.")
 
 
 if __name__ == "__main__":
