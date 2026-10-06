@@ -90,7 +90,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "13.9"
+BOT_VERSION = "14.2"
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -772,8 +772,8 @@ def init_db():
         "qris_file_id": "",
         "payment_note": DEFAULT_PAYMENT_NOTE,
         "unique_code_enabled": "1",
-        "unique_code_min": "1",
-        "unique_code_max": "999",
+        "unique_code_min": "200",
+        "unique_code_max": "500",
         "payment_mode": "manual",
         "min_topup": "5000",
         "low_stock_threshold": "5",
@@ -801,6 +801,12 @@ def init_db():
         cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)", (k, v))
     cur.execute(
         "UPDATE settings SET value='1' WHERE key='unique_code_enabled'"
+    )
+    cur.execute(
+        "UPDATE settings SET value='200' WHERE key='unique_code_min'"
+    )
+    cur.execute(
+        "UPDATE settings SET value='500' WHERE key='unique_code_max'"
     )
 
     count = cur.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"]
@@ -1901,6 +1907,18 @@ async def send_review_prompt_if_needed(bot: Bot, order_id: int) -> bool:
 
     if row["status"]!="completed" or row["fulfillment_status"]!="delivered":
         return False
+
+    # OWNER_FREE is a stock take for an external buyer, not a store-rating event.
+    if str(row["payment_method"] or "")=="OWNER_FREE":
+        if int(row["review_prompt_sent"] or 0)==0:
+            conn=db()
+            conn.execute(
+                "UPDATE orders SET review_prompt_sent=1 WHERE id=?",
+                (int(order_id),)
+            )
+            conn.commit()
+            conn.close()
+        return True
 
     if int(row["reviewed"] or 0)==1:
         if int(row["review_prompt_sent"] or 0)==0:
@@ -5102,6 +5120,10 @@ def order_user_status_label(order) -> str:
     status=str(order["status"] or "")
     review_status=str(order["payment_review_status"] or "")
 
+    if str(order["payment_method"] or "")=="OWNER_FREE":
+        if status=="completed" and fulfillment=="delivered":
+            return "🎁 OWNER FREE • Akun Terkirim"
+        return "🎁 OWNER FREE • Menunggu Pengiriman"
     if status=="completed" and fulfillment=="delivered":
         return "✅ Selesai • Akun Terkirim"
     if payment_status=="paid" and fulfillment!="delivered":
@@ -5509,10 +5531,10 @@ async def startup_automation(bot: Bot):
 
 def unique_code_for_order(conn=None):
     """
-    Kode unik pembayaran wajib:
-    - selalu > 0
-    - tidak random
-    - tidak pernah memakai ulang kode yang sudah pernah tersimpan
+    Kode unik pembayaran:
+    - selalu 200..500 rupiah
+    - berputar/cyclic, bukan terus membesar
+    - tidak memakai kode yang sedang dipakai transaksi aktif
     - aman terhadap race ketika dipanggil di dalam BEGIN IMMEDIATE
     """
     own_conn = conn is None
@@ -5521,28 +5543,62 @@ def unique_code_for_order(conn=None):
         conn.execute("BEGIN IMMEDIATE")
 
     try:
-        max_order = conn.execute(
-            "SELECT COALESCE(MAX(unique_code),0) AS n FROM orders"
-        ).fetchone()["n"]
-        max_topup = conn.execute(
-            "SELECT COALESCE(MAX(unique_code),0) AS n FROM topups"
-        ).fetchone()["n"]
+        low = 200
+        high = 500
 
-        last_setting = 0
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key='last_unique_code'"
+        ).fetchone()
         try:
-            row = conn.execute(
-                "SELECT value FROM settings WHERE key='last_unique_code'"
-            ).fetchone()
-            last_setting = int(row["value"]) if row and row["value"] else 0
+            last_code = int(row["value"]) if row and row["value"] else 0
         except Exception:
-            last_setting = 0
+            last_code = 0
 
-        code = max(
-            int(max_order or 0),
-            int(max_topup or 0),
-            int(last_setting or 0),
-            0
-        ) + 1
+        # Active orders and topups must not share the same unique code.
+        active_codes = set()
+
+        order_rows = conn.execute(
+            """SELECT unique_code
+               FROM orders
+               WHERE unique_code BETWEEN ? AND ?
+                 AND payment_status NOT IN ('paid','cancelled','expired')
+                 AND status NOT IN ('completed','cancelled','expired')""",
+            (low,high)
+        ).fetchall()
+        active_codes.update(
+            int(r["unique_code"])
+            for r in order_rows
+            if int(r["unique_code"] or 0) > 0
+        )
+
+        topup_rows = conn.execute(
+            """SELECT unique_code
+               FROM topups
+               WHERE unique_code BETWEEN ? AND ?
+                 AND status NOT IN ('completed','cancelled','expired')""",
+            (low,high)
+        ).fetchall()
+        active_codes.update(
+            int(r["unique_code"])
+            for r in topup_rows
+            if int(r["unique_code"] or 0) > 0
+        )
+
+        span = high - low + 1
+        start = last_code if low <= last_code <= high else 0
+
+        code = None
+        for offset in range(1, span + 1):
+            candidate = ((start - low + offset) % span) + low
+            if candidate not in active_codes:
+                code = candidate
+                break
+
+        if code is None:
+            raise RuntimeError(
+                "Semua kode unik 200-500 sedang dipakai transaksi aktif. "
+                "Selesaikan/expire transaksi lama terlebih dahulu."
+            )
 
         conn.execute(
             """INSERT INTO settings(key,value)
@@ -5555,6 +5611,7 @@ def unique_code_for_order(conn=None):
             conn.commit()
 
         return code
+
     except Exception:
         if own_conn:
             conn.rollback()
@@ -6268,11 +6325,44 @@ def owner_stock_variant_actions(variant_id: int):
 
 
 
+
+def owner_free_qty_keyboard(variant_id: int, available: int, sharing: bool):
+    available=max(0,int(available))
+    kb=InlineKeyboardBuilder()
+
+    if available <= 0:
+        kb.button(text="⬅️ Kembali",callback_data="owner:free_claim")
+        kb.adjust(1)
+        return kb.as_markup()
+
+    max_qty=1 if sharing else min(5,available)
+    for qty in range(1,max_qty+1):
+        kb.button(
+            text=f"{qty}x",
+            callback_data=f"ownerfreeqty:{variant_id}:{qty}"
+        )
+
+    kb.adjust(min(5,max_qty) if max_qty else 1)
+    kb.row(
+        InlineKeyboardButton(
+            text="⬅️ Pilih Produk",
+            callback_data="owner:free_claim"
+        )
+    )
+    return kb.as_markup()
+
+
+def owner_free_order_note() -> str:
+    return "OWNER FREE • Pengambilan stok untuk pembeli di luar bot"
+
+
 def owner_products_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Tambah Produk", callback_data="owner:add_product")
     kb.button(text="🔎 Cari Produk", callback_data="owner:search_products")
     kb.button(text="📦 Atur Stok", callback_data="owner:set_stock")
+    kb.button(text="🎁 Ambil Produk Free", callback_data="owner:free_claim")
+    kb.button(text="📚 Riwayat Free", callback_data="owner:free_history")
     kb.button(text="🔔 Alert Stok", callback_data="owner:low_stock")
     kb.button(text="📚 Riwayat Stok", callback_data="owner:inventory_log")
     kb.button(text="🏷️ Nama Tombol Variasi", callback_data="owner:variant_button_name")
@@ -6282,7 +6372,7 @@ def owner_products_menu():
     kb.button(text="⚡ Flash Sale", callback_data="owner:mark_flash")
     kb.button(text="🎁 Paket / Bundle", callback_data="owner:bundles")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.adjust(2, 2, 2, 2, 1, 1)
+    kb.adjust(2, 2, 2, 2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -8218,6 +8308,451 @@ async def owner_panel_callback(call: CallbackQuery, state: FSMContext):
         )
     await call.answer()
 
+
+
+
+@router.callback_query(F.data == "owner:free_claim")
+async def owner_free_claim_start(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    products=conn.execute(
+        "SELECT * FROM products WHERE active=1 ORDER BY id"
+    ).fetchall()
+    stock_map=product_stock_map(conn)
+    conn.close()
+
+    available_products=[
+        row for row in products
+        if int(stock_map.get(int(row["id"]),0)) > 0
+    ]
+
+    if not available_products:
+        await safe_edit_or_answer(
+            call,
+            "🎁 <b>AMBIL PRODUK FREE</b>\n\n"
+            "Tidak ada stok akun yang tersedia saat ini.",
+            reply_markup=back_owner("owner:back_products"),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
+    kb=InlineKeyboardBuilder()
+    for row in available_products:
+        stock=int(stock_map.get(int(row["id"]),0))
+        kb.button(
+            text=f"{row['name']} • {stock}",
+            callback_data=f"ownerfreeprod:{row['id']}"
+        )
+    kb.button(text="⬅️ Produk & Stok",callback_data="owner:back_products")
+    kb.adjust(1)
+
+    await safe_edit_or_answer(
+        call,
+        "🎁 <b>AMBIL PRODUK FREE</b>\n\n"
+        "Gunakan untuk pembeli yang transaksi <b>di luar bot</b>.\n\n"
+        "✅ Saldo owner tidak dipotong\n"
+        "✅ Total pembayaran = Rp0\n"
+        "✅ Akun tetap dikirim dengan fulfillment aman\n"
+        "✅ Stok tetap berkurang setelah akun berhasil dikirim\n"
+        "✅ Tercatat sebagai <code>OWNER_FREE</code>\n\n"
+        "Pilih produk:",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerfreeprod:"))
+async def owner_free_product_pick(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        product_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Produk tidak valid.",show_alert=True)
+
+    conn=db()
+    product=conn.execute(
+        "SELECT * FROM products WHERE id=? AND active=1",
+        (product_id,)
+    ).fetchone()
+    variants=conn.execute(
+        """SELECT * FROM product_variants
+           WHERE product_id=? AND active=1
+           ORDER BY id""",
+        (product_id,)
+    ).fetchall()
+    conn.close()
+
+    if not product:
+        return await call.answer("Produk tidak ditemukan.",show_alert=True)
+
+    variants=[row for row in variants if available_stock(row)>0]
+    if not variants:
+        return await call.answer("Stok produk sedang habis.",show_alert=True)
+
+    kb=InlineKeyboardBuilder()
+    for row in variants:
+        stock=available_stock(row)
+        kind="👥" if variant_is_sharing(row) else "🔐"
+        kb.button(
+            text=f"{kind} {variant_button_label(row)} • {stock}",
+            callback_data=f"ownerfreevar:{row['id']}"
+        )
+    kb.button(text="⬅️ Produk",callback_data="owner:free_claim")
+    kb.adjust(1)
+
+    await safe_edit_or_answer(
+        call,
+        "🎁 <b>PILIH VARIAN FREE</b>\n\n"
+        f"📦 Produk: <b>{html.escape(product['name'])}</b>\n\n"
+        "Pilih varian yang akan diambil:",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerfreevar:"))
+async def owner_free_variant_pick(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT v.*,p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Varian tidak ditemukan.",show_alert=True)
+
+    available=available_stock(row)
+    if available<=0:
+        return await call.answer("Stok varian habis.",show_alert=True)
+
+    sharing=variant_is_sharing(row)
+
+    await safe_edit_or_answer(
+        call,
+        "🎁 <b>JUMLAH PRODUK FREE</b>\n\n"
+        f"📦 Produk: <b>{html.escape(row['product_name'])}</b>\n"
+        f"🧩 Varian: <b>{html.escape(row['name'])}</b>\n"
+        f"📊 Stok tersedia: <b>{available}</b>\n"
+        f"👤 Jenis: <b>{'Sharing' if sharing else 'Private / Unique'}</b>\n\n"
+        + (
+            "Akun sharing dibatasi <b>1 stok per pengambilan</b>."
+            if sharing
+            else "Pilih jumlah yang akan diambil (maksimal 5 per proses)."
+        ),
+        reply_markup=owner_free_qty_keyboard(variant_id,available,sharing),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerfreeqty:"))
+async def owner_free_qty_pick(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        _,variant_raw,qty_raw=call.data.split(":")
+        variant_id=int(variant_raw)
+        qty=max(1,int(qty_raw))
+    except Exception:
+        return await call.answer("Jumlah tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT v.*,p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Varian tidak ditemukan.",show_alert=True)
+
+    available=available_stock(row)
+    if variant_is_sharing(row) and qty!=1:
+        return await call.answer(
+            "Akun sharing hanya 1 stok per pengambilan.",
+            show_alert=True
+        )
+    if qty>available:
+        return await call.answer("Stok tidak mencukupi.",show_alert=True)
+    if qty>5:
+        return await call.answer("Maksimal 5 per proses.",show_alert=True)
+
+    await safe_edit_or_answer(
+        call,
+        "⚠️ <b>KONFIRMASI AMBIL PRODUK FREE</b>\n\n"
+        f"📦 Produk: <b>{html.escape(row['product_name'])}</b>\n"
+        f"🧩 Varian: <b>{html.escape(row['name'])}</b>\n"
+        f"🔢 Qty: <b>{qty}</b>\n"
+        "💰 Pembayaran: <b>FREE / Rp0</b>\n\n"
+        "Akun akan dikirim ke PM owner dan stok akan tercatat keluar "
+        "sebagai transaksi <code>OWNER_FREE</code>.\n\n"
+        "Lanjutkan?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Ya, Ambil Free",
+                    callback_data=f"ownerfreeconfirm:{variant_id}:{qty}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Batal",
+                    callback_data=f"ownerfreevar:{variant_id}"
+                )
+            ]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerfreeconfirm:"))
+async def owner_free_execute(call: CallbackQuery,bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        _,variant_raw,qty_raw=call.data.split(":")
+        variant_id=int(variant_raw)
+        qty=max(1,int(qty_raw))
+    except Exception:
+        return await call.answer("Permintaan tidak valid.",show_alert=True)
+
+    guard_key=f"ownerfree:{call.from_user.id}:{variant_id}:{qty}"
+    if not recent_action_allowed(guard_key,4):
+        return await call.answer(
+            "Pengambilan sedang diproses. Jangan tekan dua kali.",
+            show_alert=True
+        )
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+
+    variant=conn.execute(
+        "SELECT * FROM product_variants WHERE id=? AND active=1",
+        (variant_id,)
+    ).fetchone()
+    product=conn.execute(
+        "SELECT * FROM products WHERE id=? AND active=1",
+        (variant["product_id"],)
+    ).fetchone() if variant else None
+
+    if not variant or not product:
+        conn.rollback()
+        conn.close()
+        return await call.answer("Produk tidak tersedia.",show_alert=True)
+
+    if variant_is_sharing(variant) and qty!=1:
+        conn.rollback()
+        conn.close()
+        return await call.answer(
+            "Akun sharing hanya 1 stok per pengambilan.",
+            show_alert=True
+        )
+
+    if qty>5:
+        conn.rollback()
+        conn.close()
+        return await call.answer("Maksimal 5 per proses.",show_alert=True)
+
+    if available_stock(variant)<qty:
+        conn.rollback()
+        conn.close()
+        return await call.answer(
+            "Stok baru saja berubah / tidak mencukupi.",
+            show_alert=True
+        )
+
+    if not reserve_stock_for_order(conn,variant_id,qty):
+        conn.rollback()
+        conn.close()
+        return await call.answer(
+            "Stok baru saja digunakan transaksi lain. Coba lagi.",
+            show_alert=True
+        )
+
+    now=datetime.now().isoformat(timespec="seconds")
+    cur=conn.execute(
+        """INSERT INTO orders
+           (user_id,username,product_id,variant_id,qty,unit_price,total,
+            status,payment_method,payment_status,note,unique_code,
+            payment_total,stock_reserved,reserved_until,
+            fulfillment_status,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            int(call.from_user.id),
+            call.from_user.username or ADMIN_USERNAME or "owner",
+            int(product["id"]),
+            int(variant_id),
+            int(qty),
+            0,
+            0,
+            "paid_pending_delivery",
+            "OWNER_FREE",
+            "paid",
+            owner_free_order_note(),
+            0,
+            0,
+            1,
+            "",
+            "pending",
+            now
+        )
+    )
+    order_id=int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+
+    record_payment_event(
+        "order",
+        order_id,
+        "owner_free",
+        0,
+        call.from_user.id,
+        "OWNER_FREE • external buyer"
+    )
+    inventory_log(
+        variant_id,
+        "OWNER_FREE",
+        qty,
+        invoice(order_id),
+        "Pengambilan stok gratis oleh owner untuk pembeli di luar bot"
+    )
+
+    await call.answer("Memproses akun...",show_alert=False)
+
+    delivered=await fulfill_order(order_id,bot)
+
+    if delivered:
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>PRODUK FREE BERHASIL DIAMBIL</b>\n\n"
+            f"🧾 Referensi: <b>{invoice(order_id)}</b>\n"
+            f"📦 Produk: <b>{html.escape(product['name'])}</b>\n"
+            f"🧩 Varian: <b>{html.escape(variant['name'])}</b>\n"
+            f"🔢 Qty: <b>{qty}</b>\n"
+            "💰 Saldo terpotong: <b>Rp0</b>\n"
+            "✅ Akun sudah dikirim ke PM owner.\n"
+            "📉 Stok sudah dikurangi.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🎁 Ambil Lagi",
+                        callback_data="owner:free_claim"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📚 Riwayat Free",
+                        callback_data="owner:free_history"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Produk & Stok",
+                        callback_data="owner:back_products"
+                    )
+                ]
+            ]),
+            parse_mode="HTML"
+        )
+    else:
+        await safe_edit_or_answer(
+            call,
+            "🟡 <b>OWNER FREE TERCATAT</b>\n\n"
+            f"🧾 Referensi: <b>{invoice(order_id)}</b>\n"
+            "Akun belum selesai dikirim oleh Telegram.\n"
+            "Stok yang dialokasikan tetap aman dan tidak diberikan ke pembeli lain.\n\n"
+            "Gunakan Recovery Order / Kirim Ulang Akun bila diperlukan.",
+            reply_markup=owner_orders_menu(),
+            parse_mode="HTML"
+        )
+
+
+@router.callback_query(F.data == "owner:free_history")
+async def owner_free_history(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    rows=conn.execute(
+        """SELECT o.*,p.name AS product_name,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.payment_method='OWNER_FREE'
+           ORDER BY o.id DESC
+           LIMIT 30"""
+    ).fetchall()
+    conn.close()
+
+    lines=[
+        "📚 <b>RIWAYAT OWNER FREE</b>",
+        "",
+        "Pengambilan stok untuk pembeli di luar bot.",
+        ""
+    ]
+
+    if not rows:
+        lines.append("Belum ada pengambilan OWNER_FREE.")
+    else:
+        for row in rows:
+            delivered=(
+                row["status"]=="completed"
+                and row["fulfillment_status"]=="delivered"
+            )
+            icon="✅" if delivered else "🟡"
+            lines.append(
+                f"{icon} <b>{invoice(row['id'])}</b>\n"
+                f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
+                f"{html.escape(row['variant_name'] or 'Standard')}\n"
+                f"🔢 Qty {int(row['qty'] or 0)} • "
+                f"{'Terkirim' if delivered else 'Menunggu/Recovery'}\n"
+                f"🕒 <code>{html.escape(str(row['created_at'] or '-'))}</code>"
+            )
+
+    await safe_edit_or_answer(
+        call,
+        "\n\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎁 Ambil Produk Free",
+                    callback_data="owner:free_claim"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Produk & Stok",
+                    callback_data="owner:back_products"
+                )
+            ]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data == "owner:back_products")
@@ -11036,10 +11571,21 @@ async def owner_unique_info(call: CallbackQuery):
     ).fetchone()["n"]
     conn.close()
 
-    last_code = max(int(max_order or 0), int(max_topup or 0))
+    last_code = 0
+    try:
+        db_conn=db()
+        setting_row=db_conn.execute(
+            "SELECT value FROM settings WHERE key='last_unique_code'"
+        ).fetchone()
+        last_code=int(setting_row["value"] or 0) if setting_row else 0
+        db_conn.close()
+    except Exception:
+        last_code=0
+
     await call.answer(
-        f"Kode unik wajib aktif. Kode terakhir: +{last_code}. "
-        "Transaksi berikutnya otomatis memakai kode baru.",
+        f"Kode unik aktif dengan rentang +Rp200 sampai +Rp500. "
+        f"Kode terakhir: +{last_code}. Kode akan berputar dan tidak bentrok "
+        "dengan transaksi aktif.",
         show_alert=True
     )
 
@@ -11052,7 +11598,7 @@ async def owner_qris_settings(call: CallbackQuery, state: FSMContext):
     await state.clear()
     enabled = get_setting("unique_code_enabled", "1") == "1"
     low = get_setting("unique_code_min", "1")
-    high = get_setting("unique_code_max", "999")
+    high = get_setting("unique_code_max", "500")
     qris_status = "✅ Sudah dipasang" if get_setting("qris_file_id", "") else "❌ Belum dipasang"
     auto_status = "✅ Siap" if shopeepay_ready() else "⚪ Belum siap"
     mode = get_setting("payment_mode", "manual")
@@ -11095,7 +11641,7 @@ async def owner_qris_toggle_mode(call: CallbackQuery):
 
     enabled = get_setting("unique_code_enabled", "1") == "1"
     low = get_setting("unique_code_min", "1")
-    high = get_setting("unique_code_max", "999")
+    high = get_setting("unique_code_max", "500")
     qris_status = "✅ Sudah dipasang" if get_setting("qris_file_id", "") else "❌ Belum dipasang"
     auto_status = "✅ Siap" if shopeepay_ready() else "⚪ Belum siap"
 
@@ -18068,7 +18614,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "13.9"
+EXPECTED_SOURCE_VERSION = "14.2"
 
 
 def source_integrity_self_test():
@@ -18118,6 +18664,7 @@ def runtime_dependency_self_test():
     checks.append(("demo_isolation_self_test", callable(demo_isolation_self_test)))
     checks.append(("send_review_prompt_if_needed", callable(send_review_prompt_if_needed)))
     checks.append(("store_rating_summary", callable(store_rating_summary)))
+    checks.append(("owner_free_order_note", callable(owner_free_order_note)))
     checks.append(("order_user_status_label", callable(order_user_status_label)))
     checks.append(("conservative_cleanup_old_data", callable(conservative_cleanup_old_data)))
     checks.append(("cleanup_menu_self_test", callable(cleanup_menu_self_test)))
