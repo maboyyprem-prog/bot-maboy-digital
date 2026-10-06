@@ -88,7 +88,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "11.6"
+BOT_VERSION = "11.7"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -822,12 +822,14 @@ def parse_rupiah_input(text: str):
     Rp15.000
     rp 15 000
     """
+    import re as _re
+
     raw=(text or "").strip().lower()
     if not raw:
         return None
 
     raw=raw.replace("rp","").replace("idr","").strip()
-    digits=re.sub(r"[^0-9]","",raw)
+    digits=_re.sub(r"[^0-9]","",raw)
 
     if not digits:
         return None
@@ -15450,10 +15452,39 @@ async def silent_recovery_loop(bot: Bot):
         )
 
 
+
+def runtime_dependency_self_test():
+    """
+    Fail fast before polling if critical runtime symbols/modules are unavailable.
+    Prevents late NameError crashes during price parsing or owner workflows.
+    """
+    checks=[]
+
+    try:
+        sample=re.sub(r"[^0-9]","","Rp2.500")
+        checks.append(("re", sample=="2500"))
+    except Exception:
+        checks.append(("re",False))
+
+    checks.append(("JAKARTA_TZ", str(JAKARTA_TZ)=="Asia/Jakarta"))
+    checks.append(("main_menu", callable(main_menu)))
+    checks.append(("parse_rupiah_input", callable(parse_rupiah_input)))
+    checks.append(("fulfill_order", callable(fulfill_order)))
+
+    failed=[name for name,ok in checks if not ok]
+    if failed:
+        raise RuntimeError(
+            "Startup dependency self-test gagal: " + ", ".join(failed)
+        )
+
+    return True
+
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN belum diisi.")
 
+    runtime_dependency_self_test()
     init_db()
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(

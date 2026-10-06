@@ -1,17 +1,15 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v11.6  
+**Versi aktif:** v11.7  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Update Terbaru — v11.6 Demo Isolation Lock
-- `/demo` tetap 100% simulasi untuk user dan owner.
-- Semua callback demo diwajibkan berada di namespace `userdemo:*`.
-- Demo callback tidak boleh memanggil fulfillment, mark paid, topup verification, inventory sync, atau database produksi.
-- Audit AST memastikan callback demo tidak memiliki callback menuju flow produksi.
-- `/start` diaudit tidak memiliki referensi demo.
-- Ditambahkan safety-net untuk callback `userdemo:*` yang tidak dikenal; bot menolak tanpa mengubah data.
-- Akun demo tetap string palsu tetap, tidak pernah mengambil inventory resmi.
-- Tidak ada produk/order/topup/saldo/stok resmi yang dibuat atau diubah oleh demo.
+## Update Terbaru — v11.7 Runtime Import Guard
+- Memastikan `import re` tersedia tepat satu kali.
+- Parser harga sekarang memakai local import `_re` sebagai pertahanan tambahan.
+- Ditambahkan `runtime_dependency_self_test()` sebelum polling.
+- Startup akan gagal lebih awal bila `re`, timezone, main menu, parser harga, atau fulfillment core tidak tersedia.
+- Parser 2500 / 2.500 / Rp2.500 / 15,000 lolos smoke test.
+- Demo Isolation v11.6 tetap dipertahankan.
 - Tidak ada Railway Variable baru.
 
 ## Command
