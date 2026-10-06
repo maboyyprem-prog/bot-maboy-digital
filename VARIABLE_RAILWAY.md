@@ -1112,3 +1112,25 @@ Indikator warna stok dihapus. List Produk tetap menampilkan jumlah stok per prod
 ## v15.0 — Major Reliability & Owner Tools
 - Tidak ada Railway Variable baru.
 - Menambah riwayat akun terjual, dashboard stok, claim log, payment reconciliation, customer profile, dan audit owner.
+
+
+## v15.1
+- Tidak ada Railway Variable baru.
+- Smart Alert menyimpan signature di SQLite settings.
+- Refund masuk ke Saldo Kamu menggunakan wallet ledger.
+- Rekening opsional tidak lagi membuat startup check gagal.
+
+
+## v15.2 — Customer Profile Hotfix
+- Tidak ada Railway Variable baru.
+- Wajib upload semua 6 file release bersama agar source version sinkron.
+
+
+## v15.3 — /ping IPv4 / IPv6
+- Tidak ada Railway Variable baru.
+- Public IPv4 dan IPv6 dideteksi ketika `/ping` dipanggil.
+
+
+## v15.4 — Owner UI Simplification
+- Tidak ada Railway Variable baru.
+- Hanya restrukturisasi menu/callback; database path dan konfigurasi Railway tetap sama.

@@ -1,3 +1,6 @@
+import aiohttp
+import socket
+import ipaddress
 from collections.abc import Mapping
 import os
 import re
@@ -90,7 +93,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "15.0"
+BOT_VERSION = "15.4"
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1680,6 +1683,174 @@ def owner_action_log(action: str, detail: str = "", owner_id: int = 0):
         conn.close()
     except Exception:
         logging.exception("owner_action_log failed")
+
+
+
+def inventory_integrity_v2(conn):
+    available_with_order = int(conn.execute(
+        """SELECT COUNT(*) AS n FROM inventory_items
+           WHERE status='available' AND COALESCE(order_id,0)!=0"""
+    ).fetchone()["n"] or 0)
+
+    allocated_without_order = int(conn.execute(
+        """SELECT COUNT(*) AS n FROM inventory_items i
+           WHERE i.status='allocated'
+             AND (
+               COALESCE(i.order_id,0)=0
+               OR NOT EXISTS(SELECT 1 FROM orders o WHERE o.id=i.order_id)
+             )"""
+    ).fetchone()["n"] or 0)
+
+    sold_without_order = int(conn.execute(
+        """SELECT COUNT(*) AS n FROM inventory_items i
+           WHERE i.status='sold'
+             AND (
+               COALESCE(i.order_id,0)=0
+               OR NOT EXISTS(SELECT 1 FROM orders o WHERE o.id=i.order_id)
+             )"""
+    ).fetchone()["n"] or 0)
+
+    delivered_without_sold = int(conn.execute(
+        """SELECT COUNT(*) AS n
+           FROM orders o
+           WHERE o.status='completed'
+             AND COALESCE(o.account_sent,0)=1
+             AND COALESCE(o.payment_method,'')!='OWNER_FREE'
+             AND NOT EXISTS(
+               SELECT 1 FROM inventory_items i
+               WHERE i.order_id=o.id AND i.status='sold'
+             )"""
+    ).fetchone()["n"] or 0)
+
+    account_sent_but_not_completed = int(conn.execute(
+        """SELECT COUNT(*) AS n
+           FROM orders
+           WHERE COALESCE(account_sent,0)=1
+             AND status!='completed'"""
+    ).fetchone()["n"] or 0)
+
+    return {
+        "available_with_order": available_with_order,
+        "allocated_without_order": allocated_without_order,
+        "sold_without_order": sold_without_order,
+        "delivered_without_sold": delivered_without_sold,
+        "account_sent_but_not_completed": account_sent_but_not_completed,
+    }
+
+
+def business_report(conn):
+    now = datetime.now(JAKARTA_TZ)
+    today = now.strftime("%Y-%m-%d")
+    month = now.strftime("%Y-%m")
+    week_start = (now.date() - timedelta(days=now.weekday())).isoformat()
+
+    def revenue(where_sql, params=()):
+        row = conn.execute(
+            f"""SELECT COALESCE(SUM(payment_total),0) AS n
+                FROM orders
+                WHERE status='completed'
+                  AND COALESCE(payment_method,'')!='OWNER_FREE'
+                  AND {where_sql}""",
+            params
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    total_rev = revenue("1=1")
+    completed = int(conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE status='completed'
+             AND COALESCE(payment_method,'')!='OWNER_FREE'"""
+    ).fetchone()["n"] or 0)
+
+    return {
+        "today": revenue("substr(completed_at,1,10)=?", (today,)),
+        "week": revenue("substr(completed_at,1,10)>=?", (week_start,)),
+        "month": revenue("substr(completed_at,1,7)=?", (month,)),
+        "total": total_rev,
+        "customers": int(conn.execute(
+            """SELECT COUNT(DISTINCT user_id) AS n FROM orders
+               WHERE status='completed'
+                 AND COALESCE(payment_method,'')!='OWNER_FREE'"""
+        ).fetchone()["n"] or 0),
+        "repeat": int(conn.execute(
+            """SELECT COUNT(*) AS n FROM (
+                 SELECT user_id FROM orders
+                 WHERE status='completed'
+                   AND COALESCE(payment_method,'')!='OWNER_FREE'
+                 GROUP BY user_id HAVING COUNT(*)>=2
+               )"""
+        ).fetchone()["n"] or 0),
+        "completed": completed,
+        "aov": int(total_rev / completed) if completed else 0,
+    }
+
+
+def customer_profile_full(conn, user_id: int):
+    orders, balance = customer_profile_data(conn, user_id)
+    security = conn.execute(
+        "SELECT * FROM user_security WHERE user_id=?",
+        (int(user_id),)
+    ).fetchone()
+    latest = conn.execute(
+        """SELECT id,username,status,product_name_snapshot,variant_name_snapshot,
+                  payment_total,created_at,completed_at
+           FROM orders
+           WHERE user_id=?
+           ORDER BY id DESC LIMIT 5""",
+        (int(user_id),)
+    ).fetchall()
+    reviews = int(conn.execute(
+        "SELECT COUNT(*) AS n FROM reviews WHERE user_id=?",
+        (int(user_id),)
+    ).fetchone()["n"] or 0)
+    return {
+        "orders": orders,
+        "balance": balance,
+        "security": security,
+        "latest": latest,
+        "reviews": reviews,
+    }
+
+
+def smart_alert_signature(conn):
+    paid_pending = int(conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE payment_status='paid'
+             AND fulfillment_status!='delivered'"""
+    ).fetchone()["n"] or 0)
+    failed_delivery = int(conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE fulfillment_status='send_failed'"""
+    ).fetchone()["n"] or 0)
+    low = int(conn.execute(
+        """SELECT COUNT(*) AS n
+           FROM product_variants
+           WHERE active=1
+             AND MAX(0,stock-COALESCE(reserved_stock,0)) BETWEEN 1 AND 3"""
+    ).fetchone()["n"] or 0)
+    empty = int(conn.execute(
+        """SELECT COUNT(*) AS n
+           FROM product_variants
+           WHERE active=1
+             AND MAX(0,stock-COALESCE(reserved_stock,0))=0"""
+    ).fetchone()["n"] or 0)
+    proofs = int(conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE payment_status!='paid'
+             AND (
+               COALESCE(payment_proof_file_id,'')!=''
+               OR COALESCE(proof_file_id,'')!=''
+             )
+             AND COALESCE(payment_review_status,'') NOT IN ('verified','rejected')"""
+    ).fetchone()["n"] or 0)
+    signature = f"{paid_pending}:{failed_delivery}:{low}:{empty}:{proofs}"
+    return signature, {
+        "paid_pending": paid_pending,
+        "failed_delivery": failed_delivery,
+        "low": low,
+        "empty": empty,
+        "proofs": proofs,
+    }
 
 
 def historical_product_sold(conn, product_id: int) -> int:
@@ -4716,8 +4887,60 @@ async def periodic_auto_recovery(bot: Bot):
         await asyncio.sleep(600)
 
 
+
+async def smart_owner_alert_loop(bot: Bot):
+    await asyncio.sleep(180)
+    while True:
+        try:
+            if ADMIN_ID:
+                conn=db()
+                signature,data=smart_alert_signature(conn)
+                conn.close()
+                previous=get_setting("smart_alert_signature","")
+                meaningful=(
+                    data["paid_pending"] or data["failed_delivery"]
+                    or data["low"] or data["proofs"]
+                )
+                if meaningful and signature!=previous:
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            "🔔 <b>SMART ALERT • MABOYY DIGITAL</b>\n\n"
+                            f"💰 Paid belum terkirim: <b>{data['paid_pending']}</b>\n"
+                            f"📨 Delivery gagal: <b>{data['failed_delivery']}</b>\n"
+                            f"⚠️ Stok rendah: <b>{data['low']}</b>\n"
+                            f"❌ Stok kosong: <b>{data['empty']}</b>\n"
+                            f"📎 Bukti menunggu: <b>{data['proofs']}</b>",
+                            parse_mode="HTML"
+                        )
+                        set_setting("smart_alert_signature",signature)
+                    except Exception:
+                        logging.exception("Smart owner alert send failed")
+                elif not meaningful and signature!=previous:
+                    set_setting("smart_alert_signature",signature)
+        except Exception:
+            logging.exception("smart_owner_alert_loop crashed")
+        await asyncio.sleep(900)
+
+
 async def startup_recovery_audit(bot: Bot):
     report = await auto_recovery_cycle(bot, source="startup")
+    required_owner_states = (
+        "customer_profile_lookup",
+        "global_search",
+        "claim_order_id",
+        "claim_reason",
+    )
+    missing_owner_states = [
+        name for name in required_owner_states
+        if getattr(OwnerState, name, None) is None
+    ]
+    if missing_owner_states:
+        raise RuntimeError(
+            "OWNER FSM SOURCE MISMATCH: missing states "
+            + ", ".join(missing_owner_states)
+            + ". Upload all release files together."
+        )
 
     return {
         "recovered_orders": report["recovered_orders"],
@@ -4787,8 +5010,24 @@ async def transaction_self_test():
         checks.append(("Demo Isolation",False,str(exc)[:100]))
 
     # Payment config
-    checks.append(("QRIS", bool(get_setting("qris_file_id","")), "configured" if get_setting("qris_file_id","") else "not set"))
-    checks.append(("Rekening", bank_transfer_ready(), "configured" if bank_transfer_ready() else "not set"))
+    qris_ready = bool(get_setting("qris_file_id",""))
+    bank_ready = bank_transfer_ready()
+
+    checks.append((
+        "QRIS",
+        True,
+        "configured" if qris_ready else "opsional / belum diset"
+    ))
+    checks.append((
+        "Rekening",
+        True,
+        "configured" if bank_ready else "opsional / belum diset"
+    ))
+    checks.append((
+        "Pembayaran",
+        bool(qris_ready or bank_ready),
+        "ready" if (qris_ready or bank_ready) else "QRIS & rekening belum dikonfigurasi"
+    ))
 
     return checks
 
@@ -6130,6 +6369,10 @@ class OwnerState(StatesGroup):
     set_bank_name = State()
     set_bank_account = State()
     set_bank_holder = State()
+    customer_profile_lookup = State()
+    global_search = State()
+    claim_order_id = State()
+    claim_reason = State()
 
 
 
@@ -6319,12 +6562,15 @@ def main_menu():
 def owner_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📦 Produk & Stok", callback_data="owner:menu_products")
-    kb.button(text="🧾 Order & Pembayaran", callback_data="owner:menu_orders")
-    kb.button(text="👥 Pelanggan & Promo", callback_data="owner:menu_customers")
-    kb.button(text="⚙️ Sistem", callback_data="owner:menu_system")
+    kb.button(text="🧾 Order", callback_data="owner:menu_orders")
+    kb.button(text="💳 Pembayaran", callback_data="owner:menu_payments")
+    kb.button(text="👥 Pelanggan", callback_data="owner:menu_customers")
     kb.button(text="📊 Dashboard", callback_data="owner:stats")
+    kb.button(text="🛟 Recovery", callback_data="owner:menu_recovery")
+    kb.button(text="⚙️ Sistem", callback_data="owner:menu_system")
+    kb.button(text="🔎 Cari", callback_data="owner:global_search")
     kb.button(text="🏠 Menu User", callback_data="home")
-    kb.adjust(2, 2, 2)
+    kb.adjust(2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -6605,6 +6851,16 @@ def owner_products_menu():
     kb.button(text="➕ Tambah Produk", callback_data="owner:add_product")
     kb.button(text="🔎 Cari Produk", callback_data="owner:search_products")
     kb.button(text="📦 Atur Stok", callback_data="owner:set_stock")
+    kb.button(text="📊 Dashboard Stok", callback_data="owner:stock_dashboard")
+    kb.button(text="📚 Akun Terjual", callback_data="owner:sold_accounts")
+    kb.button(text="🧰 Lainnya", callback_data="owner:products_more")
+    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.adjust(2, 2, 2, 1)
+    return kb.as_markup()
+
+
+def owner_products_more_menu():
+    kb = InlineKeyboardBuilder()
     kb.button(text="🎁 Ambil Produk Free", callback_data="owner:free_claim")
     kb.button(text="📚 Riwayat Free", callback_data="owner:free_history")
     kb.button(text="🔔 Alert Stok", callback_data="owner:low_stock")
@@ -6615,44 +6871,66 @@ def owner_products_menu():
     kb.button(text="🔥 Produk Populer", callback_data="owner:mark_popular")
     kb.button(text="⚡ Flash Sale", callback_data="owner:mark_flash")
     kb.button(text="🎁 Paket / Bundle", callback_data="owner:bundles")
-    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.button(text="📚 Riwayat Akun Terjual",callback_data="owner:sold_accounts")
-    kb.button(text="📊 Dashboard Stok",callback_data="owner:stock_dashboard")
-    kb.adjust(2, 2, 2, 2, 2, 1, 1)
+    kb.button(text="⬅️ Produk & Stok", callback_data="owner:back_products")
+    kb.adjust(2, 2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
 def owner_orders_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🧾 Pesanan", callback_data="owner:orders")
+    kb.button(text="🧾 Semua Pesanan", callback_data="owner:orders")
     kb.button(text="✅ History Sukses", callback_data="owner:success_history")
     kb.button(text="🔎 Cari Order/User", callback_data="owner:search_orders")
     kb.button(text="⏳ Order Pending", callback_data="owner:pending_orders")
+    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+def owner_payments_menu():
+    kb = InlineKeyboardBuilder()
     kb.button(text="✅ Verifikasi Pembayaran", callback_data="owner:verify_payments")
-    kb.button(text="📥 Verifikasi via Bukti PM", callback_data="owner:proof_info")
+    kb.button(text="📥 Bukti Pembayaran PM", callback_data="owner:proof_info")
     kb.button(text="💳 Pengaturan Pembayaran", callback_data="owner:qris_settings")
     kb.button(text="💰 Manajemen Saldo", callback_data="owner:wallet")
+    kb.button(text="🔐 Reconciliation", callback_data="owner:payment_reconcile")
+    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.adjust(2, 2, 1, 1)
+    return kb.as_markup()
+
+
+def owner_recovery_menu():
+    kb = InlineKeyboardBuilder()
     kb.button(text="♻️ Recovery Order", callback_data="owner:recover_orders")
     kb.button(text="📨 Kirim Ulang Akun", callback_data="owner:resend_order")
     kb.button(text="❌ Batalkan Order", callback_data="owner:cancel_order")
+    kb.button(text="♻️ Refund & Replacement", callback_data="owner:claims")
+    kb.button(text="🔔 Smart Alert", callback_data="owner:smart_alert")
+    kb.button(text="🧪 Self-Test v2", callback_data="owner:selftest_v2")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.button(text="♻️ Refund & Replacement",callback_data="owner:claims")
-    kb.button(text="🔐 Payment Reconciliation",callback_data="owner:payment_reconcile")
-    kb.adjust(2, 2, 2, 2, 2)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 
 def owner_customers_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🎁 Voucher", callback_data="owner:add_voucher")
+    kb.button(text="👤 Customer Profile", callback_data="owner:customer_profile")
+    kb.button(text="⭐ Rating & Ulasan", callback_data="owner:reviews")
     kb.button(text="📣 Broadcast", callback_data="owner:broadcast")
+    kb.button(text="🛡️ Anti-Fraud", callback_data="owner:security")
+    kb.button(text="🎯 Promo & Voucher", callback_data="owner:promo_menu")
+    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.adjust(2, 2, 1, 1)
+    return kb.as_markup()
+
+
+def owner_promo_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎁 Voucher", callback_data="owner:add_voucher")
     kb.button(text="👥 Segmentasi", callback_data="owner:segments")
     kb.button(text="🎯 Promo Otomatis", callback_data="owner:auto_promo")
-    kb.button(text="⭐ Rating Toko & Ulasan", callback_data="owner:reviews")
-    kb.button(text="🛡️ Anti-Fraud", callback_data="owner:security")
-    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.button(text="👤 Customer Profile",callback_data="owner:customer_profile")
-    kb.adjust(2, 2, 2, 1)
+    kb.button(text="⬅️ Pelanggan", callback_data="owner:menu_customers")
+    kb.adjust(2, 1, 1)
     return kb.as_markup()
 
 
@@ -7550,8 +7828,19 @@ def cleanup_menu_self_test() -> list[tuple[str,bool,str]]:
 
 def owner_system_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🩺 Diagnostik Sistem", callback_data="owner:diagnostics")
+    kb.button(text="🩺 Diagnostik", callback_data="owner:diagnostics")
     kb.button(text="🧬 Database Health", callback_data="owner:db_health")
+    kb.button(text="🧪 Self-Test v2", callback_data="owner:selftest_v2")
+    kb.button(text="🔔 Smart Alert", callback_data="owner:smart_alert")
+    kb.button(text="🧹 Bersihkan Data Aman", callback_data="cleanup:preview:safe")
+    kb.button(text="🧰 Sistem Lanjutan", callback_data="owner:system_more")
+    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
+    kb.adjust(2, 2, 2, 1)
+    return kb.as_markup()
+
+
+def owner_system_more_menu():
+    kb = InlineKeyboardBuilder()
     kb.button(text="📨 Test PM Owner", callback_data="owner:test_pm")
     kb.button(text="📢 Test Channel", callback_data="owner:test_channel")
     kb.button(text="🛟 Safe Mode", callback_data="owner:safe_mode")
@@ -7563,9 +7852,9 @@ def owner_system_menu():
     kb.button(text="ℹ️ Backup Terakhir", callback_data="owner:backup_last")
     kb.button(text="📢 Sinkron Stok Channel", callback_data="owner:sync_stock")
     kb.button(text="📅 Laporan Harian", callback_data="owner:daily_report")
-    kb.button(text="🗑️ Hapus Data", callback_data="owner:cleanup_data")
-    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.adjust(2, 2, 2, 2, 1)
+    kb.button(text="🗑️ Hapus Data Detail", callback_data="owner:cleanup_data")
+    kb.button(text="⬅️ Sistem", callback_data="owner:back_system")
+    kb.adjust(2, 2, 2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -9025,7 +9314,7 @@ async def owner_back_orders(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await safe_edit_or_answer(
         call,
-        "🧾 <b>ORDER & PEMBAYARAN</b>\n\nPilih pengaturan:",
+        "🧾 <b>ORDER</b>\n\nPilih kebutuhan order:",
         reply_markup=owner_orders_menu(),
         parse_mode="HTML"
     )
@@ -9039,7 +9328,7 @@ async def owner_back_customers(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await safe_edit_or_answer(
         call,
-        "👥 <b>PELANGGAN & PROMO</b>\n\nPilih pengaturan:",
+        "👥 <b>PELANGGAN</b>\n\nPilih kebutuhan pelanggan:",
         reply_markup=owner_customers_menu(),
         parse_mode="HTML"
     )
@@ -9155,6 +9444,35 @@ async def demo_command(message: Message):
 
 
 
+
+async def fetch_public_ip(family: int) -> str:
+    """Best-effort public IPv4/IPv6 lookup for /ping."""
+    connector = aiohttp.TCPConnector(family=family)
+    timeout = aiohttp.ClientTimeout(total=2.5, connect=1.5, sock_read=1.5)
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.get("https://api.ipify.org") as response:
+                if response.status != 200:
+                    return "N/A"
+                value = (await response.text()).strip()
+                parsed = ipaddress.ip_address(value)
+                if family == socket.AF_INET and parsed.version != 4:
+                    return "N/A"
+                if family == socket.AF_INET6 and parsed.version != 6:
+                    return "N/A"
+                return value
+    except Exception:
+        return "N/A"
+
+
+async def get_public_ips():
+    ipv4, ipv6 = await asyncio.gather(
+        fetch_public_ip(socket.AF_INET),
+        fetch_public_ip(socket.AF_INET6),
+    )
+    return ipv4, ipv6
+
+
 @router.message(Command("ping"))
 async def ping_command(message: Message):
     if not is_owner(message.from_user.id):
@@ -9178,6 +9496,8 @@ async def ping_command(message: Message):
     except Exception:
         db_ok=False
 
+    ipv4, ipv6 = await get_public_ips()
+
     system_ok=parser_ok and db_ok
     deployment=str(fp["deployment_id"] or "-")
     if deployment!="-" and len(deployment)>12:
@@ -9192,6 +9512,8 @@ async def ping_command(message: Message):
         f"{'✅ ONLINE' if system_ok else '⚠️ DEGRADED'} • <b>v{html.escape(BOT_VERSION)}</b>\n"
         f"📅 {date_text} • 🕒 {time_text}\n"
         f"🗄️ DB: <b>{'OK' if db_ok else 'ERROR'}</b>\n"
+        f"🌐 IPv4: <code>{html.escape(ipv4)}</code>\n"
+        f"🌐 IPv6: <code>{html.escape(ipv6)}</code>\n"
         f"🚀 Deploy: <code>{html.escape(deployment)}</code> • "
         f"<code>{html.escape(fp['commit'])}</code>",
         parse_mode="HTML"
@@ -12647,8 +12969,11 @@ async def owner_stats(call: CallbackQuery):
     ).fetchone()["n"]
     revenue = conn.execute(
         """SELECT COALESCE(SUM(payment_total),0) AS n
-           FROM orders WHERE status='completed'"""
+           FROM orders
+           WHERE status='completed'
+             AND COALESCE(payment_method,'')!='OWNER_FREE'"""
     ).fetchone()["n"]
+    biz = business_report(conn)
     today_orders = conn.execute(
         """SELECT COUNT(*) AS n FROM orders
            WHERE substr(created_at,1,10)=?""",
@@ -12656,7 +12981,9 @@ async def owner_stats(call: CallbackQuery):
     ).fetchone()["n"]
     today_revenue = conn.execute(
         """SELECT COALESCE(SUM(payment_total),0) AS n FROM orders
-           WHERE status='completed' AND substr(completed_at,1,10)=?""",
+           WHERE status='completed'
+             AND COALESCE(payment_method,'')!='OWNER_FREE'
+             AND substr(completed_at,1,10)=?""",
         (today,)
     ).fetchone()["n"]
     users = conn.execute(
@@ -12703,7 +13030,12 @@ async def owner_stats(call: CallbackQuery):
         f"💰 Omzet: <b>{rupiah(today_revenue)}</b>\n\n"
         "📈 <b>Keseluruhan</b>\n"
         f"💰 Omzet: <b>{rupiah(revenue)}</b>\n"
+        f"📆 Minggu ini: <b>{rupiah(biz['week'])}</b>\n"
+        f"🗓️ Bulan ini: <b>{rupiah(biz['month'])}</b>\n"
         f"🧾 Total order: <b>{orders}</b>\n"
+        f"👥 Customer pembeli: <b>{biz['customers']}</b>\n"
+        f"🔁 Repeat buyer: <b>{biz['repeat']}</b>\n"
+        f"🧮 AOV: <b>{rupiah(biz['aov'])}</b>\n"
         f"✅ Selesai: <b>{completed}</b>\n"
         f"⏳ Pending bayar: <b>{pending}</b>\n"
         f"⚠️ Pending delivery: <b>{paid_pending}</b>\n"
@@ -19222,11 +19554,27 @@ async def owner_stock_dashboard(call: CallbackQuery):
 async def owner_customer_profile_prompt(call: CallbackQuery,state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
+
     await state.clear()
-    await state.set_state(OwnerState.search_order_user)
+
+    profile_state = getattr(OwnerState, "customer_profile_lookup", None)
+    if profile_state is None:
+        logging.error(
+            "Customer Profile state missing at runtime. "
+            "BOT_VERSION=%s EXPECTED_SOURCE_VERSION=%s",
+            BOT_VERSION, EXPECTED_SOURCE_VERSION
+        )
+        return await call.answer(
+            "Source bot tidak sinkron. Upload ulang semua file release terbaru.",
+            show_alert=True
+        )
+
+    await state.set_state(profile_state)
     await safe_edit_or_answer(
         call,
-        "👤 <b>CUSTOMER PROFILE</b>\n\nKirim Telegram user ID customer.",
+        "👤 <b>CUSTOMER PROFILE</b>\n\n"
+        "Kirim Telegram user ID customer.\n\n"
+        "Contoh: <code>123456789</code>",
         reply_markup=back_owner("owner:back_customers"),
         parse_mode="HTML"
     )
@@ -19291,7 +19639,8 @@ async def owner_claims(call: CallbackQuery):
     ).fetchall()
     conn.close()
 
-    lines=["♻️ <b>REFUND & REPLACEMENT</b>",""]
+    lines=["♻️ <b>REFUND & REPLACEMENT</b>","",
+           "Gunakan tombol <b>➕ Buat Klaim</b> untuk memproses refund saldo atau penggantian akun.",""]
     if not rows:
         lines.append("Belum ada klaim tercatat.")
     else:
@@ -19306,7 +19655,603 @@ async def owner_claims(call: CallbackQuery):
     await safe_edit_or_answer(
         call,
         "\n".join(lines)[:3900],
-        reply_markup=back_owner("owner:back_orders"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Buat Klaim",callback_data="owner:claim_new")],
+            [InlineKeyboardButton(text="⬅️ Order & Pembayaran",callback_data="owner:back_orders")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+
+@router.message(OwnerState.customer_profile_lookup)
+async def owner_customer_profile_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+
+    raw=(message.text or "").strip()
+    if not raw.isdigit():
+        return await message.answer("❌ Kirim Telegram user ID berupa angka.")
+
+    user_id=int(raw)
+    conn=db()
+    profile=customer_profile_full(conn,user_id)
+    conn.close()
+    await state.clear()
+
+    orders=profile["orders"]
+    sec=profile["security"]
+    blocked=bool(sec and int(sec["blocked"] or 0))
+    latest=profile["latest"]
+
+    lines=[
+        "👤 <b>CUSTOMER PROFILE</b>","",
+        f"🆔 User ID: <code>{user_id}</code>",
+        f"💰 Saldo: <b>{rupiah(profile['balance'])}</b>",
+        f"🧾 Total order: <b>{int(orders['total_orders'] or 0)}</b>",
+        f"✅ Sukses: <b>{int(orders['completed_orders'] or 0)}</b>",
+        f"❌ Batal: <b>{int(orders['cancelled_orders'] or 0)}</b>",
+        f"💵 Total belanja: <b>{rupiah(int(orders['total_spent'] or 0))}</b>",
+        f"⭐ Rating diberikan: <b>{profile['reviews']}</b>",
+        f"🛡️ Status: <b>{'BLOKIR' if blocked else 'AKTIF'}</b>",
+        f"🕒 Order terakhir: <b>{html.escape(str(orders['last_order_at'] or '-'))}</b>",
+    ]
+    if latest:
+        lines += ["","📚 <b>5 ORDER TERAKHIR</b>"]
+        for row in latest:
+            lines.append(
+                f"• {invoice(row['id'])} • {html.escape(row['status'])} • "
+                f"{rupiah(row['payment_total'] or 0)}"
+            )
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=("✅ Buka Blokir" if blocked else "🚫 Blokir User"),
+                callback_data=f"securityuser:{user_id}"
+            )],
+            [InlineKeyboardButton(text="💰 Manajemen Saldo",callback_data="owner:wallet")],
+            [InlineKeyboardButton(text="⬅️ Pelanggan & Promo",callback_data="owner:menu_customers")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "owner:global_search")
+async def owner_global_search_start(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.clear()
+    await state.set_state(OwnerState.global_search)
+    await safe_edit_or_answer(
+        call,
+        "🔎 <b>PENCARIAN GLOBAL</b>\n\n"
+        "Kirim Order ID, user ID, username, nama produk/varian, "
+        "atau potongan data akun.",
+        reply_markup=back_owner("owner:panel"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.global_search)
+async def owner_global_search_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+    q=(message.text or "").strip()
+    if not q:
+        return await message.answer("❌ Kata pencarian kosong.")
+
+    numeric=re.sub(r"[^0-9]","",q)
+    username=q.lstrip("@")
+    conn=db()
+
+    clauses=[
+        "LOWER(COALESCE(o.username,'')) LIKE LOWER(?)",
+        "LOWER(COALESCE(o.product_name_snapshot,'')) LIKE LOWER(?)",
+        "LOWER(COALESCE(o.variant_name_snapshot,'')) LIKE LOWER(?)",
+    ]
+    params=[f"%{username}%",f"%{q}%",f"%{q}%"]
+    if numeric:
+        clauses += ["o.id=?","o.user_id=?"]
+        params += [int(numeric),int(numeric)]
+
+    orders=conn.execute(
+        """SELECT o.id,o.user_id,o.username,o.status,o.payment_total,
+                  o.product_name_snapshot,o.variant_name_snapshot
+           FROM orders o WHERE """+" OR ".join(clauses)+"""
+           ORDER BY o.id DESC LIMIT 10""",
+        tuple(params)
+    ).fetchall()
+
+    products=conn.execute(
+        """SELECT p.id,p.name,v.name AS variant_name
+           FROM products p
+           LEFT JOIN product_variants v ON v.product_id=p.id
+           WHERE LOWER(p.name) LIKE LOWER(?)
+              OR LOWER(COALESCE(v.name,'')) LIKE LOWER(?)
+           LIMIT 10""",
+        (f"%{q}%",f"%{q}%")
+    ).fetchall()
+
+    inventory=conn.execute(
+        """SELECT i.id,i.status,i.order_id,p.name AS product_name,v.name AS variant_name
+           FROM inventory_items i
+           JOIN product_variants v ON v.id=i.variant_id
+           JOIN products p ON p.id=v.product_id
+           WHERE LOWER(i.content) LIKE LOWER(?)
+           ORDER BY i.id DESC LIMIT 10""",
+        (f"%{q}%",)
+    ).fetchall()
+    conn.close()
+    await state.clear()
+
+    lines=["🔎 <b>HASIL PENCARIAN GLOBAL</b>",""]
+    if orders:
+        lines.append("🧾 <b>ORDER</b>")
+        for r in orders:
+            lines.append(
+                f"• {invoice(r['id'])} • <code>{r['user_id']}</code> • "
+                f"{html.escape(r['status'])}\n"
+                f"  {html.escape(r['product_name_snapshot'] or '-')} / "
+                f"{html.escape(r['variant_name_snapshot'] or '-')}"
+            )
+    if products:
+        lines += ["","📦 <b>PRODUK / VARIAN</b>"]
+        for r in products:
+            lines.append(
+                f"• ID {r['id']} • {html.escape(r['name'])} / "
+                f"{html.escape(r['variant_name'] or '-')}"
+            )
+    if inventory:
+        lines += ["","🔐 <b>INVENTORY</b>"]
+        for r in inventory:
+            lines.append(
+                f"• Item #{r['id']} • {html.escape(r['status'])} • "
+                f"Order #{int(r['order_id'] or 0)}\n"
+                f"  {html.escape(r['product_name'])} / {html.escape(r['variant_name'])}"
+            )
+    if len(lines)==2:
+        lines.append("Tidak ada hasil.")
+
+    await message.answer(
+        "\n".join(lines)[:3900],
+        reply_markup=owner_menu(),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "owner:claim_new")
+async def owner_claim_new(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.clear()
+    await state.set_state(OwnerState.claim_order_id)
+    await safe_edit_or_answer(
+        call,
+        "♻️ <b>BUAT KLAIM</b>\n\n"
+        "Kirim Order ID yang akan diproses.",
+        reply_markup=back_owner("owner:claims"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.claim_order_id)
+async def owner_claim_order_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+    raw=re.sub(r"[^0-9]","",(message.text or ""))
+    if not raw:
+        return await message.answer("❌ Order ID tidak valid.")
+
+    order_id=int(raw)
+    conn=db()
+    order=conn.execute(
+        """SELECT * FROM orders
+           WHERE id=? AND status='completed'
+             AND COALESCE(payment_method,'')!='OWNER_FREE'""",
+        (order_id,)
+    ).fetchone()
+    conn.close()
+    if not order:
+        return await message.answer("❌ Order tidak ditemukan / belum selesai / OWNER_FREE.")
+
+    await state.update_data(claim_order_id=order_id)
+    await state.set_state(OwnerState.claim_reason)
+    await message.answer(
+        f"🧾 {invoice(order_id)} ditemukan.\n\nKirim alasan klaim.",
+        parse_mode="HTML"
+    )
+
+
+@router.message(OwnerState.claim_reason)
+async def owner_claim_reason_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+    reason=(message.text or "").strip()
+    if not reason:
+        return await message.answer("❌ Alasan klaim tidak boleh kosong.")
+
+    data=await state.get_data()
+    order_id=int(data.get("claim_order_id",0) or 0)
+    conn=db()
+    order=conn.execute("SELECT * FROM orders WHERE id=?",(order_id,)).fetchone()
+    if not order:
+        conn.close()
+        await state.clear()
+        return await message.answer("❌ Order tidak ditemukan.")
+
+    existing=conn.execute(
+        """SELECT id FROM support_claims
+           WHERE order_id=? AND status='open'
+           ORDER BY id DESC LIMIT 1""",
+        (order_id,)
+    ).fetchone()
+
+    if existing:
+        claim_id=int(existing["id"])
+    else:
+        cur=conn.execute(
+            """INSERT INTO support_claims
+               (order_id,user_id,claim_type,reason,status,created_at)
+               VALUES(?,?, 'support', ?, 'open', ?)""",
+            (order_id,int(order["user_id"]),reason[:500],
+             datetime.now().isoformat(timespec="seconds"))
+        )
+        claim_id=int(cur.lastrowid)
+        conn.commit()
+    conn.close()
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>KLAIM DIBUAT</b>\n\n"
+        f"Claim ID: <b>#{claim_id}</b>\n"
+        f"Order: <b>{invoice(order_id)}</b>\n"
+        f"Alasan: {html.escape(reason[:500])}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♻️ Ganti Akun",callback_data=f"claimact:{claim_id}:replace")],
+            [InlineKeyboardButton(text="💰 Refund ke Saldo",callback_data=f"claimact:{claim_id}:refund")],
+            [InlineKeyboardButton(text="❌ Tolak Klaim",callback_data=f"claimact:{claim_id}:reject")],
+            [InlineKeyboardButton(text="⬅️ Order & Pembayaran",callback_data="owner:menu_orders")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("claimact:"))
+async def owner_claim_action(call: CallbackQuery,bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        _,claim_raw,action=call.data.split(":")
+        claim_id=int(claim_raw)
+    except Exception:
+        return await call.answer("Klaim tidak valid.",show_alert=True)
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+    claim=conn.execute("SELECT * FROM support_claims WHERE id=?",(claim_id,)).fetchone()
+    if not claim or claim["status"]!="open":
+        conn.rollback(); conn.close()
+        return await call.answer("Klaim sudah diproses / tidak ditemukan.",show_alert=True)
+
+    order=conn.execute("SELECT * FROM orders WHERE id=?",(int(claim["order_id"]),)).fetchone()
+    if not order:
+        conn.rollback(); conn.close()
+        return await call.answer("Order tidak ditemukan.",show_alert=True)
+
+    now=datetime.now().isoformat(timespec="seconds")
+
+    if action=="refund":
+        amount=int(order["payment_total"] or order["total"] or 0)
+        conn.execute(
+            """UPDATE support_claims
+               SET claim_type='refund',status='resolved',
+                   resolution=?,resolved_at=?
+               WHERE id=? AND status='open'""",
+            (f"Refund saldo {amount}",now,claim_id)
+        )
+        conn.commit(); conn.close()
+
+        try:
+            balance=wallet_change(
+                int(order["user_id"]),amount,"CLAIM_REFUND",
+                f"CLAIM-{claim_id}",f"Refund {invoice(order['id'])}"
+            )
+        except Exception as exc:
+            conn=db()
+            conn.execute(
+                "UPDATE support_claims SET status='open',resolution='',resolved_at='' WHERE id=?",
+                (claim_id,)
+            )
+            conn.commit(); conn.close()
+            return await call.answer(f"Refund gagal: {str(exc)[:100]}",show_alert=True)
+
+        owner_audit(call.from_user.id,"CLAIM_REFUND","ok",f"claim={claim_id} order={order['id']} amount={amount}")
+        try:
+            await bot.send_message(
+                int(order["user_id"]),
+                "💰 <b>REFUND BERHASIL</b>\n\n"
+                f"🧾 {invoice(order['id'])}\n"
+                f"💵 Refund: <b>{rupiah(amount)}</b>\n"
+                f"💰 Saldo sekarang: <b>{rupiah(balance)}</b>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        await call.answer("Refund berhasil.",show_alert=True)
+        return await safe_edit_or_answer(
+            call,
+            f"✅ <b>REFUND BERHASIL</b>\n\n🧾 {invoice(order['id'])}\n💰 {rupiah(amount)}",
+            reply_markup=owner_orders_menu(),
+            parse_mode="HTML"
+        )
+
+    if action=="reject":
+        conn.execute(
+            """UPDATE support_claims
+               SET claim_type='rejected',status='rejected',
+                   resolution='Ditolak owner',resolved_at=?
+               WHERE id=?""",
+            (now,claim_id)
+        )
+        conn.commit(); conn.close()
+        owner_audit(call.from_user.id,"CLAIM_REJECT","ok",f"claim={claim_id}")
+        await call.answer("Klaim ditolak.",show_alert=True)
+        return await safe_edit_or_answer(
+            call,"❌ <b>KLAIM DITOLAK</b>",
+            reply_markup=owner_orders_menu(),parse_mode="HTML"
+        )
+
+    if action=="replace":
+        item=conn.execute(
+            """SELECT * FROM inventory_items
+               WHERE variant_id=? AND status='available'
+               ORDER BY id ASC LIMIT 1""",
+            (int(order["variant_id"]),)
+        ).fetchone()
+        if not item:
+            conn.rollback(); conn.close()
+            return await call.answer("Stok pengganti tidak tersedia.",show_alert=True)
+
+        cur=conn.execute(
+            """UPDATE inventory_items
+               SET status='allocated',order_id=?
+               WHERE id=? AND status='available'""",
+            (int(order["id"]),int(item["id"]))
+        )
+        if int(cur.rowcount or 0)!=1:
+            conn.rollback(); conn.close()
+            return await call.answer("Stok sedang dipakai proses lain.",show_alert=True)
+        conn.commit(); conn.close()
+
+        try:
+            await bot.send_message(
+                int(order["user_id"]),
+                "♻️ <b>AKUN PENGGANTI</b>\n\n"
+                f"🧾 {invoice(order['id'])}\n"
+                f"<code>{html.escape(str(item['content']))}</code>",
+                parse_mode="HTML"
+            )
+        except Exception as exc:
+            conn=db()
+            conn.execute(
+                "UPDATE inventory_items SET status='available',order_id=0 WHERE id=? AND status='allocated'",
+                (int(item["id"]),)
+            )
+            sync_variant_stock_from_inventory(conn,int(order["variant_id"]))
+            conn.commit(); conn.close()
+            return await call.answer(f"Kirim gagal: {str(exc)[:100]}",show_alert=True)
+
+        conn=db()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE inventory_items SET status='sold',delivered_at=? WHERE id=? AND status='allocated'",
+            (now,int(item["id"]))
+        )
+        conn.execute(
+            """UPDATE support_claims
+               SET claim_type='replacement',status='resolved',
+                   resolution=?,resolved_at=?
+               WHERE id=? AND status='open'""",
+            (f"Replacement inventory #{item['id']}",now,claim_id)
+        )
+        sync_variant_stock_from_inventory(conn,int(order["variant_id"]))
+        conn.commit(); conn.close()
+
+        inventory_log(
+            int(order["variant_id"]),"REPLACEMENT",1,
+            f"order:{order['id']}",f"claim:{claim_id} inventory:{item['id']}"
+        )
+        owner_audit(call.from_user.id,"CLAIM_REPLACEMENT","ok",f"claim={claim_id} item={item['id']}")
+        await call.answer("Replacement berhasil.",show_alert=True)
+        return await safe_edit_or_answer(
+            call,
+            f"✅ <b>REPLACEMENT BERHASIL</b>\n\n🧾 {invoice(order['id'])}\n📦 Item #{item['id']}",
+            reply_markup=owner_orders_menu(),
+            parse_mode="HTML"
+        )
+
+    conn.rollback(); conn.close()
+    await call.answer("Tindakan tidak dikenal.",show_alert=True)
+
+
+@router.callback_query(F.data == "owner:selftest_v2")
+async def owner_selftest_v2(call: CallbackQuery,bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    checks=await transaction_self_test()
+    required_states_ok = all(
+        getattr(OwnerState, name, None) is not None
+        for name in (
+            "customer_profile_lookup",
+            "global_search",
+            "claim_order_id",
+            "claim_reason",
+        )
+    )
+    checks.append((
+        "Owner FSM",
+        required_states_ok,
+        "required states ready" if required_states_ok else "state release tidak sinkron"
+    ))
+    conn=db()
+    inv2=inventory_integrity_v2(conn)
+    _sig,alerts=smart_alert_signature(conn)
+    conn.close()
+    failed=[x for x in checks if not x[1]]
+
+    lines=[
+        "🧪 <b>SELF-TEST v2</b>","",
+        f"✅ Lolos: <b>{len(checks)-len(failed)}/{len(checks)}</b>",
+        f"{'✅' if not failed else '⚠️'} Status: <b>{'SIAP' if not failed else 'PERLU PEMERIKSAAN'}</b>",
+        "",
+        "📦 <b>Inventory Integrity v2</b>",
+        f"• Available punya order: <b>{inv2['available_with_order']}</b>",
+        f"• Allocated orphan: <b>{inv2['allocated_without_order']}</b>",
+        f"• Sold orphan: <b>{inv2['sold_without_order']}</b>",
+        f"• Delivered tanpa sold item: <b>{inv2['delivered_without_sold']}</b>",
+        f"• account_sent belum completed: <b>{inv2['account_sent_but_not_completed']}</b>",
+        "",
+        "🔔 <b>Smart Alert</b>",
+        f"• Paid belum terkirim: <b>{alerts['paid_pending']}</b>",
+        f"• Delivery gagal: <b>{alerts['failed_delivery']}</b>",
+        f"• Stok rendah: <b>{alerts['low']}</b>",
+        f"• Stok kosong: <b>{alerts['empty']}</b>",
+        f"• Bukti menunggu: <b>{alerts['proofs']}</b>",
+    ]
+    if failed:
+        lines += ["","❌ <b>Perlu diperiksa</b>"]
+        for name,_ok,detail in failed:
+            lines.append(f"• {html.escape(name)}: {html.escape(str(detail))}")
+
+    await safe_edit_or_answer(
+        call,"\n".join(lines)[:3900],
+        reply_markup=owner_system_menu(),parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:smart_alert")
+async def owner_smart_alert_status(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    conn=db()
+    _signature,data=smart_alert_signature(conn)
+    conn.close()
+    await safe_edit_or_answer(
+        call,
+        "🔔 <b>SMART ALERT OWNER</b>\n\n"
+        f"💰 Paid belum terkirim: <b>{data['paid_pending']}</b>\n"
+        f"📨 Delivery gagal: <b>{data['failed_delivery']}</b>\n"
+        f"⚠️ Stok rendah: <b>{data['low']}</b>\n"
+        f"❌ Stok kosong: <b>{data['empty']}</b>\n"
+        f"📎 Bukti menunggu: <b>{data['proofs']}</b>\n\n"
+        "Notifikasi otomatis hanya dikirim saat kondisi berubah.",
+        reply_markup=owner_system_menu(),parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+
+@router.callback_query(F.data == "owner:products_more")
+async def owner_products_more(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "🧰 <b>PRODUK & STOK • LAINNYA</b>\n\n"
+        "Fitur lanjutan tetap tersedia di sini.",
+        reply_markup=owner_products_more_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:menu_payments")
+async def owner_menu_payments(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "💳 <b>PEMBAYARAN</b>\n\n"
+        "Verifikasi, metode pembayaran, saldo, dan reconciliation.",
+        reply_markup=owner_payments_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:menu_recovery")
+async def owner_menu_recovery(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    await state.clear()
+    conn=db()
+    paid_pending=int(conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE payment_status='paid'
+             AND COALESCE(fulfillment_status,'')!='delivered'"""
+    ).fetchone()["n"] or 0)
+    failed=int(conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE fulfillment_status='send_failed'"""
+    ).fetchone()["n"] or 0)
+    pending=int(conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE status IN ('pending','pending_payment','paid_pending_delivery')"""
+    ).fetchone()["n"] or 0)
+    conn.close()
+
+    await safe_edit_or_answer(
+        call,
+        "🛟 <b>RECOVERY CENTER</b>\n\n"
+        f"⏳ Order perlu perhatian: <b>{pending}</b>\n"
+        f"💰 Paid belum delivered: <b>{paid_pending}</b>\n"
+        f"📨 Delivery gagal: <b>{failed}</b>\n\n"
+        "Gunakan fitur di bawah hanya jika diperlukan.",
+        reply_markup=owner_recovery_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:promo_menu")
+async def owner_promo_submenu(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "🎯 <b>PROMO & VOUCHER</b>\n\n"
+        "Fitur pemasaran dipisahkan agar menu pelanggan tetap ringkas.",
+        reply_markup=owner_promo_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "owner:system_more")
+async def owner_system_more(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "🧰 <b>SISTEM LANJUTAN</b>\n\n"
+        "Backup, maintenance, repair, test, dan utilitas lanjutan.",
+        reply_markup=owner_system_more_menu(),
         parse_mode="HTML"
     )
     await safe_callback_notice(call)
@@ -19570,7 +20515,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "15.0"
+EXPECTED_SOURCE_VERSION = "15.4"
 
 
 def source_integrity_self_test():
@@ -19663,6 +20608,7 @@ async def main():
         asyncio.create_task(silent_recovery_loop(bot), name="silent_recovery_loop"),
         asyncio.create_task(periodic_operations_loop(bot), name="periodic_operations_loop"),
         asyncio.create_task(periodic_safe_cleanup_loop(), name="periodic_safe_cleanup_loop"),
+        asyncio.create_task(smart_owner_alert_loop(bot), name="smart_owner_alert_loop"),
     ]
 
     try:
