@@ -27,7 +27,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     ErrorEvent,
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
@@ -81,7 +81,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "9.3"
+BOT_VERSION = "9.6"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -1032,6 +1032,37 @@ async def send_join_required(target_message: Message):
         reply_markup=join_required_keyboard(),
         parse_mode="HTML"
     )
+
+
+
+async def force_refresh_user_keyboard(message: Message):
+    """
+    Force Telegram clients (Android/iOS) to discard an old persistent
+    reply keyboard, then send the current keyboard again.
+    """
+    try:
+        remove_msg = await message.answer(
+            "🔄 Memperbarui keyboard...",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception:
+        remove_msg = None
+
+    # Small message boundary helps Telegram clients apply removal before re-send.
+    await asyncio.sleep(0.15)
+
+    await message.answer(
+        "✅ <b>KEYBOARD DIPERBARUI</b>\n\n"
+        "Keyboard menu terbaru sudah dimuat.",
+        reply_markup=user_reply_menu(),
+        parse_mode="HTML"
+    )
+
+    if remove_msg:
+        try:
+            await remove_msg.delete()
+        except Exception:
+            pass
 
 
 async def show_main_menu_message(message: Message):
@@ -5888,7 +5919,7 @@ async def owner_back_system(call: CallbackQuery, state: FSMContext):
         await state.clear()
         await safe_edit_or_answer(
             call,
-            "⚙️ <b>SISTEM</b>\n\nPilih pengaturan:",
+            "⚙️ <b>SISTEM</b>\n\nPilih fitur sistem:",
             reply_markup=owner_system_menu(),
             parse_mode="HTML"
         )
@@ -5949,7 +5980,7 @@ async def owner_menu_system(call: CallbackQuery, state: FSMContext):
         await state.clear()
         await safe_edit_or_answer(
             call,
-            "⚙️ <b>SISTEM</b>\n\nPilih pengaturan:",
+            "⚙️ <b>SISTEM</b>\n\nPilih fitur sistem:",
             reply_markup=owner_system_menu(),
             parse_mode="HTML"
         )
@@ -8580,9 +8611,8 @@ async def owner_qris_upload_invalid(message: Message):
         return
 
     await message.answer(
-        "❌ <b>FORMAT TIDAK SESUAI</b>\n\n"
+        "❌ <b>FORMAT QRIS TIDAK VALID</b>\n\n"
         "Kirim QRIS sebagai <b>foto</b> atau <b>file gambar JPG/PNG</b>.",
-        reply_markup=back_owner("owner:back_orders"),
         parse_mode="HTML"
     )
 
@@ -11986,59 +12016,6 @@ async def owner_bundle_second(call: CallbackQuery, state: FSMContext):
 
 
 
-@router.callback_query()
-async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
-    """
-    Last-resort for stale inline buttons from older bot messages.
-    Specific callback handlers above always get first chance.
-    """
-    data = call.data or ""
-
-    # Every old/stale admin button remains protected.
-    admin_prefixes = (
-        "owner:",
-        "ownerstock:",
-        "ownerresend:",
-        "ownercancel:",
-        "ownerdelete:",
-        "ownerbtnname:",
-        "proofapprove:",
-        "proofreject:",
-        "proofrejectreason:",
-        "proofpending:",
-        "topupverify:",
-        "topuprejectreason:",
-    )
-
-    if data.startswith(admin_prefixes):
-        if not is_owner(call.from_user.id):
-            return await deny_owner_callback(call)
-
-        await state.clear()
-        await safe_edit_or_answer(
-            call,
-            f"🛠️ <b>PANEL OWNER • {STORE_NAME}</b>\n\n"
-            "Menu lama sudah diperbarui. Silakan pilih pengaturan dari panel terbaru.\n\n"
-            f"<i>{STORE_FOOTER}</i>",
-            reply_markup=owner_menu(),
-            parse_mode="HTML"
-        )
-        return await call.answer("Menu diperbarui.")
-
-    # User-facing stale navigation falls back to home rather than silently doing nothing.
-    if data in {"back", "menu", "main_menu", "start"}:
-        await state.clear()
-        await safe_edit_or_answer(
-            call,
-            f"🛍️ <b>{STORE_NAME}</b>\n\nSilakan pilih menu:",
-            reply_markup=main_menu(),
-            parse_mode="HTML"
-        )
-        return await call.answer("Menu diperbarui.")
-
-    await call.answer("Tombol ini sudah kedaluwarsa. Buka menu terbaru.", show_alert=True)
-
-
 
 @router.callback_query(F.data == "owner:payment_health")
 async def owner_payment_health(call: CallbackQuery, bot: Bot):
@@ -12577,6 +12554,98 @@ async def owner_cleanup_confirm(call: CallbackQuery):
         await safe_callback_notice(call)
     except Exception as exc:
         await owner_system_error_view(call, "Hapus Data", exc)
+
+
+@router.message(F.text == "🔄 Perbarui Keyboard")
+async def refresh_user_keyboard(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+
+    if not await is_channel_member(bot, message.from_user.id):
+        return await send_join_required(message)
+
+    mark_user_verified(
+        message.from_user.id,
+        message.from_user.username or ""
+    )
+
+    await force_refresh_user_keyboard(message)
+
+
+@router.callback_query(F.data == "refresh_keyboard")
+async def refresh_keyboard_callback(call: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+
+    if not await is_channel_member(bot, call.from_user.id):
+        await safe_edit_or_answer(
+            call,
+            "🔐 <b>VERIFIKASI CHANNEL</b>\n\n"
+            f"Silakan join <b>{REQUIRED_CHANNEL_NAME}</b> terlebih dahulu.",
+            reply_markup=join_required_keyboard(),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
+    await safe_callback_notice(call, "Keyboard diperbarui.")
+    await force_refresh_user_keyboard(call.message)
+
+
+@router.callback_query()
+async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
+    """
+    FINAL fallback for callbacks that truly have no current handler.
+
+    IMPORTANT:
+    This handler MUST stay after all specific callback handlers.
+    Otherwise it will swallow valid owner/system callbacks.
+    """
+    data = call.data or ""
+
+    admin_prefixes = (
+        "owner:",
+        "ownerstock:",
+        "ownerresend:",
+        "ownercancel:",
+        "ownerdelete:",
+        "ownerbtnname:",
+        "proofapprove:",
+        "proofreject:",
+        "proofrejectreason:",
+        "proofpending:",
+        "topupverify:",
+        "topuprejectreason:",
+        "cleanup:",
+        "dailyreport:",
+    )
+
+    if data.startswith(admin_prefixes):
+        if not is_owner(call.from_user.id):
+            return await deny_owner_callback(call)
+
+        await state.clear()
+        await safe_edit_or_answer(
+            call,
+            "⚠️ <b>TOMBOL SUDAH KEDALUWARSA</b>\n\n"
+            "Tombol dari pesan lama sudah tidak digunakan.\n"
+            "Buka kembali panel owner untuk mendapatkan tombol terbaru.",
+            reply_markup=owner_menu(),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call, "Buka panel terbaru.")
+
+    if data in {"back", "menu", "main_menu", "start"}:
+        await state.clear()
+        await safe_edit_or_answer(
+            call,
+            f"🛍️ <b>{STORE_NAME}</b>\n\nSilakan pilih menu:",
+            reply_markup=main_menu(),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
+    await call.answer(
+        "Tombol ini sudah kedaluwarsa. Buka menu terbaru.",
+        show_alert=True
+    )
 
 
 @router.message()
