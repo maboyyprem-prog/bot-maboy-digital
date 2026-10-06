@@ -93,7 +93,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "15.9"
+BOT_VERSION = "16.2"
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -317,6 +317,45 @@ class SQLiteFSMStorage(BaseStorage):
 
 
 
+
+
+
+def db_retry(operation, *, attempts: int = 4, base_delay: float = 0.08):
+    """Run a small synchronous SQLite operation with bounded retry on lock/busy errors."""
+    last_exc = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            text = str(exc).lower()
+            if "locked" not in text and "busy" not in text:
+                raise
+            last_exc = exc
+            if attempt + 1 >= attempts:
+                break
+            time.sleep(base_delay * (2 ** attempt))
+    if last_exc:
+        raise last_exc
+    return operation()
+
+
+def begin_immediate_retry(conn, *, attempts: int = 4, base_delay: float = 0.08):
+    """BEGIN IMMEDIATE with bounded retry for transient SQLite contention."""
+    last_exc = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as exc:
+            text = str(exc).lower()
+            if "locked" not in text and "busy" not in text:
+                raise
+            last_exc = exc
+            if attempt + 1 >= attempts:
+                break
+            time.sleep(base_delay * (2 ** attempt))
+    if last_exc:
+        raise last_exc
 
 
 def has_column(conn, table, column):
@@ -2915,6 +2954,9 @@ def recent_duplicate_checkout(
 
 
 def reserve_stock_for_order(conn, variant_id: int, qty: int) -> bool:
+    # Repair any stale cached reservation count first.
+    sync_variant_reserved_stock(conn, variant_id)
+
     row = conn.execute(
         """SELECT stock, reserved_stock
            FROM product_variants
@@ -2938,20 +2980,95 @@ def reserve_stock_for_order(conn, variant_id: int, qty: int) -> bool:
     return True
 
 
-def release_order_reservation(conn, order):
-    if not order or int(order["stock_reserved"] or 0) != 1:
-        return
+def reserved_qty_for_variant(conn, variant_id: int) -> int:
+    row = conn.execute(
+        """SELECT COALESCE(SUM(qty),0) AS n
+           FROM orders
+           WHERE variant_id=?
+             AND stock_reserved=1
+             AND status NOT IN ('cancelled','expired','completed')""",
+        (int(variant_id),)
+    ).fetchone()
+    return max(0, int(row["n"] or 0))
 
+
+def sync_variant_reserved_stock(conn, variant_id: int) -> int:
+    reserved = reserved_qty_for_variant(conn, variant_id)
     conn.execute(
-        """UPDATE product_variants
-           SET reserved_stock=MAX(0, reserved_stock-?)
-           WHERE id=?""",
-        (order["qty"], order["variant_id"])
+        "UPDATE product_variants SET reserved_stock=? WHERE id=?",
+        (reserved, int(variant_id))
     )
-    conn.execute(
-        "UPDATE orders SET stock_reserved=0 WHERE id=?",
-        (order["id"],)
-    )
+    return reserved
+
+
+def sync_all_reserved_stock(conn) -> int:
+    rows = conn.execute("SELECT id FROM product_variants").fetchall()
+    changed = 0
+    for row in rows:
+        variant_id = int(row["id"])
+        current = conn.execute(
+            "SELECT reserved_stock FROM product_variants WHERE id=?",
+            (variant_id,)
+        ).fetchone()
+        before = int(current["reserved_stock"] or 0) if current else 0
+        after = reserved_qty_for_variant(conn, variant_id)
+        if before != after:
+            conn.execute(
+                "UPDATE product_variants SET reserved_stock=? WHERE id=?",
+                (after, variant_id)
+            )
+            changed += 1
+    return changed
+
+
+
+def reservation_integrity_snapshot(conn):
+    """Read-only consistency snapshot for cached reserved_stock vs active orders."""
+    rows = conn.execute(
+        "SELECT id,reserved_stock FROM product_variants"
+    ).fetchall()
+    mismatches = []
+    for row in rows:
+        variant_id = int(row["id"])
+        cached = int(row["reserved_stock"] or 0)
+        expected = reserved_qty_for_variant(conn, variant_id)
+        if cached != expected:
+            mismatches.append((variant_id, cached, expected))
+    return mismatches
+
+
+def repair_reservation_integrity(conn) -> int:
+    """Repair all reserved_stock counters from authoritative order rows."""
+    mismatches = reservation_integrity_snapshot(conn)
+    for variant_id, _cached, expected in mismatches:
+        conn.execute(
+            "UPDATE product_variants SET reserved_stock=? WHERE id=?",
+            (int(expected), int(variant_id))
+        )
+    return len(mismatches)
+
+
+def release_order_reservation(conn, order):
+    """Atomically release one order reservation and reconcile the variant counter."""
+    if not order:
+        return False
+
+    order_id = int(order["id"] or 0)
+    variant_id = int(order["variant_id"] or 0)
+    if order_id <= 0 or variant_id <= 0:
+        return False
+
+    released = conn.execute(
+        """UPDATE orders
+           SET stock_reserved=0
+           WHERE id=? AND stock_reserved=1""",
+        (order_id,)
+    ).rowcount
+
+    # Recompute from the authoritative active-order rows instead of decrementing
+    # a possibly stale cached counter.
+    sync_variant_reserved_stock(conn, variant_id)
+    return released == 1
 
 
 
@@ -3210,7 +3327,7 @@ async def cleanup_expired_orders(bot: Bot):
             now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
             conn = db()
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate_retry(conn)
 
             rows = conn.execute(
                 """SELECT * FROM orders
@@ -3226,10 +3343,14 @@ async def cleanup_expired_orders(bot: Bot):
                 release_order_reservation(conn, order)
                 conn.execute(
                     """UPDATE orders
-                       SET status='expired', payment_status='expired'
+                       SET status='expired',
+                           payment_status='expired',
+                           payment_review_status='',
+                           reserved_until=''
                        WHERE id=?""",
                     (order["id"],)
                 )
+                sync_variant_reserved_stock(conn, int(order["variant_id"] or 0))
                 notify_orders.append((order["user_id"], order["id"]))
 
             stale_topups = conn.execute(
@@ -4759,6 +4880,8 @@ async def auto_recovery_cycle(bot: Bot, source: str = "periodic"):
         "pending_paid": 0,
         "inventory_mismatch": 0,
         "inventory_repaired": 0,
+        "reservation_counters_repaired": 0,
+        "reservation_integrity_repaired": 0,
         "topups_reset": 0,
         "proof_sessions_cleaned": 0,
         "owner_input_sessions_cleaned": 0,
@@ -4779,6 +4902,21 @@ async def auto_recovery_cycle(bot: Bot, source: str = "periodic"):
             mismatches, repaired = inventory_integrity_report(auto_repair=True)
             report["inventory_mismatch"] = len(mismatches)
             report["inventory_repaired"] = repaired
+
+        # 2b) Repair cached reserved_stock from active order reservations.
+        conn=db()
+        conn.execute("BEGIN IMMEDIATE")
+        repaired_reserved=sync_all_reserved_stock(conn)
+        conn.commit()
+        conn.close()
+        report["reservation_counters_repaired"] = repaired_reserved
+
+        conn=db()
+        begin_immediate_retry(conn)
+        repaired_integrity=repair_reservation_integrity(conn)
+        conn.commit()
+        conn.close()
+        report["reservation_integrity_repaired"] = repaired_integrity
 
         # 3) Reset ONLY genuinely stale topups stuck in processing.
         # Fresh verification in progress must never be reverted by periodic recovery.
@@ -4941,6 +5079,7 @@ async def periodic_auto_recovery(bot: Bot):
                     f"✅ Order recovered: <b>{report['recovered_orders']}</b>",
                     f"📦 Paid belum terkirim: <b>{report['pending_paid']}</b>",
                     f"🧹 Inventory repaired: <b>{report['inventory_repaired']}</b>",
+                    f"📦 Reservasi stok repaired: <b>{report['reservation_counters_repaired']}</b>",
                     f"💰 Topup reset: <b>{report['topups_reset']}</b>",
                     f"📎 Proof session cleaned: <b>{report['proof_sessions_cleaned']}</b>",
                     f"🛟 Safe Mode: <b>{'ON' if report['safe_mode_triggered'] else 'tidak berubah'}</b>",
@@ -5020,6 +5159,7 @@ async def startup_recovery_audit(bot: Bot):
         "pending_orders": report["pending_paid"],
         "inventory_mismatch": report["inventory_mismatch"],
         "inventory_repaired": report["inventory_repaired"],
+        "reservation_counters_repaired": report["reservation_counters_repaired"],
         "processing_topups_reset": report["topups_reset"],
         "proof_sessions_cleaned": report["proof_sessions_cleaned"],
         "safe_mode_triggered": report["safe_mode_triggered"],
@@ -5054,6 +5194,96 @@ async def transaction_self_test():
         checks.append(("Inventory", len(mismatches)==0, f"{len(mismatches)} mismatch"))
     except Exception as exc:
         checks.append(("Inventory", False, str(exc)[:100]))
+
+    # SQLite write-path sanity
+    try:
+        conn=db()
+        begin_immediate_retry(conn)
+        conn.execute("SELECT 1").fetchone()
+        conn.rollback()
+        conn.close()
+        checks.append(("SQLite Write Lock", True, "OK"))
+    except Exception as exc:
+        checks.append(("SQLite Write Lock", False, str(exc)[:100]))
+
+    # Reservation integrity
+    try:
+        conn=db()
+        reservation_mismatches=reservation_integrity_snapshot(conn)
+        conn.close()
+        checks.append((
+            "Reservation Integrity",
+            len(reservation_mismatches)==0,
+            f"{len(reservation_mismatches)} mismatch"
+        ))
+    except Exception as exc:
+        checks.append(("Reservation Integrity",False,str(exc)[:100]))
+
+    # Duplicate paid-event sanity
+    try:
+        conn=db()
+        dup_paid=int(conn.execute(
+            """SELECT COUNT(*) AS n FROM (
+                   SELECT entity_id
+                   FROM payment_events
+                   WHERE entity_type='order' AND event_type='paid'
+                   GROUP BY entity_id
+                   HAVING COUNT(*)>1
+               )"""
+        ).fetchone()["n"] or 0)
+        conn.close()
+        checks.append((
+            "Payment Idempotency",
+            dup_paid==0,
+            f"{dup_paid} duplicate paid event"
+        ))
+    except Exception as exc:
+        checks.append(("Payment Idempotency",False,str(exc)[:100]))
+
+    # Payment proof state consistency
+    try:
+        conn=db()
+        bad_proof_states=int(conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM orders
+               WHERE payment_status='paid'
+                 AND COALESCE(payment_review_status,'') NOT IN ('verified','')"""
+        ).fetchone()["n"] or 0)
+        final_waiting=int(conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM orders
+               WHERE status IN ('cancelled','expired','completed')
+                 AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')"""
+        ).fetchone()["n"] or 0)
+        conn.close()
+        proof_issues=bad_proof_states+final_waiting
+        checks.append((
+            "Payment Proof State",
+            proof_issues==0,
+            f"{proof_issues} mismatch"
+        ))
+    except Exception as exc:
+        checks.append(("Payment Proof State",False,str(exc)[:100]))
+
+    # Reservation cache consistency
+    try:
+        conn=db()
+        mismatched=0
+        variants=conn.execute(
+            "SELECT id,reserved_stock FROM product_variants"
+        ).fetchall()
+        for variant in variants:
+            expected=reserved_qty_for_variant(conn,int(variant["id"]))
+            if int(variant["reserved_stock"] or 0) != expected:
+                mismatched += 1
+        conn.close()
+        checks.append((
+            "Stock Reservation",
+            mismatched==0,
+            f"{mismatched} mismatch"
+        ))
+    except Exception as exc:
+        checks.append(("Stock Reservation",False,str(exc)[:100]))
 
     # Wallet negatives
     try:
@@ -5525,18 +5755,25 @@ async def process_payment_proof_message(
             conn.close()
             return False, "Invoice tidak ditemukan."
 
-        if row["payment_status"] == "paid":
+        if order_payment_terminal(row):
             conn.close()
             clear_payment_proof_session(message.from_user.id)
             await state.clear()
-            return False, "Order ini sudah diverifikasi."
+            return False, "Pesanan ini sudah final."
+
+        if order_reservation_expired(row):
+            conn.close()
+            clear_payment_proof_session(message.from_user.id)
+            await state.clear()
+            return False, "Waktu pembayaran sudah habis. Buat pesanan baru."
 
         conn.execute(
             """UPDATE orders
                SET payment_proof_file_id=?,
                    payment_proof_type=?,
                    payment_proof_submitted_at=?,
-                   payment_reject_reason=''
+                   payment_reject_reason='',
+                   payment_review_status='submitted'
                WHERE id=?""",
             (file_id, proof_type, now, entity_id)
         )
@@ -5550,20 +5787,22 @@ async def process_payment_proof_message(
             conn.close()
             return False, "Invoice top up tidak ditemukan."
 
-        if row["status"] == "completed":
+        if topup_payment_terminal(row):
             conn.close()
             clear_payment_proof_session(message.from_user.id)
             await state.clear()
-            return False, "Top up ini sudah selesai."
+            return False, "Top up ini sudah final."
 
         conn.execute(
             """UPDATE topups
                SET payment_proof_file_id=?,
                    payment_proof_type=?,
                    payment_proof_submitted_at=?,
-                   payment_reject_reason=''
+                   payment_reject_reason='',
+                   payment_review_status='submitted',
+                   updated_at=?
                WHERE id=?""",
-            (file_id, proof_type, now, entity_id)
+            (file_id, proof_type, now, now, entity_id)
         )
 
     conn.commit()
@@ -5582,10 +5821,53 @@ async def process_payment_proof_message(
         await state.clear()
         return True, ""
 
-    # Keep persistent session active so the user can retry after owner PM is fixed.
+    # Owner PM failed: mark as retryable, not as waiting for review.
+    conn=db()
+    if entity=="order":
+        conn.execute(
+            "UPDATE orders SET payment_review_status='forward_failed' WHERE id=? AND payment_status!='paid'",
+            (entity_id,)
+        )
+    else:
+        conn.execute(
+            """UPDATE topups
+               SET payment_review_status='forward_failed', updated_at=?
+               WHERE id=? AND status NOT IN ('completed','expired','cancelled','rejected')""",
+            (datetime.now().isoformat(timespec="seconds"), entity_id)
+        )
+    conn.commit()
+    conn.close()
+
     set_payment_proof_session(message.from_user.id, entity, entity_id)
     return False, error or "Gagal meneruskan bukti ke owner."
 
+
+
+def order_payment_terminal(order) -> bool:
+    if not order:
+        return True
+    return (
+        str(order["payment_status"] or "") == "paid"
+        or str(order["status"] or "") in {"cancelled","expired","completed"}
+    )
+
+
+def order_reservation_expired(order) -> bool:
+    if not order:
+        return True
+    expiry = str(order["reserved_until"] or "").strip()
+    if not expiry:
+        return False
+    try:
+        return datetime.fromisoformat(expiry) <= datetime.now(timezone.utc).astimezone()
+    except Exception:
+        return False
+
+
+def topup_payment_terminal(row) -> bool:
+    if not row:
+        return True
+    return str(row["status"] or "") in {"completed","expired","cancelled","rejected"}
 
 
 def order_user_status_label(order) -> str:
@@ -5604,6 +5886,10 @@ def order_user_status_label(order) -> str:
         return "💰 Pembayaran Dikonfirmasi • Menunggu Akun"
     if review_status=="reviewing":
         return "⏳ Bukti Sedang Diperiksa"
+    if review_status=="submitted":
+        return "📤 Bukti Terkirim • Menunggu Owner"
+    if review_status=="forward_failed":
+        return "⚠️ Bukti Belum Sampai ke Owner"
     if review_status=="rejected":
         return "❌ Bukti Ditolak"
     if status=="expired" or payment_status=="expired":
@@ -5648,31 +5934,47 @@ def order_detail_text(order) -> str:
 
 def order_detail_keyboard(order):
     rows=[]
+    status=str(order["status"] or "")
+    payment_status=str(order["payment_status"] or "")
+    review_status=str(order["payment_review_status"] or "")
 
-    if order["status"]=="completed" and order["fulfillment_status"]=="delivered":
+    if status=="completed" and order["fulfillment_status"]=="delivered":
         rows.append([
             InlineKeyboardButton(
                 text="⭐ Nilai Toko",
                 callback_data=f"reviewopen:{order['id']}"
             )
         ])
-    elif order["payment_status"]!="paid" and order["status"] not in {"expired","cancelled"}:
-        rows.append([
-            InlineKeyboardButton(
-                text="📤 Kirim Bukti",
-                callback_data=f"proofsubmit:order:{order['id']}"
-            ),
-            InlineKeyboardButton(
-                text="🔄 Cek Status",
-                callback_data=f"statuscheck:order:{order['id']}"
+    elif payment_status!="paid" and status not in {"expired","cancelled","completed"}:
+        if review_status in {"submitted","reviewing"}:
+            rows.append([
+                InlineKeyboardButton(
+                    text="🔄 Cek Status",
+                    callback_data=f"statuscheck:order:{order['id']}"
+                )
+            ])
+        else:
+            proof_label = (
+                "📤 Kirim Ulang Bukti"
+                if review_status in {"rejected","forward_failed"}
+                else "📤 Kirim Bukti"
             )
-        ])
-        rows.append([
-            InlineKeyboardButton(
-                text="❌ Batalkan Pesanan",
-                callback_data=f"usercancel:{order['id']}"
-            )
-        ])
+            rows.append([
+                InlineKeyboardButton(
+                    text=proof_label,
+                    callback_data=f"proofsubmit:order:{order['id']}"
+                )
+            ])
+            rows.append([
+                InlineKeyboardButton(
+                    text="🔄 Cek Status",
+                    callback_data=f"statuscheck:order:{order['id']}"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Batalkan",
+                    callback_data=f"usercancel:{order['id']}"
+                )
+            ])
     else:
         rows.append([
             InlineKeyboardButton(
@@ -6310,7 +6612,7 @@ async def mark_order_paid(
     verified_by: int = 0,
 ):
     conn = db()
-    conn.execute("BEGIN IMMEDIATE")
+    begin_immediate_retry(conn)
     order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
 
     if not order:
@@ -6318,7 +6620,34 @@ async def mark_order_paid(
         conn.close()
         return False
 
-    if order["status"] == "cancelled":
+    if order_payment_terminal(order):
+        conn.rollback()
+        conn.close()
+        return False
+
+    if order_reservation_expired(order):
+        # Expired invoices must never be revived by an old owner button.
+        release_order_reservation(conn, order)
+        conn.execute(
+            """UPDATE orders
+               SET status='expired',
+                   payment_status='expired',
+                   payment_review_status='',
+                   reserved_until=''
+               WHERE id=? AND payment_status!='paid'""",
+            (order_id,)
+        )
+        conn.commit()
+        conn.close()
+        return False
+
+    # Re-read inside the same write transaction so two concurrent
+    # confirmations cannot both become the first payment transition.
+    order = conn.execute(
+        "SELECT * FROM orders WHERE id=?",
+        (order_id,)
+    ).fetchone()
+    if not order:
         conn.rollback()
         conn.close()
         return False
@@ -6337,7 +6666,7 @@ async def mark_order_paid(
                    payment_error=''
                WHERE id=?
                  AND payment_status!='paid'
-                 AND status!='cancelled'""",
+                 AND status NOT IN ('cancelled','expired','completed')""",
             (now, int(verified_by or 0), order_id)
         ).rowcount
 
@@ -8756,10 +9085,36 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
     if not row:
         return await call.answer("Invoice tidak ditemukan.", show_alert=True)
 
-    if entity == "order" and row["payment_status"] == "paid":
-        return await call.answer("Order ini sudah diverifikasi.", show_alert=True)
-    if entity == "topup" and row["status"] == "completed":
-        return await call.answer("Top up ini sudah selesai.", show_alert=True)
+    if entity == "order":
+        if order_payment_terminal(row):
+            return await call.answer(
+                "Pesanan ini sudah final dan tidak menerima bukti pembayaran lagi.",
+                show_alert=True
+            )
+        if order_reservation_expired(row):
+            return await call.answer(
+                "Waktu pembayaran sudah habis. Buat pesanan baru agar stok aman.",
+                show_alert=True
+            )
+        review_status=str(row["payment_review_status"] or "")
+        if review_status in {"submitted","reviewing"}:
+            return await call.answer(
+                "Bukti sudah dikirim dan sedang menunggu pemeriksaan owner.",
+                show_alert=True
+            )
+
+    if entity == "topup":
+        if topup_payment_terminal(row):
+            return await call.answer(
+                "Top up ini sudah final dan tidak menerima bukti lagi.",
+                show_alert=True
+            )
+        review_status=str(row["payment_review_status"] or "")
+        if review_status in {"submitted","reviewing"}:
+            return await call.answer(
+                "Bukti top up sudah dikirim dan sedang diperiksa.",
+                show_alert=True
+            )
 
     set_payment_proof_session(call.from_user.id, entity, entity_id)
 
@@ -8813,8 +9168,12 @@ async def payment_proof_photo(message: Message, state: FSMContext, bot: Bot):
     await message.answer(
         "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
         "Bukti sudah benar-benar diteruskan ke PM owner.\n"
-        "Owner akan memeriksa dan mengonfirmasi pembayaran.",
-        reply_markup=main_menu(),
+        "Owner akan memeriksa dan mengonfirmasi pembayaran.\n"
+        "Kamu bisa cek status dari Pesanan Saya.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
+            [InlineKeyboardButton(text="🏠 Menu", callback_data="home")]
+        ]),
         parse_mode="HTML"
     )
 
@@ -8857,8 +9216,12 @@ async def payment_proof_document(message: Message, state: FSMContext, bot: Bot):
 
     await message.answer(
         "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
-        "Bukti sudah benar-benar diteruskan ke PM owner.",
-        reply_markup=main_menu(),
+        "Bukti sudah benar-benar diteruskan ke PM owner.\n"
+        "Kamu bisa cek status dari Pesanan Saya.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
+            [InlineKeyboardButton(text="🏠 Menu", callback_data="home")]
+        ]),
         parse_mode="HTML"
     )
 
@@ -10356,7 +10719,7 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
         checkout_note = get_checkout_note_from_state(checkout_data)
 
         conn = db()
-        conn.execute("BEGIN IMMEDIATE")
+        begin_immediate_retry(conn)
 
         duplicate = recent_duplicate_checkout(
             conn, call.from_user.id, variant_id, qty, "WALLET"
@@ -10448,6 +10811,26 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
         )
         order_id = cur.lastrowid
         ref = invoice(order_id)
+
+        existing_ledger = conn.execute(
+            """SELECT 1 FROM wallet_ledger
+               WHERE user_id=? AND type='PURCHASE' AND reference=?
+               LIMIT 1""",
+            (call.from_user.id, ref)
+        ).fetchone()
+        if existing_ledger:
+            release_order_reservation(conn, conn.execute(
+                "SELECT * FROM orders WHERE id=?",
+                (order_id,)
+            ).fetchone())
+            conn.execute("DELETE FROM orders WHERE id=?", (order_id,))
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                "Transaksi yang sama sedang diproses. Cek Pesanan Saya.",
+                show_alert=True
+            )
+
         new_balance = balance - total
 
         conn.execute(
@@ -10614,7 +10997,7 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         checkout_note = get_checkout_note_from_state(checkout_data)
 
         conn = db()
-        conn.execute("BEGIN IMMEDIATE")
+        begin_immediate_retry(conn)
 
         duplicate = recent_duplicate_checkout(
             conn, call.from_user.id, variant_id, qty, "BANK_TRANSFER"
@@ -10800,7 +11183,7 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         checkout_note = get_checkout_note_from_state(checkout_data)
 
         conn = db()
-        conn.execute("BEGIN IMMEDIATE")
+        begin_immediate_retry(conn)
 
         duplicate = recent_duplicate_checkout(
             conn, call.from_user.id, variant_id, qty, "QRIS"
@@ -11009,7 +11392,7 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         checkout_note = get_checkout_note_from_state(checkout_data)
 
         conn = db()
-        conn.execute("BEGIN IMMEDIATE")
+        begin_immediate_retry(conn)
 
         duplicate = recent_duplicate_checkout(
             conn, call.from_user.id, variant_id, qty, "AUTO_QRIS"
@@ -11094,7 +11477,7 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             qr = await shopeepay_generate_qr(order_id, total)
         except Exception as e:
             conn = db()
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate_retry(conn)
             order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
             release_order_reservation(conn, order)
             conn.execute(
@@ -11334,9 +11717,9 @@ async def user_check_transaction_status(call: CallbackQuery):
         elif row["status"]=="completed":
             status="Selesai"
         await call.message.answer(
-            "💰 <b>STATUS TOP UP</b>\\n\\n"
-            f"🧾 {topup_invoice(entity_id)}\\n"
-            f"💵 Nominal: <b>{rupiah(row['amount'])}</b>\\n"
+            "💰 <b>STATUS TOP UP</b>\n\n"
+            f"🧾 {topup_invoice(entity_id)}\n"
+            f"💵 Nominal: <b>{rupiah(row['amount'])}</b>\n"
             f"📌 Status: <b>{html.escape(status)}</b>",
             parse_mode="HTML"
         )
@@ -11355,7 +11738,7 @@ async def user_cancel_order(call: CallbackQuery,bot: Bot):
         return await call.answer("Sedang diproses. Jangan tekan dua kali.",show_alert=True)
 
     conn=db()
-    conn.execute("BEGIN IMMEDIATE")
+    begin_immediate_retry(conn)
     order=conn.execute(
         "SELECT * FROM orders WHERE id=? AND user_id=?",
         (order_id,call.from_user.id)
@@ -11384,11 +11767,22 @@ async def user_cancel_order(call: CallbackQuery,bot: Bot):
         """UPDATE orders
            SET status='cancelled',
                payment_status='cancelled',
-               payment_review_status=''
+               payment_review_status='',
+               reserved_until=''
            WHERE id=?""",
         (order_id,)
     )
+
+    # Final reconciliation in the same transaction.
+    sync_variant_reserved_stock(conn, int(order["variant_id"] or 0))
+    verify=conn.execute(
+        "SELECT stock_reserved FROM orders WHERE id=?",
+        (order_id,)
+    ).fetchone()
     conn.commit(); conn.close()
+
+    if verify and int(verify["stock_reserved"] or 0) != 0:
+        raise RuntimeError(f"Reservation release failed order={order_id}")
 
     clear_payment_proof_session(call.from_user.id)
     record_payment_event(
@@ -11397,9 +11791,9 @@ async def user_cancel_order(call: CallbackQuery,bot: Bot):
 
     await safe_edit_or_answer(
         call,
-        "❌ <b>PESANAN DIBATALKAN</b>\\n\\n"
-        f"🧾 {invoice(order_id)}\\n"
-        "Reservasi stok sudah dilepas kembali.",
+        "❌ <b>PESANAN DIBATALKAN</b>\n\n"
+        f"🧾 {invoice(order_id)}\n"
+        "✅ Stok reservasi sudah dikembalikan.",
         reply_markup=back_home(),
         parse_mode="HTML"
     )
@@ -13037,10 +13431,10 @@ async def owner_last_backup_info(call: CallbackQuery):
 
     await safe_edit_or_answer(
         call,
-        "ℹ️ <b>BACKUP PROJECT TERAKHIR</b>\\n\\n"
-        f"📦 File: <code>{html.escape(name)}</code>\\n"
-        f"📅 Waktu: <b>{html.escape(time_text)}</b>\\n"
-        f"💾 Ukuran: <b>{size/1024:.1f} KB</b>\\n\\n"
+        "ℹ️ <b>BACKUP PROJECT TERAKHIR</b>\n\n"
+        f"📦 File: <code>{html.escape(name)}</code>\n"
+        f"📅 Waktu: <b>{html.escape(time_text)}</b>\n"
+        f"💾 Ukuran: <b>{size/1024:.1f} KB</b>\n\n"
         "Backup otomatis 48 jam tetap khusus database.",
         reply_markup=owner_system_menu(),
         parse_mode="HTML"
@@ -13392,6 +13786,8 @@ async def owner_verify_payments(call: CallbackQuery):
            LEFT JOIN products p ON p.id=o.product_id
            LEFT JOIN product_variants v ON v.id=o.variant_id
            WHERE o.payment_status!='paid'
+             AND o.status NOT IN ('cancelled','expired','completed')
+             AND COALESCE(o.payment_review_status,'') NOT IN ('rejected','forward_failed')
              AND (
                  (o.payment_proof_file_id IS NOT NULL AND o.payment_proof_file_id!='')
                  OR (o.proof_file_id IS NOT NULL AND o.proof_file_id!='')
@@ -13638,10 +14034,13 @@ async def owner_verify_payment_reject(call: CallbackQuery, bot: Bot):
     conn.execute(
         """UPDATE orders
            SET status='cancelled',
-               payment_status='rejected'
+               payment_status='rejected',
+               payment_review_status='rejected',
+               reserved_until=''
            WHERE id=?""",
         (order_id,)
     )
+    sync_variant_reserved_stock(conn, int(order["variant_id"] or 0))
     conn.commit()
     conn.close()
 
@@ -17797,8 +18196,17 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
         if not row:
             return await call.answer("Order tidak ditemukan.", show_alert=True)
 
-        if row["payment_status"] == "paid":
-            return await call.answer("Order sudah diverifikasi.", show_alert=True)
+        if order_payment_terminal(row):
+            return await call.answer(
+                "Order sudah final dan tidak bisa dikonfirmasi lagi.",
+                show_alert=True
+            )
+
+        if order_reservation_expired(row):
+            return await call.answer(
+                "Invoice sudah kedaluwarsa. Stok tidak boleh diproses dari invoice lama.",
+                show_alert=True
+            )
 
         ok = await mark_order_paid(
             entity_id,
@@ -17845,6 +18253,17 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
         return
 
     if entity == "topup":
+        conn=db()
+        topup_row=conn.execute("SELECT * FROM topups WHERE id=?", (entity_id,)).fetchone()
+        conn.close()
+        if not topup_row:
+            return await call.answer("Top up tidak ditemukan.", show_alert=True)
+        if topup_payment_terminal(topup_row):
+            return await call.answer(
+                "Top up sudah final dan tidak bisa dikonfirmasi lagi.",
+                show_alert=True
+            )
+
         result, status = verify_topup_atomic(entity_id, call.from_user.id)
         if status == "already_completed":
             return await call.answer("Top up sudah diverifikasi.", show_alert=True)
@@ -17886,7 +18305,7 @@ async def owner_proof_reject(call: CallbackQuery):
         [InlineKeyboardButton(text="❌ Bukti Tidak Valid", callback_data=f"proofrejectreason:{entity}:{entity_id}:invalid")],
         [InlineKeyboardButton(text="💰 Nominal Tidak Sesuai", callback_data=f"proofrejectreason:{entity}:{entity_id}:amount")],
         [InlineKeyboardButton(text="🔎 Pembayaran Tidak Ditemukan", callback_data=f"proofrejectreason:{entity}:{entity_id}:notfound")],
-        [InlineKeyboardButton(text="↩️ Kembali", callback_data=f"proofpending:{entity}:{entity_id}")]
+        [InlineKeyboardButton(text="↩️ Kembali", callback_data=f"proofback:{entity}:{entity_id}")]
     ])
 
     await safe_edit_or_answer(
@@ -17895,6 +18314,53 @@ async def owner_proof_reject(call: CallbackQuery):
         reply_markup=kb,
         parse_mode="HTML"
     )
+    await call.answer()
+
+
+
+@router.callback_query(F.data.startswith("proofback:"))
+async def owner_proof_back(call: CallbackQuery):
+    """Return from reject-reason menu without changing payment state."""
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
+
+    _, entity, raw_id = call.data.split(":")
+    entity_id = int(raw_id)
+
+    conn=db()
+    row=conn.execute(
+        "SELECT * FROM orders WHERE id=?" if entity=="order"
+        else "SELECT * FROM topups WHERE id=?",
+        (entity_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Transaksi tidak ditemukan.", show_alert=True)
+
+    caption = payment_proof_caption(entity, row)
+
+    try:
+        await call.message.edit_caption(
+            caption=caption,
+            reply_markup=owner_payment_proof_keyboard(entity, entity_id),
+            parse_mode="HTML"
+        )
+    except Exception:
+        try:
+            await safe_edit_or_answer(
+                call,
+                caption,
+                reply_markup=owner_payment_proof_keyboard(entity, entity_id),
+                parse_mode="HTML"
+            )
+        except Exception:
+            await call.message.answer(
+                caption,
+                reply_markup=owner_payment_proof_keyboard(entity, entity_id),
+                parse_mode="HTML"
+            )
+
     await call.answer()
 
 
@@ -17916,6 +18382,18 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
     conn = db()
     if entity == "order":
         row = conn.execute("SELECT * FROM orders WHERE id=?", (entity_id,)).fetchone()
+        if row and (
+            row["payment_status"]=="paid"
+            or row["status"] in {"cancelled","expired","completed"}
+        ):
+            conn.close()
+            return await call.answer(
+                "Order sudah final dan bukti tidak bisa diubah.",
+                show_alert=True
+            )
+        if row and str(row["payment_review_status"] or "")=="rejected":
+            conn.close()
+            return await call.answer("Bukti sudah ditolak sebelumnya.", show_alert=True)
         if row:
             conn.execute(
                 "UPDATE orders SET payment_reject_reason=?, payment_review_status='rejected' WHERE id=?",
@@ -17923,10 +18401,20 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
             )
     else:
         row = conn.execute("SELECT * FROM topups WHERE id=?", (entity_id,)).fetchone()
+        if row and topup_payment_terminal(row):
+            conn.close()
+            return await call.answer(
+                "Top up sudah final dan bukti tidak bisa diubah.",
+                show_alert=True
+            )
         if row:
             conn.execute(
-                "UPDATE topups SET payment_reject_reason=? WHERE id=?",
-                (reason, entity_id)
+                """UPDATE topups
+                   SET payment_reject_reason=?,
+                       payment_review_status='rejected',
+                       updated_at=?
+                   WHERE id=?""",
+                (reason, datetime.now().isoformat(timespec="seconds"), entity_id)
             )
     conn.commit()
     conn.close()
@@ -17975,6 +18463,27 @@ async def owner_proof_pending(call: CallbackQuery, bot: Bot):
 
     if not row:
         return await call.answer("Transaksi tidak ditemukan.", show_alert=True)
+
+    if entity=="order" and (
+        row["payment_status"]=="paid"
+        or row["status"] in {"cancelled","expired","completed"}
+    ):
+        return await call.answer(
+            "Order sudah final dan tidak bisa ditandai pending.",
+            show_alert=True
+        )
+
+    if entity=="topup" and row["status"] in {"completed","expired","cancelled","rejected"}:
+        return await call.answer(
+            "Top up sudah final dan tidak bisa ditandai pending.",
+            show_alert=True
+        )
+
+    if entity=="order" and str(row["payment_review_status"] or "")=="reviewing":
+        return await call.answer("Bukti sudah berstatus pending.", show_alert=True)
+
+    if entity=="topup" and str(row["payment_review_status"] or "")=="reviewing":
+        return await call.answer("Bukti top up sudah berstatus pending.", show_alert=True)
 
     if entity=="order":
         conn=db()
@@ -18191,7 +18700,7 @@ async def owner_product_stats(call: CallbackQuery):
     else:
         for idx,row in enumerate(rows,1):
             lines.append(
-                f"{idx}. <b>{html.escape(row['name'])}</b>\\n"
+                f"{idx}. <b>{html.escape(row['name'])}</b>\n"
                 f"   Terjual: {int(row['sold'] or 0)} • "
                 f"Varian: {int(row['variants'] or 0)} • "
                 f"Stok akun: {int(row['available'] or 0)}"
@@ -18199,7 +18708,7 @@ async def owner_product_stats(call: CallbackQuery):
 
     await safe_edit_or_answer(
         call,
-        "\\n".join(lines),
+        "\n".join(lines),
         reply_markup=back_owner("owner:back_products"),
         parse_mode="HTML"
     )
@@ -20768,7 +21277,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "15.9"
+EXPECTED_SOURCE_VERSION = "16.2"
 
 
 def source_integrity_self_test():
@@ -20822,6 +21331,9 @@ def runtime_dependency_self_test():
     checks.append(("order_user_status_label", callable(order_user_status_label)))
     checks.append(("conservative_cleanup_old_data", callable(conservative_cleanup_old_data)))
     checks.append(("cleanup_menu_self_test", callable(cleanup_menu_self_test)))
+    checks.append(("begin_immediate_retry", callable(begin_immediate_retry)))
+    checks.append(("reservation_integrity_snapshot", callable(reservation_integrity_snapshot)))
+    checks.append(("repair_reservation_integrity", callable(repair_reservation_integrity)))
 
     failed=[name for name,ok in checks if not ok]
     if failed:
