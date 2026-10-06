@@ -1,15 +1,16 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v10.8  
+**Versi aktif:** v10.9  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Update Terbaru — v10.8 Button Reliability Pack
-- `allowed_updates` dipaksa eksplisit `message` + `callback_query`.
-- Semua callback handler diaudit agar memiliki acknowledgement.
-- Memperbaiki 3 handler user yang sebelumnya tidak ACK: Produk, Populer, Flash.
-- Callback Trace Middleware mencatat callback terakhir, status handled/error, user, dan latency.
-- Diagnostik Sistem dapat membedakan callback tidak sampai ke bot vs callback masuk lalu handler error.
-- Event Isolation, persistent FSM, WAL, backoff, concurrency limit tetap aktif.
+## Update Terbaru — v10.9 Price Routing Fix
+- Menghapus broad `@router.message(F.text)` recovery handlers yang dapat menangkap pesan lalu berhenti tanpa respons.
+- Harga Custom sekarang memakai custom filter `OwnerPriceSessionFilter`.
+- Handler Harga Custom persisten diprioritaskan sebelum handler FSM harga.
+- Saat nominal masuk, bot langsung menampilkan `MEMPROSES HARGA...`.
+- Jika proses gagal, tipe dan detail error langsung ditampilkan.
+- Smoke test SQLite untuk harga `2500` → produk + varian berhasil.
+- Persistent FSM, Callback Trace, WAL, event isolation, backoff tetap dipertahankan.
 - Tidak ada Railway Variable baru.
 
 ## Command

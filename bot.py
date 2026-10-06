@@ -27,7 +27,7 @@ from Crypto.Hash import SHA256
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramBadRequest
 from aiogram.utils.backoff import BackoffConfig
-from aiogram.filters import Command
+from aiogram.filters import Command, Filter
 from aiogram.types import (
     ErrorEvent,
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile,
@@ -87,7 +87,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "10.8"
+BOT_VERSION = "10.9"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -4200,6 +4200,35 @@ def clear_owner_input_session(user_id: int):
     )
     conn.commit()
     conn.close()
+
+PRICE_SESSION_EXCLUDED_TEXTS = {
+    "🏷️ List Produk","🔥 Produk Populer","⚡ Flash Sale","🎁 Voucher",
+    "📁 Laporan Stok","🧾 Pesanan Saya","💰 Isi Saldo","❓ Cara Order",
+    "💬 Hubungi Owner","🔄 Perbarui Keyboard",
+}
+
+class OwnerPriceSessionFilter(Filter):
+    async def __call__(self, message: Message) -> bool:
+        if not getattr(message, "text", None) or not is_owner(message.from_user.id):
+            return False
+        text=(message.text or "").strip()
+        if not text or text.startswith("/") or text in PRICE_SESSION_EXCLUDED_TEXTS:
+            return False
+        session=get_owner_input_session(message.from_user.id)
+        return bool(session and session.get("flow") in {"product_custom_price","variant_custom_price"})
+
+class OwnerOrphanPriceFilter(Filter):
+    async def __call__(self, message: Message, state: FSMContext) -> bool:
+        if not getattr(message, "text", None) or not is_owner(message.from_user.id):
+            return False
+        text=(message.text or "").strip()
+        if not text or text.startswith("/") or text in PRICE_SESSION_EXCLUDED_TEXTS:
+            return False
+        if get_owner_input_session(message.from_user.id) or await state.get_state():
+            return False
+        return bool(parse_rupiah_input(text))
+
+
 
 
 def set_payment_proof_session(user_id: int, entity: str, entity_id: int):
@@ -9916,6 +9945,98 @@ async def owner_add_product(call: CallbackQuery, state: FSMContext):
 
 
 
+
+@router.message(OwnerPriceSessionFilter())
+async def owner_persisted_price_input(message: Message, state: FSMContext):
+    status=await message.answer("⏳ <b>MEMPROSES HARGA...</b>", parse_mode="HTML")
+    try:
+        session=get_owner_input_session(message.from_user.id)
+        price=parse_rupiah_input(message.text or "")
+
+        if not session:
+            await state.clear()
+            return await status.edit_text("⚠️ Sesi Harga Custom sudah tidak aktif.",reply_markup=owner_products_menu())
+
+        if not price:
+            return await status.edit_text(
+                "❌ <b>HARGA TIDAK VALID</b>\n\n"
+                "<code>2500</code>\n<code>2.500</code>\n<code>12.750</code>\n<code>Rp18.750</code>",
+                parse_mode="HTML"
+            )
+
+        if price > 1_000_000_000:
+            return await status.edit_text("❌ Harga terlalu besar. Maksimal Rp1.000.000.000.")
+
+        flow=session["flow"]
+        payload=session["payload"]
+
+        if flow=="product_custom_price":
+            await state.update_data(
+                product_name=payload.get("product_name",""),
+                product_description=payload.get("product_description",""),
+                product_variant_name=payload.get("product_variant_name",""),
+            )
+            result=await create_product_from_wizard(state,message.from_user.id,price)
+            if not result:
+                clear_owner_input_session(message.from_user.id)
+                await state.clear()
+                return await status.edit_text("❌ Data produk tidak lengkap.",reply_markup=owner_products_menu())
+
+            product_id,_,name,variant_name,final_price=result
+            clear_owner_input_session(message.from_user.id)
+            return await status.edit_text(
+                "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
+                f"📦 {html.escape(name)}\n🧩 {html.escape(variant_name)}\n💰 {rupiah(final_price)}\n"
+                "📊 Stok awal: <b>0</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="➕ Tambah Variasi Lagi",callback_data=f"addvariantprod:{product_id}")],
+                    [InlineKeyboardButton(text="📦 Atur Stok",callback_data="owner:set_stock")],
+                    [InlineKeyboardButton(text="⬅️ Produk & Stok",callback_data="owner:back_products")]
+                ]),
+                parse_mode="HTML"
+            )
+
+        if flow=="variant_custom_price":
+            await state.update_data(
+                add_variant_product_id=int(payload.get("add_variant_product_id") or 0),
+                add_variant_name=payload.get("add_variant_name",""),
+            )
+            result=await create_variant_from_wizard(state,price)
+            if result=="duplicate":
+                clear_owner_input_session(message.from_user.id)
+                await state.clear()
+                return await status.edit_text("❌ Variasi dengan nama yang sama sudah ada.",reply_markup=owner_products_menu())
+            if not result:
+                clear_owner_input_session(message.from_user.id)
+                await state.clear()
+                return await status.edit_text("❌ Data variasi tidak lengkap.",reply_markup=owner_products_menu())
+
+            clear_owner_input_session(message.from_user.id)
+            return await status.edit_text(
+                "✅ <b>VARIASI BERHASIL DITAMBAHKAN</b>\n\n"
+                f"📦 Produk: <b>{html.escape(result['product_name'])}</b>\n"
+                f"🧩 Variasi: <b>{html.escape(result['variant_name'])}</b>\n"
+                f"💰 Harga: <b>{rupiah(result['price'])}</b>\n📊 Stok awal: <b>0</b>",
+                reply_markup=owner_products_menu(),
+                parse_mode="HTML"
+            )
+
+        clear_owner_input_session(message.from_user.id)
+        await state.clear()
+        return await status.edit_text("❌ Jenis sesi harga tidak dikenal.",reply_markup=owner_products_menu())
+
+    except Exception as exc:
+        logging.exception("Persisted custom-price handler failed: %s",exc)
+        clear_owner_input_session(message.from_user.id)
+        await state.clear()
+        return await status.edit_text(
+            "❌ <b>ERROR HARGA CUSTOM</b>\n\n"
+            f"Tipe: <code>{html.escape(type(exc).__name__)}</code>\n"
+            f"Error: <code>{html.escape(str(exc)[:500])}</code>",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
+        )
+
 @router.message(OwnerState.add_product_name)
 async def owner_add_product_name_input(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
@@ -13919,169 +14040,16 @@ async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(F.text)
-async def persistent_owner_price_recovery(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
 
-    session=get_owner_input_session(message.from_user.id)
-    if not session:
-        return
-
-    flow=session["flow"]
-    payload=session["payload"]
-
-    if flow not in {"product_custom_price","variant_custom_price"}:
-        return
-
-    price=parse_rupiah_input(message.text or "")
-    if not price:
-        return await message.answer(
-            "❌ <b>HARGA TIDAK VALID</b>\n\n"
-            "Kirim nominal seperti <code>2500</code>, <code>2.500</code>, "
-            "<code>12.750</code>, atau <code>Rp18.750</code>.",
-            parse_mode="HTML"
-        )
-
-    if price > 1_000_000_000:
-        return await message.answer(
-            "❌ Harga terlalu besar. Maksimal Rp1.000.000.000."
-        )
-
-    try:
-        if flow=="product_custom_price":
-            # Rebuild FSM data from persistent session, then use the normal creator.
-            await state.update_data(
-                product_name=payload.get("product_name",""),
-                product_description=payload.get("product_description",""),
-                product_variant_name=payload.get("product_variant_name",""),
-            )
-            result=await create_product_from_wizard(
-                state,
-                message.from_user.id,
-                price
-            )
-
-            if not result:
-                clear_owner_input_session(message.from_user.id)
-                await state.clear()
-                return await message.answer(
-                    "❌ Data produk tidak lengkap. Silakan ulangi Tambah Produk.",
-                    reply_markup=owner_products_menu()
-                )
-
-            product_id,_,name,variant_name,price=result
-            clear_owner_input_session(message.from_user.id)
-
-            return await message.answer(
-                "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
-                f"📦 {html.escape(name)}\n"
-                f"🧩 {html.escape(variant_name)}\n"
-                f"💰 {rupiah(price)}\n"
-                "📊 Stok awal: <b>0</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text="➕ Tambah Variasi Lagi",
-                        callback_data=f"addvariantprod:{product_id}"
-                    )],
-                    [InlineKeyboardButton(
-                        text="📦 Atur Stok",
-                        callback_data="owner:set_stock"
-                    )],
-                    [InlineKeyboardButton(
-                        text="⬅️ Produk & Stok",
-                        callback_data="owner:back_products"
-                    )]
-                ]),
-                parse_mode="HTML"
-            )
-
-        if flow=="variant_custom_price":
-            await state.update_data(
-                add_variant_product_id=int(payload.get("add_variant_product_id") or 0),
-                add_variant_name=payload.get("add_variant_name",""),
-            )
-            result=await create_variant_from_wizard(state,price)
-
-            if result=="duplicate":
-                clear_owner_input_session(message.from_user.id)
-                await state.clear()
-                return await message.answer(
-                    "❌ Variasi dengan nama yang sama sudah ada.",
-                    reply_markup=owner_products_menu()
-                )
-
-            if not result:
-                clear_owner_input_session(message.from_user.id)
-                await state.clear()
-                return await message.answer(
-                    "❌ Data variasi tidak lengkap.",
-                    reply_markup=owner_products_menu()
-                )
-
-            clear_owner_input_session(message.from_user.id)
-
-            return await message.answer(
-                "✅ <b>VARIASI BERHASIL DITAMBAHKAN</b>\n\n"
-                f"📦 Produk: <b>{html.escape(result['product_name'])}</b>\n"
-                f"🧩 Variasi: <b>{html.escape(result['variant_name'])}</b>\n"
-                f"💰 Harga: <b>{rupiah(result['price'])}</b>\n"
-                "📊 Stok awal: <b>0</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text="➕ Tambah Variasi Lagi",
-                        callback_data=f"addvariantprod:{result['product_id']}"
-                    )],
-                    [InlineKeyboardButton(
-                        text="📦 Atur Stok",
-                        callback_data="owner:set_stock"
-                    )],
-                    [InlineKeyboardButton(
-                        text="⬅️ Produk & Stok",
-                        callback_data="owner:back_products"
-                    )]
-                ]),
-                parse_mode="HTML"
-            )
-
-    except Exception as exc:
-        logging.exception("Persistent owner price recovery failed: %s", exc)
-        clear_owner_input_session(message.from_user.id)
-        await state.clear()
-        return await message.answer(
-            "❌ <b>GAGAL MEMPROSES HARGA</b>\n\n"
-            f"<code>{html.escape(str(exc)[:400])}</code>",
-            reply_markup=owner_products_menu(),
-            parse_mode="HTML"
-        )
-
-
-@router.message(F.text)
+@router.message(OwnerOrphanPriceFilter())
 async def owner_price_recovery(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-
-    if get_owner_input_session(message.from_user.id):
-        return
-
-    current_state=await state.get_state()
-    if current_state:
-        return
-
-    text=(message.text or "").strip()
-    if not text:
-        return
-
-    # If an owner sends a bare nominal after the price screen but the FSM was
-    # unexpectedly lost, never leave the message unanswered.
-    if parse_rupiah_input(text):
-        return await message.answer(
-            "⚠️ <b>SESI HARGA SUDAH TERPUTUS</b>\n\n"
-            "Bot menerima nominal Anda, tetapi sesi Tambah Produk sudah tidak aktif.\n"
-            "Silakan buka <b>➕ Tambah Produk</b> lagi agar data tidak tersimpan setengah.",
-            reply_markup=owner_products_menu(),
-            parse_mode="HTML"
-        )
+    await message.answer(
+        "⚠️ <b>SESI HARGA SUDAH TERPUTUS</b>\n\n"
+        "Bot menerima nominal Anda, tetapi sesi Harga Custom sudah tidak aktif.\n"
+        "Silakan buka <b>➕ Tambah Produk</b> lagi.",
+        reply_markup=owner_products_menu(),
+        parse_mode="HTML"
+    )
 
 
 @router.message()
