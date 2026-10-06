@@ -81,7 +81,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "8.0"
+BOT_VERSION = "9.0"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -569,6 +569,32 @@ def is_owner(user_id: int) -> bool:
 
 
 
+
+def format_uptime_detail(seconds: int) -> str:
+    seconds=max(0,int(seconds))
+    days, rem=divmod(seconds,86400)
+    hours, rem=divmod(rem,3600)
+    minutes, secs=divmod(rem,60)
+
+    parts=[]
+    if days:
+        parts.append(f"{days} hari")
+    if hours or days:
+        parts.append(f"{hours} jam")
+    if minutes or hours or days:
+        parts.append(f"{minutes} menit")
+    parts.append(f"{secs} detik")
+    return " ".join(parts)
+
+
+def jakarta_now():
+    return datetime.now(JAKARTA_TZ)
+
+
+def bot_started_at_jakarta():
+    return datetime.fromtimestamp(START_TIME, tz=JAKARTA_TZ)
+
+
 def owner_access_denied_text() -> str:
     return (
         "⛔ <b>AKSES DITOLAK</b>\n\n"
@@ -589,36 +615,121 @@ async def deny_owner_callback(call: CallbackQuery):
 
 
 
-async def is_channel_member(bot: Bot, user_id: int) -> bool:
+def parse_rupiah_input(text: str):
+    """
+    Menerima format:
+    15000
+    15.000
+    15,000
+    Rp15.000
+    rp 15 000
+    """
+    raw=(text or "").strip().lower()
+    if not raw:
+        return None
+
+    raw=raw.replace("rp","").replace("idr","").strip()
+    digits=re.sub(r"[^0-9]","",raw)
+
+    if not digits:
+        return None
+
+    try:
+        value=int(digits)
+    except Exception:
+        return None
+
+    return value if value > 0 else None
+
+
+
+
+async def check_channel_membership(bot: Bot, user_id: int):
+    """
+    Returns (joined: bool, reason: str, detail: str).
+
+    reason:
+    - disabled
+    - joined
+    - not_member
+    - bot_not_admin
+    - invalid_channel
+    - telegram_error
+    """
     if not REQUIRED_CHANNEL_ID:
-        return True
+        return True, "disabled", "Verifikasi channel tidak diwajibkan."
 
     raw_target = str(REQUIRED_CHANNEL_ID).strip()
     target = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
 
     try:
+        # First make sure the bot itself can access the required channel.
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(target, me.id)
+        bot_status_obj = getattr(bot_member, "status", "")
+        bot_status = str(getattr(bot_status_obj, "value", bot_status_obj)).lower()
+
+        # Telegram getChatMember for OTHER users in channels is reliable
+        # when the bot is an administrator.
+        if bot_status not in {"administrator", "creator", "owner"}:
+            return (
+                False,
+                "bot_not_admin",
+                "Bot belum menjadi admin di channel wajib."
+            )
+
         member = await bot.get_chat_member(target, user_id)
+        status_obj = getattr(member, "status", "")
+        status = str(getattr(status_obj, "value", status_obj)).lower()
 
-        status = getattr(member, "status", "")
-        status_text = str(getattr(status, "value", status)).lower()
+        if status in {"member", "administrator", "creator", "owner"}:
+            return True, "joined", status
 
-        if status_text in {"member", "administrator", "creator", "owner"}:
-            return True
-
-        # Restricted members can still be members if they have not left.
-        if status_text == "restricted":
+        if status == "restricted":
             is_member_flag = getattr(member, "is_member", None)
-            return bool(is_member_flag)
+            if bool(is_member_flag):
+                return True, "joined", "restricted-member"
 
-        return False
+        return False, "not_member", status or "not_member"
+
     except Exception as exc:
+        error_text = str(exc)
+        lower = error_text.lower()
+
+        if (
+            "chat not found" in lower
+            or "chat_id_invalid" in lower
+            or "peer_id_invalid" in lower
+        ):
+            return False, "invalid_channel", error_text[:300]
+
+        if (
+            "administrator" in lower
+            or "not enough rights" in lower
+            or "member list is inaccessible" in lower
+        ):
+            return False, "bot_not_admin", error_text[:300]
+
+        if (
+            "user not participant" in lower
+            or "participant_id_invalid" in lower
+        ):
+            return False, "not_member", error_text[:300]
+
         logging.warning(
-            "Required channel verification failed: target=%r user_id=%s error=%s",
+            "Required channel verification failed target=%r user_id=%s error=%s",
             target,
             user_id,
             exc
         )
-        return False
+        return False, "telegram_error", error_text[:300]
+
+
+async def is_channel_member(bot: Bot, user_id: int) -> bool:
+    joined, _reason, _detail = await check_channel_membership(bot, user_id)
+    return joined
+
+
 
 
 def mark_user_verified(user_id: int, username: str = ""):
@@ -3436,10 +3547,23 @@ async def launch_readiness_report(bot: Bot):
         target = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
         try:
             chat = await bot.get_chat(target)
+            me = await bot.get_me()
+            bot_member = await bot.get_chat_member(target, me.id)
+            bot_status_obj = getattr(bot_member, "status", "")
+            bot_status = str(
+                getattr(bot_status_obj, "value", bot_status_obj)
+            ).lower()
+            bot_admin = bot_status in {"administrator", "creator", "owner"}
+
+            channel_name = (
+                getattr(chat, "title", "")
+                or getattr(chat, "username", "")
+                or str(target)
+            )
             checks.append((
                 "Required Channel",
-                True,
-                getattr(chat, "title", "") or getattr(chat, "username", "") or str(target)
+                bot_admin,
+                f"{channel_name} • bot={bot_status}"
             ))
         except Exception as exc:
             checks.append(("Required Channel", False, str(exc)[:120]))
@@ -4265,6 +4389,8 @@ class OwnerState(StatesGroup):
     add_product_description = State()
     add_product_name = State()
     add_variant = State()
+    add_variant_price = State()
+    add_variant_name = State()
     stock_add_items = State()
     set_price = State()
     mark_popular = State()
@@ -4466,7 +4592,6 @@ def owner_menu():
 def owner_products_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Tambah Produk", callback_data="owner:add_product")
-    kb.button(text="🧩 Tambah Variasi", callback_data="owner:add_variant")
     kb.button(text="📦 Atur Stok", callback_data="owner:set_stock")
     kb.button(text="🔔 Alert Stok", callback_data="owner:low_stock")
     kb.button(text="📚 Riwayat Stok", callback_data="owner:inventory_log")
@@ -4477,7 +4602,7 @@ def owner_products_menu():
     kb.button(text="⚡ Flash Sale", callback_data="owner:mark_flash")
     kb.button(text="🎁 Paket / Bundle", callback_data="owner:bundles")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.adjust(2, 2, 2, 2, 2, 1, 1)
+    kb.adjust(2, 2, 2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -4508,6 +4633,224 @@ def owner_customers_menu():
     return kb.as_markup()
 
 
+async def owner_system_error_view(call: CallbackQuery, feature: str, exc: Exception):
+    logging.exception("Owner system feature failed [%s]: %s", feature, exc)
+    try:
+        log_system_error(
+            "OWNER_SYSTEM",
+            str(exc),
+            reference=feature,
+            severity="error",
+            recovered=False
+        )
+    except Exception:
+        logging.exception("Failed to write owner system error log.")
+
+    await safe_edit_or_answer(
+        call,
+        "❌ <b>FITUR SISTEM ERROR</b>\n\n"
+        f"Fitur: <b>{html.escape(feature)}</b>\n"
+        f"Error: <code>{html.escape(str(exc)[:600])}</code>\n\n"
+        "Fitur lain tetap dapat digunakan.",
+        reply_markup=owner_system_menu(),
+        parse_mode="HTML"
+    )
+
+
+async def safe_callback_notice(call: CallbackQuery, text: str = ""):
+    try:
+        await call.answer(text)
+    except Exception:
+        pass
+
+
+
+def cleanup_data_counts():
+    conn = db()
+    now = datetime.now().isoformat(timespec="seconds")
+
+    def count(sql, params=()):
+        try:
+            row=conn.execute(sql, params).fetchone()
+            return int(row["n"] or 0)
+        except Exception:
+            return 0
+
+    result = {
+        "expired_orders": count(
+            """SELECT COUNT(*) AS n FROM orders
+               WHERE payment_status!='paid'
+                 AND status NOT IN ('completed','cancelled')
+                 AND (
+                    (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
+                    OR status='expired'
+                 )""",
+            (now,)
+        ),
+        "expired_topups": count(
+            """SELECT COUNT(*) AS n FROM topups
+               WHERE status NOT IN ('completed','paid')
+                 AND (
+                    (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
+                    OR status='expired'
+                 )""",
+            (now,)
+        ),
+        "proof_sessions": count(
+            "SELECT COUNT(*) AS n FROM payment_proof_sessions"
+        ),
+        "system_errors": count(
+            "SELECT COUNT(*) AS n FROM system_errors"
+        ),
+    }
+    conn.close()
+    return result
+
+
+def cleanup_data_keyboard():
+    counts=cleanup_data_counts()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"🧾 Order Expired ({counts['expired_orders']})",
+            callback_data="cleanup:preview:orders"
+        )],
+        [InlineKeyboardButton(
+            text=f"💰 Top Up Expired ({counts['expired_topups']})",
+            callback_data="cleanup:preview:topups"
+        )],
+        [InlineKeyboardButton(
+            text=f"📎 Session Bukti ({counts['proof_sessions']})",
+            callback_data="cleanup:preview:proofs"
+        )],
+        [InlineKeyboardButton(
+            text=f"🧯 Log Error ({counts['system_errors']})",
+            callback_data="cleanup:preview:errors"
+        )],
+        [InlineKeyboardButton(
+            text="🧹 Bersihkan Data Aman",
+            callback_data="cleanup:preview:safe"
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ Kembali",
+            callback_data="owner:back_system"
+        )]
+    ])
+
+
+def cleanup_preview_text(kind: str):
+    counts=cleanup_data_counts()
+    mapping={
+        "orders": (
+            "🧾 ORDER EXPIRED",
+            counts["expired_orders"],
+            "Order belum dibayar yang sudah expired. Reservasi stok akan dilepas sebelum order dihapus."
+        ),
+        "topups": (
+            "💰 TOP UP EXPIRED",
+            counts["expired_topups"],
+            "Top up yang belum selesai dan sudah expired."
+        ),
+        "proofs": (
+            "📎 SESSION BUKTI PEMBAYARAN",
+            counts["proof_sessions"],
+            "Session bukti pembayaran yang tersimpan. Bukti pada transaksi tidak ikut dihapus."
+        ),
+        "errors": (
+            "🧯 LOG ERROR SISTEM",
+            counts["system_errors"],
+            "Riwayat log error sistem. Transaksi user tidak ikut dihapus."
+        ),
+        "safe": (
+            "🧹 PEMBERSIHAN DATA AMAN",
+            counts["expired_orders"] + counts["expired_topups"] + counts["proof_sessions"],
+            "Order expired belum bayar, top up expired, dan session bukti akan dibersihkan sekaligus."
+        ),
+    }
+    return mapping.get(kind)
+
+
+def cleanup_confirm_keyboard(kind: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ Ya, Hapus",
+            callback_data=f"cleanup:confirm:{kind}"
+        )],
+        [InlineKeyboardButton(
+            text="❌ Batal",
+            callback_data="owner:cleanup_data"
+        )]
+    ])
+
+
+def cleanup_execute(kind: str):
+    conn=db()
+    now=datetime.now().isoformat(timespec="seconds")
+    result={"orders":0,"topups":0,"proofs":0,"errors":0}
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        if kind in {"orders","safe"}:
+            rows=conn.execute(
+                """SELECT id,variant_id,qty,stock_reserved
+                   FROM orders
+                   WHERE payment_status!='paid'
+                     AND status NOT IN ('completed','cancelled')
+                     AND (
+                        (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
+                        OR status='expired'
+                     )""",
+                (now,)
+            ).fetchall()
+
+            for row in rows:
+                if int(row["stock_reserved"] or 0)==1:
+                    conn.execute(
+                        """UPDATE product_variants
+                           SET reserved_stock=MAX(0,reserved_stock-?)
+                           WHERE id=?""",
+                        (int(row["qty"] or 0), row["variant_id"])
+                    )
+
+            ids=[int(r["id"]) for r in rows]
+            if ids:
+                marks=",".join("?" for _ in ids)
+                conn.execute(f"DELETE FROM orders WHERE id IN ({marks})", ids)
+            result["orders"]=len(ids)
+
+        if kind in {"topups","safe"}:
+            rows=conn.execute(
+                """SELECT id FROM topups
+                   WHERE status NOT IN ('completed','paid')
+                     AND (
+                        (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
+                        OR status='expired'
+                     )""",
+                (now,)
+            ).fetchall()
+            ids=[int(r["id"]) for r in rows]
+            if ids:
+                marks=",".join("?" for _ in ids)
+                conn.execute(f"DELETE FROM topups WHERE id IN ({marks})", ids)
+            result["topups"]=len(ids)
+
+        if kind in {"proofs","safe"}:
+            cur=conn.execute("DELETE FROM payment_proof_sessions")
+            result["proofs"]=max(0,int(cur.rowcount or 0))
+
+        if kind=="errors":
+            cur=conn.execute("DELETE FROM system_errors")
+            result["errors"]=max(0,int(cur.rowcount or 0))
+
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def owner_system_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🩺 Diagnostik Sistem", callback_data="owner:diagnostics")
@@ -4519,6 +4862,7 @@ def owner_system_menu():
     kb.button(text="🗄️ Backup Sekarang", callback_data="owner:backup_now")
     kb.button(text="📢 Sinkron Stok Channel", callback_data="owner:sync_stock")
     kb.button(text="📅 Laporan Harian", callback_data="owner:daily_report")
+    kb.button(text="🗑️ Hapus Data", callback_data="owner:cleanup_data")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
     kb.adjust(2, 2, 2, 2, 1)
     return kb.as_markup()
@@ -5449,15 +5793,20 @@ async def owner_back_customers(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "owner:back_system")
 async def owner_back_system(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
-    await state.clear()
-    await safe_edit_or_answer(
-        call,
-        "⚙️ <b>SISTEM</b>\n\nPilih pengaturan:",
-        reply_markup=owner_system_menu(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+        return await deny_owner_callback(call)
+
+    try:
+        await state.clear()
+        await safe_edit_or_answer(
+            call,
+            "⚙️ <b>SISTEM</b>\n\nPilih pengaturan:",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Menu Sistem", exc)
+
 
 
 @router.callback_query(F.data == "owner:menu_products")
@@ -5505,29 +5854,69 @@ async def owner_menu_customers(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "owner:menu_system")
 async def owner_menu_system(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
-    await state.clear()
-    await safe_edit_or_answer(
-        call,
-        "⚙️ <b>SISTEM</b>\n\nPilih pengaturan:",
-        reply_markup=owner_system_menu(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+        return await deny_owner_callback(call)
+
+    try:
+        await state.clear()
+        await safe_edit_or_answer(
+            call,
+            "⚙️ <b>SISTEM</b>\n\nPilih pengaturan:",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Menu Sistem", exc)
 
 
 
 @router.message(Command("ping"))
 async def ping(message: Message, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return await message.answer(
+            "⛔ <b>AKSES DITOLAK</b>\n\n"
+            "Command <code>/ping</code> khusus owner.",
+            parse_mode="HTML"
+        )
+
     ready, checks, blockers = await launch_readiness_report(bot)
+
+    now = jakarta_now()
+    uptime_seconds = int(time.time() - START_TIME)
+    uptime_text = format_uptime_detail(uptime_seconds)
+
+    hari_indonesia = {
+        "Monday": "Senin",
+        "Tuesday": "Selasa",
+        "Wednesday": "Rabu",
+        "Thursday": "Kamis",
+        "Friday": "Jumat",
+        "Saturday": "Sabtu",
+        "Sunday": "Minggu",
+    }
+
+    bulan_indonesia = {
+        1: "Januari", 2: "Februari", 3: "Maret", 4: "April",
+        5: "Mei", 6: "Juni", 7: "Juli", 8: "Agustus",
+        9: "September", 10: "Oktober", 11: "November", 12: "Desember"
+    }
+
+    day_name = hari_indonesia.get(now.strftime("%A"), now.strftime("%A"))
+    now_date = f"{day_name}, {now.day} {bulan_indonesia[now.month]} {now.year}"
+    now_time = now.strftime("%H:%M:%S WIB")
+
 
     lines = [
         ("🟢" if ready else "🔴")
         + f" <b>STATUS BOT: {'SIAP' if ready else 'PERLU DICEK'}</b>",
         "",
-        f"🤖 Versi: <b>v{BOT_VERSION}</b>",
-        f"⏱️ Uptime: <b>{int(time.time() - START_TIME)} detik</b>",
-        ""
+        "🤖 <b>INFORMASI BOT</b>",
+        f"• Versi: <b>v{BOT_VERSION}</b>",
+        f"• Tanggal: <b>{now_date}</b>",
+        f"• Jam: <b>{now_time}</b>",
+        f"• Runtime: <b>{uptime_text}</b>",
+        "",
+        "🩺 <b>STATUS SISTEM</b>",
     ]
 
     for name, ok, detail in checks:
@@ -5545,7 +5934,7 @@ async def ping(message: Message, bot: Bot):
     else:
         lines += [
             "",
-            "✅ Tidak ada blocker utama terdeteksi."
+            "✅ <b>Tidak ada blocker utama terdeteksi.</b>"
         ]
 
     await message.answer(
@@ -5561,74 +5950,114 @@ async def ping(message: Message, bot: Bot):
 
 @router.callback_query(F.data == "verify_join")
 async def verify_join(call: CallbackQuery, bot: Bot, state: FSMContext):
+    joined, reason, detail = await check_channel_membership(
+        bot,
+        call.from_user.id
+    )
+
+    check_time = datetime.now().strftime("%H:%M:%S")
+
+    if joined:
+        mark_user_verified(
+            call.from_user.id,
+            call.from_user.username or ""
+        )
+        await state.clear()
+
+        try:
+            await call.answer("✅ Verifikasi berhasil!", show_alert=True)
+        except Exception:
+            pass
+
+        success_text = (
+            f"🛍️ <b>{STORE_NAME}</b>\n\n"
+            "✅ <b>VERIFIKASI BERHASIL</b>\n"
+            f"Dicek: <b>{check_time} WIB</b>\n\n"
+            "Silakan pilih menu:"
+        )
+
+        edited = await safe_edit_or_answer(
+            call,
+            success_text,
+            reply_markup=main_menu(),
+            parse_mode="HTML"
+        )
+
+        try:
+            await call.message.answer(
+                "✅ Menu cepat sudah aktif.",
+                reply_markup=user_reply_menu()
+            )
+        except Exception:
+            if not edited:
+                await call.message.answer(
+                    success_text,
+                    reply_markup=main_menu(),
+                    parse_mode="HTML"
+                )
+        return
+
+    rows = []
+    if REQUIRED_CHANNEL_URL:
+        rows.append([
+            InlineKeyboardButton(
+                text="📢 Join Channel",
+                url=REQUIRED_CHANNEL_URL
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            text=f"🔄 Cek Lagi • {check_time}",
+            callback_data="verify_join"
+        )
+    ])
+
+    if reason == "not_member":
+        title = "❌ <b>BELUM TERDETEKSI JOIN</b>"
+        explanation = (
+            "Telegram masih membaca akun Anda sebagai belum menjadi member.\n\n"
+            "Pastikan Anda join menggunakan akun Telegram yang sama dengan akun yang memakai bot."
+        )
+        alert = "Belum terdeteksi sebagai member."
+    elif reason == "bot_not_admin":
+        title = "⚠️ <b>VERIFIKASI CHANNEL BELUM SIAP</b>"
+        explanation = (
+            "Bot belum memiliki akses yang cukup untuk memeriksa member channel.\n\n"
+            "Owner perlu menjadikan bot sebagai <b>admin channel</b> agar verifikasi user dapat bekerja."
+        )
+        alert = "Bot belum menjadi admin channel."
+    elif reason == "invalid_channel":
+        title = "⚠️ <b>KONFIGURASI CHANNEL SALAH</b>"
+        explanation = (
+            "Channel wajib tidak dapat ditemukan.\n\n"
+            "Owner perlu memeriksa <code>REQUIRED_CHANNEL_ID</code> di Railway."
+        )
+        alert = "REQUIRED_CHANNEL_ID perlu diperiksa."
+    else:
+        title = "⚠️ <b>VERIFIKASI SEMENTARA GAGAL</b>"
+        explanation = (
+            "Telegram tidak dapat menyelesaikan pengecekan membership saat ini.\n"
+            "Silakan coba lagi beberapa saat."
+        )
+        alert = "Pengecekan Telegram gagal."
+
     try:
-        await call.answer("Memeriksa channel...")
+        await call.answer(
+            f"{alert}\nCek: {check_time} WIB",
+            show_alert=True
+        )
     except Exception:
         pass
 
-    joined = await is_channel_member(bot, call.from_user.id)
-
-    if not joined:
-        rows = []
-        if REQUIRED_CHANNEL_URL:
-            rows.append([
-                InlineKeyboardButton(
-                    text="📢 Join Channel",
-                    url=REQUIRED_CHANNEL_URL
-                )
-            ])
-        rows.append([
-            InlineKeyboardButton(
-                text="🔄 Cek Lagi",
-                callback_data="verify_join"
-            )
-        ])
-
-        await safe_edit_or_answer(
-            call,
-            "❌ <b>BELUM TERVERIFIKASI</b>\n\n"
-            "Bot belum mendeteksi akun Anda sebagai member channel.\n\n"
-            "Pastikan Anda sudah join channel yang benar, lalu tekan <b>🔄 Cek Lagi</b>.\n\n"
-            "<i>Jika Anda sudah join tetapi tetap gagal, konfigurasi channel perlu diperiksa owner.</i>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode="HTML"
-        )
-        return
-
-    mark_user_verified(
-        call.from_user.id,
-        call.from_user.username or ""
-    )
-    await state.clear()
-
-    # Remove/replace the verification message itself.
-    success_text = (
-        f"🛍️ <b>{STORE_NAME}</b>\n\n"
-        "✅ <b>VERIFIKASI BERHASIL</b>\n"
-        "Akun Anda sudah terverifikasi.\n\n"
-        "Silakan pilih menu:"
-    )
-
-    edited = await safe_edit_or_answer(
+    await safe_edit_or_answer(
         call,
-        success_text,
-        reply_markup=main_menu(),
+        f"{title}\n\n"
+        f"{explanation}\n\n"
+        f"🕒 Pemeriksaan terakhir: <b>{check_time} WIB</b>\n"
+        f"📢 Channel: <b>{html.escape(REQUIRED_CHANNEL_NAME)}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         parse_mode="HTML"
     )
-
-    # Persistent reply keyboard must be sent as a separate message.
-    try:
-        await call.message.answer(
-            "Menu cepat sudah aktif.",
-            reply_markup=user_reply_menu()
-        )
-    except Exception:
-        if not edited:
-            await call.message.answer(
-                success_text,
-                reply_markup=main_menu(),
-                parse_mode="HTML"
-            )
 
 
 
@@ -8481,29 +8910,84 @@ async def owner_cancel_confirm(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "owner:backup_now")
 async def owner_backup_now(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
     try:
         backup_path = create_database_backup()
-        await send_backup(bot, backup_path)
-        await call.answer("✅ Backup berhasil dibuat.", show_alert=True)
+        if not backup_path.exists():
+            raise RuntimeError("File backup tidak berhasil dibuat.")
+
+        if not ADMIN_ID:
+            raise RuntimeError("ADMIN_ID belum dikonfigurasi.")
+
+        await bot.send_document(
+            ADMIN_ID,
+            document=FSInputFile(str(backup_path)),
+            caption=(
+                "🗄️ <b>BACKUP MANUAL MABOYY DIGITAL</b>\n\n"
+                f"📦 Versi bot: <b>v{BOT_VERSION}</b>\n"
+                f"🕒 {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
+            ),
+            parse_mode="HTML"
+        )
+
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>BACKUP BERHASIL</b>\n\n"
+            "Database berhasil dibuat dan dikirim ke PM owner.",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
     except Exception as exc:
-        await call.answer(f"❌ Backup gagal: {str(exc)[:100]}", show_alert=True)
+        await owner_system_error_view(call, "Backup Sekarang", exc)
+
 
 
 @router.callback_query(F.data == "owner:sync_stock")
 async def owner_sync_stock(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
-    if not STOCK_CHANNEL_ID:
-        return await call.answer(
-            "STOCK_CHANNEL_ID belum diisi di Railway.",
-            show_alert=True
+    try:
+        if not STOCK_CHANNEL_ID:
+            raise RuntimeError("STOCK_CHANNEL_ID belum diisi di Railway.")
+
+        target = channel_target(STOCK_CHANNEL_ID)
+        if not target:
+            raise RuntimeError("STOCK_CHANNEL_ID tidak valid.")
+
+        text = build_stock_text()
+        message_id_raw = get_setting("stock_channel_message_id", "")
+        message_id = int(message_id_raw) if message_id_raw.isdigit() else None
+
+        synced = False
+        if message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=target,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="HTML"
+                )
+                synced = True
+            except Exception:
+                synced = False
+
+        if not synced:
+            msg = await bot.send_message(target, text, parse_mode="HTML")
+            set_setting("stock_channel_message_id", msg.message_id)
+
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>STOK CHANNEL TERSINKRON</b>",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
         )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Sinkron Stok Channel", exc)
 
-    await sync_stock_channel(bot)
-    await call.answer("✅ Stok channel disinkronkan.", show_alert=True)
 
 
 @router.callback_query(F.data == "owner:stats")
@@ -8791,7 +9275,20 @@ async def owner_new_product_price_button(call: CallbackQuery, state: FSMContext)
         f"💰 {rupiah(price)}\n"
         "📊 Stok awal: <b>0</b>\n\n"
         "Selanjutnya tambahkan akun dari menu Atur Stok.",
-        reply_markup=owner_products_menu(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="➕ Tambah Variasi Lagi",
+                callback_data=f"addvariantprod:{product_id}"
+            )],
+            [InlineKeyboardButton(
+                text="📦 Atur Stok",
+                callback_data="owner:set_stock"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Produk & Stok",
+                callback_data="owner:back_products"
+            )]
+        ]),
         parse_mode="HTML"
     )
     await call.answer("Produk dibuat.")
@@ -8802,19 +9299,23 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
 
-    raw=(message.text or "").replace(".","").replace(",","").strip()
-    try:
-        price=int(raw)
-        if price <= 0:
-            raise ValueError
-    except Exception:
-        return await message.answer("❌ Harga tidak valid. Kirim angka saja.")
+    price=parse_rupiah_input(message.text or "")
+    if not price:
+        return await message.answer(
+            "❌ <b>HARGA TIDAK VALID</b>\n\n"
+            "Format yang diterima:\n"
+            "<code>15000</code>\n"
+            "<code>15.000</code>\n"
+            "<code>15,000</code>\n"
+            "<code>Rp15.000</code>",
+            parse_mode="HTML"
+        )
 
     result=await create_product_from_wizard(state,message.from_user.id,price)
     if not result:
         return await message.answer("❌ Data produk tidak lengkap.",reply_markup=owner_products_menu())
 
-    _,_,name,variant_name,price=result
+    product_id,_,name,variant_name,price=result
     await message.answer(
         "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
         f"📦 {html.escape(name)}\n"
@@ -8822,7 +9323,20 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
         f"💰 {rupiah(price)}\n"
         "📊 Stok awal: <b>0</b>\n\n"
         "Tambahkan akun dari menu Atur Stok.",
-        reply_markup=owner_products_menu(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="➕ Tambah Variasi Lagi",
+                callback_data=f"addvariantprod:{product_id}"
+            )],
+            [InlineKeyboardButton(
+                text="📦 Atur Stok",
+                callback_data="owner:set_stock"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Produk & Stok",
+                callback_data="owner:back_products"
+            )]
+        ]),
         parse_mode="HTML"
     )
 
@@ -8832,85 +9346,281 @@ async def owner_add_variant(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    await prompt_state(
-        call, state, OwnerState.add_variant,
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "ℹ️ <b>TAMBAH VARIASI SUDAH DIGABUNG</b>\n\n"
+        "Sekarang variasi ditambahkan langsung setelah membuat produk.\n"
+        "Gunakan menu <b>➕ Tambah Produk</b>.",
+        reply_markup=owner_products_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+
+@router.callback_query(F.data.startswith("addvariantprod:"))
+async def owner_add_variant_product(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        product_id=int(call.data.split(":")[1])
+    except Exception:
+        return await call.answer("Produk tidak valid.", show_alert=True)
+
+    conn=db()
+    product=conn.execute(
+        "SELECT id,name FROM products WHERE id=? AND active=1",
+        (product_id,)
+    ).fetchone()
+    conn.close()
+
+    if not product:
+        return await call.answer("Produk tidak ditemukan.", show_alert=True)
+
+    await state.update_data(add_variant_product_id=product_id)
+    await state.set_state(OwnerState.add_variant_name)
+
+    await safe_edit_or_answer(
+        call,
         "🧩 <b>TAMBAH VARIASI</b>\n\n"
-        "Kirim:\n"
-        "<code>ID Produk | Nama Variasi | Kode | Harga | Stok | Grosir10 | Grosir20</code>\n\n"
-        "Isi 0 jika tidak ada harga grosir.\n"
-        "Contoh:\n<code>1 | Durasi 1 Tahun | am1th | 500 | 416 | 400 | 300</code>"
+        f"Produk: <b>{html.escape(product['name'])}</b>\n\n"
+        "Langkah 2/3\n"
+        "Kirim <b>nama variasi</b>.\n\n"
+        "Contoh: <code>1 Bulan</code>",
+        reply_markup=back_owner("owner:back_products"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.add_variant_name)
+async def owner_add_variant_name_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    name=(message.text or "").strip()
+    if not name:
+        return await message.answer("❌ Nama variasi tidak boleh kosong.")
+
+    await state.update_data(add_variant_name=name[:120])
+    await state.set_state(OwnerState.add_variant_price)
+
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="5.000", callback_data="addvariantprice:5000"),
+            InlineKeyboardButton(text="10.000", callback_data="addvariantprice:10000"),
+        ],
+        [
+            InlineKeyboardButton(text="20.000", callback_data="addvariantprice:20000"),
+            InlineKeyboardButton(text="50.000", callback_data="addvariantprice:50000"),
+        ],
+        [
+            InlineKeyboardButton(text="100.000", callback_data="addvariantprice:100000"),
+            InlineKeyboardButton(text="200.000", callback_data="addvariantprice:200000"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Harga Custom", callback_data="addvariantprice:custom")
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Kembali", callback_data="owner:back_products")
+        ]
+    ])
+
+    await message.answer(
+        "💰 <b>TAMBAH VARIASI</b>\n\n"
+        f"Nama variasi: <b>{html.escape(name)}</b>\n\n"
+        "Langkah 3/3\n"
+        "Pilih harga:",
+        reply_markup=kb,
+        parse_mode="HTML"
     )
 
 
-@router.message(OwnerState.add_variant)
-async def owner_add_variant_input(message: Message, state: FSMContext):
+async def create_variant_from_wizard(state: FSMContext, price: int):
+    data=await state.get_data()
+    product_id=int(data.get("add_variant_product_id") or 0)
+    name=(data.get("add_variant_name") or "").strip()
+
+    if not product_id or not name or price <= 0:
+        return None
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+
+    product=conn.execute(
+        "SELECT id,name FROM products WHERE id=? AND active=1",
+        (product_id,)
+    ).fetchone()
+    if not product:
+        conn.rollback()
+        conn.close()
+        return None
+
+    existing=conn.execute(
+        """SELECT id FROM product_variants
+           WHERE product_id=? AND LOWER(name)=LOWER(?)""",
+        (product_id,name)
+    ).fetchone()
+    if existing:
+        conn.rollback()
+        conn.close()
+        return "duplicate"
+
+    code_base=re.sub(r"[^A-Za-z0-9]+","",name.upper())[:8] or "VAR"
+    existing_count=conn.execute(
+        "SELECT COUNT(*) AS n FROM product_variants WHERE product_id=?",
+        (product_id,)
+    ).fetchone()["n"]
+    code=f"{code_base}{int(existing_count)+1}"
+
+    cur=conn.execute(
+        """INSERT INTO product_variants
+           (product_id,name,code,price,stock,wholesale10,wholesale20,active,reserved_stock,button_label)
+           VALUES(?,?,?,?,0,0,0,1,0,'')""",
+        (product_id,name,code,price)
+    )
+    variant_id=cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    return {
+        "product_id":product_id,
+        "product_name":product["name"],
+        "variant_id":variant_id,
+        "variant_name":name,
+        "price":price,
+        "code":code,
+    }
+
+
+@router.callback_query(F.data.startswith("addvariantprice:"))
+async def owner_add_variant_price_button(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    value=call.data.split(":")[1]
+
+    if value=="custom":
+        await state.set_state(OwnerState.add_variant_price)
+        await safe_edit_or_answer(
+            call,
+            "💰 <b>HARGA CUSTOM</b>\n\n"
+            "Kirim nominal harga. Format berikut diterima:\n"
+            "<code>15000</code>\n"
+            "<code>15.000</code>\n"
+            "<code>15,000</code>\n"
+            "<code>Rp15.000</code>",
+            reply_markup=back_owner("owner:back_products"),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
+    result=await create_variant_from_wizard(state,int(value))
+
+    if result=="duplicate":
+        return await call.answer(
+            "Variasi dengan nama yang sama sudah ada.",
+            show_alert=True
+        )
+    if not result:
+        return await call.answer(
+            "Data variasi tidak lengkap.",
+            show_alert=True
+        )
+
+    await safe_edit_or_answer(
+        call,
+        "✅ <b>VARIASI BERHASIL DITAMBAHKAN</b>\n\n"
+        f"📦 Produk: <b>{html.escape(result['product_name'])}</b>\n"
+        f"🧩 Variasi: <b>{html.escape(result['variant_name'])}</b>\n"
+        f"💰 Harga: <b>{rupiah(result['price'])}</b>\n"
+        f"🏷️ Kode: <code>{html.escape(result['code'])}</code>\n"
+        "📊 Stok awal: <b>0</b>\n\n"
+        "Tambahkan akun dari menu Atur Stok.",
+        reply_markup=owner_products_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.add_variant_price)
+async def owner_add_variant_price_custom(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
+
+    price=parse_rupiah_input(message.text or "")
+    if not price:
+        return await message.answer(
+            "❌ <b>HARGA TIDAK VALID</b>\n\n"
+            "Format yang diterima:\n"
+            "<code>15000</code>\n"
+            "<code>15.000</code>\n"
+            "<code>15,000</code>\n"
+            "<code>Rp15.000</code>",
+            reply_markup=back_owner("owner:back_products"),
+            parse_mode="HTML"
+        )
+
+    if price > 100_000_000:
+        return await message.answer(
+            "❌ Harga terlalu besar. Maksimal Rp100.000.000.",
+            reply_markup=back_owner("owner:back_products")
+        )
+
     try:
-        pid, name, code, price, stock, g10, g20 = [p.strip() for p in message.text.split("|")]
-        conn = db()
-        conn.execute(
-            """INSERT INTO product_variants
-               (product_id, name, code, price, stock, wholesale10, wholesale20)
-               VALUES(?,?,?,?,?,?,?)""",
-            (int(pid), name, code, int(price), int(stock), int(g10), int(g20))
+        result=await create_variant_from_wizard(state,price)
+    except Exception as exc:
+        logging.exception("Create variant custom price failed: %s", exc)
+        return await message.answer(
+            "❌ <b>GAGAL MENAMBAHKAN VARIASI</b>\n\n"
+            f"<code>{html.escape(str(exc)[:300])}</code>",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
         )
-        conn.commit()
-        conn.close()
+
+    if result=="duplicate":
         await state.clear()
-        await message.answer("✅ Variasi berhasil ditambahkan.", reply_markup=owner_menu())
-    except Exception:
-        await message.answer("❌ Format variasi tidak valid.")
-
-
-def owner_stock_products_keyboard():
-    conn = db()
-    rows = conn.execute(
-        "SELECT id, name FROM products WHERE active=1 ORDER BY id"
-    ).fetchall()
-    conn.close()
-
-    kb = InlineKeyboardBuilder()
-    for row in rows:
-        kb.button(
-            text=f"📦 {row['name']}",
-            callback_data=f"ownerstock:product:{row['id']}"
+        return await message.answer(
+            "❌ Variasi dengan nama yang sama sudah ada.",
+            reply_markup=owner_products_menu()
         )
-    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.adjust(1)
-    return kb.as_markup()
 
-
-def owner_stock_variants_keyboard(product_id: int):
-    conn = db()
-    product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
-    rows = conn.execute(
-        """SELECT * FROM product_variants
-           WHERE product_id=? AND active=1
-           ORDER BY id""",
-        (product_id,)
-    ).fetchall()
-    conn.close()
-
-    kb = InlineKeyboardBuilder()
-    for row in rows:
-        kb.button(
-            text=f"{row['name']} • stok {available_stock(row)}",
-            callback_data=f"ownerstock:variant:{row['id']}"
+    if not result:
+        await state.clear()
+        return await message.answer(
+            "❌ Data variasi tidak lengkap atau produk tidak aktif.",
+            reply_markup=owner_products_menu()
         )
-    kb.button(text="⬅️ Pilih Produk", callback_data="owner:set_stock")
-    kb.adjust(1)
-    return (product, kb.as_markup())
 
+    await state.clear()
 
-def owner_stock_variant_actions(variant_id: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Tambah Akun", callback_data=f"ownerstock:add:{variant_id}")
-    kb.button(text="📣 Broadcast Restock", callback_data=f"ownerstock:broadcast:{variant_id}")
-    kb.button(text="📤 Kirim Pending", callback_data=f"ownerstock:fulfill:{variant_id}")
-    kb.button(text="⬅️ Kembali", callback_data=f"ownerstock:backvariant:{variant_id}")
-    kb.adjust(1)
-    return kb.as_markup()
+    await message.answer(
+        "✅ <b>VARIASI BERHASIL DITAMBAHKAN</b>\n\n"
+        f"📦 Produk: <b>{html.escape(result['product_name'])}</b>\n"
+        f"🧩 Variasi: <b>{html.escape(result['variant_name'])}</b>\n"
+        f"💰 Harga: <b>{rupiah(result['price'])}</b>\n"
+        f"🏷️ Kode: <code>{html.escape(result['code'])}</code>\n"
+        "📊 Stok awal: <b>0</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="➕ Tambah Variasi Lagi",
+                callback_data=f"addvariantprod:{result['product_id']}"
+            )],
+            [InlineKeyboardButton(
+                text="📦 Atur Stok",
+                callback_data="owner:set_stock"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Produk & Stok",
+                callback_data="owner:back_products"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
+
 
 
 @router.callback_query(F.data == "owner:set_stock")
@@ -10771,20 +11481,25 @@ async def owner_selftest(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "owner:maintenance")
 async def owner_maintenance(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
-    new_value = "0" if maintenance_enabled() else "1"
-    set_setting("maintenance_mode", new_value)
-    status = "ON" if new_value == "1" else "OFF"
+    try:
+        new_value = "0" if maintenance_enabled() else "1"
+        set_setting("maintenance_mode", new_value)
+        status = "ON" if new_value == "1" else "OFF"
 
-    await safe_edit_or_answer(call, 
-        "🔧 <b>MAINTENANCE MODE</b>\n\n"
-        f"Status sekarang: <b>{status}</b>\n\n"
-        "Saat ON, menu tetap dapat dilihat tetapi checkout baru ditahan.",
-        reply_markup=owner_menu(),
-        parse_mode="HTML"
-    )
-    await call.answer(f"Maintenance {status}")
+        await safe_edit_or_answer(
+            call,
+            "🔧 <b>MAINTENANCE MODE</b>\n\n"
+            f"Status sekarang: <b>{status}</b>\n\n"
+            "Saat ON, checkout baru ditahan.",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Maintenance", exc)
+
 
 
 @router.callback_query(F.data == "owner:segments")
@@ -10940,39 +11655,78 @@ async def owner_cashback_set(call: CallbackQuery):
 @router.callback_query(F.data == "owner:daily_report")
 async def owner_daily_report(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.",show_alert=True)
+        return await deny_owner_callback(call)
 
-    enabled=get_setting("daily_report_enabled","1")=="1"
-    kb=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=("🔕 Matikan Laporan" if enabled else "🔔 Aktifkan Laporan"),
-            callback_data="dailyreport:toggle"
-        )],
-        [InlineKeyboardButton(text="📨 Kirim Laporan Sekarang",callback_data="dailyreport:send")],
-        [InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:panel")]
-    ])
-    await safe_edit_or_answer(call, 
-        "📅 <b>LAPORAN HARIAN</b>\n\n"
-        f"Status: <b>{'ON' if enabled else 'OFF'}</b>\n"
-        f"Jam laporan: sekitar <b>{setting_int('daily_report_hour',20):02d}:00</b>",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-    await call.answer()
+    try:
+        enabled = get_setting("daily_report_enabled","1") == "1"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=("🔕 Matikan Laporan" if enabled else "🔔 Aktifkan Laporan"),
+                callback_data="dailyreport:toggle"
+            )],
+            [InlineKeyboardButton(
+                text="📨 Kirim Laporan Sekarang",
+                callback_data="dailyreport:send"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Kembali",
+                callback_data="owner:back_system"
+            )]
+        ])
+
+        await safe_edit_or_answer(
+            call,
+            "📅 <b>LAPORAN HARIAN</b>\n\n"
+            f"Status: <b>{'ON' if enabled else 'OFF'}</b>\n"
+            f"Jam laporan: sekitar <b>{setting_int('daily_report_hour',20):02d}:00</b>",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Laporan Harian", exc)
+
 
 
 @router.callback_query(F.data == "dailyreport:toggle")
 async def owner_daily_report_toggle(call: CallbackQuery):
-    enabled=get_setting("daily_report_enabled","1")=="1"
-    set_setting("daily_report_enabled","0" if enabled else "1")
-    await call.answer("Pengaturan laporan diperbarui.",show_alert=True)
-    await safe_edit_or_answer(call, "✅ Pengaturan laporan harian diperbarui.",reply_markup=owner_menu())
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        enabled = get_setting("daily_report_enabled","1") == "1"
+        set_setting("daily_report_enabled","0" if enabled else "1")
+
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>PENGATURAN LAPORAN DIPERBARUI</b>\n\n"
+            f"Status sekarang: <b>{'OFF' if enabled else 'ON'}</b>",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Toggle Laporan Harian", exc)
+
 
 
 @router.callback_query(F.data == "dailyreport:send")
 async def owner_daily_report_send(call: CallbackQuery, bot: Bot):
-    await send_daily_owner_report(bot)
-    await call.answer("Laporan dikirim ke PM owner.",show_alert=True)
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        await send_daily_owner_report(bot)
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>LAPORAN HARIAN DIKIRIM</b>\n\n"
+            "Laporan sudah dikirim ke PM owner.",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Kirim Laporan Harian", exc)
 
 
 
@@ -11127,42 +11881,45 @@ async def owner_health_score(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "owner:safe_mode")
 async def owner_safe_mode(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
-    enabled = not safe_mode_enabled()
-    set_safe_mode(enabled)
+    try:
+        enabled = not safe_mode_enabled()
+        set_safe_mode(enabled)
 
-    await call.answer(
-        f"Safe Mode {'diaktifkan' if enabled else 'dimatikan'}.",
-        show_alert=True
-    )
-    await safe_edit_or_answer(
-        call,
-        "🛟 <b>SAFE MODE</b>\n\n"
-        f"Status: <b>{'ON' if enabled else 'OFF'}</b>\n\n"
-        "Saat ON, checkout dan top up user ditahan sementara.",
-        reply_markup=owner_system_menu(),
-        parse_mode="HTML"
-    )
+        await safe_edit_or_answer(
+            call,
+            "🛟 <b>SAFE MODE</b>\n\n"
+            f"Status: <b>{'ON' if enabled else 'OFF'}</b>\n\n"
+            "Saat ON, checkout dan top up user ditahan sementara.",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Safe Mode", exc)
+
 
 
 @router.callback_query(F.data == "owner:repair_inventory")
 async def owner_repair_inventory(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
-    mismatches, repaired = inventory_integrity_report(auto_repair=True)
-
-    await safe_edit_or_answer(
-        call,
-        "🧹 <b>REPAIR INVENTORY</b>\n\n"
-        f"Mismatch ditemukan: <b>{len(mismatches)}</b>\n"
-        f"Diperbaiki: <b>{repaired}</b>\n\n"
-        "Stock counter disinkronkan ulang dari inventory_items.",
-        reply_markup=owner_system_menu(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+    try:
+        mismatches, repaired = inventory_integrity_report(auto_repair=True)
+        await safe_edit_or_answer(
+            call,
+            "🧹 <b>REPAIR INVENTORY</b>\n\n"
+            f"Mismatch ditemukan: <b>{len(mismatches)}</b>\n"
+            f"Diperbaiki: <b>{repaired}</b>\n\n"
+            "Stock counter disinkronkan ulang dari inventory_items.",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Repair Inventory", exc)
 
 
 
@@ -11449,10 +12206,13 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "owner:diagnostics")
 async def owner_diagnostics(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
-    await call.answer("Menjalankan diagnostik...")
-    await render_owner_diagnostics(call, bot)
+    await safe_callback_notice(call, "Menjalankan diagnostik...")
+    try:
+        await render_owner_diagnostics(call, bot)
+    except Exception as exc:
+        await owner_system_error_view(call, "Diagnostik Sistem", exc)
 
 
 
@@ -11481,24 +12241,27 @@ async def owner_test_pm(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    if not ADMIN_ID:
-        return await call.answer("ADMIN_ID belum dikonfigurasi.", show_alert=True)
-
     try:
+        if not ADMIN_ID:
+            raise RuntimeError("ADMIN_ID belum dikonfigurasi.")
+
         await bot.send_message(
             ADMIN_ID,
             "✅ <b>TEST PM OWNER BERHASIL</b>\n\n"
-            "Bot dapat mengirim pesan langsung ke PM owner.\n"
-            "Fitur bukti pembayaran seharusnya dapat diteruskan ke chat ini.",
+            "Bot dapat mengirim pesan langsung ke PM owner.",
             parse_mode="HTML"
         )
-        await call.answer("PM test berhasil dikirim.", show_alert=True)
-    except Exception as exc:
-        logging.exception("Owner PM test failed: %s", exc)
-        await call.answer(
-            f"PM test gagal: {str(exc)[:150]}",
-            show_alert=True
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>TEST PM OWNER BERHASIL</b>\n\n"
+            "Pesan test sudah dikirim ke PM owner.",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
         )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Test PM Owner", exc)
+
 
 
 @router.callback_query(F.data == "owner:test_channel")
@@ -11506,43 +12269,43 @@ async def owner_test_channel(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    if not REQUIRED_CHANNEL_ID:
-        return await call.answer(
-            "REQUIRED_CHANNEL_ID belum diisi.",
-            show_alert=True
-        )
-
-    raw_target = str(REQUIRED_CHANNEL_ID).strip()
-    target = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
-
     try:
+        if not REQUIRED_CHANNEL_ID:
+            raise RuntimeError("REQUIRED_CHANNEL_ID belum diisi.")
+
+        raw_target = str(REQUIRED_CHANNEL_ID).strip()
+        target = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
+
         chat = await bot.get_chat(target)
-        member = await bot.get_chat_member(target, call.from_user.id)
-        status = getattr(member, "status", "")
-        status_text = str(getattr(status, "value", status))
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(target, me.id)
+        bot_status_obj = getattr(bot_member, "status", "")
+        bot_status = str(getattr(bot_status_obj, "value", bot_status_obj)).lower()
+
+        owner_member = await bot.get_chat_member(target, call.from_user.id)
+        owner_status_obj = getattr(owner_member, "status", "")
+        owner_status = str(getattr(owner_status_obj, "value", owner_status_obj)).lower()
+
+        bot_admin = bot_status in {"administrator", "creator", "owner"}
 
         await safe_edit_or_answer(
             call,
             "📢 <b>TEST REQUIRED CHANNEL</b>\n\n"
             f"Channel: <b>{html.escape(getattr(chat, 'title', '') or str(target))}</b>\n"
-            f"Target: <code>{html.escape(str(target))}</code>\n"
-            f"Status owner: <b>{html.escape(status_text)}</b>\n\n"
-            "✅ Bot dapat membaca channel dan membership.",
+            f"Status bot: <b>{html.escape(bot_status)}</b>\n"
+            f"Status owner: <b>{html.escape(owner_status)}</b>\n\n"
+            + (
+                "✅ Bot sudah admin dan dapat memeriksa membership."
+                if bot_admin
+                else "❌ Bot belum admin channel."
+            ),
             reply_markup=owner_system_menu(),
             parse_mode="HTML"
         )
-        await call.answer("Channel test berhasil.")
+        await safe_callback_notice(call)
     except Exception as exc:
-        logging.exception("Required channel test failed: %s", exc)
-        await safe_edit_or_answer(
-            call,
-            "❌ <b>TEST CHANNEL GAGAL</b>\n\n"
-            f"<code>{html.escape(str(exc)[:500])}</code>\n\n"
-            "Periksa REQUIRED_CHANNEL_ID dan pastikan bot sudah ditambahkan ke channel.",
-            reply_markup=owner_system_menu(),
-            parse_mode="HTML"
-        )
-        await call.answer("Channel belum bisa diverifikasi.", show_alert=True)
+        await owner_system_error_view(call, "Test Channel", exc)
+
 
 
 @router.callback_query(F.data == "owner:launch_readiness")
@@ -11557,6 +12320,75 @@ async def owner_launch_readiness(call: CallbackQuery):
 
 
 
+@router.callback_query(F.data == "owner:cleanup_data")
+async def owner_cleanup_data(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        await safe_edit_or_answer(
+            call,
+            "🗑️ <b>HAPUS DATA</b>\n\n"
+            "Pilih data yang ingin dibersihkan.\n\n"
+            "🔒 Paid/completed, saldo user, dan akun terjual tidak ikut dihapus.",
+            reply_markup=cleanup_data_keyboard(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Hapus Data", exc)
+
+
+@router.callback_query(F.data.startswith("cleanup:preview:"))
+async def owner_cleanup_preview(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    kind=call.data.split(":")[-1]
+    data=cleanup_preview_text(kind)
+    if not data:
+        return await call.answer("Jenis data tidak valid.", show_alert=True)
+
+    title,count,description=data
+    await safe_edit_or_answer(
+        call,
+        f"🗑️ <b>{html.escape(title)}</b>\n\n"
+        f"Data ditemukan: <b>{count}</b>\n\n"
+        f"{html.escape(description)}\n\n"
+        "⚠️ Data yang dihapus tidak bisa dikembalikan dari bot.",
+        reply_markup=cleanup_confirm_keyboard(kind),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("cleanup:confirm:"))
+async def owner_cleanup_confirm(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    kind=call.data.split(":")[-1]
+    if kind not in {"orders","topups","proofs","errors","safe"}:
+        return await call.answer("Jenis data tidak valid.", show_alert=True)
+
+    try:
+        result=cleanup_execute(kind)
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>PEMBERSIHAN SELESAI</b>\n\n"
+            f"🧾 Order expired: <b>{result['orders']}</b>\n"
+            f"💰 Top up expired: <b>{result['topups']}</b>\n"
+            f"📎 Session bukti: <b>{result['proofs']}</b>\n"
+            f"🧯 Log error: <b>{result['errors']}</b>\n\n"
+            "Data paid/completed dan akun terjual tetap aman.",
+            reply_markup=cleanup_data_keyboard(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Hapus Data", exc)
+
+
 @router.message()
 async def fallback(message: Message):
     text = (message.text or "").strip()
@@ -11564,25 +12396,25 @@ async def fallback(message: Message):
     if text.startswith("/"):
         command = text.split()[0].split("@")[0].lower()
 
-        if command == "/owner" and not is_owner(message.from_user.id):
+        if command in {"/owner", "/ping"} and not is_owner(message.from_user.id):
             return await message.answer(
-                owner_access_denied_text(),
+                "⛔ <b>AKSES DITOLAK</b>\n\n"
+                "Command ini khusus owner.\n"
+                "Gunakan /start untuk membuka menu toko.",
                 parse_mode="HTML"
             )
 
         if is_owner(message.from_user.id):
             return await message.answer(
-                "ℹ️ Command tersedia:\n"
+                "ℹ️ Command owner:\n"
                 "/start — Menu utama\n"
                 "/owner — Panel owner\n"
                 "/ping — Status bot"
             )
 
         return await message.answer(
-            "ℹ️ Command tersedia:\n"
-            "/start — Menu utama\n"
-            "/ping — Status bot\n\n"
-            "🔒 /owner khusus pemilik bot."
+            "ℹ️ Command user:\n"
+            "/start — Menu utama"
         )
 
 
