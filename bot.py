@@ -81,7 +81,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "9.6"
+BOT_VERSION = "9.8"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -9484,16 +9484,31 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
 
-    price=parse_rupiah_input(message.text or "")
+    raw_text=(message.text or "").strip()
+
+    if not raw_text:
+        return await message.answer(
+            "❌ <b>NOMINAL KOSONG</b>\n\n"
+            "Kirim nominal harga, contoh <code>2500</code> atau <code>2.500</code>.",
+            parse_mode="HTML"
+        )
+
+    price=parse_rupiah_input(raw_text)
+
     if not price:
         return await message.answer(
             "❌ <b>HARGA TIDAK VALID</b>\n\n"
             "Format yang diterima:\n"
-            "<code>15000</code>\n"
-            "<code>15.000</code>\n"
-            "<code>15,000</code>\n"
-            "<code>Rp15.000</code>",
+            "<code>2500</code>\n"
+            "<code>2.500</code>\n"
+            "<code>2,500</code>\n"
+            "<code>Rp2.500</code>",
             parse_mode="HTML"
+        )
+
+    if price > 100_000_000:
+        return await message.answer(
+            "❌ Harga terlalu besar. Maksimal Rp100.000.000."
         )
 
     try:
@@ -9515,17 +9530,19 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
         except Exception:
             pass
 
+        await state.clear()
         return await message.answer(
             "❌ <b>GAGAL MEMBUAT PRODUK</b>\n\n"
             f"Error: <code>{html.escape(str(exc)[:400])}</code>\n\n"
-            "Data produk belum disimpan.",
+            "Silakan ulangi Tambah Produk.",
             reply_markup=owner_products_menu(),
             parse_mode="HTML"
         )
 
     if not result:
+        await state.clear()
         return await message.answer(
-            "❌ Data produk tidak lengkap.",
+            "❌ Data produk tidak lengkap. Silakan ulangi Tambah Produk.",
             reply_markup=owner_products_menu()
         )
 
@@ -10312,58 +10329,129 @@ async def owner_set_price(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    await prompt_state(
-        call, state, OwnerState.set_price,
-        "💰 <b>ATUR HARGA VARIASI</b>\n\n"
-        "Kirim:\n<code>ID VARIASI | HARGA | GROSIR10 | GROSIR20</code>\n\n"
-        "Contoh: <code>1 | 500 | 400 | 300</code>"
+    await state.clear()
+
+    conn=db()
+    products=conn.execute(
+        "SELECT id,name FROM products WHERE active=1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    if not products:
+        return await safe_edit_or_answer(
+            call,
+            "❌ <b>BELUM ADA PRODUK</b>\n\n"
+            "Tambahkan produk terlebih dahulu.",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
+        )
+
+    rows=[
+        [InlineKeyboardButton(
+            text=f"📦 {p['name']}",
+            callback_data=f"setpriceprod:{p['id']}"
+        )]
+        for p in products
+    ]
+    rows.append([
+        InlineKeyboardButton(
+            text="⬅️ Kembali",
+            callback_data="owner:back_products"
+        )
+    ])
+
+    await safe_edit_or_answer(
+        call,
+        "💰 <b>ATUR HARGA VARIAN</b>\n\n"
+        "Pilih produk:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML"
     )
+    await safe_callback_notice(call)
+
 
 
 @router.message(OwnerState.set_price)
 async def owner_set_price_input(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
+
+    price=parse_rupiah_input(message.text or "")
+    if not price:
+        return await message.answer(
+            "❌ <b>HARGA TIDAK VALID</b>\n\n"
+            "Kirim nominal bebas, contoh:\n"
+            "<code>2500</code>\n"
+            "<code>2750</code>\n"
+            "<code>12.500</code>\n"
+            "<code>Rp18.750</code>",
+            parse_mode="HTML"
+        )
+
+    if price > 1_000_000_000:
+        return await message.answer(
+            "❌ Harga terlalu besar. Maksimal Rp1.000.000.000."
+        )
+
+    data=await state.get_data()
+    variant_id=int(data.get("set_price_variant_id") or 0)
+
+    if not variant_id:
+        await state.clear()
+        return await message.answer(
+            "❌ Sesi Atur Harga sudah terputus. Silakan buka menu Atur Harga lagi.",
+            reply_markup=owner_products_menu()
+        )
+
+    conn=db()
     try:
-        vid, price, g10, g20 = [x.strip() for x in message.text.split("|")]
-        conn = db()
+        conn.execute("BEGIN IMMEDIATE")
+        row=conn.execute(
+            """SELECT v.id,v.name,p.name AS product_name
+               FROM product_variants v
+               JOIN products p ON p.id=v.product_id
+               WHERE v.id=? AND v.active=1 AND p.active=1""",
+            (variant_id,)
+        ).fetchone()
+
+        if not row:
+            conn.rollback()
+            conn.close()
+            await state.clear()
+            return await message.answer(
+                "❌ Varian tidak ditemukan.",
+                reply_markup=owner_products_menu()
+            )
+
         conn.execute(
-            """UPDATE product_variants
-               SET price=?, wholesale10=?, wholesale20=?
-               WHERE id=?""",
-            (int(price), int(g10), int(g20), int(vid))
+            "UPDATE product_variants SET price=? WHERE id=?",
+            (price,variant_id)
         )
         conn.commit()
+    except Exception as exc:
+        conn.rollback()
         conn.close()
-        await state.clear()
-        await message.answer("✅ Harga berhasil diperbarui.", reply_markup=owner_menu())
-    except Exception:
-        await message.answer("❌ Format salah.")
-
-
-def owner_delete_products_keyboard():
-    conn = db()
-    rows = conn.execute(
-        """SELECT p.id, p.name,
-                  COUNT(v.id) AS variant_count
-           FROM products p
-           LEFT JOIN product_variants v
-             ON v.product_id=p.id AND v.active=1
-           WHERE p.active=1
-           GROUP BY p.id, p.name
-           ORDER BY p.id"""
-    ).fetchall()
-    conn.close()
-
-    kb = InlineKeyboardBuilder()
-    for row in rows:
-        kb.button(
-            text=f"🗑️ {row['name']} • {row['variant_count']} varian",
-            callback_data=f"ownerdelete:select:{row['id']}"
+        logging.exception("Set variant price failed: %s", exc)
+        return await message.answer(
+            "❌ <b>GAGAL MENGUBAH HARGA</b>\n\n"
+            f"<code>{html.escape(str(exc)[:300])}</code>",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
         )
-    kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.adjust(1)
-    return kb.as_markup()
+    else:
+        conn.close()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>HARGA VARIAN DIPERBARUI</b>\n\n"
+        f"📦 Produk: <b>{html.escape(row['product_name'])}</b>\n"
+        f"🧩 Varian: <b>{html.escape(row['name'])}</b>\n"
+        f"💰 Harga baru: <b>{rupiah(price)}</b>",
+        reply_markup=owner_products_menu(),
+        parse_mode="HTML"
+    )
+
 
 
 @router.callback_query(F.data == "owner:delete_product")
@@ -12646,6 +12734,31 @@ async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
         "Tombol ini sudah kedaluwarsa. Buka menu terbaru.",
         show_alert=True
     )
+
+
+@router.message(F.text)
+async def owner_price_recovery(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    current_state=await state.get_state()
+    if current_state:
+        return
+
+    text=(message.text or "").strip()
+    if not text:
+        return
+
+    # If an owner sends a bare nominal after the price screen but the FSM was
+    # unexpectedly lost, never leave the message unanswered.
+    if parse_rupiah_input(text):
+        return await message.answer(
+            "⚠️ <b>SESI HARGA SUDAH TERPUTUS</b>\n\n"
+            "Bot menerima nominal Anda, tetapi sesi Tambah Produk sudah tidak aktif.\n"
+            "Silakan buka <b>➕ Tambah Produk</b> lagi agar data tidak tersimpan setengah.",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
+        )
 
 
 @router.message()
