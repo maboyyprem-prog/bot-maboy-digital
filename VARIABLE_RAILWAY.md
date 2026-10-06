@@ -1134,3 +1134,18 @@ Indikator warna stok dihapus. List Produk tetap menampilkan jumlah stok per prod
 ## v15.4 — Owner UI Simplification
 - Tidak ada Railway Variable baru.
 - Hanya restrukturisasi menu/callback; database path dan konfigurasi Railway tetap sama.
+
+
+## v15.5 — Navigation Fix
+- Tidak ada Railway Variable baru.
+- Parent callback tombol Kembali disinkronkan dengan menu v15.4.
+
+
+## v15.6 — Atur Harga UI
+- Tidak ada Railway Variable baru.
+- Hanya memindahkan tombol Atur Harga ke menu utama Produk & Stok.
+
+
+## v15.7 — Buyer Transaction Menu
+- Tidak ada Railway Variable baru.
+- Perubahan fokus pada UI/callback checkout pembeli; DB dan payment credentials tetap sama.
