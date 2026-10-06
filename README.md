@@ -1,25 +1,29 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v13.2  
+**Versi aktif:** v13.5  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Update Terbaru — v13.2 Backup Project
-- Menu `/owner → ⚙️ Sistem` sekarang memiliki dua backup terpisah:
-  - `🗄️ Backup Database`
-  - `📦 Backup Project`
-- `📦 Backup Project` membuat ZIP flat berisi:
-  - `main.py`
-  - `bot.py`
-  - `requirements.txt`
-  - `.env.example`
-  - `README.md`
-  - `VARIABLE_RAILWAY.md`
-  - `shop.db` (snapshot database saat tombol ditekan)
-- ZIP dikirim langsung ke PM owner.
-- `.env`, BOT_TOKEN, password, private key, dan secret Railway tidak dimasukkan ke ZIP.
-- Backup database otomatis setiap 48 jam tetap berjalan seperti sebelumnya.
-- Project backup manual memakai retention yang sama agar folder backup tidak tumbuh tanpa batas.
+## Update Terbaru — v13.5 Stok Ringkas
+- Jumlah stok tetap ditampilkan pada List Produk.
+- Indikator warna/status stok dihapus sesuai permintaan.
+- Format list: `Nama Produk — Stok 8`.
+- Format tombol: `Nama Produk (8)`.
+- Perhitungan stok tetap menggunakan stok tersedia setelah reservasi.
+- Tidak menambah query per produk.
 - Tidak ada Railway Variable baru.
 
 ## File Project
 `main.py` • `bot.py` • `requirements.txt` • `.env.example` • `README.md` • `VARIABLE_RAILWAY.md`
+
+
+## v13.6 — Contoh Catatan Pesanan
+- Contoh catatan checkout dibuat lebih umum dan profesional.
+- Tidak lagi menggunakan contoh email, profil anak, atau instruksi password.
+- Tidak ada perubahan pada alur pembayaran maupun penyimpanan catatan.
+
+
+## v13.7 — Alur Verifikasi Bukti Pembayaran
+- Menghapus instruksi lama `Buka /owner → Verifikasi Bayar` dari notifikasi order.
+- Jalur utama verifikasi sekarang tegas: user kirim bukti → PM owner → tombol Konfirmasi/Tolak/Pending.
+- Menu Verifikasi Pembayaran owner hanya menampilkan transaksi yang sudah memiliki bukti dan berfungsi sebagai fallback.
+- User diberi konfirmasi bahwa tidak perlu membuka /owner atau menghubungi owner untuk verifikasi.

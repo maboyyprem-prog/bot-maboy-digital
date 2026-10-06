@@ -1032,3 +1032,29 @@ Tanggal dan waktu WIB dikembalikan ke /ping tanpa mengembalikan detail teknis pa
 ## v13.2 — Backup Project
 
 Menambahkan tombol manual `📦 Backup Project` pada menu Sistem. ZIP berisi 6 file project yang dideploy + snapshot `shop.db`. `.env`/secret Railway sengaja tidak disertakan. Backup database otomatis 48 jam tetap aktif. Tidak ada Railway Variable baru.
+
+
+## v13.3 — Stok di List Produk
+- Menu list produk user sekarang menampilkan stok total per produk.
+- Tombol pilihan produk juga menampilkan jumlah stok saat ini.
+
+
+## v13.4 — Indikator Stok
+- Indikator stok user: 🔴 0, 🟡 1–3, 🟢 4+.
+- Memperbaiki version guard launcher agar sesuai v13.4.
+- Tidak ada Railway Variable baru.
+
+
+## v13.5 — Stok Ringkas
+
+Indikator warna stok dihapus. List Produk tetap menampilkan jumlah stok per produk dan tombol produk tetap menampilkan angka stok. Tidak ada Railway Variable baru.
+
+
+## v13.6 — Contoh Catatan Pesanan
+- Hanya perubahan teks contoh catatan checkout.
+- Tidak ada Railway Variable baru.
+
+
+## v13.7 — Alur Verifikasi Bukti Pembayaran
+- Tidak ada Railway Variable baru.
+- Perubahan hanya pada routing/pesan verifikasi bukti dan filter menu verifikasi.
