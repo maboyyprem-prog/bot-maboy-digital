@@ -81,7 +81,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "9.0"
+BOT_VERSION = "9.2"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -2751,6 +2751,16 @@ async def run_system_self_test(bot: Bot):
         results.append(("Database", False, str(exc)[:100]))
 
     try:
+        schema_ok, schema_problems = validate_system_schema()
+        results.append((
+            "Schema DB",
+            schema_ok,
+            "Lengkap" if schema_ok else "; ".join(schema_problems)[:200]
+        ))
+    except Exception as exc:
+        results.append(("Schema DB", False, str(exc)[:100]))
+
+    try:
         db_file = Path(DB_PATH)
         writable = db_file.parent.exists() and os.access(db_file.parent, os.W_OK)
         results.append(("Storage /data", writable, str(db_file.parent)))
@@ -4665,46 +4675,91 @@ async def safe_callback_notice(call: CallbackQuery, text: str = ""):
 
 
 
+
+def validate_system_schema():
+    required = {
+        "orders": {
+            "id","user_id","status","payment_status","fulfillment_status",
+            "variant_id","qty","stock_reserved","reserved_until","created_at"
+        },
+        "topups": {"id","user_id","status","expires_at","created_at"},
+        "product_variants": {"id","stock","reserved_stock","active"},
+        "inventory_items": {"id","variant_id","status","order_id"},
+        "settings": {"key","value"},
+        "system_errors": {"id","error_text","created_at"},
+        "payment_proof_sessions": {"user_id","entity_type","entity_id"},
+    }
+
+    conn=db()
+    problems=[]
+    try:
+        for table, columns in required.items():
+            exists=conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)
+            ).fetchone()
+            if not exists:
+                problems.append(f"table {table} tidak ada")
+                continue
+
+            real={
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            missing=sorted(columns-real)
+            if missing:
+                problems.append(f"{table}: kolom kurang {', '.join(missing)}")
+    finally:
+        conn.close()
+
+    return len(problems)==0, problems
+
+
 def cleanup_data_counts():
     conn = db()
     now = datetime.now().isoformat(timespec="seconds")
 
     def count(sql, params=()):
-        try:
-            row=conn.execute(sql, params).fetchone()
-            return int(row["n"] or 0)
-        except Exception:
-            return 0
+        row=conn.execute(sql, params).fetchone()
+        return int(row["n"] or 0)
 
-    result = {
-        "expired_orders": count(
-            """SELECT COUNT(*) AS n FROM orders
-               WHERE payment_status!='paid'
-                 AND status NOT IN ('completed','cancelled')
-                 AND (
-                    (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
-                    OR status='expired'
-                 )""",
-            (now,)
-        ),
-        "expired_topups": count(
-            """SELECT COUNT(*) AS n FROM topups
-               WHERE status NOT IN ('completed','paid')
-                 AND (
-                    (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
-                    OR status='expired'
-                 )""",
-            (now,)
-        ),
-        "proof_sessions": count(
-            "SELECT COUNT(*) AS n FROM payment_proof_sessions"
-        ),
-        "system_errors": count(
-            "SELECT COUNT(*) AS n FROM system_errors"
-        ),
-    }
-    conn.close()
-    return result
+    try:
+        return {
+            "pending_orders": count(
+                """SELECT COUNT(*) AS n FROM orders
+                   WHERE payment_status!='paid'
+                     AND status IN ('pending','pending_payment','waiting_payment')"""
+            ),
+            "expired_orders": count(
+                """SELECT COUNT(*) AS n FROM orders
+                   WHERE payment_status!='paid'
+                     AND status NOT IN ('completed','cancelled')
+                     AND (
+                        (reserved_until IS NOT NULL AND reserved_until!='' AND reserved_until<=?)
+                        OR status='expired'
+                     )""",
+                (now,)
+            ),
+            "expired_topups": count(
+                """SELECT COUNT(*) AS n FROM topups
+                   WHERE status NOT IN ('completed','paid')
+                     AND (
+                        (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
+                        OR status='expired'
+                     )""",
+                (now,)
+            ),
+            "proof_sessions": count(
+                "SELECT COUNT(*) AS n FROM payment_proof_sessions"
+            ),
+            "system_errors": count(
+                "SELECT COUNT(*) AS n FROM system_errors"
+            ),
+        }
+    finally:
+        conn.close()
+
+
 
 
 def cleanup_data_keyboard():
@@ -4713,6 +4768,10 @@ def cleanup_data_keyboard():
         [InlineKeyboardButton(
             text=f"🧾 Order Expired ({counts['expired_orders']})",
             callback_data="cleanup:preview:orders"
+        )],
+        [InlineKeyboardButton(
+            text=f"⏳ Pesanan Pending ({counts['pending_orders']})",
+            callback_data="cleanup:preview:pending"
         )],
         [InlineKeyboardButton(
             text=f"💰 Top Up Expired ({counts['expired_topups']})",
@@ -4740,6 +4799,11 @@ def cleanup_data_keyboard():
 def cleanup_preview_text(kind: str):
     counts=cleanup_data_counts()
     mapping={
+        "pending": (
+            "⏳ PESANAN PENDING BELUM BAYAR",
+            counts["pending_orders"],
+            "Pesanan pending yang belum dibayar. Reservasi stok akan dilepas sebelum order dihapus."
+        ),
         "orders": (
             "🧾 ORDER EXPIRED",
             counts["expired_orders"],
@@ -4790,6 +4854,30 @@ def cleanup_execute(kind: str):
     try:
         conn.execute("BEGIN IMMEDIATE")
 
+
+        if kind=="pending":
+            rows=conn.execute(
+                """SELECT id,variant_id,qty,stock_reserved
+                   FROM orders
+                   WHERE payment_status!='paid'
+                     AND status IN ('pending','pending_payment','waiting_payment')"""
+            ).fetchall()
+
+            for row in rows:
+                if int(row["stock_reserved"] or 0)==1:
+                    conn.execute(
+                        """UPDATE product_variants
+                           SET reserved_stock=MAX(0,reserved_stock-?)
+                           WHERE id=?""",
+                        (int(row["qty"] or 0), row["variant_id"])
+                    )
+
+            ids=[int(r["id"]) for r in rows]
+            if ids:
+                marks=",".join("?" for _ in ids)
+                conn.execute(f"DELETE FROM orders WHERE id IN ({marks})", ids)
+            result["orders"]=len(ids)
+
         if kind in {"orders","safe"}:
             rows=conn.execute(
                 """SELECT id,variant_id,qty,stock_reserved
@@ -4797,7 +4885,7 @@ def cleanup_execute(kind: str):
                    WHERE payment_status!='paid'
                      AND status NOT IN ('completed','cancelled')
                      AND (
-                        (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
+                        (reserved_until IS NOT NULL AND reserved_until!='' AND reserved_until<=?)
                         OR status='expired'
                      )""",
                 (now,)
@@ -12330,7 +12418,7 @@ async def owner_cleanup_data(call: CallbackQuery):
             call,
             "🗑️ <b>HAPUS DATA</b>\n\n"
             "Pilih data yang ingin dibersihkan.\n\n"
-            "🔒 Paid/completed, saldo user, dan akun terjual tidak ikut dihapus.",
+            "🔒 Pending hanya bisa dihapus jika belum dibayar. Paid/completed, saldo user, dan akun terjual tidak ikut dihapus.",
             reply_markup=cleanup_data_keyboard(),
             parse_mode="HTML"
         )
@@ -12344,22 +12432,26 @@ async def owner_cleanup_preview(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    kind=call.data.split(":")[-1]
-    data=cleanup_preview_text(kind)
-    if not data:
-        return await call.answer("Jenis data tidak valid.", show_alert=True)
+    try:
+        kind=call.data.split(":")[-1]
+        data=cleanup_preview_text(kind)
+        if not data:
+            return await call.answer("Jenis data tidak valid.", show_alert=True)
 
-    title,count,description=data
-    await safe_edit_or_answer(
-        call,
-        f"🗑️ <b>{html.escape(title)}</b>\n\n"
-        f"Data ditemukan: <b>{count}</b>\n\n"
-        f"{html.escape(description)}\n\n"
-        "⚠️ Data yang dihapus tidak bisa dikembalikan dari bot.",
-        reply_markup=cleanup_confirm_keyboard(kind),
-        parse_mode="HTML"
-    )
-    await safe_callback_notice(call)
+        title,count,description=data
+        await safe_edit_or_answer(
+            call,
+            f"🗑️ <b>{html.escape(title)}</b>\n\n"
+            f"Data ditemukan: <b>{count}</b>\n\n"
+            f"{html.escape(description)}\n\n"
+            "⚠️ Data yang dihapus tidak bisa dikembalikan dari bot.",
+            reply_markup=cleanup_confirm_keyboard(kind),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_system_error_view(call, "Preview Hapus Data", exc)
+
 
 
 @router.callback_query(F.data.startswith("cleanup:confirm:"))
@@ -12368,7 +12460,7 @@ async def owner_cleanup_confirm(call: CallbackQuery):
         return await deny_owner_callback(call)
 
     kind=call.data.split(":")[-1]
-    if kind not in {"orders","topups","proofs","errors","safe"}:
+    if kind not in {"orders","pending","topups","proofs","errors","safe"}:
         return await call.answer("Jenis data tidak valid.", show_alert=True)
 
     try:
