@@ -93,7 +93,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "15.7"
+BOT_VERSION = "15.9"
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1443,16 +1443,12 @@ async def force_refresh_user_keyboard(message: Message):
 async def show_main_menu_message(message: Message):
     await message.answer(
         f"🛍️ <b>{STORE_NAME}</b>\n\n"
+        "Selamat datang di Maboyy Digital.\n"
         f"{store_rating_text()}\n\n"
-        "Selamat datang.\n"
-        "Gunakan tombol menu atau nomor produk di bawah untuk akses cepat.\n\n"
+        "Pilih menu atau nomor produk di bawah untuk mulai belanja.\n\n"
         f"<i>{STORE_FOOTER}</i>",
         reply_markup=user_reply_menu(),
         parse_mode="HTML"
-    )
-    await message.answer(
-        "Atau pilih menu berikut:",
-        reply_markup=main_menu()
     )
 
 
@@ -2989,13 +2985,13 @@ def checkout_transaction_keyboard(variant_id: int, qty: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="💳 Lanjut ke Pembayaran",
+                text="💳 Lanjut Pembayaran",
                 callback_data=f"checkoutpay:{variant_id}:{qty}"
             )
         ],
         [
             InlineKeyboardButton(
-                text="📝 Catatan Pesanan",
+                text="📝 Catatan",
                 callback_data=f"checkoutnote:add:{variant_id}:{qty}"
             ),
             InlineKeyboardButton(
@@ -3005,7 +3001,7 @@ def checkout_transaction_keyboard(variant_id: int, qty: int):
         ],
         [
             InlineKeyboardButton(
-                text="🔢 Ubah Jumlah",
+                text="⬅️ Kembali ke Produk",
                 callback_data=f"variant:{variant_id}"
             )
         ],
@@ -3020,51 +3016,39 @@ def checkout_transaction_keyboard(variant_id: int, qty: int):
 
 def transaction_pending_keyboard(order_id: int, include_proof: bool = True):
     rows=[]
+
     if include_proof:
         rows.append([
             InlineKeyboardButton(
-                text="📤 Kirim Bukti Pembayaran",
+                text="📤 Kirim Bukti",
                 callback_data=f"proofsubmit:order:{order_id}"
             )
         ])
+
     rows.append([
         InlineKeyboardButton(
             text="🔄 Cek Status",
             callback_data=f"statuscheck:order:{order_id}"
-        ),
-        InlineKeyboardButton(
-            text="🧾 Detail",
-            callback_data=f"orderdetail:{order_id}"
         )
     ])
+
     rows.append([
         InlineKeyboardButton(
             text="❌ Batalkan Pesanan",
             callback_data=f"usercancel:{order_id}"
         )
     ])
-    if ADMIN_USERNAME:
-        rows.append([
-            InlineKeyboardButton(
-                text="💬 Hubungi Owner",
-                url=f"https://t.me/{ADMIN_USERNAME}"
-            )
-        ])
+
     rows.append([
         InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders"),
         InlineKeyboardButton(text="🏠 Menu",callback_data="home")
     ])
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def transaction_done_keyboard(order_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="🧾 Detail Pesanan",
-                callback_data=f"orderdetail:{order_id}"
-            )
-        ],
         [
             InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders"),
             InlineKeyboardButton(text="🏠 Menu",callback_data="home")
@@ -3129,26 +3113,18 @@ def payment_method_keyboard(variant_id: int, qty: int):
 
     rows.append([
         InlineKeyboardButton(
-            text="🎟️ Voucher",
-            callback_data=f"checkoutvoucher:{variant_id}:{qty}"
-        ),
-        InlineKeyboardButton(
-            text="📝 Catatan",
-            callback_data=f"checkoutnote:add:{variant_id}:{qty}"
-        )
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            text="⬅️ Ringkasan",
+            text="⬅️ Ringkasan Pesanan",
             callback_data=f"confirm:{variant_id}:{qty}"
         )
     ])
+
     rows.append([
         InlineKeyboardButton(
-            text="❌ Batalkan Transaksi",
+            text="❌ Batalkan",
             callback_data=f"checkoutcancel:{variant_id}"
         )
     ])
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -5722,7 +5698,7 @@ def payment_proof_keyboard(entity: str, entity_id: int):
         ],
         [
             InlineKeyboardButton(
-                text="🔄 Cek Status Transaksi",
+                text="🔄 Cek Status",
                 callback_data=f"statuscheck:{entity}:{entity_id}"
             )
         ]
@@ -5736,11 +5712,8 @@ def payment_proof_keyboard(entity: str, entity_id: int):
             )
         ])
         rows.append([
-            InlineKeyboardButton(text="🧾 Detail",callback_data=f"orderdetail:{entity_id}"),
-            InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders")
-        ])
-        rows.append([
-            InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")
+            InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders"),
+            InlineKeyboardButton(text="🏠 Menu",callback_data="home")
         ])
     else:
         rows.append([
@@ -9757,8 +9730,7 @@ async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     await safe_edit_or_answer(call, 
         f"🛍️ <b>{STORE_NAME}</b>\n\n"
-        "Selamat datang.\n"
-        "Silakan pilih menu:\n\n"
+        "Pilih menu yang ingin dibuka.\n\n"
         f"<i>{STORE_FOOTER}</i>",
         reply_markup=main_menu(),
         parse_mode="HTML"
@@ -10142,9 +10114,9 @@ async def confirm_order(call: CallbackQuery, state: FSMContext):
         if voucher_code else "🎟️ Voucher: <i>Belum digunakan</i>\n"
     )
 
-    await safe_edit_or_answer(call,
-        "🛒 <b>CHECKOUT • RINGKASAN PESANAN</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+    await safe_edit_or_answer(
+        call,
+        "🛒 <b>RINGKASAN PESANAN</b>\n\n"
         f"📦 Produk: <b>{html.escape(product['name'])}</b>\n"
         f"🧩 Variasi: <b>{html.escape(variant['name'])}</b>\n"
         f"🔐 Jenis: <b>{'Sharing' if variant_is_sharing(variant) else 'Private / Unique'}</b>\n"
@@ -10152,10 +10124,8 @@ async def confirm_order(call: CallbackQuery, state: FSMContext):
         f"💰 Harga/unit: <b>{rupiah(unit)}</b>\n"
         f"💵 Subtotal: <b>{rupiah(total)}</b>\n"
         f"{voucher_line}"
-        f"{note_line}"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ Ringkasan  →  2️⃣ Pembayaran  →  3️⃣ Selesai\n\n"
-        "Periksa pesanan sebelum melanjutkan.",
+        f"{note_line}\n"
+        "Periksa pesanan sebelum melanjutkan ke pembayaran.",
         reply_markup=checkout_transaction_keyboard(variant_id, qty),
         parse_mode="HTML"
     )
@@ -10177,15 +10147,14 @@ async def checkout_go_payment(call: CallbackQuery, state: FSMContext):
         extras.append(f"🎟️ Voucher: <b>{html.escape(voucher)}</b>")
     if note:
         extras.append(f"📝 Catatan: <b>{html.escape(note[:100])}</b>")
-    extra_text=("\\n".join(extras)+"\\n\\n") if extras else ""
+
+    extra_text=("\n".join(extras) + "\n\n") if extras else ""
 
     await safe_edit_or_answer(
         call,
-        "💳 <b>CHECKOUT • PILIH PEMBAYARAN</b>\\n"
-        "━━━━━━━━━━━━━━━━━━\\n"
+        "💳 <b>PILIH METODE PEMBAYARAN</b>\n\n"
         f"{extra_text}"
-        "Pilih metode pembayaran yang ingin digunakan.\\n\\n"
-        "2️⃣ <b>Pembayaran</b>  →  3️⃣ Selesai",
+        "Pilih metode pembayaran:",
         reply_markup=payment_method_keyboard(variant_id, qty),
         parse_mode="HTML"
     )
@@ -10211,16 +10180,19 @@ async def checkout_cancel_flow(call: CallbackQuery, state: FSMContext):
     if variant and product:
         await safe_edit_or_answer(
             call,
-            "❌ <b>CHECKOUT DIBATALKAN</b>\\n\\n"
-            "Belum ada order yang dibuat dan stok belum direservasi.\\n"
-            "Kamu bisa mengubah jumlah atau memilih produk lain.",
+            "❌ <b>CHECKOUT DIBATALKAN</b>\n\n"
+            "Belum ada order yang dibuat dan stok belum direservasi.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="🔄 Kembali ke Produk",
-                    callback_data=f"variant:{variant_id}"
-                )],
-                [InlineKeyboardButton(text="🛍️ List Produk",callback_data="products")],
-                [InlineKeyboardButton(text="🏠 Menu",callback_data="home")]
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Kembali ke Produk",
+                        callback_data=f"variant:{variant_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(text="🛍️ List Produk",callback_data="products"),
+                    InlineKeyboardButton(text="🏠 Menu",callback_data="home")
+                ]
             ]),
             parse_mode="HTML"
         )
@@ -10233,6 +10205,7 @@ async def checkout_cancel_flow(call: CallbackQuery, state: FSMContext):
                 [InlineKeyboardButton(text="🏠 Menu",callback_data="home")]
             ])
         )
+
     await safe_callback_notice(call)
 
 
@@ -10288,7 +10261,7 @@ async def checkout_note_input(message: Message, state: FSMContext):
     await message.answer(
         "✅ <b>CATATAN DISIMPAN</b>\n\n"
         f"<blockquote>{html.escape(note)}</blockquote>\n\n"
-        "💳 Lanjut pilih metode pembayaran:",
+        "Pilih metode pembayaran:",
         reply_markup=payment_method_keyboard(variant_id, qty),
         parse_mode="HTML"
     )
@@ -10307,8 +10280,7 @@ async def checkout_note_skip(call: CallbackQuery, state: FSMContext):
     await state.set_state(None)
 
     await safe_edit_or_answer(call, 
-        "💳 <b>CHECKOUT • PILIH PEMBAYARAN</b>\n\n"
-        "📝 Catatan: <i>Dilewati</i>\n\n"
+        "💳 <b>PILIH METODE PEMBAYARAN</b>\n\n"
         "Pilih metode pembayaran:",
         reply_markup=payment_method_keyboard(variant_id, qty),
         parse_mode="HTML"
@@ -10601,11 +10573,10 @@ async def checkout_voucher_input(message: Message, state: FSMContext):
 
     await message.answer(
         "✅ <b>VOUCHER DITERAPKAN</b>\n\n"
-        f"Kode: <b>{html.escape(code)}</b>\n"
-        f"Subtotal: <b>{rupiah(subtotal)}</b>\n"
-        f"Diskon: <b>-{rupiah(discount)}</b>\n"
-        f"Total setelah voucher: <b>{rupiah(max(0, subtotal-discount))}</b>\n\n"
-        "Silakan pilih metode pembayaran:",
+        f"🎟️ {html.escape(code)}\n"
+        f"💸 Diskon: <b>-{rupiah(discount)}</b>\n"
+        f"💵 Total: <b>{rupiah(max(0, subtotal-discount))}</b>\n\n"
+        "Pilih metode pembayaran:",
         reply_markup=payment_method_keyboard(variant_id, qty),
         parse_mode="HTML"
     )
@@ -20797,7 +20768,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "15.7"
+EXPECTED_SOURCE_VERSION = "15.9"
 
 
 def source_integrity_self_test():
