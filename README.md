@@ -1,24 +1,22 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v11.0  
+**Versi aktif:** v11.6  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Update Terbaru — v11.0 Runtime NameError Audit
-- Memperbaiki `NameError: name 're' is not defined` pada Harga Custom.
-- Menambahkan `import re` yang memang dibutuhkan `parse_rupiah_input()`.
-- Menambahkan `JAKARTA_TZ = ZoneInfo("Asia/Jakarta")` yang sebelumnya dipakai tetapi belum didefinisikan.
-- Menambahkan `main_menu()` yang sebelumnya dipanggil di banyak flow user tetapi belum ada.
-- Memperbaiki `expiry_text` pada checkout QRIS.
-- Menghapus dead legacy code `startup_recovery_audit` yang masih mereferensikan `results`.
-- Merapikan duplicate import `TelegramRetryAfter`.
-- Menambahkan symbol-table audit: unresolved global symbol harus 0 sebelum rilis.
-- Parser harga, timezone, callback menu, dan SQLite insert smoke test lolos.
-- Persistent FSM, Callback Trace, WAL, event isolation, backoff, dan Error Analytics tetap dipertahankan.
+## Update Terbaru — v11.6 Demo Isolation Lock
+- `/demo` tetap 100% simulasi untuk user dan owner.
+- Semua callback demo diwajibkan berada di namespace `userdemo:*`.
+- Demo callback tidak boleh memanggil fulfillment, mark paid, topup verification, inventory sync, atau database produksi.
+- Audit AST memastikan callback demo tidak memiliki callback menuju flow produksi.
+- `/start` diaudit tidak memiliki referensi demo.
+- Ditambahkan safety-net untuk callback `userdemo:*` yang tidak dikenal; bot menolak tanpa mengubah data.
+- Akun demo tetap string palsu tetap, tidak pernah mengambil inventory resmi.
+- Tidak ada produk/order/topup/saldo/stok resmi yang dibuat atau diubah oleh demo.
 - Tidak ada Railway Variable baru.
 
 ## Command
-User: `/start`  
-Owner: `/owner` • `/ping`
+User: `/start` • `/demo`  
+Owner: `/owner` • `/ping` • `/demo`
 
 ## File Project
 `bot.py` • `requirements.txt` • `.env.example` • `README.md` • `VARIABLE_RAILWAY.md`

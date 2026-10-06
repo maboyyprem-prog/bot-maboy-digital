@@ -88,7 +88,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "11.0"
+BOT_VERSION = "11.6"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -535,6 +535,35 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_report_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_date TEXT NOT NULL,
+            message_id INTEGER NOT NULL DEFAULT 0,
+            report_text TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS demo_user_sessions (
+            user_id INTEGER PRIMARY KEY,
+            step TEXT NOT NULL DEFAULT 'home',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS demo_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(entity_type, entity_id)
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS integrity_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_type TEXT NOT NULL,
@@ -598,6 +627,8 @@ def init_db():
     add_column_if_missing(conn, "orders", "delivery_text", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "last_delivery_error", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "proof_file_id", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "proof_file_type", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "system_errors", "update_id", "INTEGER DEFAULT 0")
     add_column_if_missing(conn, "system_errors", "event_type", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "system_errors", "callback_data", "TEXT DEFAULT ''")
@@ -3091,17 +3122,35 @@ async def send_daily_owner_report(bot: Bot):
     ).fetchone()["n"]
     conn.close()
 
-    await bot.send_message(
-        ADMIN_ID,
+    report_text=(
         "📊 <b>LAPORAN HARIAN MABOYY DIGITAL</b>\n\n"
         f"🧾 Order hari ini: <b>{order_count}</b>\n"
         f"✅ Selesai: <b>{completed}</b>\n"
         f"💰 Omzet: <b>{rupiah(revenue)}</b>\n"
         f"⏳ Perlu perhatian: <b>{pending}</b>\n"
         f"📉 Variasi stok rendah: <b>{low}</b>\n\n"
-        f"<i>{STORE_FOOTER}</i>",
+        f"<i>{STORE_FOOTER}</i>"
+    )
+
+    sent=await bot.send_message(
+        ADMIN_ID,
+        report_text,
         parse_mode="HTML"
     )
+
+    conn=db()
+    conn.execute(
+        """INSERT INTO daily_report_history(report_date,message_id,report_text,created_at)
+           VALUES(?,?,?,?)""",
+        (
+            today,
+            int(getattr(sent,"message_id",0) or 0),
+            report_text,
+            datetime.now().isoformat(timespec="seconds")
+        )
+    )
+    conn.commit()
+    conn.close()
 
 
 async def periodic_operations_loop(bot: Bot):
@@ -5285,6 +5334,8 @@ def owner_products_menu():
 def owner_orders_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🧾 Pesanan", callback_data="owner:orders")
+    kb.button(text="⏳ Order Pending", callback_data="owner:pending_orders")
+    kb.button(text="✅ Verifikasi Pembayaran", callback_data="owner:verify_payments")
     kb.button(text="📥 Verifikasi via Bukti PM", callback_data="owner:proof_info")
     kb.button(text="💳 Pengaturan Pembayaran", callback_data="owner:qris_settings")
     kb.button(text="💰 Manajemen Saldo", callback_data="owner:wallet")
@@ -5292,7 +5343,7 @@ def owner_orders_menu():
     kb.button(text="📨 Kirim Ulang Akun", callback_data="owner:resend_order")
     kb.button(text="❌ Batalkan Order", callback_data="owner:cancel_order")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.adjust(2, 2, 2, 1, 1)
+    kb.adjust(2, 2, 2, 2, 2)
     return kb.as_markup()
 
 
@@ -5381,6 +5432,103 @@ def validate_system_schema():
     return len(problems)==0, problems
 
 
+
+def purge_paid_pending_orders(conn, product_id: int | None = None):
+    """
+    Permanently delete PAID but not delivered orders.
+    Before deletion:
+    - release reserved_stock
+    - return allocated inventory to available
+    - clear order_id from returned inventory
+    - delete dependent proof/payment/voucher records where possible
+
+    This is intentionally destructive and must only be called from owner-confirmed flows.
+    """
+    where = """
+        payment_status='paid'
+        AND (
+            fulfillment_status!='delivered'
+            OR status='paid_pending_delivery'
+        )
+    """
+    params=[]
+
+    if product_id is not None:
+        where += " AND product_id=?"
+        params.append(int(product_id))
+
+    rows=conn.execute(
+        f"SELECT * FROM orders WHERE {where} ORDER BY id",
+        tuple(params)
+    ).fetchall()
+
+    deleted=0
+    restored_inventory=0
+    released_reservations=0
+
+    for order in rows:
+        order_id=int(order["id"])
+
+        if int(order["stock_reserved"] or 0)==1:
+            release_order_reservation(conn,order)
+            released_reservations+=1
+
+        # Account may have been allocated but never delivered.
+        cur=conn.execute(
+            """UPDATE inventory_items
+               SET status='available',
+                   order_id=NULL,
+                   delivered_at=NULL
+               WHERE order_id=?
+                 AND status='allocated'""",
+            (order_id,)
+        )
+        restored_inventory += max(0,int(cur.rowcount or 0))
+
+        # Remove dependent rows if the tables/columns exist.
+        try:
+            conn.execute(
+                "DELETE FROM voucher_usage WHERE order_id=?",
+                (order_id,)
+            )
+        except Exception:
+            pass
+
+        try:
+            conn.execute(
+                """DELETE FROM payment_events
+                   WHERE entity_type='order' AND entity_id=?""",
+                (order_id,)
+            )
+        except Exception:
+            pass
+
+        try:
+            conn.execute(
+                """DELETE FROM payment_proof_sessions
+                   WHERE entity_type='order' AND entity_id=?""",
+                (order_id,)
+            )
+        except Exception:
+            pass
+
+        conn.execute("DELETE FROM orders WHERE id=?",(order_id,))
+        deleted+=1
+
+        variant_id=int(order["variant_id"] or 0)
+        if variant_id:
+            try:
+                sync_variant_stock_from_inventory(conn,variant_id)
+            except Exception:
+                pass
+
+    return {
+        "deleted": deleted,
+        "restored_inventory": restored_inventory,
+        "released_reservations": released_reservations,
+    }
+
+
 def cleanup_data_counts():
     conn = db()
     now = datetime.now().isoformat(timespec="seconds")
@@ -5395,6 +5543,14 @@ def cleanup_data_counts():
                 """SELECT COUNT(*) AS n FROM orders
                    WHERE payment_status!='paid'
                      AND status IN ('pending','pending_payment','waiting_payment')"""
+            ),
+            "paid_pending_orders": count(
+                """SELECT COUNT(*) AS n FROM orders
+                   WHERE payment_status='paid'
+                     AND (
+                        fulfillment_status!='delivered'
+                        OR status='paid_pending_delivery'
+                     )"""
             ),
             "expired_orders": count(
                 """SELECT COUNT(*) AS n FROM orders
@@ -5421,6 +5577,21 @@ def cleanup_data_counts():
             "system_errors": count(
                 "SELECT COUNT(*) AS n FROM system_errors"
             ),
+            "daily_reports": count(
+                "SELECT COUNT(*) AS n FROM daily_report_history"
+            ),
+            "payment_events": count(
+                "SELECT COUNT(*) AS n FROM payment_events"
+            ),
+            "integrity_events": count(
+                "SELECT COUNT(*) AS n FROM integrity_events"
+            ),
+            "inventory_logs": count(
+                "SELECT COUNT(*) AS n FROM inventory_logs"
+            ),
+            "demo_records": count(
+                "SELECT COUNT(*) AS n FROM demo_records"
+            ),
         }
     finally:
         conn.close()
@@ -5431,6 +5602,10 @@ def cleanup_data_counts():
 def cleanup_data_keyboard():
     counts=cleanup_data_counts()
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"💰 Paid Belum Terkirim ({counts['paid_pending_orders']})",
+            callback_data="cleanup:preview:paid_pending"
+        )],
         [InlineKeyboardButton(
             text=f"🧾 Order Expired ({counts['expired_orders']})",
             callback_data="cleanup:preview:orders"
@@ -5452,6 +5627,18 @@ def cleanup_data_keyboard():
             callback_data="cleanup:preview:errors"
         )],
         [InlineKeyboardButton(
+            text=f"📅 Riwayat Laporan ({counts['daily_reports']})",
+            callback_data="cleanup:preview:daily_reports"
+        )],
+        [InlineKeyboardButton(
+            text=f"🧾 Log Operasional ({counts['payment_events'] + counts['integrity_events'] + counts['inventory_logs']})",
+            callback_data="cleanup:preview:ops_logs"
+        )],
+        [InlineKeyboardButton(
+            text=f"🧪 Data Demo Lama ({counts['demo_records']})",
+            callback_data="cleanup:preview:demo"
+        )],
+        [InlineKeyboardButton(
             text="🧹 Bersihkan Data Aman",
             callback_data="cleanup:preview:safe"
         )],
@@ -5465,6 +5652,13 @@ def cleanup_data_keyboard():
 def cleanup_preview_text(kind: str):
     counts=cleanup_data_counts()
     mapping={
+        "paid_pending": (
+            "💰 PAID BELUM TERKIRIM",
+            counts["paid_pending_orders"],
+            "PERINGATAN: order sudah berstatus PAID namun belum delivered akan DIHAPUS PERMANEN. "
+            "Akun yang masih allocated akan dikembalikan ke stok tersedia. "
+            "Gunakan hanya jika data lama/orphan memang ingin dibuang."
+        ),
         "pending": (
             "⏳ PESANAN PENDING BELUM BAYAR",
             counts["pending_orders"],
@@ -5490,6 +5684,21 @@ def cleanup_preview_text(kind: str):
             counts["system_errors"],
             "Riwayat log error sistem. Transaksi user tidak ikut dihapus."
         ),
+        "daily_reports": (
+            "📅 RIWAYAT LAPORAN HARIAN",
+            counts["daily_reports"],
+            "Menghapus riwayat laporan harian yang disimpan bot. Transaksi/order asli tidak ikut dihapus."
+        ),
+        "ops_logs": (
+            "🧾 LOG OPERASIONAL",
+            counts["payment_events"] + counts["integrity_events"] + counts["inventory_logs"],
+            "Menghapus payment events, integrity events, dan inventory logs. Data inti order, saldo, produk, dan stok tidak ikut dihapus."
+        ),
+        "demo": (
+            "🧪 DATA DEMO",
+            counts["demo_records"],
+            "Menghapus seluruh data uji yang dibuat melalui /demo, termasuk order/topup dan produk demo tersembunyi."
+        ),
         "safe": (
             "🧹 PEMBERSIHAN DATA AMAN",
             counts["expired_orders"] + counts["expired_topups"] + counts["proof_sessions"],
@@ -5512,6 +5721,297 @@ def cleanup_confirm_keyboard(kind: str):
     ])
 
 
+
+
+
+DEMO_CALLBACK_PREFIX = "userdemo:"
+DEMO_FAKE_PRODUCT_NAME = DEMO_FAKE_PRODUCT_NAME
+DEMO_FAKE_VARIANT_NAME = DEMO_FAKE_VARIANT_NAME
+DEMO_FAKE_PRICE = 2500
+DEMO_FAKE_ACCOUNT = "demo@example.com | DEMO123"
+
+
+def is_demo_callback(data: str) -> bool:
+    return str(data or "").startswith(DEMO_CALLBACK_PREFIX)
+
+
+def demo_assert_pure_callback(data: str):
+    """
+    Defensive guard: demo callbacks must stay inside the userdemo:* namespace.
+    Any accidental production callback is rejected before execution.
+    """
+    if not is_demo_callback(data):
+        raise RuntimeError("Demo callback keluar dari namespace simulasi.")
+
+
+def set_demo_user_session(user_id: int, step: str):
+    now=datetime.now().isoformat(timespec="seconds")
+    conn=db()
+    conn.execute(
+        """INSERT INTO demo_user_sessions(user_id,step,created_at,updated_at)
+           VALUES(?,?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             step=excluded.step,
+             updated_at=excluded.updated_at""",
+        (int(user_id),str(step),now,now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_demo_user_session(user_id: int):
+    conn=db()
+    conn.execute(
+        "DELETE FROM demo_user_sessions WHERE user_id=?",
+        (int(user_id),)
+    )
+    conn.commit()
+    conn.close()
+
+
+def demo_simulation_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛍️ Simulasi Produk",callback_data="userdemo:product")],
+        [InlineKeyboardButton(text="🧾 Simulasi Checkout",callback_data="userdemo:checkout")],
+        [InlineKeyboardButton(text="💳 Simulasi Pembayaran",callback_data="userdemo:payment")],
+        [InlineKeyboardButton(text="📤 Simulasi Bukti Pembayaran",callback_data="userdemo:proof")],
+        [InlineKeyboardButton(text="⏳ Simulasi Pending",callback_data="userdemo:pending")],
+        [InlineKeyboardButton(text="✅ Simulasi Berhasil",callback_data="userdemo:success")],
+        [InlineKeyboardButton(text="❌ Simulasi Ditolak",callback_data="userdemo:rejected")],
+        [InlineKeyboardButton(text="🧹 Reset Demo",callback_data="userdemo:reset")],
+    ])
+
+
+def demo_track(conn, entity_type: str, entity_id: int):
+    conn.execute(
+        """INSERT OR IGNORE INTO demo_records(entity_type,entity_id,created_at)
+           VALUES(?,?,?)""",
+        (
+            str(entity_type),
+            int(entity_id),
+            datetime.now().isoformat(timespec="seconds")
+        )
+    )
+
+
+def insert_dynamic(conn, table: str, values: dict):
+    columns={
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    payload={k:v for k,v in values.items() if k in columns}
+    if not payload:
+        raise RuntimeError(f"Tidak ada kolom cocok untuk insert {table}.")
+
+    names=list(payload.keys())
+    marks=",".join("?" for _ in names)
+    cur=conn.execute(
+        f"INSERT INTO {table} ({','.join(names)}) VALUES ({marks})",
+        tuple(payload[name] for name in names)
+    )
+    return int(cur.lastrowid)
+
+
+def purge_demo_data(conn):
+    records=conn.execute(
+        "SELECT entity_type,entity_id FROM demo_records ORDER BY id DESC"
+    ).fetchall()
+
+    by_type={}
+    for row in records:
+        by_type.setdefault(row["entity_type"],[]).append(int(row["entity_id"]))
+
+    # Orders first, with reservation/inventory safety.
+    for order_id in by_type.get("order",[]):
+        order=conn.execute("SELECT * FROM orders WHERE id=?",(order_id,)).fetchone()
+        if order:
+            if int(order["stock_reserved"] or 0)==1:
+                release_order_reservation(conn,order)
+
+            conn.execute(
+                """UPDATE inventory_items
+                   SET status='available',order_id=NULL,delivered_at=NULL
+                   WHERE order_id=? AND status='allocated'""",
+                (order_id,)
+            )
+
+            conn.execute(
+                "DELETE FROM payment_events WHERE entity_type='order' AND entity_id=?",
+                (order_id,)
+            )
+            conn.execute(
+                "DELETE FROM payment_proof_sessions WHERE entity_type='order' AND entity_id=?",
+                (order_id,)
+            )
+            try:
+                conn.execute("DELETE FROM voucher_usage WHERE order_id=?",(order_id,))
+            except Exception:
+                pass
+            conn.execute("DELETE FROM orders WHERE id=?",(order_id,))
+
+    for topup_id in by_type.get("topup",[]):
+        conn.execute(
+            "DELETE FROM payment_events WHERE entity_type='topup' AND entity_id=?",
+            (topup_id,)
+        )
+        conn.execute(
+            "DELETE FROM payment_proof_sessions WHERE entity_type='topup' AND entity_id=?",
+            (topup_id,)
+        )
+        conn.execute("DELETE FROM topups WHERE id=?",(topup_id,))
+
+    for variant_id in by_type.get("variant",[]):
+        conn.execute("DELETE FROM inventory_items WHERE variant_id=?",(variant_id,))
+        conn.execute("DELETE FROM inventory_logs WHERE variant_id=?",(variant_id,))
+        conn.execute("DELETE FROM product_variants WHERE id=?",(variant_id,))
+
+    for product_id in by_type.get("product",[]):
+        conn.execute("DELETE FROM products WHERE id=?",(product_id,))
+
+    total=len(records)
+    conn.execute("DELETE FROM demo_records")
+    return total
+
+
+def seed_all_demo_data(owner_id: int):
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+
+    try:
+        # Clean prior demo data first so /demo is idempotent.
+        purge_demo_data(conn)
+
+        now=datetime.now().isoformat(timespec="seconds")
+
+        product_id=insert_dynamic(conn,"products",{
+            "name":"[DEMO] Produk Pembayaran",
+            "description":"Produk tersembunyi khusus pengujian /demo.",
+            "active":0,
+            "created_at":now,
+            "price":0,
+            "stock":0,
+        })
+        demo_track(conn,"product",product_id)
+
+        variant_id=insert_dynamic(conn,"product_variants",{
+            "product_id":product_id,
+            "name":"[DEMO] 1 Bulan",
+            "code":f"DEMO-{product_id}",
+            "price":2500,
+            "stock":0,
+            "reserved_stock":0,
+            "wholesale10":0,
+            "wholesale20":0,
+            "active":1,
+            "button_label":"DEMO",
+        })
+        demo_track(conn,"variant",variant_id)
+
+        order_specs=[
+            ("UNPAID","pending","unpaid","pending",2500),
+            ("VERIFY","pending_payment","pending","pending",5000),
+            ("PAID_PENDING","paid_pending_delivery","paid","pending",7500),
+            ("COMPLETED","completed","paid","delivered",10000),
+            ("REJECTED","cancelled","rejected","pending",12500),
+        ]
+
+        order_ids={}
+        for label,status,payment_status,fulfillment_status,total in order_specs:
+            oid=insert_dynamic(conn,"orders",{
+                "user_id":int(owner_id),
+                "username":"DEMO_OWNER",
+                "product_id":product_id,
+                "variant_id":variant_id,
+                "qty":1,
+                "unit_price":total,
+                "total":total,
+                "payment_total":total,
+                "payment_method":"QRIS_DEMO",
+                "status":status,
+                "payment_status":payment_status,
+                "fulfillment_status":fulfillment_status,
+                "stock_reserved":0,
+                "note":f"[DEMO] {label}",
+                "proof_file_id":"",
+                "proof_file_type":"DEMO",
+                "payment_proof_file_id":"",
+                "payment_proof_type":"DEMO",
+                "payment_proof_submitted_at":now if label=="VERIFY" else "",
+                "created_at":now,
+                "completed_at":now if label=="COMPLETED" else "",
+            })
+            demo_track(conn,"order",oid)
+            order_ids[label]=oid
+
+            conn.execute(
+                """INSERT OR IGNORE INTO payment_events
+                   (entity_type,entity_id,event_type,amount,actor_id,detail,created_at)
+                   VALUES('order',?,?,?,?,?,?)""",
+                (
+                    oid,
+                    "demo_created",
+                    total,
+                    int(owner_id),
+                    f"[DEMO] {label}",
+                    now
+                )
+            )
+
+        topup_specs=[
+            ("PENDING","pending",10000),
+            ("PROCESSING","processing",20000),
+            ("COMPLETED","completed",50000),
+            ("EXPIRED","expired",100000),
+        ]
+
+        topup_ids={}
+        for label,status,amount in topup_specs:
+            tid=insert_dynamic(conn,"topups",{
+                "user_id":int(owner_id),
+                "username":"DEMO_OWNER",
+                "amount":amount,
+                "unique_code":0,
+                "payment_total":amount,
+                "payment_method":"QRIS_DEMO",
+                "status":status,
+                "provider_reference":f"DEMO-TOPUP-{label}",
+                "created_at":now,
+                "expires_at":now if label=="EXPIRED" else "",
+                "verified_at":now if label=="COMPLETED" else "",
+                "verified_by":int(owner_id) if label=="COMPLETED" else 0,
+            })
+            demo_track(conn,"topup",tid)
+            topup_ids[label]=tid
+
+            conn.execute(
+                """INSERT OR IGNORE INTO payment_events
+                   (entity_type,entity_id,event_type,amount,actor_id,detail,created_at)
+                   VALUES('topup',?,?,?,?,?,?)""",
+                (
+                    tid,
+                    "demo_created",
+                    amount,
+                    int(owner_id),
+                    f"[DEMO] {label}",
+                    now
+                )
+            )
+
+        conn.commit()
+
+        return {
+            "product_id":product_id,
+            "variant_id":variant_id,
+            "orders":order_ids,
+            "topups":topup_ids,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def cleanup_execute(kind: str):
     conn=db()
     now=datetime.now().isoformat(timespec="seconds")
@@ -5520,6 +6020,15 @@ def cleanup_execute(kind: str):
     try:
         conn.execute("BEGIN IMMEDIATE")
 
+
+        if kind=="paid_pending":
+            result=purge_paid_pending_orders(conn)
+            conn.commit()
+            return (
+                f"Paid belum terkirim dihapus: {result['deleted']}\n"
+                f"Allocated account dikembalikan: {result['restored_inventory']}\n"
+                f"Reservasi dilepas: {result['released_reservations']}"
+            )
 
         if kind=="pending":
             rows=conn.execute(
@@ -5595,6 +6104,21 @@ def cleanup_execute(kind: str):
         if kind=="errors":
             cur=conn.execute("DELETE FROM system_errors")
             result["errors"]=max(0,int(cur.rowcount or 0))
+
+        if kind=="daily_reports":
+            cur=conn.execute("DELETE FROM daily_report_history")
+            result["daily_reports"]=max(0,int(cur.rowcount or 0))
+
+        if kind=="ops_logs":
+            p=conn.execute("DELETE FROM payment_events")
+            i=conn.execute("DELETE FROM integrity_events")
+            s=conn.execute("DELETE FROM inventory_logs")
+            result["payment_events"]=max(0,int(p.rowcount or 0))
+            result["integrity_events"]=max(0,int(i.rowcount or 0))
+            result["inventory_logs"]=max(0,int(s.rowcount or 0))
+
+        if kind=="demo":
+            result["demo_records"]=purge_demo_data(conn)
 
         conn.commit()
         return result
@@ -6655,6 +7179,30 @@ async def owner_menu_system(call: CallbackQuery, state: FSMContext):
         await safe_callback_notice(call)
     except Exception as exc:
         await owner_system_error_view(call, "Menu Sistem", exc)
+
+
+
+
+@router.message(Command("demo"))
+async def demo_command(message: Message):
+    set_demo_user_session(message.from_user.id,"home")
+
+    await message.answer(
+        "🧪 <b>MODE DEMO MABOYY DIGITAL</b>\n\n"
+        "Ini hanya <b>simulasi/rekayasa</b>.\n\n"
+        "Demo TIDAK akan:\n"
+        "• membuat produk asli\n"
+        "• membuat order asli\n"
+        "• mengurangi stok\n"
+        "• memotong saldo\n"
+        "• membuat top up\n"
+        "• mengubah laporan penjualan\n\n"
+        "Produk resmi di <b>/start</b> tidak disentuh.",
+        reply_markup=demo_simulation_menu(),
+        parse_mode="HTML"
+    )
+
+
 
 
 
@@ -9870,6 +10418,466 @@ async def owner_stats(call: CallbackQuery):
         parse_mode="HTML"
     )
     await call.answer()
+
+
+@router.callback_query(F.data == "owner:pending_orders")
+async def owner_pending_orders(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    rows=conn.execute(
+        """SELECT o.*, p.name AS product_name, v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE (
+                (o.payment_status='paid' AND o.fulfillment_status!='delivered')
+                OR
+                (o.payment_status!='paid' AND o.status IN ('pending','pending_payment','waiting_payment'))
+           )
+           ORDER BY o.id DESC
+           LIMIT 30"""
+    ).fetchall()
+    conn.close()
+
+    lines=["⏳ <b>ORDER PENDING</b>",""]
+    keyboard=[]
+
+    if not rows:
+        lines.append("✅ Tidak ada order pending.")
+    else:
+        for row in rows:
+            paid = row["payment_status"]=="paid"
+            status_label = "💰 PAID BELUM TERKIRIM" if paid else "🕒 BELUM BAYAR"
+            lines.append(
+                f"<b>{invoice(row['id'])}</b> • {status_label}\n"
+                f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
+                f"{html.escape(row['variant_name'] or 'Varian lama')}\n"
+                f"🔢 {int(row['qty'] or 0)} • 👤 <code>{int(row['user_id'])}</code>"
+            )
+
+            if paid and int(row["variant_id"] or 0):
+                keyboard.append([
+                    InlineKeyboardButton(
+                        text=f"📦 Tambah Stok {invoice(row['id'])}",
+                        callback_data=f"pendingstock:{row['variant_id']}:{row['id']}"
+                    )
+                ])
+                if row["delivery_text"]:
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            text=f"📨 Kirim Ulang {invoice(row['id'])}",
+                            callback_data=f"ownerresend:{row['id']}"
+                        )
+                    ])
+            elif not paid:
+                keyboard.append([
+                    InlineKeyboardButton(
+                        text=f"❌ Batalkan {invoice(row['id'])}",
+                        callback_data=f"pendingcancel:{row['id']}"
+                    )
+                ])
+
+    keyboard.append([
+        InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:menu_orders")
+    ])
+
+    await safe_edit_or_answer(
+        call,
+        "\n\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("pendingstock:"))
+async def owner_pending_order_add_stock(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        _,variant_id,order_id=call.data.split(":")
+        variant_id=int(variant_id)
+        order_id=int(order_id)
+    except Exception:
+        return await call.answer("Data order tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT o.id,o.payment_status,o.fulfillment_status,
+                  v.name AS variant_name,p.name AS product_name
+           FROM orders o
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           LEFT JOIN products p ON p.id=o.product_id
+           WHERE o.id=? AND o.variant_id=?""",
+        (order_id,variant_id)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Order tidak ditemukan.",show_alert=True)
+
+    if row["payment_status"]!="paid" or row["fulfillment_status"]=="delivered":
+        return await call.answer("Order ini tidak membutuhkan stok.",show_alert=True)
+
+    await state.update_data(stock_variant_id=variant_id)
+    await state.set_state(OwnerState.stock_add_items)
+
+    await safe_edit_or_answer(
+        call,
+        "📦 <b>TAMBAH STOK UNTUK ORDER PENDING</b>\n\n"
+        f"🧾 {invoice(order_id)}\n"
+        f"📦 {html.escape(row['product_name'] or 'Produk lama')}\n"
+        f"🧩 {html.escape(row['variant_name'] or 'Varian lama')}\n\n"
+        "Kirim isi akun bebas format.\n"
+        "<b>Satu pesan = satu akun = satu stok.</b>\n\n"
+        "Setelah akun masuk, bot otomatis mencoba fulfillment order pending.",
+        reply_markup=back_owner("owner:pending_orders"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("pendingcancel:"))
+async def owner_pending_order_cancel(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+    order=conn.execute("SELECT * FROM orders WHERE id=?",(order_id,)).fetchone()
+
+    if not order:
+        conn.rollback(); conn.close()
+        return await call.answer("Order tidak ditemukan.",show_alert=True)
+
+    if order["payment_status"]=="paid":
+        conn.rollback(); conn.close()
+        return await call.answer("Order paid tidak boleh dibatalkan dari menu ini.",show_alert=True)
+
+    release_order_reservation(conn,order)
+    conn.execute(
+        """UPDATE orders
+           SET status='cancelled', payment_status='cancelled'
+           WHERE id=?""",
+        (order_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    await call.answer("Order pending dibatalkan.",show_alert=True)
+    await owner_pending_orders(call)
+
+
+
+@router.callback_query(F.data == "owner:verify_payments")
+async def owner_verify_payments(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    rows=conn.execute(
+        """SELECT o.*, p.name AS product_name, v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.payment_status!='paid'
+             AND (
+                 o.proof_file_id IS NOT NULL AND o.proof_file_id!=''
+                 OR o.status IN ('pending_payment','waiting_payment')
+             )
+           ORDER BY o.id DESC
+           LIMIT 30"""
+    ).fetchall()
+    conn.close()
+
+    lines=["✅ <b>VERIFIKASI PEMBAYARAN</b>",""]
+    keyboard=[]
+
+    if not rows:
+        lines.append("✅ Tidak ada pembayaran yang menunggu verifikasi.")
+    else:
+        for row in rows:
+            proof_type=row["proof_file_type"] or "-"
+            lines.append(
+                f"<b>{invoice(row['id'])}</b>\n"
+                f"👤 <code>{int(row['user_id'])}</code>\n"
+                f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
+                f"{html.escape(row['variant_name'] or 'Varian lama')}\n"
+                f"💰 {rupiah(row['payment_total'] or row['total'])}\n"
+                f"📎 Bukti: <b>{html.escape(proof_type)}</b>"
+            )
+
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"👁️ Lihat {invoice(row['id'])}",
+                    callback_data=f"verifypay:view:{row['id']}"
+                )
+            ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            text="⬅️ Kembali",
+            callback_data="owner:menu_orders"
+        )
+    ])
+
+    await safe_edit_or_answer(
+        call,
+        "\n\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("verifypay:view:"))
+async def owner_verify_payment_view(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT o.*, p.name AS product_name, v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=?""",
+        (order_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Order tidak ditemukan.",show_alert=True)
+
+    text=(
+        "✅ <b>VERIFIKASI PEMBAYARAN</b>\n\n"
+        f"🧾 {invoice(order_id)}\n"
+        f"👤 <code>{int(row['user_id'])}</code>\n"
+        f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
+        f"{html.escape(row['variant_name'] or 'Varian lama')}\n"
+        f"🔢 {int(row['qty'] or 0)}\n"
+        f"💰 Tagihan: <b>{rupiah(row['payment_total'] or row['total'])}</b>\n"
+        f"💳 Status: <b>{html.escape(row['payment_status'] or '-')}</b>"
+    )
+
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Confirm",
+                callback_data=f"verifypay:confirm:{order_id}"
+            ),
+            InlineKeyboardButton(
+                text="❌ Reject",
+                callback_data=f"verifypay:reject:{order_id}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="⏳ Pending",
+                callback_data=f"verifypay:pending:{order_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ Kembali",
+                callback_data="owner:verify_payments"
+            )
+        ]
+    ])
+
+    # Send proof separately if available; keep action screen as text.
+    proof_id=row["proof_file_id"]
+    proof_type=(row["proof_file_type"] or "").lower()
+
+    if proof_id:
+        try:
+            if proof_type=="photo":
+                await bot.send_photo(
+                    call.from_user.id,
+                    proof_id,
+                    caption=f"📎 Bukti pembayaran {invoice(order_id)}"
+                )
+            else:
+                await bot.send_document(
+                    call.from_user.id,
+                    proof_id,
+                    caption=f"📎 Bukti pembayaran {invoice(order_id)}"
+                )
+        except Exception as exc:
+            logging.exception("Failed to send proof for order %s: %s",order_id,exc)
+
+    await safe_edit_or_answer(
+        call,
+        text,
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("verifypay:confirm:"))
+async def owner_verify_payment_confirm(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    order=conn.execute(
+        "SELECT * FROM orders WHERE id=?",
+        (order_id,)
+    ).fetchone()
+    conn.close()
+
+    if not order:
+        return await call.answer("Order tidak ditemukan.",show_alert=True)
+
+    if order["payment_status"]=="paid":
+        return await call.answer("Order sudah berstatus PAID.",show_alert=True)
+
+    paid_amount=int(order["payment_total"] or order["total"] or 0)
+
+    try:
+        ok=await mark_order_paid(
+            order_id,
+            bot,
+            paid_amount
+        )
+    except Exception as exc:
+        logging.exception("Manual verify payment failed order=%s: %s",order_id,exc)
+        return await call.answer(
+            f"Gagal confirm: {type(exc).__name__}",
+            show_alert=True
+        )
+
+    if ok:
+        await call.answer("Pembayaran dikonfirmasi.",show_alert=True)
+    else:
+        await call.answer(
+            "Pembayaran dikonfirmasi, fulfillment masih pending.",
+            show_alert=True
+        )
+
+    await owner_verify_payments(call)
+
+
+@router.callback_query(F.data.startswith("verifypay:reject:"))
+async def owner_verify_payment_reject(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+    order=conn.execute(
+        "SELECT * FROM orders WHERE id=?",
+        (order_id,)
+    ).fetchone()
+
+    if not order:
+        conn.rollback(); conn.close()
+        return await call.answer("Order tidak ditemukan.",show_alert=True)
+
+    if order["payment_status"]=="paid":
+        conn.rollback(); conn.close()
+        return await call.answer("Order paid tidak boleh direject.",show_alert=True)
+
+    release_order_reservation(conn,order)
+
+    conn.execute(
+        """UPDATE orders
+           SET status='cancelled',
+               payment_status='rejected'
+           WHERE id=?""",
+        (order_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        await bot.send_message(
+            order["user_id"],
+            "❌ <b>PEMBAYARAN DITOLAK</b>\n\n"
+            f"🧾 {invoice(order_id)}\n"
+            "Bukti pembayaran belum dapat diverifikasi.\n"
+            "Silakan hubungi owner jika merasa pembayaran sudah benar.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    await call.answer("Pembayaran ditolak.",show_alert=True)
+    await owner_verify_payments(call)
+
+
+@router.callback_query(F.data.startswith("verifypay:pending:"))
+async def owner_verify_payment_pending(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    order=conn.execute(
+        "SELECT * FROM orders WHERE id=?",
+        (order_id,)
+    ).fetchone()
+
+    if not order:
+        conn.close()
+        return await call.answer("Order tidak ditemukan.",show_alert=True)
+
+    if order["payment_status"]=="paid":
+        conn.close()
+        return await call.answer("Order sudah PAID.",show_alert=True)
+
+    conn.execute(
+        """UPDATE orders
+           SET status='waiting_payment',
+               payment_status='pending'
+           WHERE id=?""",
+        (order_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+        await bot.send_message(
+            order["user_id"],
+            "⏳ <b>PEMBAYARAN SEDANG DIPERIKSA</b>\n\n"
+            f"🧾 {invoice(order_id)}\n"
+            "Owner sedang memeriksa bukti pembayaran Anda.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    await call.answer("Status pembayaran tetap pending.",show_alert=True)
+    await owner_verify_payments(call)
+
 
 @router.callback_query(F.data == "owner:orders")
 async def owner_orders(call: CallbackQuery):
@@ -13893,6 +14901,22 @@ async def owner_delete_product_pick(call: CallbackQuery):
         "SELECT id,name FROM products WHERE id=? AND active=1",
         (product_id,)
     ).fetchone()
+
+    pending_unpaid=conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE product_id=?
+             AND payment_status!='paid'
+             AND status IN ('pending','pending_payment','waiting_payment')""",
+        (product_id,)
+    ).fetchone()["n"] if product else 0
+
+    pending_paid=conn.execute(
+        """SELECT COUNT(*) AS n FROM orders
+           WHERE product_id=?
+             AND payment_status='paid'
+             AND fulfillment_status!='delivered'""",
+        (product_id,)
+    ).fetchone()["n"] if product else 0
     conn.close()
 
     if not product:
@@ -13902,7 +14926,12 @@ async def owner_delete_product_pick(call: CallbackQuery):
         call,
         "🗑️ <b>KONFIRMASI HAPUS PRODUK</b>\n\n"
         f"Produk: <b>{html.escape(product['name'])}</b>\n\n"
-        "Produk akan disembunyikan dari toko. Riwayat transaksi lama tetap aman.",
+        "Produk akan langsung disembunyikan dari toko.\n\n"
+        f"🕒 Pending belum bayar: <b>{int(pending_unpaid or 0)}</b>\n"
+        f"💰 Paid belum terkirim: <b>{int(pending_paid or 0)}</b>\n\n"
+        "Pending belum bayar akan dibatalkan dan reservasi stok dilepas.\n"
+        "Paid belum terkirim juga akan DIHAPUS PERMANEN.\n"
+        "Akun allocated yang belum terkirim akan dikembalikan ke stok.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
                 text="✅ Ya, Hapus",
@@ -13942,37 +14971,240 @@ async def owner_delete_product_confirm(call: CallbackQuery):
             conn.close()
             return await call.answer("Produk sudah tidak aktif.", show_alert=True)
 
-        active_paid=conn.execute(
-            """SELECT COUNT(*) AS n FROM orders
+        unpaid_rows=conn.execute(
+            """SELECT * FROM orders
                WHERE product_id=?
-                 AND payment_status='paid'
-                 AND status NOT IN ('completed','cancelled')""",
+                 AND payment_status!='paid'
+                 AND status IN ('pending','pending_payment','waiting_payment')""",
             (product_id,)
-        ).fetchone()["n"]
+        ).fetchall()
 
-        if int(active_paid or 0)>0:
-            conn.rollback()
-            conn.close()
-            return await call.answer(
-                "Masih ada order paid yang belum selesai.",
-                show_alert=True
+        cancelled_unpaid=0
+        for order in unpaid_rows:
+            release_order_reservation(conn,order)
+            conn.execute(
+                """UPDATE orders
+                   SET status='cancelled', payment_status='cancelled'
+                   WHERE id=?""",
+                (order["id"],)
             )
+            cancelled_unpaid+=1
 
-        conn.execute("UPDATE products SET active=0 WHERE id=?",(product_id,))
-        conn.execute("UPDATE product_variants SET active=0 WHERE product_id=?",(product_id,))
+        paid_purge=purge_paid_pending_orders(
+            conn,
+            product_id=product_id
+        )
+
+        # Product is hidden from storefront after its pending data is cleaned.
+        conn.execute(
+            "UPDATE products SET active=0 WHERE id=?",
+            (product_id,)
+        )
+
         conn.commit()
         conn.close()
 
         await safe_edit_or_answer(
             call,
-            "✅ <b>PRODUK DIHAPUS</b>\n\n"
-            f"<b>{html.escape(product['name'])}</b> sudah disembunyikan dari toko.",
+            "✅ <b>PRODUK DIHAPUS DARI TOKO</b>\n\n"
+            f"📦 <b>{html.escape(product['name'])}</b>\n\n"
+            f"🕒 Pending belum bayar dibatalkan: <b>{cancelled_unpaid}</b>\n"
+            f"💰 Paid belum terkirim dihapus: <b>{paid_purge['deleted']}</b>\n"
+            f"📦 Allocated account dikembalikan: <b>{paid_purge['restored_inventory']}</b>\n\n"
+            "Produk tidak lagi tampil ke pembeli dan data pending produk sudah dibersihkan.",
             reply_markup=owner_products_menu(),
             parse_mode="HTML"
         )
         await safe_callback_notice(call)
+
     except Exception as exc:
         await owner_product_error_view(call, "Hapus Produk", exc)
+
+
+
+
+@router.callback_query(F.data == "userdemo:home")
+async def user_demo_home(call: CallbackQuery):
+    demo_assert_pure_callback(call.data)
+    set_demo_user_session(call.from_user.id,"home")
+    await safe_edit_or_answer(
+        call,
+        "🧪 <b>MODE DEMO</b>\n\n"
+        "Semua tampilan berikut hanya simulasi.\n"
+        "Tidak ada data toko resmi yang berubah.",
+        reply_markup=demo_simulation_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "userdemo:product")
+async def user_demo_product(call: CallbackQuery):
+    demo_assert_pure_callback(call.data)
+    set_demo_user_session(call.from_user.id,"product")
+    await safe_edit_or_answer(
+        call,
+        "🛍️ <b>PRODUK DEMO</b>\n\n"
+        f"Produk: <b>{html.escape(DEMO_FAKE_PRODUCT_NAME)}</b>\n"
+        f"Varian: <b>{html.escape(DEMO_FAKE_VARIANT_NAME)}</b>\n"
+        "Harga: <b>Rp2.500</b>\n"
+        "Stok: <b>99</b>\n\n"
+        "Data ini hanya tampilan demo dan tidak ada di database produk resmi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧾 Lanjut Checkout",callback_data="userdemo:checkout")],
+            [InlineKeyboardButton(text="⬅️ Kembali",callback_data="userdemo:home")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "userdemo:checkout")
+async def user_demo_checkout(call: CallbackQuery):
+    demo_assert_pure_callback(call.data)
+    set_demo_user_session(call.from_user.id,"checkout")
+    await safe_edit_or_answer(
+        call,
+        "🧾 <b>CHECKOUT DEMO</b>\n\n"
+        "Invoice: <b>DEMO-0001</b>\n"
+        f"Produk: <b>{html.escape(DEMO_FAKE_PRODUCT_NAME)}</b>\n"
+        f"Varian: <b>{html.escape(DEMO_FAKE_VARIANT_NAME)}</b>\n"
+        "Qty: <b>1</b>\n"
+        "Total: <b>Rp2.500</b>\n\n"
+        "Tidak ada order asli yang dibuat.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Pilih Pembayaran",callback_data="userdemo:payment")],
+            [InlineKeyboardButton(text="⬅️ Kembali",callback_data="userdemo:product")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "userdemo:payment")
+async def user_demo_payment(call: CallbackQuery):
+    demo_assert_pure_callback(call.data)
+    set_demo_user_session(call.from_user.id,"payment")
+    await safe_edit_or_answer(
+        call,
+        "💳 <b>PEMBAYARAN DEMO</b>\n\n"
+        "Total: <b>Rp2.500</b>\n\n"
+        "Pilih simulasi metode:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🟡 QRIS Demo",callback_data="userdemo:proof")],
+            [InlineKeyboardButton(text="💰 Saldo Demo",callback_data="userdemo:success")],
+            [InlineKeyboardButton(text="🏦 Transfer Demo",callback_data="userdemo:proof")],
+            [InlineKeyboardButton(text="⬅️ Kembali",callback_data="userdemo:checkout")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "userdemo:proof")
+async def user_demo_proof(call: CallbackQuery):
+    demo_assert_pure_callback(call.data)
+    set_demo_user_session(call.from_user.id,"proof")
+    await safe_edit_or_answer(
+        call,
+        "📤 <b>BUKTI PEMBAYARAN DEMO</b>\n\n"
+        "Pada transaksi asli user mengirim bukti pembayaran.\n"
+        "Di mode demo cukup pilih hasil simulasi:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Bukti Valid",callback_data="userdemo:success")],
+            [InlineKeyboardButton(text="⏳ Masih Diperiksa",callback_data="userdemo:pending")],
+            [InlineKeyboardButton(text="❌ Bukti Ditolak",callback_data="userdemo:rejected")],
+            [InlineKeyboardButton(text="⬅️ Kembali",callback_data="userdemo:payment")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "userdemo:pending")
+async def user_demo_pending(call: CallbackQuery):
+    demo_assert_pure_callback(call.data)
+    set_demo_user_session(call.from_user.id,"pending")
+    await safe_edit_or_answer(
+        call,
+        "⏳ <b>PEMBAYARAN DEMO PENDING</b>\n\n"
+        "Status simulasi: <b>MENUNGGU VERIFIKASI</b>\n\n"
+        "Tidak ada record payment/order asli yang dibuat.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Simulasi Confirm",callback_data="userdemo:success")],
+            [InlineKeyboardButton(text="❌ Simulasi Reject",callback_data="userdemo:rejected")],
+            [InlineKeyboardButton(text="⬅️ Menu Demo",callback_data="userdemo:home")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "userdemo:success")
+async def user_demo_success(call: CallbackQuery):
+    demo_assert_pure_callback(call.data)
+    set_demo_user_session(call.from_user.id,"success")
+    await safe_edit_or_answer(
+        call,
+        "✅ <b>PEMBAYARAN DEMO BERHASIL</b>\n\n"
+        "Payment: <b>PAID</b>\n"
+        "Fulfillment: <b>DELIVERED</b>\n\n"
+        "Akun Demo:\n"
+        f"<code>{html.escape(DEMO_FAKE_ACCOUNT)}</code>\n\n"
+        "Ini akun palsu untuk simulasi saja.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Ulangi Demo",callback_data="userdemo:home")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "userdemo:rejected")
+async def user_demo_rejected(call: CallbackQuery):
+    demo_assert_pure_callback(call.data)
+    set_demo_user_session(call.from_user.id,"rejected")
+    await safe_edit_or_answer(
+        call,
+        "❌ <b>PEMBAYARAN DEMO DITOLAK</b>\n\n"
+        "Status simulasi: <b>REJECTED</b>\n\n"
+        "Saldo, order, produk, dan stok resmi tetap tidak berubah.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Coba Lagi",callback_data="userdemo:home")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "userdemo:reset")
+async def user_demo_reset(call: CallbackQuery):
+    demo_assert_pure_callback(call.data)
+    clear_demo_user_session(call.from_user.id)
+    await safe_edit_or_answer(
+        call,
+        "🧹 <b>DEMO DIRESET</b>\n\n"
+        "Session demo sudah dibersihkan.\n"
+        "Data toko resmi tidak pernah berubah.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧪 Mulai Demo Lagi",callback_data="userdemo:home")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+
+@router.callback_query(F.data.startswith("userdemo:"))
+async def demo_namespace_safety_net(call: CallbackQuery):
+    """
+    Final safety net for any unknown future userdemo:* callback.
+    Must stay immediately before the generic stale callback handler.
+    """
+    await call.answer(
+        "🛡️ Callback demo tidak dikenali. Tidak ada data toko yang diubah.",
+        show_alert=True
+    )
 
 
 @router.callback_query()
@@ -14066,7 +15298,8 @@ async def fallback(message: Message):
                 "ℹ️ Command owner:\n"
                 "/start — Menu utama\n"
                 "/owner — Panel owner\n"
-                "/ping — Status bot"
+                "/ping — Status bot\n"
+                "/demo — Data uji pembayaran"
             )
 
         return await message.answer(
