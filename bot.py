@@ -81,7 +81,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "7.4"
+BOT_VERSION = "8.0"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -405,6 +405,15 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS payment_proof_sessions (
+            user_id INTEGER PRIMARY KEY,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
     # migrations from previous versions
     add_column_if_missing(conn, "products", "sold", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "rating", "REAL NOT NULL DEFAULT 0")
@@ -505,6 +514,7 @@ def init_db():
         "system_error_pm_enabled": "1",
         "auto_repair_inventory": "1",
         "auto_recovery_enabled": "1",
+        "qris_upload_pending": "0",
         "bank_name": "",
         "bank_account": "",
         "bank_holder": "",
@@ -583,12 +593,32 @@ async def is_channel_member(bot: Bot, user_id: int) -> bool:
     if not REQUIRED_CHANNEL_ID:
         return True
 
-    try:
-        member = await bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
-        return member.status in {"member", "administrator", "creator"}
-    except Exception:
-        return False
+    raw_target = str(REQUIRED_CHANNEL_ID).strip()
+    target = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
 
+    try:
+        member = await bot.get_chat_member(target, user_id)
+
+        status = getattr(member, "status", "")
+        status_text = str(getattr(status, "value", status)).lower()
+
+        if status_text in {"member", "administrator", "creator", "owner"}:
+            return True
+
+        # Restricted members can still be members if they have not left.
+        if status_text == "restricted":
+            is_member_flag = getattr(member, "is_member", None)
+            return bool(is_member_flag)
+
+        return False
+    except Exception as exc:
+        logging.warning(
+            "Required channel verification failed: target=%r user_id=%s error=%s",
+            target,
+            user_id,
+            exc
+        )
+        return False
 
 
 def mark_user_verified(user_id: int, username: str = ""):
@@ -1329,8 +1359,19 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
                     "Gunakan Pesanan Saya / kirim ulang setelah koneksi Telegram normal.",
                     parse_mode="HTML"
                 )
-            except Exception:
-                pass
+            except Exception as owner_alert_exc:
+                logging.exception(
+                    "Failed to notify owner about delivery failure for order %s: %s",
+                    order_id,
+                    owner_alert_exc
+                )
+                log_system_error(
+                    "DELIVERY_OWNER_ALERT",
+                    str(owner_alert_exc),
+                    reference=f"order:{order_id}",
+                    severity="warning",
+                    recovered=False
+                )
         return False
 
     # Telegram delivery succeeded. Finalize exactly this allocated inventory.
@@ -3357,6 +3398,352 @@ def system_health_score():
 
 
 
+
+async def launch_readiness_report(bot: Bot):
+    checks = []
+
+    # Database
+    try:
+        conn = db()
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        checks.append(("Database", integrity == "ok", integrity))
+        conn.close()
+    except Exception as exc:
+        checks.append(("Database", False, str(exc)[:120]))
+
+    # Telegram bot
+    try:
+        me = await bot.get_me()
+        checks.append(("Telegram Bot", True, f"@{me.username or me.id}"))
+    except Exception as exc:
+        checks.append(("Telegram Bot", False, str(exc)[:120]))
+
+    # Owner PM
+    if not ADMIN_ID:
+        checks.append(("PM Owner", False, "ADMIN_ID kosong"))
+    else:
+        try:
+            chat = await bot.get_chat(ADMIN_ID)
+            checks.append(("PM Owner", True, f"ID {chat.id}"))
+        except Exception as exc:
+            checks.append(("PM Owner", False, str(exc)[:120]))
+
+    # Required channel
+    if not REQUIRED_CHANNEL_ID:
+        checks.append(("Required Channel", True, "Tidak diwajibkan"))
+    else:
+        raw_target = str(REQUIRED_CHANNEL_ID).strip()
+        target = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
+        try:
+            chat = await bot.get_chat(target)
+            checks.append((
+                "Required Channel",
+                True,
+                getattr(chat, "title", "") or getattr(chat, "username", "") or str(target)
+            ))
+        except Exception as exc:
+            checks.append(("Required Channel", False, str(exc)[:120]))
+
+    # Storage
+    try:
+        db_path = Path(DB_PATH)
+        backup_path = Path(BACKUP_DIR)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        backup_path.mkdir(parents=True, exist_ok=True)
+        writable = os.access(db_path.parent, os.W_OK) and os.access(backup_path, os.W_OK)
+        checks.append(("Storage", writable, f"{db_path.parent} / {backup_path}"))
+    except Exception as exc:
+        checks.append(("Storage", False, str(exc)[:120]))
+
+    # Inventory integrity
+    try:
+        mismatches, _ = inventory_integrity_report(auto_repair=False)
+        checks.append(("Inventory", len(mismatches) == 0, f"{len(mismatches)} mismatch"))
+    except Exception as exc:
+        checks.append(("Inventory", False, str(exc)[:120]))
+
+    # Wallet integrity basics
+    try:
+        conn = db()
+        negative = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM wallets WHERE balance<0"
+        ).fetchone()["n"] or 0)
+        checks.append(("Wallet", negative == 0, f"{negative} saldo negatif"))
+        conn.close()
+    except Exception as exc:
+        checks.append(("Wallet", False, str(exc)[:120]))
+
+    # Stuck paid orders
+    try:
+        conn = db()
+        paid_pending = int(conn.execute(
+            """SELECT COUNT(*) AS n FROM orders
+               WHERE payment_status='paid'
+                 AND fulfillment_status!='delivered'"""
+        ).fetchone()["n"] or 0)
+        send_failed = int(conn.execute(
+            """SELECT COUNT(*) AS n FROM orders
+               WHERE fulfillment_status='send_failed'"""
+        ).fetchone()["n"] or 0)
+        conn.close()
+        checks.append((
+            "Fulfillment",
+            paid_pending == 0 and send_failed == 0,
+            f"paid pending={paid_pending}, send failed={send_failed}"
+        ))
+    except Exception as exc:
+        checks.append(("Fulfillment", False, str(exc)[:120]))
+
+    # Payment configuration
+    qris_ready = bool(get_setting("qris_file_id", ""))
+    bank_ready = bank_transfer_ready()
+    auto_ready = shopeepay_ready()
+    payment_ok = qris_ready or bank_ready or auto_ready
+    methods = []
+    if qris_ready:
+        methods.append("QRIS")
+    if bank_ready:
+        methods.append("Rekening")
+    if auto_ready:
+        methods.append("Gateway")
+    checks.append((
+        "Pembayaran",
+        payment_ok,
+        ", ".join(methods) if methods else "Belum ada metode aktif"
+    ))
+
+    # Invoice image renderer is optional because fallback text exists.
+    checks.append((
+        "Invoice",
+        True,
+        "Gambar aktif" if PIL_AVAILABLE else "Fallback teks aktif"
+    ))
+
+    # Safe mode / maintenance are launch blockers by design.
+    checks.append((
+        "Safe Mode",
+        not safe_mode_enabled(),
+        "OFF" if not safe_mode_enabled() else "ON"
+    ))
+    checks.append((
+        "Maintenance",
+        not maintenance_enabled(),
+        "OFF" if not maintenance_enabled() else "ON"
+    ))
+
+    blockers = [name for name, ok, _ in checks if not ok]
+    ready = len(blockers) == 0
+    return ready, checks, blockers
+
+
+
+
+def set_payment_proof_session(user_id: int, entity: str, entity_id: int):
+    conn = db()
+    conn.execute(
+        """INSERT INTO payment_proof_sessions(user_id,entity_type,entity_id,created_at)
+           VALUES(?,?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             entity_type=excluded.entity_type,
+             entity_id=excluded.entity_id,
+             created_at=excluded.created_at""",
+        (
+            int(user_id),
+            str(entity),
+            int(entity_id),
+            datetime.now().isoformat(timespec="seconds")
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_payment_proof_session(user_id: int):
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM payment_proof_sessions WHERE user_id=?",
+        (int(user_id),)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def clear_payment_proof_session(user_id: int):
+    conn = db()
+    conn.execute(
+        "DELETE FROM payment_proof_sessions WHERE user_id=?",
+        (int(user_id),)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def forward_payment_proof_to_owner(
+    bot: Bot,
+    message: Message,
+    entity: str,
+    entity_id: int,
+    row,
+) -> tuple[bool, str]:
+    if not ADMIN_ID:
+        logging.error(
+            "PAYMENT_PROOF_FORWARD failed: ADMIN_ID is empty for %s:%s",
+            entity,
+            entity_id
+        )
+        return False, "ADMIN_ID belum dikonfigurasi."
+
+    caption = payment_proof_caption(entity, row)
+    keyboard = owner_payment_proof_keyboard(entity, entity_id)
+
+    # Preferred path: copy the exact user evidence, then send action controls.
+    # This is more reliable than re-sending a Telegram file_id after restarts.
+    try:
+        await bot.copy_message(
+            chat_id=ADMIN_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
+        await bot.send_message(
+            ADMIN_ID,
+            caption,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        return True, ""
+    except Exception as copy_exc:
+        logging.warning(
+            "Payment proof copy_message failed for %s:%s: %s",
+            entity,
+            entity_id,
+            copy_exc
+        )
+
+    # Fallback: re-send by file_id.
+    try:
+        if message.photo:
+            await bot.send_photo(
+                ADMIN_ID,
+                photo=message.photo[-1].file_id,
+                caption=caption,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        elif message.document:
+            await bot.send_document(
+                ADMIN_ID,
+                document=message.document.file_id,
+                caption=caption,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        else:
+            return False, "Bukti bukan foto/file gambar."
+        return True, ""
+    except Exception as send_exc:
+        logging.exception(
+            "PAYMENT_PROOF_FORWARD failed for %s:%s: %s",
+            entity,
+            entity_id,
+            send_exc
+        )
+        return False, str(send_exc)[:300]
+
+
+async def process_payment_proof_message(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    entity: str,
+    entity_id: int,
+):
+    if entity not in {"order", "topup"} or not entity_id:
+        return False, "Data invoice tidak valid."
+
+    if not message.photo and not message.document:
+        return False, "Bukti harus berupa foto atau file gambar."
+
+    proof_type = "photo" if message.photo else "document"
+    file_id = (
+        message.photo[-1].file_id
+        if message.photo
+        else message.document.file_id
+    )
+    now = datetime.now().isoformat(timespec="seconds")
+
+    conn = db()
+    if entity == "order":
+        row = conn.execute(
+            "SELECT * FROM orders WHERE id=? AND user_id=?",
+            (entity_id, message.from_user.id)
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return False, "Invoice tidak ditemukan."
+
+        if row["payment_status"] == "paid":
+            conn.close()
+            clear_payment_proof_session(message.from_user.id)
+            await state.clear()
+            return False, "Order ini sudah diverifikasi."
+
+        conn.execute(
+            """UPDATE orders
+               SET payment_proof_file_id=?,
+                   payment_proof_type=?,
+                   payment_proof_submitted_at=?,
+                   payment_reject_reason=''
+               WHERE id=?""",
+            (file_id, proof_type, now, entity_id)
+        )
+    else:
+        row = conn.execute(
+            "SELECT * FROM topups WHERE id=? AND user_id=?",
+            (entity_id, message.from_user.id)
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return False, "Invoice top up tidak ditemukan."
+
+        if row["status"] == "completed":
+            conn.close()
+            clear_payment_proof_session(message.from_user.id)
+            await state.clear()
+            return False, "Top up ini sudah selesai."
+
+        conn.execute(
+            """UPDATE topups
+               SET payment_proof_file_id=?,
+                   payment_proof_type=?,
+                   payment_proof_submitted_at=?,
+                   payment_reject_reason=''
+               WHERE id=?""",
+            (file_id, proof_type, now, entity_id)
+        )
+
+    conn.commit()
+    conn.close()
+
+    forwarded, error = await forward_payment_proof_to_owner(
+        bot,
+        message,
+        entity,
+        entity_id,
+        row
+    )
+
+    if forwarded:
+        clear_payment_proof_session(message.from_user.id)
+        await state.clear()
+        return True, ""
+
+    # Keep persistent session active so the user can retry after owner PM is fixed.
+    set_payment_proof_session(message.from_user.id, entity, entity_id)
+    return False, error or "Gagal meneruskan bukti ke owner."
+
+
 def payment_proof_keyboard(entity: str, entity_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -4124,6 +4511,8 @@ def owner_customers_menu():
 def owner_system_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🩺 Diagnostik Sistem", callback_data="owner:diagnostics")
+    kb.button(text="📨 Test PM Owner", callback_data="owner:test_pm")
+    kb.button(text="📢 Test Channel", callback_data="owner:test_channel")
     kb.button(text="🛟 Safe Mode", callback_data="owner:safe_mode")
     kb.button(text="🧹 Repair Inventory", callback_data="owner:repair_inventory")
     kb.button(text="🔧 Maintenance", callback_data="owner:maintenance")
@@ -4131,7 +4520,7 @@ def owner_system_menu():
     kb.button(text="📢 Sinkron Stok Channel", callback_data="owner:sync_stock")
     kb.button(text="📅 Laporan Harian", callback_data="owner:daily_report")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.adjust(2, 2, 2, 1, 1)
+    kb.adjust(2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -4167,28 +4556,12 @@ def topup_amount_keyboard(amount: int | None = None):
         prefix = "✅ " if value == amount else ""
         kb.button(
             text=f"{prefix}{rupiah(value)}",
-            callback_data=f"topup:set:{value}"
+            callback_data=("noop" if value == amount else f"topup:set:{value}")
         )
-    kb.adjust(2)
 
-    step = 5000
-    minus_value = max(minimum, amount - step)
-    plus_value = amount + step
+    if presets:
+        kb.adjust(2)
 
-    kb.row(
-        InlineKeyboardButton(
-            text="➖ Rp5.000",
-            callback_data=f"topup:set:{minus_value}"
-        ),
-        InlineKeyboardButton(
-            text=f"💰 {rupiah(amount)}",
-            callback_data="noop"
-        ),
-        InlineKeyboardButton(
-            text="➕ Rp5.000",
-            callback_data=f"topup:set:{plus_value}"
-        )
-    )
     kb.row(
         InlineKeyboardButton(
             text="✏️ Nominal Custom",
@@ -4197,7 +4570,7 @@ def topup_amount_keyboard(amount: int | None = None):
     )
     kb.row(
         InlineKeyboardButton(
-            text="✅ Lanjut Pembayaran",
+            text=f"✅ Lanjut Pembayaran • {rupiah(amount)}",
             callback_data=f"topup:confirm:{amount}"
         )
     )
@@ -4249,6 +4622,24 @@ def bank_settings_menu():
     kb.button(text="⬅️ Kembali", callback_data="owner:qris_settings")
     kb.adjust(2, 1, 1, 1)
     return kb.as_markup()
+
+
+
+async def save_owner_qris_photo(message: Message, state: FSMContext, file_id: str):
+    set_setting("qris_file_id", file_id)
+    set_setting("qris_upload_pending", "0")
+    await state.clear()
+
+    await message.answer_photo(
+        photo=file_id,
+        caption=(
+            "✅ <b>QRIS BERHASIL DISIMPAN</b>\n\n"
+            "QRIS baru sudah aktif untuk pembayaran manual.\n"
+            "Gunakan tombol Preview QRIS untuk memastikan gambar tampil dengan benar."
+        ),
+        reply_markup=qris_settings_menu(),
+        parse_mode="HTML"
+    )
 
 
 def qris_settings_menu():
@@ -4322,8 +4713,7 @@ def qty_keyboard(variant_id, qty):
 
     kb = InlineKeyboardBuilder()
 
-    # Quick stock/quantity buttons.
-    # Show up to 20 direct choices; if stock is higher, add MAX.
+    # Pilih jumlah langsung dari menu angka.
     quick_max = min(stock, 20)
     for number in range(1, quick_max + 1):
         prefix = "✅ " if number == qty else ""
@@ -4339,30 +4729,14 @@ def qty_keyboard(variant_id, qty):
         kb.row(
             InlineKeyboardButton(
                 text=f"📦 MAX {stock}",
-                callback_data=f"qty:{variant_id}:{stock}"
+                callback_data=("noop" if qty == stock else f"qty:{variant_id}:{stock}")
             )
         )
-
-    # Fine adjustment.
-    kb.row(
-        InlineKeyboardButton(
-            text="➖",
-            callback_data=("noop" if qty <= 1 else f"qty:{variant_id}:{qty-1}")
-        ),
-        InlineKeyboardButton(
-            text=f"Jumlah: {qty}",
-            callback_data="noop"
-        ),
-        InlineKeyboardButton(
-            text="➕",
-            callback_data=("noop" if not stock or qty >= stock else f"qty:{variant_id}:{qty+1}")
-        )
-    )
 
     if stock > 0:
         kb.row(
             InlineKeyboardButton(
-                text="🛒 Lanjut Beli",
+                text=f"🛒 Lanjut Beli • Qty {qty}",
                 callback_data=f"confirm:{variant_id}:{qty}"
             )
         )
@@ -4871,6 +5245,8 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
     if entity == "topup" and row["status"] == "completed":
         return await call.answer("Top up ini sudah selesai.", show_alert=True)
 
+    set_payment_proof_session(call.from_user.id, entity, entity_id)
+
     await state.update_data(
         proof_entity=entity,
         proof_entity_id=entity_id
@@ -4897,81 +5273,35 @@ async def payment_proof_photo(message: Message, state: FSMContext, bot: Bot):
     entity_id = int(data.get("proof_entity_id") or 0)
 
     if entity not in {"order", "topup"} or not entity_id:
-        await state.clear()
-        return await message.answer("❌ Data invoice tidak ditemukan.")
+        session = get_payment_proof_session(message.from_user.id)
+        if session:
+            entity = session["entity_type"]
+            entity_id = int(session["entity_id"])
 
-    file_id = message.photo[-1].file_id
-    now = datetime.now().isoformat(timespec="seconds")
+    ok, error = await process_payment_proof_message(
+        message,
+        state,
+        bot,
+        entity,
+        entity_id
+    )
 
-    conn = db()
-    if entity == "order":
-        row = conn.execute(
-            "SELECT * FROM orders WHERE id=? AND user_id=?",
-            (entity_id, message.from_user.id)
-        ).fetchone()
-        if not row:
-            conn.close()
-            await state.clear()
-            return await message.answer("❌ Invoice tidak ditemukan.")
-
-        conn.execute(
-            """UPDATE orders
-               SET payment_proof_file_id=?,
-                   payment_proof_type='photo',
-                   payment_proof_submitted_at=?,
-                   payment_reject_reason=''
-               WHERE id=?""",
-            (file_id, now, entity_id)
+    if not ok:
+        return await message.answer(
+            "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
+            f"{html.escape(error)}\n\n"
+            "Silakan coba kirim ulang. Jika tetap gagal, owner perlu membuka/start chat bot terlebih dahulu.",
+            parse_mode="HTML"
         )
-    else:
-        row = conn.execute(
-            "SELECT * FROM topups WHERE id=? AND user_id=?",
-            (entity_id, message.from_user.id)
-        ).fetchone()
-        if not row:
-            conn.close()
-            await state.clear()
-            return await message.answer("❌ Invoice top up tidak ditemukan.")
-
-        conn.execute(
-            """UPDATE topups
-               SET payment_proof_file_id=?,
-                   payment_proof_type='photo',
-                   payment_proof_submitted_at=?,
-                   payment_reject_reason=''
-               WHERE id=?""",
-            (file_id, now, entity_id)
-        )
-
-    conn.commit()
-    conn.close()
-    await state.clear()
-
-    if ADMIN_ID:
-        try:
-            await bot.send_photo(
-                ADMIN_ID,
-                photo=file_id,
-                caption=payment_proof_caption(entity, row),
-                reply_markup=owner_payment_proof_keyboard(entity, entity_id),
-                parse_mode="HTML"
-            )
-        except Exception as exc:
-            await notify_owner_system_error(
-                bot,
-                "PAYMENT_PROOF_FORWARD",
-                str(exc),
-                reference=f"{entity}:{entity_id}",
-                recovered=False
-            )
 
     await message.answer(
         "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
-        "Owner akan memeriksa bukti Anda.\n"
-        "Status transaksi akan diperbarui setelah diperiksa.",
+        "Bukti sudah benar-benar diteruskan ke PM owner.\n"
+        "Owner akan memeriksa dan mengonfirmasi pembayaran.",
         reply_markup=main_menu(),
         parse_mode="HTML"
     )
+
 
 
 @router.message(CheckoutState.waiting_payment_proof, F.document)
@@ -4979,82 +5309,43 @@ async def payment_proof_document(message: Message, state: FSMContext, bot: Bot):
     document = message.document
     mime = (document.mime_type or "").lower() if document else ""
     if not document or not mime.startswith("image/"):
-        return await message.answer("❌ Bukti harus berupa foto atau file gambar.")
+        return await message.answer(
+            "❌ Bukti harus berupa foto/screenshot atau file gambar."
+        )
 
     data = await state.get_data()
     entity = data.get("proof_entity")
     entity_id = int(data.get("proof_entity_id") or 0)
 
     if entity not in {"order", "topup"} or not entity_id:
-        await state.clear()
-        return await message.answer("❌ Data invoice tidak ditemukan.")
+        session = get_payment_proof_session(message.from_user.id)
+        if session:
+            entity = session["entity_type"]
+            entity_id = int(session["entity_id"])
 
-    file_id = document.file_id
-    now = datetime.now().isoformat(timespec="seconds")
+    ok, error = await process_payment_proof_message(
+        message,
+        state,
+        bot,
+        entity,
+        entity_id
+    )
 
-    conn = db()
-    if entity == "order":
-        row = conn.execute(
-            "SELECT * FROM orders WHERE id=? AND user_id=?",
-            (entity_id, message.from_user.id)
-        ).fetchone()
-        if not row:
-            conn.close()
-            await state.clear()
-            return await message.answer("❌ Invoice tidak ditemukan.")
-        conn.execute(
-            """UPDATE orders
-               SET payment_proof_file_id=?,
-                   payment_proof_type='document',
-                   payment_proof_submitted_at=?,
-                   payment_reject_reason=''
-               WHERE id=?""",
-            (file_id, now, entity_id)
+    if not ok:
+        return await message.answer(
+            "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
+            f"{html.escape(error)}\n\n"
+            "Silakan coba kirim ulang. Jika tetap gagal, owner perlu membuka/start chat bot terlebih dahulu.",
+            parse_mode="HTML"
         )
-    else:
-        row = conn.execute(
-            "SELECT * FROM topups WHERE id=? AND user_id=?",
-            (entity_id, message.from_user.id)
-        ).fetchone()
-        if not row:
-            conn.close()
-            await state.clear()
-            return await message.answer("❌ Invoice top up tidak ditemukan.")
-        conn.execute(
-            """UPDATE topups
-               SET payment_proof_file_id=?,
-                   payment_proof_type='document',
-                   payment_proof_submitted_at=?,
-                   payment_reject_reason=''
-               WHERE id=?""",
-            (file_id, now, entity_id)
-        )
-    conn.commit()
-    conn.close()
-    await state.clear()
-
-    if ADMIN_ID:
-        try:
-            await bot.send_document(
-                ADMIN_ID,
-                document=file_id,
-                caption=payment_proof_caption(entity, row),
-                reply_markup=owner_payment_proof_keyboard(entity, entity_id),
-                parse_mode="HTML"
-            )
-        except Exception as exc:
-            await notify_owner_system_error(
-                bot,
-                "PAYMENT_PROOF_FORWARD",
-                str(exc),
-                reference=f"{entity}:{entity_id}",
-                recovered=False
-            )
 
     await message.answer(
-        "✅ Bukti pembayaran terkirim ke owner.",
-        reply_markup=main_menu()
+        "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
+        "Bukti sudah benar-benar diteruskan ke PM owner.",
+        reply_markup=main_menu(),
+        parse_mode="HTML"
     )
+
 
 
 @router.message(CheckoutState.waiting_payment_proof)
@@ -5227,22 +5518,41 @@ async def owner_menu_system(call: CallbackQuery, state: FSMContext):
 
 
 @router.message(Command("ping"))
-async def ping(message: Message):
-    started = time.perf_counter()
-    sent = await message.answer("🏓 Mengecek bot...")
-    latency = int((time.perf_counter() - started) * 1000)
-    uptime = int(time.time() - START_TIME)
-    h, rem = divmod(uptime, 3600)
-    m, s = divmod(rem, 60)
+async def ping(message: Message, bot: Bot):
+    ready, checks, blockers = await launch_readiness_report(bot)
 
-    await sent.edit_text(
-        "🏓 <b>PONG!</b>\n\n"
-        f"⚡ Response: <b>{latency} ms</b>\n"
-        "🟢 Status: <b>Online</b>\n"
-        f"⏱️ Uptime: <b>{h}j {m}m {s}d</b>\n\n"
-        f"<i>{STORE_FOOTER}</i>",
+    lines = [
+        ("🟢" if ready else "🔴")
+        + f" <b>STATUS BOT: {'SIAP' if ready else 'PERLU DICEK'}</b>",
+        "",
+        f"🤖 Versi: <b>v{BOT_VERSION}</b>",
+        f"⏱️ Uptime: <b>{int(time.time() - START_TIME)} detik</b>",
+        ""
+    ]
+
+    for name, ok, detail in checks:
+        lines.append(
+            f"{'✅' if ok else '❌'} <b>{html.escape(name)}</b>: "
+            f"{html.escape(str(detail))}"
+        )
+
+    if blockers:
+        lines += [
+            "",
+            "⚠️ <b>Yang perlu diperbaiki:</b>",
+            *[f"• {html.escape(name)}" for name in blockers]
+        ]
+    else:
+        lines += [
+            "",
+            "✅ Tidak ada blocker utama terdeteksi."
+        ]
+
+    await message.answer(
+        "\n".join(lines),
         parse_mode="HTML"
     )
+
 
 
 # =========================
@@ -5250,26 +5560,76 @@ async def ping(message: Message):
 # =========================
 
 @router.callback_query(F.data == "verify_join")
-async def verify_join(call: CallbackQuery, bot: Bot):
-    if await is_channel_member(bot, call.from_user.id):
-        mark_user_verified(
-            call.from_user.id,
-            call.from_user.username or ""
-        )
-        await call.answer("✅ Terverifikasi!", show_alert=True)
-        await safe_edit_or_answer(call, 
-            f"🛍️ <b>{STORE_NAME}</b>\n\n"
-            "✅ Verifikasi berhasil.\n"
-            "Silakan pilih menu:\n\n"
-            f"<i>{STORE_FOOTER}</i>",
-            reply_markup=main_menu(),
+async def verify_join(call: CallbackQuery, bot: Bot, state: FSMContext):
+    try:
+        await call.answer("Memeriksa channel...")
+    except Exception:
+        pass
+
+    joined = await is_channel_member(bot, call.from_user.id)
+
+    if not joined:
+        rows = []
+        if REQUIRED_CHANNEL_URL:
+            rows.append([
+                InlineKeyboardButton(
+                    text="📢 Join Channel",
+                    url=REQUIRED_CHANNEL_URL
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                text="🔄 Cek Lagi",
+                callback_data="verify_join"
+            )
+        ])
+
+        await safe_edit_or_answer(
+            call,
+            "❌ <b>BELUM TERVERIFIKASI</b>\n\n"
+            "Bot belum mendeteksi akun Anda sebagai member channel.\n\n"
+            "Pastikan Anda sudah join channel yang benar, lalu tekan <b>🔄 Cek Lagi</b>.\n\n"
+            "<i>Jika Anda sudah join tetapi tetap gagal, konfigurasi channel perlu diperiksa owner.</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode="HTML"
         )
-    else:
-        await call.answer(
-            "❌ Belum terdeteksi join channel. Silakan join lalu coba lagi.",
-            show_alert=True
+        return
+
+    mark_user_verified(
+        call.from_user.id,
+        call.from_user.username or ""
+    )
+    await state.clear()
+
+    # Remove/replace the verification message itself.
+    success_text = (
+        f"🛍️ <b>{STORE_NAME}</b>\n\n"
+        "✅ <b>VERIFIKASI BERHASIL</b>\n"
+        "Akun Anda sudah terverifikasi.\n\n"
+        "Silakan pilih menu:"
+    )
+
+    edited = await safe_edit_or_answer(
+        call,
+        success_text,
+        reply_markup=main_menu(),
+        parse_mode="HTML"
+    )
+
+    # Persistent reply keyboard must be sent as a separate message.
+    try:
+        await call.message.answer(
+            "Menu cepat sudah aktif.",
+            reply_markup=user_reply_menu()
         )
+    except Exception:
+        if not edited:
+            await call.message.answer(
+                success_text,
+                reply_markup=main_menu(),
+                parse_mode="HTML"
+            )
+
 
 
 @router.callback_query(F.data == "noop")
@@ -6800,7 +7160,7 @@ async def wallet_topup_set(call: CallbackQuery, state: FSMContext):
         "➕ <b>ISI SALDO</b>\n\n"
         f"Nominal dipilih: <b>{rupiah(amount)}</b>\n"
         f"Minimum: <b>{rupiah(get_min_topup())}</b>\n\n"
-        "Atur nominal lalu lanjutkan ke pembayaran.",
+        "Pilih nominal dari menu di bawah atau gunakan Nominal Custom.",
         reply_markup=topup_amount_keyboard(amount),
         parse_mode="HTML"
     )
@@ -7612,19 +7972,22 @@ async def owner_shopeepay_status(call: CallbackQuery):
 @router.callback_query(F.data == "owner:qris_set")
 async def owner_qris_set(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
+    await state.clear()
+    set_setting("qris_upload_pending", "1")
     await state.set_state(OwnerState.set_qris)
-    await safe_edit_or_answer(call, 
+
+    await safe_edit_or_answer(
+        call,
         "🖼️ <b>GANTI QRIS</b>\n\n"
-        "Silakan kirim <b>foto QRIS pribadi</b> ke chat ini.\n\n"
-        "Bot akan menyimpan Telegram file_id, jadi QRIS tidak perlu di-upload ke GitHub.",
+        "Kirim gambar QRIS ke chat ini.\n"
+        "Boleh sebagai <b>foto biasa</b> atau <b>file gambar JPG/PNG</b>.\n\n"
+        "Setelah tersimpan, bot akan menampilkan konfirmasi dan QRIS langsung aktif.",
         reply_markup=back_owner("owner:back_orders"),
         parse_mode="HTML"
     )
     await call.answer()
-
-
 
 @router.message(OwnerState.set_qris, F.photo)
 async def owner_qris_upload_photo(message: Message, state: FSMContext):
@@ -7634,24 +7997,15 @@ async def owner_qris_upload_photo(message: Message, state: FSMContext):
     if not message.photo:
         return await message.answer("❌ Foto QRIS tidak terbaca.")
 
-    file_id = message.photo[-1].file_id
-    set_setting("qris_file_id", file_id)
-    await state.clear()
-
-    await message.answer_photo(
-        photo=file_id,
-        caption=(
-            "✅ <b>QRIS BERHASIL DISIMPAN</b>\n\n"
-            "QRIS manual sekarang aktif untuk pembayaran.\n"
-            "Bot menyimpan Telegram <code>file_id</code>, jadi gambar tidak perlu di-upload ke GitHub."
-        ),
-        reply_markup=qris_settings_menu(),
-        parse_mode="HTML"
+    await save_owner_qris_photo(
+        message,
+        state,
+        message.photo[-1].file_id
     )
 
 
 @router.message(OwnerState.set_qris, F.document)
-async def owner_qris_upload_document(message: Message, state: FSMContext):
+async def owner_qris_upload_document(message: Message, state: FSMContext, bot: Bot):
     if not is_owner(message.from_user.id):
         return
 
@@ -7661,20 +8015,45 @@ async def owner_qris_upload_document(message: Message, state: FSMContext):
     if not document or not mime.startswith("image/"):
         return await message.answer(
             "❌ File harus berupa gambar QRIS.\n"
-            "Kirim sebagai foto atau file gambar."
+            "Kirim sebagai foto atau file gambar JPG/PNG."
         )
 
-    file_id = document.file_id
-    set_setting("qris_file_id", file_id)
-    await state.clear()
+    temp_path = None
+    try:
+        suffix = ".png" if "png" in mime else ".jpg"
+        fd, temp_path = tempfile.mkstemp(prefix="qris_upload_", suffix=suffix)
+        os.close(fd)
 
-    await message.answer(
-        "✅ <b>QRIS BERHASIL DISIMPAN</b>\n\n"
-        "QRIS manual sekarang aktif.\n"
-        "File gambar disimpan menggunakan Telegram <code>file_id</code>.",
-        reply_markup=qris_settings_menu(),
-        parse_mode="HTML"
-    )
+        await bot.download(document, destination=temp_path)
+
+        normalized = await bot.send_photo(
+            message.from_user.id,
+            FSInputFile(temp_path),
+            caption="🔄 Memproses gambar QRIS..."
+        )
+
+        if not normalized.photo:
+            raise RuntimeError("Telegram tidak menghasilkan photo file_id.")
+
+        await save_owner_qris_photo(
+            message,
+            state,
+            normalized.photo[-1].file_id
+        )
+
+    except Exception as exc:
+        logging.exception("QRIS document normalization failed: %s", exc)
+        await message.answer(
+            "❌ Gagal memproses file QRIS.\n"
+            "Coba kirim ulang sebagai <b>foto biasa</b>.",
+            parse_mode="HTML"
+        )
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 @router.message(OwnerState.set_qris)
@@ -7684,12 +8063,155 @@ async def owner_qris_upload_invalid(message: Message):
 
     await message.answer(
         "❌ <b>FORMAT TIDAK SESUAI</b>\n\n"
-        "Silakan kirim QRIS sebagai <b>foto</b> atau <b>file gambar</b>.",
-        reply_markup=back_owner(),
+        "Kirim QRIS sebagai <b>foto</b> atau <b>file gambar JPG/PNG</b>.",
+        reply_markup=back_owner("owner:back_orders"),
+        parse_mode="HTML"
+    )
+
+@router.message(F.photo)
+async def payment_proof_photo_recovery(message: Message, state: FSMContext, bot: Bot):
+    if is_owner(message.from_user.id):
+        return
+
+    session = get_payment_proof_session(message.from_user.id)
+    if not session:
+        return
+
+    entity = session["entity_type"]
+    entity_id = int(session["entity_id"])
+
+    ok, error = await process_payment_proof_message(
+        message,
+        state,
+        bot,
+        entity,
+        entity_id
+    )
+
+    if not ok:
+        return await message.answer(
+            "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
+            f"{html.escape(error)}\n\n"
+            "Silakan kirim ulang bukti pembayaran.",
+            parse_mode="HTML"
+        )
+
+    await message.answer(
+        "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
+        "Bukti sudah diteruskan ke PM owner.",
+        reply_markup=main_menu(),
         parse_mode="HTML"
     )
 
 
+@router.message(F.document)
+async def payment_proof_document_recovery(message: Message, state: FSMContext, bot: Bot):
+    if is_owner(message.from_user.id):
+        return
+
+    session = get_payment_proof_session(message.from_user.id)
+    if not session:
+        return
+
+    document = message.document
+    mime = (document.mime_type or "").lower() if document else ""
+    if not document or not mime.startswith("image/"):
+        return await message.answer(
+            "❌ Bukti harus berupa foto/screenshot atau file gambar."
+        )
+
+    entity = session["entity_type"]
+    entity_id = int(session["entity_id"])
+
+    ok, error = await process_payment_proof_message(
+        message,
+        state,
+        bot,
+        entity,
+        entity_id
+    )
+
+    if not ok:
+        return await message.answer(
+            "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
+            f"{html.escape(error)}\n\n"
+            "Silakan kirim ulang bukti pembayaran.",
+            parse_mode="HTML"
+        )
+
+    await message.answer(
+        "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
+        "Bukti sudah diteruskan ke PM owner.",
+        reply_markup=main_menu(),
+        parse_mode="HTML"
+    )
+
+
+@router.message(F.photo)
+async def owner_qris_photo_recovery(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    if get_setting("qris_upload_pending", "0") != "1":
+        return
+
+    if not message.photo:
+        return
+
+    await save_owner_qris_photo(
+        message,
+        state,
+        message.photo[-1].file_id
+    )
+
+
+@router.message(F.document)
+async def owner_qris_document_recovery(message: Message, state: FSMContext, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return
+
+    if get_setting("qris_upload_pending", "0") != "1":
+        return
+
+    document = message.document
+    mime = (document.mime_type or "").lower() if document else ""
+    if not document or not mime.startswith("image/"):
+        return
+
+    temp_path = None
+    try:
+        suffix = ".png" if "png" in mime else ".jpg"
+        fd, temp_path = tempfile.mkstemp(prefix="qris_recovery_", suffix=suffix)
+        os.close(fd)
+
+        await bot.download(document, destination=temp_path)
+
+        normalized = await bot.send_photo(
+            message.from_user.id,
+            FSInputFile(temp_path),
+            caption="🔄 Memproses gambar QRIS..."
+        )
+
+        if not normalized.photo:
+            raise RuntimeError("Telegram tidak menghasilkan photo file_id.")
+
+        await save_owner_qris_photo(
+            message,
+            state,
+            normalized.photo[-1].file_id
+        )
+
+    except Exception as exc:
+        logging.exception("QRIS recovery normalization failed: %s", exc)
+        await message.answer(
+            "❌ Gagal memproses QRIS. Coba kirim sebagai foto biasa."
+        )
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 
@@ -7730,25 +8252,32 @@ async def owner_qris_note_input(message: Message, state: FSMContext):
 @router.callback_query(F.data == "owner:qris_preview")
 async def owner_qris_preview(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
     qris_file_id = get_setting("qris_file_id", "")
     if not qris_file_id:
         return await call.answer("QRIS belum dipasang.", show_alert=True)
 
-    await bot.send_photo(
-        call.from_user.id,
-        qris_file_id,
-        caption=(
-            "👁️ <b>PREVIEW QRIS</b>\n\n"
-            f"📝 {get_setting('payment_note', DEFAULT_PAYMENT_NOTE)}\n"
-            f"🔢 Kode unik: {'ON' if get_setting('unique_code_enabled', '1') == '1' else 'OFF'}"
-        ),
-        parse_mode="HTML"
-    )
-    await call.answer("Preview dikirim.")
-
-
+    try:
+        await bot.send_photo(
+            call.from_user.id,
+            qris_file_id,
+            caption=(
+                "👁️ <b>PREVIEW QRIS</b>\n\n"
+                f"📝 {html.escape(get_setting('payment_note', DEFAULT_PAYMENT_NOTE))}\n"
+                "🔢 Kode unik: <b>WAJIB</b>"
+            ),
+            parse_mode="HTML"
+        )
+        await call.answer("Preview dikirim.")
+    except Exception as exc:
+        logging.exception("QRIS preview failed: %s", exc)
+        set_setting("qris_file_id", "")
+        set_setting("qris_upload_pending", "1")
+        await call.answer(
+            "QRIS lama tidak valid. Kirim ulang gambar QRIS sekarang.",
+            show_alert=True
+        )
 
 @router.callback_query(F.data == "owner:health")
 async def owner_health(call: CallbackQuery, bot: Bot):
@@ -10947,9 +11476,87 @@ async def owner_proof_info(call: CallbackQuery):
     )
     await call.answer()
 
-# =========================
-# FALLBACK
-# =========================
+@router.callback_query(F.data == "owner:test_pm")
+async def owner_test_pm(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    if not ADMIN_ID:
+        return await call.answer("ADMIN_ID belum dikonfigurasi.", show_alert=True)
+
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            "✅ <b>TEST PM OWNER BERHASIL</b>\n\n"
+            "Bot dapat mengirim pesan langsung ke PM owner.\n"
+            "Fitur bukti pembayaran seharusnya dapat diteruskan ke chat ini.",
+            parse_mode="HTML"
+        )
+        await call.answer("PM test berhasil dikirim.", show_alert=True)
+    except Exception as exc:
+        logging.exception("Owner PM test failed: %s", exc)
+        await call.answer(
+            f"PM test gagal: {str(exc)[:150]}",
+            show_alert=True
+        )
+
+
+@router.callback_query(F.data == "owner:test_channel")
+async def owner_test_channel(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    if not REQUIRED_CHANNEL_ID:
+        return await call.answer(
+            "REQUIRED_CHANNEL_ID belum diisi.",
+            show_alert=True
+        )
+
+    raw_target = str(REQUIRED_CHANNEL_ID).strip()
+    target = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
+
+    try:
+        chat = await bot.get_chat(target)
+        member = await bot.get_chat_member(target, call.from_user.id)
+        status = getattr(member, "status", "")
+        status_text = str(getattr(status, "value", status))
+
+        await safe_edit_or_answer(
+            call,
+            "📢 <b>TEST REQUIRED CHANNEL</b>\n\n"
+            f"Channel: <b>{html.escape(getattr(chat, 'title', '') or str(target))}</b>\n"
+            f"Target: <code>{html.escape(str(target))}</code>\n"
+            f"Status owner: <b>{html.escape(status_text)}</b>\n\n"
+            "✅ Bot dapat membaca channel dan membership.",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await call.answer("Channel test berhasil.")
+    except Exception as exc:
+        logging.exception("Required channel test failed: %s", exc)
+        await safe_edit_or_answer(
+            call,
+            "❌ <b>TEST CHANNEL GAGAL</b>\n\n"
+            f"<code>{html.escape(str(exc)[:500])}</code>\n\n"
+            "Periksa REQUIRED_CHANNEL_ID dan pastikan bot sudah ditambahkan ke channel.",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await call.answer("Channel belum bisa diverifikasi.", show_alert=True)
+
+
+@router.callback_query(F.data == "owner:launch_readiness")
+async def owner_launch_readiness(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    await call.answer(
+        "Pengecekan kesiapan sekarang dipindah ke /ping.",
+        show_alert=True
+    )
+
+
+
 @router.message()
 async def fallback(message: Message):
     text = (message.text or "").strip()
