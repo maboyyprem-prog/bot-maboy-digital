@@ -81,7 +81,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "9.8"
+BOT_VERSION = "10.1"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -3417,17 +3417,199 @@ def inventory_integrity_report(auto_repair: bool = False):
     return mismatches, repaired
 
 
-async def startup_recovery_audit(bot: Bot):
-    results = {
+
+async def auto_recovery_cycle(bot: Bot, source: str = "periodic"):
+    """
+    Safe self-healing cycle.
+    Never edits source code and never deletes paid/completed transactions.
+    """
+    report = {
+        "source": source,
         "recovered_orders": 0,
-        "pending_orders": 0,
+        "pending_paid": 0,
         "inventory_mismatch": 0,
         "inventory_repaired": 0,
-        "processing_topups_reset": 0,
+        "topups_reset": 0,
+        "proof_sessions_cleaned": 0,
+        "safe_mode_triggered": False,
+        "errors": [],
     }
 
-    if get_setting("auto_recovery_enabled", "1") != "1":
-        return results
+    try:
+        # 1) Recover paid orders that were not delivered.
+        if get_setting("auto_recovery_enabled", "1") == "1":
+            recovered, pending = await recover_stuck_orders(bot)
+            report["recovered_orders"] = recovered
+            report["pending_paid"] = pending
+
+        # 2) Repair inventory counters from inventory_items.
+        if get_setting("auto_repair_inventory", "1") == "1":
+            mismatches, repaired = inventory_integrity_report(auto_repair=True)
+            report["inventory_mismatch"] = len(mismatches)
+            report["inventory_repaired"] = repaired
+
+        # 3) Reset topups stuck in processing.
+        conn = db()
+        stuck = conn.execute(
+            "SELECT id FROM topups WHERE status='processing'"
+        ).fetchall()
+        for row in stuck:
+            conn.execute(
+                "UPDATE topups SET status='pending' WHERE id=? AND status='processing'",
+                (row["id"],)
+            )
+        conn.commit()
+        conn.close()
+        report["topups_reset"] = len(stuck)
+
+        # 4) Clean proof sessions that point to missing/already finished entities.
+        conn = db()
+        sessions = conn.execute(
+            "SELECT user_id,entity_type,entity_id FROM payment_proof_sessions"
+        ).fetchall()
+
+        stale_user_ids = []
+        for row in sessions:
+            entity = row["entity_type"]
+            entity_id = int(row["entity_id"] or 0)
+            stale = False
+
+            if entity == "order":
+                item = conn.execute(
+                    "SELECT payment_status,status FROM orders WHERE id=?",
+                    (entity_id,)
+                ).fetchone()
+                stale = (
+                    item is None
+                    or item["payment_status"] == "paid"
+                    or item["status"] in {"completed","cancelled","expired"}
+                )
+            elif entity == "topup":
+                item = conn.execute(
+                    "SELECT status FROM topups WHERE id=?",
+                    (entity_id,)
+                ).fetchone()
+                stale = (
+                    item is None
+                    or item["status"] in {"completed","paid","rejected","cancelled","expired"}
+                )
+            else:
+                stale = True
+
+            if stale:
+                stale_user_ids.append(int(row["user_id"]))
+
+        for user_id in stale_user_ids:
+            conn.execute(
+                "DELETE FROM payment_proof_sessions WHERE user_id=?",
+                (user_id,)
+            )
+
+        conn.commit()
+        conn.close()
+        report["proof_sessions_cleaned"] = len(stale_user_ids)
+
+        # 5) DB integrity check.
+        conn = db()
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        conn.close()
+
+        if str(integrity).lower() != "ok":
+            raise RuntimeError(f"SQLite integrity_check: {integrity}")
+
+        # If recovery is healthy, do not force-disable Safe Mode automatically.
+        # Owner controls when Safe Mode should be turned off.
+
+    except Exception as exc:
+        report["errors"].append(str(exc)[:500])
+        report["safe_mode_triggered"] = True
+
+        try:
+            set_safe_mode(True)
+        except Exception:
+            pass
+
+        try:
+            log_system_error(
+                "AUTO_RECOVERY",
+                str(exc),
+                reference=source,
+                severity="critical",
+                recovered=False
+            )
+        except Exception:
+            pass
+
+        try:
+            await notify_owner_system_error(
+                bot,
+                "AUTO_RECOVERY",
+                str(exc),
+                reference=source,
+                recovered=False
+            )
+        except Exception:
+            pass
+
+    return report
+
+
+async def periodic_auto_recovery(bot: Bot):
+    """
+    Lightweight periodic recovery every 10 minutes.
+    """
+    await asyncio.sleep(120)
+
+    while True:
+        try:
+            report = await auto_recovery_cycle(bot, source="periodic")
+
+            # Only notify owner when something meaningful happened.
+            if ADMIN_ID and (
+                report["recovered_orders"]
+                or report["inventory_repaired"]
+                or report["topups_reset"]
+                or report["proof_sessions_cleaned"]
+                or report["safe_mode_triggered"]
+            ):
+                lines = [
+                    "♻️ <b>AUTO RECOVERY</b>",
+                    "",
+                    f"✅ Order recovered: <b>{report['recovered_orders']}</b>",
+                    f"📦 Paid belum terkirim: <b>{report['pending_paid']}</b>",
+                    f"🧹 Inventory repaired: <b>{report['inventory_repaired']}</b>",
+                    f"💰 Topup reset: <b>{report['topups_reset']}</b>",
+                    f"📎 Proof session cleaned: <b>{report['proof_sessions_cleaned']}</b>",
+                    f"🛟 Safe Mode: <b>{'ON' if report['safe_mode_triggered'] else 'tidak berubah'}</b>",
+                ]
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        "\n".join(lines),
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            logging.exception("Periodic auto recovery crashed: %s", exc)
+
+        await asyncio.sleep(600)
+
+
+async def startup_recovery_audit(bot: Bot):
+    report = await auto_recovery_cycle(bot, source="startup")
+
+    return {
+        "recovered_orders": report["recovered_orders"],
+        "pending_orders": report["pending_paid"],
+        "inventory_mismatch": report["inventory_mismatch"],
+        "inventory_repaired": report["inventory_repaired"],
+        "processing_topups_reset": report["topups_reset"],
+        "proof_sessions_cleaned": report["proof_sessions_cleaned"],
+        "safe_mode_triggered": report["safe_mode_triggered"],
+    }
+
 
     try:
         recovered, pending = await recover_stuck_orders(bot)
@@ -4631,6 +4813,32 @@ def owner_menu():
 
 
 
+
+async def owner_product_error_view(call: CallbackQuery, feature: str, exc: Exception):
+    logging.exception("Owner product feature failed [%s]: %s", feature, exc)
+    try:
+        log_system_error(
+            "OWNER_PRODUCT",
+            str(exc),
+            reference=feature,
+            severity="error",
+            recovered=False
+        )
+    except Exception:
+        pass
+
+    await safe_edit_or_answer(
+        call,
+        "❌ <b>FITUR PRODUK ERROR</b>\n\n"
+        f"Fitur: <b>{html.escape(feature)}</b>\n"
+        f"Error: <code>{html.escape(str(exc)[:500])}</code>\n\n"
+        "Menu Produk & Stok tetap dapat digunakan.",
+        reply_markup=owner_products_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
 def owner_products_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Tambah Produk", callback_data="owner:add_product")
@@ -4834,7 +5042,7 @@ def cleanup_preview_text(kind: str):
         "pending": (
             "⏳ PESANAN PENDING BELUM BAYAR",
             counts["pending_orders"],
-            "Pesanan pending yang belum dibayar. Reservasi stok akan dilepas sebelum order dihapus."
+            "Pesanan pending yang BELUM dibayar. Reservasi stok akan dilepas sebelum order dihapus. Order paid tidak termasuk."
         ),
         "orders": (
             "🧾 ORDER EXPIRED",
@@ -4978,6 +5186,7 @@ def owner_system_menu():
     kb.button(text="📢 Test Channel", callback_data="owner:test_channel")
     kb.button(text="🛟 Safe Mode", callback_data="owner:safe_mode")
     kb.button(text="🧹 Repair Inventory", callback_data="owner:repair_inventory")
+    kb.button(text="♻️ Auto Recovery", callback_data="owner:auto_recovery_now")
     kb.button(text="🔧 Maintenance", callback_data="owner:maintenance")
     kb.button(text="🗄️ Backup Sekarang", callback_data="owner:backup_now")
     kb.button(text="📢 Sinkron Stok Channel", callback_data="owner:sync_stock")
@@ -5932,15 +6141,20 @@ async def owner_back_system(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "owner:menu_products")
 async def owner_menu_products(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
-    await state.clear()
-    await safe_edit_or_answer(
-        call,
-        "📦 <b>PRODUK & STOK</b>\n\nPilih pengaturan:",
-        reply_markup=owner_products_menu(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+        return await deny_owner_callback(call)
+
+    try:
+        await state.clear()
+        await safe_edit_or_answer(
+            call,
+            "📦 <b>PRODUK & STOK</b>\n\nPilih pengaturan:",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Menu Produk & Stok", exc)
+
 
 
 @router.callback_query(F.data == "owner:menu_orders")
@@ -9238,21 +9452,25 @@ async def prompt_state(call, state, target_state, text):
 @router.callback_query(F.data == "owner:add_product")
 async def owner_add_product(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
-    await state.clear()
-    await state.set_state(OwnerState.add_product_name)
+    try:
+        await state.clear()
+        await state.set_state(OwnerState.add_product_name)
 
-    await safe_edit_or_answer(
-        call,
-        "➕ <b>TAMBAH PRODUK</b>\n\n"
-        "Langkah 1/4\n"
-        "Kirim <b>nama produk</b>.\n\n"
-        "Contoh: <code>Alight Motion</code>",
-        reply_markup=back_owner("owner:back_products"),
-        parse_mode="HTML"
-    )
-    await call.answer()
+        await safe_edit_or_answer(
+            call,
+            "➕ <b>TAMBAH PRODUK</b>\n\n"
+            "Langkah 1/4\n"
+            "Kirim <b>nama produk</b>.\n\n"
+            "Contoh: <code>Alight Motion</code>",
+            reply_markup=back_owner("owner:back_products"),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Tambah Produk", exc)
+
 
 
 @router.message(OwnerState.add_product_name)
@@ -9859,16 +10077,22 @@ async def owner_add_variant_price_custom(message: Message, state: FSMContext):
 @router.callback_query(F.data == "owner:set_stock")
 async def owner_set_stock(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
-    await state.clear()
-    await safe_edit_or_answer(call, 
-        "📦 <b>ATUR STOK</b>\n\n"
-        "Pilih produk yang ingin diatur.\n"
-        "Tidak perlu mengetik ID produk/variasi.",
-        reply_markup=owner_stock_products_keyboard(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+        return await deny_owner_callback(call)
+
+    try:
+        await state.clear()
+        keyboard=owner_stock_products_keyboard()
+        await safe_edit_or_answer(
+            call,
+            "📦 <b>ATUR STOK</b>\n\n"
+            "Pilih produk yang ingin diatur.",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Atur Stok", exc)
+
 
 
 @router.callback_query(F.data.startswith("ownerstock:product:"))
@@ -10166,18 +10390,22 @@ def owner_variant_button_products_keyboard():
 @router.callback_query(F.data == "owner:variant_button_name")
 async def owner_variant_button_name(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
-    await state.clear()
-    await safe_edit_or_answer(call, 
-        "🏷️ <b>NAMA TOMBOL VARIASI</b>\n\n"
-        "Pilih produk.\n\n"
-        "Nama ini hanya mengubah tulisan pada tombol variasi. "
-        "Stok tetap ditampilkan otomatis dari database.",
-        reply_markup=owner_variant_button_products_keyboard(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+    try:
+        await state.clear()
+        await safe_edit_or_answer(
+            call,
+            "🏷️ <b>NAMA TOMBOL VARIASI</b>\n\n"
+            "Pilih produk.\n\n"
+            "Nama ini hanya mengubah tulisan tombol variasi.",
+            reply_markup=owner_variant_button_products_keyboard(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Nama Tombol Variasi", exc)
+
 
 
 @router.callback_query(F.data.startswith("ownerbtnname:product:"))
@@ -10329,45 +10557,49 @@ async def owner_set_price(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    await state.clear()
+    try:
+        await state.clear()
 
-    conn=db()
-    products=conn.execute(
-        "SELECT id,name FROM products WHERE active=1 ORDER BY id"
-    ).fetchall()
-    conn.close()
+        conn=db()
+        products=conn.execute(
+            "SELECT id,name FROM products WHERE active=1 ORDER BY id"
+        ).fetchall()
+        conn.close()
 
-    if not products:
-        return await safe_edit_or_answer(
+        if not products:
+            await safe_edit_or_answer(
+                call,
+                "❌ <b>BELUM ADA PRODUK</b>\n\n"
+                "Tambahkan produk terlebih dahulu.",
+                reply_markup=owner_products_menu(),
+                parse_mode="HTML"
+            )
+            return await safe_callback_notice(call)
+
+        rows=[
+            [InlineKeyboardButton(
+                text=f"📦 {p['name']}",
+                callback_data=f"setpriceprod:{p['id']}"
+            )]
+            for p in products
+        ]
+        rows.append([
+            InlineKeyboardButton(
+                text="⬅️ Kembali",
+                callback_data="owner:back_products"
+            )
+        ])
+
+        await safe_edit_or_answer(
             call,
-            "❌ <b>BELUM ADA PRODUK</b>\n\n"
-            "Tambahkan produk terlebih dahulu.",
-            reply_markup=owner_products_menu(),
+            "💰 <b>ATUR HARGA VARIAN</b>\n\n"
+            "Pilih produk:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode="HTML"
         )
-
-    rows=[
-        [InlineKeyboardButton(
-            text=f"📦 {p['name']}",
-            callback_data=f"setpriceprod:{p['id']}"
-        )]
-        for p in products
-    ]
-    rows.append([
-        InlineKeyboardButton(
-            text="⬅️ Kembali",
-            callback_data="owner:back_products"
-        )
-    ])
-
-    await safe_edit_or_answer(
-        call,
-        "💰 <b>ATUR HARGA VARIAN</b>\n\n"
-        "Pilih produk:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        parse_mode="HTML"
-    )
-    await safe_callback_notice(call)
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Atur Harga", exc)
 
 
 
@@ -10457,32 +10689,37 @@ async def owner_set_price_input(message: Message, state: FSMContext):
 @router.callback_query(F.data == "owner:delete_product")
 async def owner_delete_product(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
-    await state.clear()
+    try:
+        await state.clear()
+        conn=db()
+        total=conn.execute(
+            "SELECT COUNT(*) AS n FROM products WHERE active=1"
+        ).fetchone()["n"]
+        conn.close()
 
-    conn = db()
-    total = conn.execute(
-        "SELECT COUNT(*) AS n FROM products WHERE active=1"
-    ).fetchone()["n"]
-    conn.close()
+        if int(total or 0)==0:
+            await safe_edit_or_answer(
+                call,
+                "🗑️ <b>HAPUS PRODUK</b>\n\nBelum ada produk aktif.",
+                reply_markup=back_owner("owner:back_products"),
+                parse_mode="HTML"
+            )
+            return await safe_callback_notice(call)
 
-    if int(total or 0) == 0:
-        await safe_edit_or_answer(call, 
-            "🗑️ <b>HAPUS PRODUK</b>\n\nBelum ada produk aktif.",
-            reply_markup=back_owner("owner:back_products"),
+        await safe_edit_or_answer(
+            call,
+            "🗑️ <b>HAPUS PRODUK</b>\n\n"
+            "Pilih produk yang ingin dihapus dari toko.\n\n"
+            "Produk menggunakan soft delete agar riwayat order lama tetap aman.",
+            reply_markup=owner_delete_products_keyboard(),
             parse_mode="HTML"
         )
-        return await call.answer()
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Hapus Produk", exc)
 
-    await safe_edit_or_answer(call, 
-        "🗑️ <b>HAPUS PRODUK</b>\n\n"
-        "Pilih produk yang ingin dihapus dari toko.\n\n"
-        "Produk menggunakan soft delete agar riwayat order lama tetap aman.",
-        reply_markup=owner_delete_products_keyboard(),
-        parse_mode="HTML"
-    )
-    await call.answer()
 
 
 @router.callback_query(F.data.startswith("ownerdelete:select:"))
@@ -10637,12 +10874,35 @@ async def owner_mark_popular(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    await prompt_state(
-        call, state, OwnerState.mark_popular,
-        "🔥 <b>PRODUK POPULER</b>\n\n"
-        "Kirim:\n<code>ID PRODUK | 1/0</code>\n\n"
-        "1 = tampilkan sebagai populer\n0 = matikan"
-    )
+    try:
+        await state.clear()
+        conn=db()
+        rows=conn.execute(
+            "SELECT id,name,is_popular FROM products WHERE active=1 ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        kb=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{'✅' if int(r['is_popular'] or 0) else '▫️'} {r['name']}",
+                callback_data=f"popular:toggle:{r['id']}"
+            )] for r in rows
+        ] + [[InlineKeyboardButton(
+            text="⬅️ Kembali",
+            callback_data="owner:back_products"
+        )]])
+
+        await safe_edit_or_answer(
+            call,
+            "🔥 <b>PRODUK POPULER</b>\n\n"
+            "Tekan produk untuk mengaktifkan / menonaktifkan status populer.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Produk Populer", exc)
+
 
 
 @router.message(OwnerState.mark_popular)
@@ -10666,12 +10926,35 @@ async def owner_mark_flash(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    await prompt_state(
-        call, state, OwnerState.mark_flash,
-        "⚡ <b>FLASH SALE</b>\n\n"
-        "Kirim:\n<code>ID PRODUK | 1/0</code>\n\n"
-        "1 = masuk Flash Sale\n0 = keluarkan"
-    )
+    try:
+        await state.clear()
+        conn=db()
+        rows=conn.execute(
+            "SELECT id,name,is_flash_sale FROM products WHERE active=1 ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        kb=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{'✅' if int(r['is_flash_sale'] or 0) else '▫️'} {r['name']}",
+                callback_data=f"flash:toggle:{r['id']}"
+            )] for r in rows
+        ] + [[InlineKeyboardButton(
+            text="⬅️ Kembali",
+            callback_data="owner:back_products"
+        )]])
+
+        await safe_edit_or_answer(
+            call,
+            "⚡ <b>FLASH SALE</b>\n\n"
+            "Tekan produk untuk mengaktifkan / menonaktifkan Flash Sale.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Flash Sale", exc)
+
 
 
 @router.message(OwnerState.mark_flash)
@@ -11492,19 +11775,25 @@ async def submit_rating(call: CallbackQuery):
 @router.callback_query(F.data == "owner:low_stock")
 async def owner_low_stock(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
-    current = low_stock_threshold()
-    await state.set_state(OwnerState.low_stock_threshold)
-    await safe_edit_or_answer(call, 
-        "🔔 <b>ALERT STOK MENIPIS</b>\n\n"
-        f"Batas saat ini: <b>{current}</b>\n\n"
-        "Kirim angka batas stok.\n"
-        "Contoh: <code>5</code>\n"
-        "Kirim <code>0</code> untuk menonaktifkan alert.",
-        reply_markup=back_owner("owner:back_products"),
-        parse_mode="HTML"
-    )
-    await call.answer()
+        return await deny_owner_callback(call)
+
+    try:
+        current=low_stock_threshold()
+        await state.set_state(OwnerState.low_stock_threshold)
+        await safe_edit_or_answer(
+            call,
+            "🔔 <b>ALERT STOK MENIPIS</b>\n\n"
+            f"Batas saat ini: <b>{current}</b>\n\n"
+            "Kirim angka batas stok.\n"
+            "Contoh: <code>5</code>\n"
+            "Kirim <code>0</code> untuk menonaktifkan alert.",
+            reply_markup=back_owner("owner:back_products"),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Alert Stok", exc)
+
 
 
 @router.message(OwnerState.low_stock_threshold)
@@ -11530,36 +11819,43 @@ async def owner_low_stock_input(message: Message, state: FSMContext):
 @router.callback_query(F.data == "owner:inventory_log")
 async def owner_inventory_log(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await deny_owner_callback(call)
 
-    conn = db()
-    rows = conn.execute(
-        """SELECT l.*, v.name AS variant_name, p.name AS product_name
-           FROM inventory_logs l
-           JOIN product_variants v ON v.id=l.variant_id
-           JOIN products p ON p.id=v.product_id
-           ORDER BY l.id DESC LIMIT 25"""
-    ).fetchall()
-    conn.close()
+    try:
+        conn=db()
+        rows=conn.execute(
+            """SELECT l.*, v.name AS variant_name, p.name AS product_name
+               FROM inventory_logs l
+               LEFT JOIN product_variants v ON v.id=l.variant_id
+               LEFT JOIN products p ON p.id=v.product_id
+               ORDER BY l.id DESC LIMIT 25"""
+        ).fetchall()
+        conn.close()
 
-    lines = ["📚 <b>RIWAYAT STOK</b>", ""]
-    if not rows:
-        lines.append("Belum ada log stok.")
-    else:
-        for row in rows:
-            sign = "+" if int(row["qty"]) > 0 else ""
-            lines.append(
-                f"{row['created_at'][:16]} • {html.escape(row['action'])}\n"
-                f"{html.escape(row['product_name'])} — {html.escape(row['variant_name'])}\n"
-                f"{sign}{row['qty']} • {html.escape(row['reference'] or '-')}"
-            )
+        lines=["📚 <b>RIWAYAT STOK</b>",""]
+        if not rows:
+            lines.append("Belum ada log stok.")
+        else:
+            for row in rows:
+                sign="+" if int(row["qty"] or 0)>0 else ""
+                product_name=row["product_name"] or "Produk lama"
+                variant_name=row["variant_name"] or "Varian lama"
+                lines.append(
+                    f"{str(row['created_at'] or '-')[:16]} • {html.escape(str(row['action'] or '-'))}\n"
+                    f"{html.escape(product_name)} — {html.escape(variant_name)}\n"
+                    f"{sign}{int(row['qty'] or 0)} • {html.escape(str(row['reference'] or '-'))}"
+                )
 
-    await safe_edit_or_answer(call, 
-        "\n\n".join(lines),
-        reply_markup=back_owner("owner:back_products"),
-        parse_mode="HTML"
-    )
-    await call.answer()
+        await safe_edit_or_answer(
+            call,
+            "\n\n".join(lines),
+            reply_markup=back_owner("owner:back_products"),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Riwayat Stok", exc)
+
 
 
 @router.callback_query(F.data == "owner:security")
@@ -12045,7 +12341,7 @@ async def owner_bundles(call: CallbackQuery):
     kb=InlineKeyboardBuilder()
     for row in rows:
         kb.button(text=f"1️⃣ {row['name']}",callback_data=f"bundlefirst:{row['id']}")
-    kb.button(text="⬅️ Kembali",callback_data="owner:panel")
+    kb.button(text="⬅️ Kembali",callback_data="owner:back_products")
     kb.adjust(1)
     await safe_edit_or_answer(call, 
         "🎁 <b>BUAT PAKET</b>\n\nPilih produk pertama:",
@@ -12189,7 +12485,11 @@ async def global_error_handler(event: ErrorEvent):
             reference = f"callback:{callback.data or '-'}"
             try:
                 await callback.answer(
-                    "Terjadi gangguan sementara. Silakan tekan lagi.",
+                    (
+                        f"Error pada tombol: {callback.data}"
+                        if is_owner(callback.from_user.id)
+                        else "Terjadi gangguan sementara. Sistem mencoba recovery otomatis."
+                    ),
                     show_alert=True
                 )
             except Exception:
@@ -12206,6 +12506,12 @@ async def global_error_handler(event: ErrorEvent):
                 reference=reference,
                 recovered=False
             )
+        except Exception:
+            pass
+
+    if bot:
+        try:
+            await auto_recovery_cycle(bot, source=reference or "unhandled")
         except Exception:
             pass
 
@@ -12414,7 +12720,7 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
         f"• Produk aktif: <b>{snap['active_products']}</b>",
         f"• Variasi aktif: <b>{snap['active_variants']}</b>",
         f"• Pending order: <b>{snap['pending_orders']}</b>",
-        f"• Paid pending delivery: <b>{snap['paid_pending']}</b>",
+        f"• Paid belum terkirim: <b>{snap['paid_pending']}</b>",
         f"• Send failed: <b>{snap['send_failed']}</b>",
         f"• Stock mismatch: <b>{snap['stock_mismatch']}</b>",
         "",
@@ -12425,6 +12731,9 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
         f"• Top up expired: <b>{payment['topup_expired']}</b>",
         f"• Wallet negatif: <b>{payment['wallet_negative']}</b>",
         f"• Duplicate paid event: <b>{payment['duplicate_paid_events']}</b>",
+        "",
+        f"• Auto Recovery: <b>{'ON' if get_setting('auto_recovery_enabled','1') == '1' else 'OFF'}</b>",
+        f"• Auto Repair Inventory: <b>{'ON' if get_setting('auto_repair_inventory','1') == '1' else 'OFF'}</b>",
         "",
         "🧪 <b>Self-Test</b>",
     ]
@@ -12677,6 +12986,141 @@ async def refresh_keyboard_callback(call: CallbackQuery, state: FSMContext, bot:
     await force_refresh_user_keyboard(call.message)
 
 
+@router.callback_query(F.data.startswith("popular:toggle:"))
+async def owner_popular_toggle(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        product_id=int(call.data.split(":")[-1])
+        conn=db()
+        row=conn.execute(
+            "SELECT id,is_popular FROM products WHERE id=? AND active=1",
+            (product_id,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return await call.answer("Produk tidak ditemukan.", show_alert=True)
+
+        new_value=0 if int(row["is_popular"] or 0) else 1
+        conn.execute(
+            "UPDATE products SET is_popular=? WHERE id=?",
+            (new_value,product_id)
+        )
+        conn.commit()
+        conn.close()
+
+        await call.answer(
+            "Produk populer diperbarui.",
+            show_alert=False
+        )
+        # reopen selector
+        fake_state=None
+        conn=db()
+        rows=conn.execute(
+            "SELECT id,name,is_popular FROM products WHERE active=1 ORDER BY id"
+        ).fetchall()
+        conn.close()
+        kb=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{'✅' if int(r['is_popular'] or 0) else '▫️'} {r['name']}",
+                callback_data=f"popular:toggle:{r['id']}"
+            )] for r in rows
+        ] + [[InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:back_products")]])
+        await safe_edit_or_answer(
+            call,
+            "🔥 <b>PRODUK POPULER</b>\n\nTekan produk untuk mengaktifkan / menonaktifkan status populer.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        await owner_product_error_view(call, "Produk Populer", exc)
+
+
+@router.callback_query(F.data.startswith("flash:toggle:"))
+async def owner_flash_toggle(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        product_id=int(call.data.split(":")[-1])
+        conn=db()
+        row=conn.execute(
+            "SELECT id,is_flash_sale FROM products WHERE id=? AND active=1",
+            (product_id,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return await call.answer("Produk tidak ditemukan.", show_alert=True)
+
+        new_value=0 if int(row["is_flash_sale"] or 0) else 1
+        conn.execute(
+            "UPDATE products SET is_flash_sale=? WHERE id=?",
+            (new_value,product_id)
+        )
+        conn.commit()
+        conn.close()
+
+        await call.answer("Flash Sale diperbarui.")
+        conn=db()
+        rows=conn.execute(
+            "SELECT id,name,is_flash_sale FROM products WHERE active=1 ORDER BY id"
+        ).fetchall()
+        conn.close()
+        kb=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{'✅' if int(r['is_flash_sale'] or 0) else '▫️'} {r['name']}",
+                callback_data=f"flash:toggle:{r['id']}"
+            )] for r in rows
+        ] + [[InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:back_products")]])
+        await safe_edit_or_answer(
+            call,
+            "⚡ <b>FLASH SALE</b>\n\nTekan produk untuk mengaktifkan / menonaktifkan Flash Sale.",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        await owner_product_error_view(call, "Flash Sale", exc)
+
+
+@router.callback_query(F.data == "owner:auto_recovery_now")
+async def owner_auto_recovery_now(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    await safe_callback_notice(call, "Menjalankan auto recovery...")
+
+    try:
+        report=await auto_recovery_cycle(bot, source="manual_owner")
+
+        lines=[
+            "♻️ <b>AUTO RECOVERY SELESAI</b>",
+            "",
+            f"✅ Order recovered: <b>{report['recovered_orders']}</b>",
+            f"📦 Paid belum terkirim: <b>{report['pending_paid']}</b>",
+            f"🧹 Inventory repaired: <b>{report['inventory_repaired']}</b>",
+            f"💰 Topup reset: <b>{report['topups_reset']}</b>",
+            f"📎 Proof session cleaned: <b>{report['proof_sessions_cleaned']}</b>",
+            f"🛟 Safe Mode triggered: <b>{'YA' if report['safe_mode_triggered'] else 'TIDAK'}</b>",
+        ]
+
+        if report["errors"]:
+            lines += [
+                "",
+                "⚠️ <b>Error:</b>",
+                *[f"• {html.escape(x)}" for x in report["errors"]]
+            ]
+
+        await safe_edit_or_answer(
+            call,
+            "\n".join(lines),
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        await owner_system_error_view(call, "Auto Recovery", exc)
+
+
 @router.callback_query()
 async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
     """
@@ -12910,10 +13354,13 @@ async def silent_recovery_loop(bot: Bot):
                     ADMIN_ID,
                     "♻️ <b>STARTUP RECOVERY</b>\n\n"
                     f"✅ Order recovered: <b>{results['recovered_orders']}</b>\n"
-                    f"⏳ Masih pending: <b>{results['pending_orders']}</b>\n"
+                    f"📦 Paid belum terkirim: <b>{results['pending_orders']}</b>\n"
                     f"📦 Inventory mismatch: <b>{results['inventory_mismatch']}</b>\n"
                     f"🧹 Inventory repaired: <b>{results['inventory_repaired']}</b>\n"
-                    f"💰 Topup processing reset: <b>{results['processing_topups_reset']}</b>",
+                    f"💰 Topup processing reset: <b>{results['processing_topups_reset']}</b>\n"
+            f"📎 Proof session cleaned: <b>{results.get('proof_sessions_cleaned',0)}</b>\n"
+            f"🛟 Safe Mode triggered: <b>{'YA' if results.get('safe_mode_triggered') else 'TIDAK'}</b>"
+            "\n\n<i>Paid belum terkirim = pembayaran sudah diterima tetapi akun belum berhasil dikirim. Order ini tidak dihapus otomatis.</i>",
                     parse_mode="HTML"
                 )
             except Exception:
@@ -12943,6 +13390,7 @@ async def main():
 
     backup_task = asyncio.create_task(backup_loop(bot))
     cleanup_task = asyncio.create_task(cleanup_expired_orders(bot))
+    asyncio.create_task(periodic_auto_recovery(bot))
     recovery_task = asyncio.create_task(silent_recovery_loop(bot))
     operations_task = asyncio.create_task(periodic_operations_loop(bot))
 

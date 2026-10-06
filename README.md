@@ -1,26 +1,24 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v9.8  
+**Versi aktif:** v10.1  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Fitur Utama
-- Produk digital, stok akun, wallet, top up, voucher, promo.
-- Verifikasi channel sebelum akses toko.
-- QRIS / transfer rekening dengan bukti pembayaran ke PM owner.
-- Recovery, backup, Safe Mode, maintenance, diagnostik, pembersihan data.
-- Refresh keyboard manual untuk Android/iOS.
+## Update Terbaru — v10.1 Auto Recovery Layer
+- Ditambahkan self-healing yang aman tanpa mengubah source code saat runtime.
+- Recovery otomatis paid order yang belum terkirim.
+- Auto repair inventory mismatch.
+- Reset top up `processing` yang nyangkut ke `pending`.
+- Bersihkan payment proof session stale.
+- SQLite integrity check setiap recovery cycle.
+- Jika recovery kritis gagal, bot otomatis mengaktifkan Safe Mode.
+- Error runtime mencoba auto recovery sebelum owner mengambil tindakan.
+- Auto recovery periodik setiap 10 menit.
+- Ditambahkan tombol `♻️ Auto Recovery` di menu Sistem owner.
+- Tidak ada Railway Variable baru.
 
 ## Command
 User: `/start`  
 Owner: `/owner` • `/ping`
-
-## Update Terbaru — v9.8
-- Atur Harga Varian diubah menjadi bebas nominal.
-- Owner pilih produk → pilih varian → ketik harga berapa pun.
-- Mendukung `2500`, `2750`, `12.500`, `Rp18.750`, dan nominal lain.
-- Tidak lagi bergantung pada preset harga.
-- Harga langsung diperbarui ke varian yang dipilih.
-- Tidak ada Railway Variable baru.
 
 ## File Project
 `bot.py` • `requirements.txt` • `.env.example` • `README.md` • `VARIABLE_RAILWAY.md`
