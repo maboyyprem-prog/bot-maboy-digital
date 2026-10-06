@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 import os
+import re
 import traceback
 from contextlib import asynccontextmanager
 import sqlite3
@@ -38,7 +39,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.fsm.storage.memory import SimpleEventIsolation
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramForbiddenError
 from dotenv import load_dotenv
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -87,7 +88,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "10.9"
+BOT_VERSION = "11.0"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -103,6 +104,7 @@ STORE_FOOTER = "Aplikasi Premium • Since 2020"
 logging.basicConfig(level=logging.INFO)
 router = Router()
 START_TIME = time.time()
+JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
 LAST_CALLBACK_TRACE = {
     "at": "",
@@ -3873,43 +3875,6 @@ async def startup_recovery_audit(bot: Bot):
     }
 
 
-    try:
-        recovered, pending = await recover_stuck_orders(bot)
-        results["recovered_orders"] = recovered
-        results["pending_orders"] = pending
-
-        mismatches, repaired = inventory_integrity_report(
-            auto_repair=get_setting("auto_repair_inventory","1") == "1"
-        )
-        results["inventory_mismatch"] = len(mismatches)
-        results["inventory_repaired"] = repaired
-
-        # Reset topups stuck in 'processing' back to pending after restart.
-        conn = db()
-        stuck = conn.execute(
-            "SELECT id FROM topups WHERE status='processing'"
-        ).fetchall()
-        for row in stuck:
-            conn.execute(
-                "UPDATE topups SET status='pending' WHERE id=? AND status='processing'",
-                (row["id"],)
-            )
-        conn.commit()
-        conn.close()
-        results["processing_topups_reset"] = len(stuck)
-
-    except Exception as exc:
-        set_safe_mode(True)
-        await notify_owner_system_error(
-            bot,
-            "STARTUP_RECOVERY",
-            str(exc),
-            recovered=False
-        )
-
-    return results
-
-
 async def transaction_self_test():
     checks = []
 
@@ -5143,6 +5108,26 @@ def user_reply_menu():
         is_persistent=True,
         input_field_placeholder="Pilih menu atau nomor produk"
     )
+
+
+def main_menu():
+    kb=InlineKeyboardBuilder()
+    kb.button(text="🏷️ List Produk", callback_data="products")
+    kb.button(text="🔥 Produk Populer", callback_data="popular")
+    kb.button(text="⚡ Flash Sale", callback_data="flash")
+    kb.button(text="🎁 Voucher", callback_data="voucher_info")
+    kb.button(text="💰 Isi Saldo", callback_data="wallet")
+    kb.button(text="🧾 Pesanan Saya", callback_data="my_orders")
+
+    if ADMIN_USERNAME:
+        kb.button(
+            text="💬 Hubungi Owner",
+            url=f"https://t.me/{ADMIN_USERNAME}"
+        )
+
+    kb.adjust(2,2,2,1)
+    return kb.as_markup()
+
 
 def owner_menu():
     kb = InlineKeyboardBuilder()
@@ -7867,6 +7852,15 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         order_id = cur.lastrowid
         conn.commit()
         conn.close()
+
+        conn=db()
+        saved_order=conn.execute(
+            "SELECT * FROM orders WHERE id=?",
+            (order_id,)
+        ).fetchone()
+        conn.close()
+
+        expiry_text=order_expiry_text(saved_order) if saved_order else ""
 
         inv = invoice(order_id)
         kb = InlineKeyboardBuilder()
