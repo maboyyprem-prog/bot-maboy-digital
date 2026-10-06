@@ -1,4 +1,6 @@
+from collections.abc import Mapping
 import os
+import traceback
 from contextlib import asynccontextmanager
 import sqlite3
 import logging
@@ -22,7 +24,9 @@ from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
 from Crypto.Hash import SHA256
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramBadRequest
+from aiogram.utils.backoff import BackoffConfig
 from aiogram.filters import Command
 from aiogram.types import (
     ErrorEvent,
@@ -32,6 +36,8 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from dotenv import load_dotenv
 try:
@@ -81,7 +87,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "10.1"
+BOT_VERSION = "10.8"
 BOT_CHANGELOG = [
     "Invoice pembayaran berhasil sekarang dikirim sebagai gambar profesional.",
     "Detail akun premium digabung dalam invoice gambar agar chat lebih ringkas.",
@@ -97,6 +103,15 @@ STORE_FOOTER = "Aplikasi Premium • Since 2020"
 logging.basicConfig(level=logging.INFO)
 router = Router()
 START_TIME = time.time()
+
+LAST_CALLBACK_TRACE = {
+    "at": "",
+    "data": "",
+    "user_id": 0,
+    "elapsed_ms": 0,
+    "status": "none",
+}
+
 
 
 # =========================
@@ -115,9 +130,133 @@ def prepare_storage():
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=10.0,
+        check_same_thread=False
+    )
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     return conn
+
+class SQLiteFSMStorage(BaseStorage):
+    """
+    Persistent Aiogram FSM storage backed by the same SQLite database.
+    This replaces Dispatcher()'s default MemoryStorage so wizard state
+    survives Railway restarts/redeploys.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path=db_path
+
+    @staticmethod
+    def _storage_key(key: StorageKey) -> str:
+        parts = {
+            "bot_id": getattr(key, "bot_id", 0),
+            "chat_id": getattr(key, "chat_id", 0),
+            "user_id": getattr(key, "user_id", 0),
+            "thread_id": getattr(key, "thread_id", None),
+            "business_connection_id": getattr(key, "business_connection_id", None),
+            "destiny": getattr(key, "destiny", "default"),
+        }
+        return json.dumps(parts, sort_keys=True, separators=(",", ":"))
+
+    def _connect(self):
+        conn=sqlite3.connect(self.db_path)
+        conn.row_factory=sqlite3.Row
+        return conn
+
+    async def set_state(self, key: StorageKey, state=None) -> None:
+        state_value = state.state if isinstance(state, State) else (state or "")
+        skey=self._storage_key(key)
+        conn=self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO fsm_storage(storage_key,state,data,updated_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(storage_key) DO UPDATE SET
+                     state=excluded.state,
+                     updated_at=excluded.updated_at""",
+                (
+                    skey,
+                    str(state_value),
+                    "{}",
+                    datetime.now().isoformat(timespec="seconds")
+                )
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def get_state(self, key: StorageKey):
+        skey=self._storage_key(key)
+        conn=self._connect()
+        try:
+            row=conn.execute(
+                "SELECT state FROM fsm_storage WHERE storage_key=?",
+                (skey,)
+            ).fetchone()
+            if not row or not row["state"]:
+                return None
+            return str(row["state"])
+        finally:
+            conn.close()
+
+    async def set_data(self, key: StorageKey, data: Mapping) -> None:
+        if not isinstance(data, Mapping):
+            raise TypeError("FSM data must be mapping-like.")
+
+        skey=self._storage_key(key)
+        payload=json.dumps(dict(data), ensure_ascii=False, default=str)
+        conn=self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO fsm_storage(storage_key,state,data,updated_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(storage_key) DO UPDATE SET
+                     data=excluded.data,
+                     updated_at=excluded.updated_at""",
+                (
+                    skey,
+                    "",
+                    payload,
+                    datetime.now().isoformat(timespec="seconds")
+                )
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def get_data(self, key: StorageKey) -> dict:
+        skey=self._storage_key(key)
+        conn=self._connect()
+        try:
+            row=conn.execute(
+                "SELECT data FROM fsm_storage WHERE storage_key=?",
+                (skey,)
+            ).fetchone()
+            if not row or not row["data"]:
+                return {}
+            try:
+                value=json.loads(row["data"])
+                return value if isinstance(value, dict) else {}
+            except Exception:
+                return {}
+        finally:
+            conn.close()
+
+    async def close(self) -> None:
+        # Connections are short-lived per operation.
+        return None
+
+
+
 
 
 def has_column(conn, table, column):
@@ -406,6 +545,24 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS fsm_storage (
+            storage_key TEXT PRIMARY KEY,
+            state TEXT DEFAULT '',
+            data TEXT DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_input_sessions (
+            user_id INTEGER PRIMARY KEY,
+            flow TEXT NOT NULL,
+            payload TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS payment_proof_sessions (
             user_id INTEGER PRIMARY KEY,
             entity_type TEXT NOT NULL,
@@ -439,6 +596,13 @@ def init_db():
     add_column_if_missing(conn, "orders", "delivery_text", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "last_delivery_error", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "system_errors", "update_id", "INTEGER DEFAULT 0")
+    add_column_if_missing(conn, "system_errors", "event_type", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "system_errors", "callback_data", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "system_errors", "user_id", "INTEGER DEFAULT 0")
+    add_column_if_missing(conn, "system_errors", "state_name", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "system_errors", "exception_type", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "system_errors", "traceback_text", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "delivery_sent_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "voucher_code", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "discount_amount", "INTEGER NOT NULL DEFAULT 0")
@@ -2793,6 +2957,19 @@ async def run_system_self_test(bot: Bot):
         results.append(("Schema DB", False, str(exc)[:100]))
 
     try:
+        conn=db()
+        journal=conn.execute("PRAGMA journal_mode").fetchone()[0]
+        busy=conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        conn.close()
+        results.append((
+            "SQLite WAL",
+            str(journal).lower()=="wal",
+            f"journal={journal} busy_timeout={busy}ms"
+        ))
+    except Exception as exc:
+        results.append(("SQLite WAL",False,str(exc)[:100]))
+
+    try:
         db_file = Path(DB_PATH)
         writable = db_file.parent.exists() and os.access(db_file.parent, os.W_OK)
         results.append(("Storage /data", writable, str(db_file.parent)))
@@ -3225,6 +3402,65 @@ def set_safe_mode(enabled: bool):
     set_setting("safe_mode", "1" if enabled else "0")
 
 
+
+def log_detailed_error(
+    module: str,
+    exc: Exception,
+    reference: str = "",
+    update_id: int = 0,
+    event_type: str = "",
+    callback_data: str = "",
+    user_id: int = 0,
+    state_name: str = "",
+    recovered: bool = False,
+):
+    exc_type=type(exc).__name__
+    tb="".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-4000:]
+
+    conn=db()
+    try:
+        conn.execute(
+            """INSERT INTO system_errors(
+                module,severity,reference,error_text,recovered,created_at,
+                update_id,event_type,callback_data,user_id,state_name,
+                exception_type,traceback_text
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                module[:60],
+                "error",
+                reference[:250],
+                str(exc)[:1500],
+                1 if recovered else 0,
+                datetime.now().isoformat(timespec="seconds"),
+                int(update_id or 0),
+                event_type[:80],
+                callback_data[:500],
+                int(user_id or 0),
+                state_name[:200],
+                exc_type[:120],
+                tb,
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def latest_error_diagnostics(limit: int = 5):
+    conn=db()
+    try:
+        return conn.execute(
+            """SELECT id,module,reference,error_text,recovered,created_at,
+                      update_id,event_type,callback_data,user_id,state_name,
+                      exception_type
+               FROM system_errors
+               ORDER BY id DESC LIMIT ?""",
+            (max(1,min(int(limit),20)),)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
 def log_system_error(
     module: str,
     error_text: str,
@@ -3431,6 +3667,8 @@ async def auto_recovery_cycle(bot: Bot, source: str = "periodic"):
         "inventory_repaired": 0,
         "topups_reset": 0,
         "proof_sessions_cleaned": 0,
+        "owner_input_sessions_cleaned": 0,
+        "fsm_rows_cleaned": 0,
         "safe_mode_triggered": False,
         "errors": [],
     }
@@ -3509,7 +3747,31 @@ async def auto_recovery_cycle(bot: Bot, source: str = "periodic"):
         conn.close()
         report["proof_sessions_cleaned"] = len(stale_user_ids)
 
-        # 5) DB integrity check.
+        # 5) Clear abandoned owner input sessions older than 24h.
+        conn=db()
+        cutoff=(datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
+        cur=conn.execute(
+            "DELETE FROM owner_input_sessions WHERE created_at<?",
+            (cutoff,)
+        )
+        conn.commit()
+        conn.close()
+        report["owner_input_sessions_cleaned"]=max(0,int(cur.rowcount or 0))
+
+        # 6) Clean old empty FSM rows only; active wizard states are preserved.
+        conn=db()
+        cutoff=(datetime.now() - timedelta(days=7)).isoformat(timespec="seconds")
+        cur=conn.execute(
+            """DELETE FROM fsm_storage
+               WHERE (state IS NULL OR state='')
+                 AND updated_at<?""",
+            (cutoff,)
+        )
+        conn.commit()
+        conn.close()
+        report["fsm_rows_cleaned"]=max(0,int(cur.rowcount or 0))
+
+        # 7) DB integrity check.
         conn = db()
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
         conn.close()
@@ -3884,6 +4146,60 @@ async def launch_readiness_report(bot: Bot):
     return ready, checks, blockers
 
 
+
+
+
+def set_owner_input_session(user_id: int, flow: str, payload: dict):
+    conn=db()
+    conn.execute(
+        """INSERT INTO owner_input_sessions(user_id,flow,payload,created_at)
+           VALUES(?,?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             flow=excluded.flow,
+             payload=excluded.payload,
+             created_at=excluded.created_at""",
+        (
+            int(user_id),
+            str(flow),
+            json.dumps(payload, ensure_ascii=False),
+            datetime.now().isoformat(timespec="seconds")
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_owner_input_session(user_id: int):
+    conn=db()
+    row=conn.execute(
+        "SELECT * FROM owner_input_sessions WHERE user_id=?",
+        (int(user_id),)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    try:
+        payload=json.loads(row["payload"] or "{}")
+    except Exception:
+        payload={}
+
+    return {
+        "flow": row["flow"],
+        "payload": payload,
+        "created_at": row["created_at"],
+    }
+
+
+def clear_owner_input_session(user_id: int):
+    conn=db()
+    conn.execute(
+        "DELETE FROM owner_input_sessions WHERE user_id=?",
+        (int(user_id),)
+    )
+    conn.commit()
+    conn.close()
 
 
 def set_payment_proof_session(user_id: int, entity: str, entity_id: int):
@@ -4839,6 +5155,102 @@ async def owner_product_error_view(call: CallbackQuery, feature: str, exc: Excep
     await safe_callback_notice(call)
 
 
+
+def owner_delete_products_keyboard():
+    conn=db()
+    rows=conn.execute(
+        "SELECT id,name FROM products WHERE active=1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    kb=InlineKeyboardBuilder()
+    for row in rows:
+        kb.button(
+            text=f"🗑️ {row['name']}",
+            callback_data=f"ownerdelete:{row['id']}"
+        )
+    kb.button(text="⬅️ Kembali", callback_data="owner:back_products")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def owner_stock_products_keyboard():
+    conn=db()
+    rows=conn.execute(
+        "SELECT id,name FROM products WHERE active=1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+
+    kb=InlineKeyboardBuilder()
+    for row in rows:
+        kb.button(
+            text=f"📦 {row['name']}",
+            callback_data=f"ownerstock:{row['id']}"
+        )
+    kb.button(text="⬅️ Kembali", callback_data="owner:back_products")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def owner_stock_variants_keyboard(product_id: int):
+    conn=db()
+    rows=conn.execute(
+        """SELECT id,name,stock,reserved_stock
+           FROM product_variants
+           WHERE product_id=? AND active=1
+           ORDER BY id""",
+        (int(product_id),)
+    ).fetchall()
+    conn.close()
+
+    kb=InlineKeyboardBuilder()
+    for row in rows:
+        available=max(0, int(row["stock"] or 0)-int(row["reserved_stock"] or 0))
+        kb.button(
+            text=f"🧩 {row['name']} • {available}",
+            callback_data=f"ownerstockvar:{row['id']}"
+        )
+    kb.button(text="⬅️ Kembali", callback_data="owner:set_stock")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def owner_stock_variant_actions(variant_id: int):
+    conn=db()
+    row=conn.execute(
+        """SELECT v.id,v.name,v.stock,v.reserved_stock,p.id AS product_id,p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
+        (int(variant_id),)
+    ).fetchone()
+    conn.close()
+
+    kb=InlineKeyboardBuilder()
+
+    if not row:
+        kb.button(text="⬅️ Kembali", callback_data="owner:set_stock")
+        kb.adjust(1)
+        return kb.as_markup()
+
+    kb.button(
+        text="➕ Tambah Akun",
+        callback_data=f"ownerstockadd:{variant_id}"
+    )
+    kb.button(
+        text="📚 Riwayat Stok",
+        callback_data="owner:inventory_log"
+    )
+    kb.button(
+        text="⬅️ Kembali",
+        callback_data=f"ownerstock:{row['product_id']}"
+    )
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+
+
+
 def owner_products_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Tambah Produk", callback_data="owner:add_product")
@@ -5482,6 +5894,34 @@ def variant_card(product, variant, qty=1):
 # =========================
 # PUBLIC COMMANDS (ONLY 3)
 # =========================
+
+class CallbackTraceMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        started=time.monotonic()
+        callback_data=str(getattr(event,"data","") or "")
+        user_id=int(getattr(getattr(event,"from_user",None),"id",0) or 0)
+
+        LAST_CALLBACK_TRACE.update({
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "data": callback_data[:250],
+            "user_id": user_id,
+            "elapsed_ms": 0,
+            "status": "received",
+        })
+
+        try:
+            result=await handler(event,data)
+            LAST_CALLBACK_TRACE["status"]="handled"
+            return result
+        except Exception:
+            LAST_CALLBACK_TRACE["status"]="error"
+            raise
+        finally:
+            LAST_CALLBACK_TRACE["elapsed_ms"]=int(
+                (time.monotonic()-started)*1000
+            )
+
+
 @router.message(Command("start"))
 async def start(message: Message, bot: Bot):
     if not await is_channel_member(bot, message.from_user.id):
@@ -6456,16 +6896,19 @@ async def show_product_list(call, title, filter_sql=""):
 
 @router.callback_query(F.data == "products")
 async def products(call: CallbackQuery):
+    await safe_callback_notice(call)
     await show_product_list(call, "🏷️ <b>LIST PRODUK</b>")
 
 
 @router.callback_query(F.data == "popular")
 async def popular(call: CallbackQuery):
+    await safe_callback_notice(call)
     await show_product_list(call, "🔥 <b>PRODUK POPULER</b>", "AND is_popular=1")
 
 
 @router.callback_query(F.data == "flash")
 async def flash(call: CallbackQuery):
+    await safe_callback_notice(call)
     await show_product_list(call, "⚡ <b>FLASH SALE</b>", "AND is_flash_sale=1")
 
 
@@ -9611,6 +10054,16 @@ async def owner_new_product_price_button(call: CallbackQuery, state: FSMContext)
     value=call.data.split(":")[1]
 
     if value=="custom":
+        data=await state.get_data()
+        set_owner_input_session(
+            call.from_user.id,
+            "product_custom_price",
+            {
+                "product_name": data.get("product_name",""),
+                "product_description": data.get("product_description",""),
+                "product_variant_name": data.get("product_variant_name",""),
+            }
+        )
         await state.set_state(OwnerState.add_product_variant_price)
         await safe_edit_or_answer(
             call,
@@ -9748,6 +10201,7 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
         except Exception:
             pass
 
+        clear_owner_input_session(message.from_user.id)
         await state.clear()
         return await message.answer(
             "❌ <b>GAGAL MEMBUAT PRODUK</b>\n\n"
@@ -9765,6 +10219,7 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
         )
 
     product_id,_,name,variant_name,price=result
+    clear_owner_input_session(message.from_user.id)
 
     await message.answer(
         "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
@@ -9955,6 +10410,15 @@ async def owner_add_variant_price_button(call: CallbackQuery, state: FSMContext)
     value=call.data.split(":")[1]
 
     if value=="custom":
+        data=await state.get_data()
+        set_owner_input_session(
+            call.from_user.id,
+            "variant_custom_price",
+            {
+                "add_variant_product_id": int(data.get("add_variant_product_id") or 0),
+                "add_variant_name": data.get("add_variant_name",""),
+            }
+        )
         await state.set_state(OwnerState.add_variant_price)
         await safe_edit_or_answer(
             call,
@@ -10046,6 +10510,7 @@ async def owner_add_variant_price_custom(message: Message, state: FSMContext):
             reply_markup=owner_products_menu()
         )
 
+    clear_owner_input_session(message.from_user.id)
     await state.clear()
 
     await message.answer(
@@ -12472,46 +12937,92 @@ async def owner_repair_inventory(call: CallbackQuery):
 
 @router.errors()
 async def global_error_handler(event: ErrorEvent):
-    exc = event.exception
-    update = event.update
-    logging.exception("Unhandled bot error: %s", exc)
+    exc=event.exception
+    update=event.update
 
-    bot = getattr(event, "bot", None)
-    reference = ""
+    if isinstance(exc, TelegramRetryAfter):
+        wait_seconds=max(1,int(getattr(exc,"retry_after",1) or 1))
+        logging.warning("Telegram rate limit: retry_after=%s", wait_seconds)
+        await asyncio.sleep(min(wait_seconds,30))
+        return True
+
+    if isinstance(exc, TelegramNetworkError):
+        logging.warning("Telegram network error: %s", exc)
+        return True
+
+
+    update_id=int(getattr(update,"update_id",0) or 0)
+    callback=getattr(update,"callback_query",None)
+    message=getattr(update,"message",None)
+
+    event_type="unknown"
+    callback_data=""
+    user_id=0
+    reference=""
+    state_name=""
+
+    if callback:
+        event_type="callback_query"
+        callback_data=str(callback.data or "")
+        user_id=int(callback.from_user.id or 0)
+        reference=f"callback:{callback_data or '-'}"
+    elif message:
+        event_type="message"
+        user_id=int(message.from_user.id or 0)
+        msg_text=str(message.text or "")
+        reference=f"message:{msg_text[:80]}" if msg_text else "message"
+
+    logging.exception(
+        "Unhandled bot error update_id=%s event=%s user=%s callback=%r: %s",
+        update_id,event_type,user_id,callback_data,exc
+    )
 
     try:
-        callback = getattr(update, "callback_query", None)
-        if callback:
-            reference = f"callback:{callback.data or '-'}"
-            try:
+        log_detailed_error(
+            "GLOBAL_HANDLER",
+            exc,
+            reference=reference,
+            update_id=update_id,
+            event_type=event_type,
+            callback_data=callback_data,
+            user_id=user_id,
+            state_name=state_name,
+            recovered=False
+        )
+    except Exception as log_exc:
+        logging.exception("Detailed error log failed: %s",log_exc)
+
+    bot=getattr(event,"bot",None)
+
+    if callback:
+        try:
+            if is_owner(user_id):
                 await callback.answer(
-                    (
-                        f"Error pada tombol: {callback.data}"
-                        if is_owner(callback.from_user.id)
-                        else "Terjadi gangguan sementara. Sistem mencoba recovery otomatis."
-                    ),
+                    f"{type(exc).__name__} • {callback_data or 'callback'}",
                     show_alert=True
                 )
-            except Exception:
-                pass
-    except Exception:
-        pass
+            else:
+                await callback.answer(
+                    "Terjadi gangguan sementara. Sistem mencoba recovery otomatis.",
+                    show_alert=True
+                )
+        except Exception:
+            pass
 
     if bot:
         try:
             await notify_owner_system_error(
                 bot,
                 "UNHANDLED",
-                str(exc),
+                f"{type(exc).__name__}: {exc}",
                 reference=reference,
                 recovered=False
             )
         except Exception:
             pass
 
-    if bot:
         try:
-            await auto_recovery_cycle(bot, source=reference or "unhandled")
+            await auto_recovery_cycle(bot,source=reference or f"update:{update_id}")
         except Exception:
             pass
 
@@ -12733,6 +13244,15 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
         f"• Duplicate paid event: <b>{payment['duplicate_paid_events']}</b>",
         "",
         f"• Auto Recovery: <b>{'ON' if get_setting('auto_recovery_enabled','1') == '1' else 'OFF'}</b>",
+        "• FSM Storage: <b>SQLite Persistent</b>",
+        "• Drop Pending Updates: <b>OFF</b>",
+        "• Event Isolation: <b>ON</b>",
+        "• Polling Concurrency Limit: <b>32</b>",
+        "• SQLite WAL: <b>ON</b>",
+        "• SQLite Busy Timeout: <b>10s</b>",
+        "• Allowed Updates: <b>message + callback_query</b>",
+        f"• Callback Terakhir: <code>{html.escape(LAST_CALLBACK_TRACE['data'] or '-')}</code>",
+        f"• Callback Status: <b>{html.escape(LAST_CALLBACK_TRACE['status'])}</b> • {int(LAST_CALLBACK_TRACE['elapsed_ms'])}ms",
         f"• Auto Repair Inventory: <b>{'ON' if get_setting('auto_repair_inventory','1') == '1' else 'OFF'}</b>",
         "",
         "🧪 <b>Self-Test</b>",
@@ -12754,6 +13274,24 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
     if notes:
         lines += ["", "⚠️ <b>Catatan</b>"]
         lines += [f"• {html.escape(str(note))}" for note in notes]
+
+    recent_errors=latest_error_diagnostics(5)
+    lines += ["", "🧾 <b>ERROR TERAKHIR</b>"]
+
+    if not recent_errors:
+        lines.append("✅ Belum ada error tercatat.")
+    else:
+        for row in recent_errors:
+            stamp=str(row["created_at"] or "-").replace("T"," ")[:19]
+            lines.append(
+                f"• <b>#{row['id']} {html.escape(row['exception_type'] or 'Exception')}</b> • "
+                f"{html.escape(stamp)}\n"
+                f"  Event: <code>{html.escape(row['event_type'] or '-')}</code>\n"
+                f"  Callback: <code>{html.escape((row['callback_data'] or '-')[:120])}</code>\n"
+                f"  State: <code>{html.escape((row['state_name'] or '-')[:120])}</code>\n"
+                f"  User: <code>{int(row['user_id'] or 0)}</code> • "
+                f"Update: <code>{int(row['update_id'] or 0)}</code>"
+            )
 
     await safe_edit_or_answer(
         call,
@@ -13121,6 +13659,207 @@ async def owner_auto_recovery_now(call: CallbackQuery, bot: Bot):
         await owner_system_error_view(call, "Auto Recovery", exc)
 
 
+@router.callback_query(F.data.startswith("ownerstock:"))
+async def owner_stock_product_pick(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        product_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Produk tidak valid.", show_alert=True)
+
+    conn=db()
+    product=conn.execute(
+        "SELECT id,name FROM products WHERE id=? AND active=1",
+        (product_id,)
+    ).fetchone()
+    conn.close()
+
+    if not product:
+        return await call.answer("Produk tidak ditemukan.", show_alert=True)
+
+    await safe_edit_or_answer(
+        call,
+        "📦 <b>ATUR STOK</b>\n\n"
+        f"Produk: <b>{html.escape(product['name'])}</b>\n\n"
+        "Pilih varian:",
+        reply_markup=owner_stock_variants_keyboard(product_id),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstockvar:"))
+async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.", show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT v.id,v.name,v.stock,v.reserved_stock,p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Varian tidak ditemukan.", show_alert=True)
+
+    available=max(0,int(row["stock"] or 0)-int(row["reserved_stock"] or 0))
+
+    await state.update_data(stock_variant_id=variant_id)
+
+    await safe_edit_or_answer(
+        call,
+        "📦 <b>ATUR STOK</b>\n\n"
+        f"Produk: <b>{html.escape(row['product_name'])}</b>\n"
+        f"Varian: <b>{html.escape(row['name'])}</b>\n"
+        f"Stok tersedia: <b>{available}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="➕ Tambah Akun",
+                callback_data=f"ownerstockadd:{variant_id}"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Kembali",
+                callback_data="owner:set_stock"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstockadd:"))
+async def owner_stock_add_begin(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.", show_alert=True)
+
+    await state.update_data(stock_variant_id=variant_id)
+    await state.set_state(OwnerState.stock_add_items)
+
+    await safe_edit_or_answer(
+        call,
+        "➕ <b>TAMBAH AKUN</b>\n\n"
+        "Kirim isi akun bebas format.\n"
+        "Satu pesan = satu akun = satu stok.\n\n"
+        "Boleh multi-baris dan tidak perlu tanda <code>|</code>.",
+        reply_markup=back_owner("owner:back_products"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerdelete:"))
+async def owner_delete_product_pick(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        product_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Produk tidak valid.", show_alert=True)
+
+    conn=db()
+    product=conn.execute(
+        "SELECT id,name FROM products WHERE id=? AND active=1",
+        (product_id,)
+    ).fetchone()
+    conn.close()
+
+    if not product:
+        return await call.answer("Produk tidak ditemukan.", show_alert=True)
+
+    await safe_edit_or_answer(
+        call,
+        "🗑️ <b>KONFIRMASI HAPUS PRODUK</b>\n\n"
+        f"Produk: <b>{html.escape(product['name'])}</b>\n\n"
+        "Produk akan disembunyikan dari toko. Riwayat transaksi lama tetap aman.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="✅ Ya, Hapus",
+                callback_data=f"ownerdeleteconfirm:{product_id}"
+            )],
+            [InlineKeyboardButton(
+                text="❌ Batal",
+                callback_data="owner:delete_product"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerdeleteconfirm:"))
+async def owner_delete_product_confirm(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        product_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Produk tidak valid.", show_alert=True)
+
+    try:
+        conn=db()
+        conn.execute("BEGIN IMMEDIATE")
+
+        product=conn.execute(
+            "SELECT id,name FROM products WHERE id=? AND active=1",
+            (product_id,)
+        ).fetchone()
+
+        if not product:
+            conn.rollback()
+            conn.close()
+            return await call.answer("Produk sudah tidak aktif.", show_alert=True)
+
+        active_paid=conn.execute(
+            """SELECT COUNT(*) AS n FROM orders
+               WHERE product_id=?
+                 AND payment_status='paid'
+                 AND status NOT IN ('completed','cancelled')""",
+            (product_id,)
+        ).fetchone()["n"]
+
+        if int(active_paid or 0)>0:
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                "Masih ada order paid yang belum selesai.",
+                show_alert=True
+            )
+
+        conn.execute("UPDATE products SET active=0 WHERE id=?",(product_id,))
+        conn.execute("UPDATE product_variants SET active=0 WHERE product_id=?",(product_id,))
+        conn.commit()
+        conn.close()
+
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>PRODUK DIHAPUS</b>\n\n"
+            f"<b>{html.escape(product['name'])}</b> sudah disembunyikan dari toko.",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call, "Hapus Produk", exc)
+
+
 @router.callback_query()
 async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
     """
@@ -13181,8 +13920,148 @@ async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
 
 
 @router.message(F.text)
+async def persistent_owner_price_recovery(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    session=get_owner_input_session(message.from_user.id)
+    if not session:
+        return
+
+    flow=session["flow"]
+    payload=session["payload"]
+
+    if flow not in {"product_custom_price","variant_custom_price"}:
+        return
+
+    price=parse_rupiah_input(message.text or "")
+    if not price:
+        return await message.answer(
+            "❌ <b>HARGA TIDAK VALID</b>\n\n"
+            "Kirim nominal seperti <code>2500</code>, <code>2.500</code>, "
+            "<code>12.750</code>, atau <code>Rp18.750</code>.",
+            parse_mode="HTML"
+        )
+
+    if price > 1_000_000_000:
+        return await message.answer(
+            "❌ Harga terlalu besar. Maksimal Rp1.000.000.000."
+        )
+
+    try:
+        if flow=="product_custom_price":
+            # Rebuild FSM data from persistent session, then use the normal creator.
+            await state.update_data(
+                product_name=payload.get("product_name",""),
+                product_description=payload.get("product_description",""),
+                product_variant_name=payload.get("product_variant_name",""),
+            )
+            result=await create_product_from_wizard(
+                state,
+                message.from_user.id,
+                price
+            )
+
+            if not result:
+                clear_owner_input_session(message.from_user.id)
+                await state.clear()
+                return await message.answer(
+                    "❌ Data produk tidak lengkap. Silakan ulangi Tambah Produk.",
+                    reply_markup=owner_products_menu()
+                )
+
+            product_id,_,name,variant_name,price=result
+            clear_owner_input_session(message.from_user.id)
+
+            return await message.answer(
+                "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
+                f"📦 {html.escape(name)}\n"
+                f"🧩 {html.escape(variant_name)}\n"
+                f"💰 {rupiah(price)}\n"
+                "📊 Stok awal: <b>0</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="➕ Tambah Variasi Lagi",
+                        callback_data=f"addvariantprod:{product_id}"
+                    )],
+                    [InlineKeyboardButton(
+                        text="📦 Atur Stok",
+                        callback_data="owner:set_stock"
+                    )],
+                    [InlineKeyboardButton(
+                        text="⬅️ Produk & Stok",
+                        callback_data="owner:back_products"
+                    )]
+                ]),
+                parse_mode="HTML"
+            )
+
+        if flow=="variant_custom_price":
+            await state.update_data(
+                add_variant_product_id=int(payload.get("add_variant_product_id") or 0),
+                add_variant_name=payload.get("add_variant_name",""),
+            )
+            result=await create_variant_from_wizard(state,price)
+
+            if result=="duplicate":
+                clear_owner_input_session(message.from_user.id)
+                await state.clear()
+                return await message.answer(
+                    "❌ Variasi dengan nama yang sama sudah ada.",
+                    reply_markup=owner_products_menu()
+                )
+
+            if not result:
+                clear_owner_input_session(message.from_user.id)
+                await state.clear()
+                return await message.answer(
+                    "❌ Data variasi tidak lengkap.",
+                    reply_markup=owner_products_menu()
+                )
+
+            clear_owner_input_session(message.from_user.id)
+
+            return await message.answer(
+                "✅ <b>VARIASI BERHASIL DITAMBAHKAN</b>\n\n"
+                f"📦 Produk: <b>{html.escape(result['product_name'])}</b>\n"
+                f"🧩 Variasi: <b>{html.escape(result['variant_name'])}</b>\n"
+                f"💰 Harga: <b>{rupiah(result['price'])}</b>\n"
+                "📊 Stok awal: <b>0</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="➕ Tambah Variasi Lagi",
+                        callback_data=f"addvariantprod:{result['product_id']}"
+                    )],
+                    [InlineKeyboardButton(
+                        text="📦 Atur Stok",
+                        callback_data="owner:set_stock"
+                    )],
+                    [InlineKeyboardButton(
+                        text="⬅️ Produk & Stok",
+                        callback_data="owner:back_products"
+                    )]
+                ]),
+                parse_mode="HTML"
+            )
+
+    except Exception as exc:
+        logging.exception("Persistent owner price recovery failed: %s", exc)
+        clear_owner_input_session(message.from_user.id)
+        await state.clear()
+        return await message.answer(
+            "❌ <b>GAGAL MEMPROSES HARGA</b>\n\n"
+            f"<code>{html.escape(str(exc)[:400])}</code>",
+            reply_markup=owner_products_menu(),
+            parse_mode="HTML"
+        )
+
+
+@router.message(F.text)
 async def owner_price_recovery(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
+        return
+
+    if get_owner_input_session(message.from_user.id):
         return
 
     current_state=await state.get_state()
@@ -13382,7 +14261,11 @@ async def main():
 
     init_db()
     bot = Bot(BOT_TOKEN)
-    dp = Dispatcher()
+    dp = Dispatcher(
+        storage=SQLiteFSMStorage(DB_PATH),
+        events_isolation=SimpleEventIsolation(),
+    )
+    dp.callback_query.outer_middleware(CallbackTraceMiddleware())
     dp.include_router(router)
 
     # Railway web endpoint for health check + payment callback.
@@ -13395,14 +14278,30 @@ async def main():
     operations_task = asyncio.create_task(periodic_operations_loop(bot))
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message","callback_query"],
+            polling_timeout=30,
+            handle_as_tasks=True,
+            tasks_concurrency_limit=32,
+            backoff_config=BackoffConfig(
+                min_delay=1.0,
+                max_delay=8.0,
+                factor=1.5,
+                jitter=0.2
+            ),
+        )
     finally:
         backup_task.cancel()
         cleanup_task.cancel()
         recovery_task.cancel()
         operations_task.cancel()
         await runner.cleanup()
+        try:
+            await dp.storage.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -1,19 +1,15 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v10.1  
+**Versi aktif:** v10.8  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Update Terbaru — v10.1 Auto Recovery Layer
-- Ditambahkan self-healing yang aman tanpa mengubah source code saat runtime.
-- Recovery otomatis paid order yang belum terkirim.
-- Auto repair inventory mismatch.
-- Reset top up `processing` yang nyangkut ke `pending`.
-- Bersihkan payment proof session stale.
-- SQLite integrity check setiap recovery cycle.
-- Jika recovery kritis gagal, bot otomatis mengaktifkan Safe Mode.
-- Error runtime mencoba auto recovery sebelum owner mengambil tindakan.
-- Auto recovery periodik setiap 10 menit.
-- Ditambahkan tombol `♻️ Auto Recovery` di menu Sistem owner.
+## Update Terbaru — v10.8 Button Reliability Pack
+- `allowed_updates` dipaksa eksplisit `message` + `callback_query`.
+- Semua callback handler diaudit agar memiliki acknowledgement.
+- Memperbaiki 3 handler user yang sebelumnya tidak ACK: Produk, Populer, Flash.
+- Callback Trace Middleware mencatat callback terakhir, status handled/error, user, dan latency.
+- Diagnostik Sistem dapat membedakan callback tidak sampai ke bot vs callback masuk lalu handler error.
+- Event Isolation, persistent FSM, WAL, backoff, concurrency limit tetap aktif.
 - Tidak ada Railway Variable baru.
 
 ## Command
