@@ -1,13 +1,15 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v13.9  
+**Versi aktif:** v14.2  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Update v13.9 — Repair Semua Menu Hapus Data
-- Memperbaiki error `Jenis data tidak valid` pada konfirmasi cleanup.
-- Semua 11 tombol Hapus Data sekarang memakai daftar jenis yang sama dari preview sampai eksekusi.
-- Hasil pembersihan ditampilkan sesuai jenis data yang dipilih.
-- `Bersihkan Data Aman` tidak menghapus session bukti yang masih aktif.
+## Update Terbaru — v14.2 Kode Unik Rp200–Rp500
+- Kode unik pembayaran sekarang selalu berada di rentang `+Rp200` sampai `+Rp500`.
+- Kode tidak pernah di bawah Rp200 dan tidak pernah lebih dari Rp500.
+- Setelah mencapai 500, sistem berputar kembali ke 200.
+- Kode yang sedang dipakai transaksi aktif tidak akan dipakai ulang.
+- Setting lama otomatis dimigrasikan ke `min=200` dan `max=500`.
+- Berlaku untuk order dan top up.
 - Tidak ada Railway Variable baru.
 
 ## File Project

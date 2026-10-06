@@ -1074,3 +1074,22 @@ Indikator warna stok dihapus. List Produk tetap menampilkan jumlah stok per prod
 ## v13.9 — Repair Semua Menu Hapus Data
 - Semua preview/confirm cleanup disinkronkan.
 - Tidak ada Railway Variable baru.
+
+
+## v14.0 — Owner Free Claim
+- Menambahkan pengambilan stok owner tanpa saldo untuk pembeli di luar bot.
+- Metode order: `OWNER_FREE`, payment_total Rp0.
+- Menggunakan fulfillment/recovery order yang sama dengan pembelian normal.
+- Tidak ada Railway Variable baru.
+
+
+## v14.1 — Kode Unik Maksimal Rp500
+- Rentang kode unik dikunci ke 1–500.
+- Setting lama otomatis dimigrasikan ke maksimum 500.
+- Tidak ada Railway Variable baru.
+
+
+## v14.2 — Kode Unik Rp200–Rp500
+- unique_code_min otomatis menjadi 200.
+- unique_code_max tetap 500.
+- Tidak ada Railway Variable baru.
