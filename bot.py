@@ -16,6 +16,7 @@ import asyncio
 import ast
 import shutil
 import tempfile
+import zipfile
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -89,7 +90,17 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "12.3"
+BOT_VERSION = "13.2"
+
+CHECKOUT_TERMS_SHORT = (
+    "📜 <b>Syarat Singkat</b>\n"
+    "👥 Sharing: jangan ubah data akun, logout perangkat lain, atau membagikan akun.\n"
+    "🔐 Private: perubahan data hanya jika diizinkan.\n"
+    "🛡️ Garansi berlaku jika kendala bukan karena kesalahan pembeli.\n"
+    "<i>Dengan melanjutkan pembayaran, Anda menyetujui ketentuan Maboyy Digital.</i>"
+)
+
+
 
 RAILWAY_DEPLOYMENT_ID = os.getenv("RAILWAY_DEPLOYMENT_ID","").strip()
 RAILWAY_REPLICA_ID = os.getenv("RAILWAY_REPLICA_ID","").strip()
@@ -341,7 +352,8 @@ def init_db():
             stock INTEGER NOT NULL DEFAULT 0,
             wholesale10 INTEGER NOT NULL DEFAULT 0,
             wholesale20 INTEGER NOT NULL DEFAULT 0,
-            active INTEGER NOT NULL DEFAULT 1
+            active INTEGER NOT NULL DEFAULT 1,
+            sharing_mode INTEGER NOT NULL DEFAULT 0
         )
     """)
 
@@ -463,9 +475,11 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             order_id INTEGER NOT NULL UNIQUE,
             user_id INTEGER NOT NULL,
-            product_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL DEFAULT 0,
             rating INTEGER NOT NULL,
             comment TEXT DEFAULT '',
+            product_name_snapshot TEXT DEFAULT '',
+            variant_name_snapshot TEXT DEFAULT '',
             created_at TEXT NOT NULL
         )
     """)
@@ -666,6 +680,7 @@ def init_db():
     add_column_if_missing(conn, "products", "is_flash_sale", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "product_variants", "reserved_stock", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "product_variants", "button_label", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "product_variants", "sharing_mode", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "variant_id", "INTEGER DEFAULT 0")
     add_column_if_missing(conn, "orders", "unit_price", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "payment_method", "TEXT DEFAULT 'QRIS'")
@@ -724,6 +739,8 @@ def init_db():
     add_column_if_missing(conn, "orders", "invoice_sent", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "delivery_footer_sent", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "payment_review_status", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "reviews", "product_name_snapshot", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "reviews", "variant_name_snapshot", "TEXT DEFAULT ''")
 
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_inventory_variant_status "
@@ -815,6 +832,43 @@ def init_db():
                    VALUES(?,?,?,?,?,?,?)""",
                 (p["id"], "Standard", f"P{p['id']}", p["price"], p["stock"], 0, 0)
             )
+
+    # Existing duplicated credentials are sharing stock.
+    # Reviews are store-level. Product/variant names are only immutable transaction snapshots.
+    cur.execute(
+        """UPDATE reviews
+           SET product_name_snapshot=COALESCE(
+                   NULLIF(product_name_snapshot,''),
+                   (
+                       SELECT p.name
+                       FROM orders o
+                       LEFT JOIN products p ON p.id=o.product_id
+                       WHERE o.id=reviews.order_id
+                   ),
+                   ''
+               ),
+               variant_name_snapshot=COALESCE(
+                   NULLIF(variant_name_snapshot,''),
+                   (
+                       SELECT v.name
+                       FROM orders o
+                       LEFT JOIN product_variants v ON v.id=o.variant_id
+                       WHERE o.id=reviews.order_id
+                   ),
+                   ''
+               )"""
+    )
+
+    cur.execute(
+        """UPDATE product_variants
+           SET sharing_mode=1
+           WHERE id IN (
+               SELECT variant_id
+               FROM inventory_items
+               GROUP BY variant_id, content
+               HAVING COUNT(*) > 1
+           )"""
+    )
 
     reconcile_all_inventory_stock(conn)
     conn.commit()
@@ -1330,6 +1384,7 @@ async def force_refresh_user_keyboard(message: Message):
 async def show_main_menu_message(message: Message):
     await message.answer(
         f"🛍️ <b>{STORE_NAME}</b>\n\n"
+        f"{store_rating_text()}\n\n"
         "Selamat datang.\n"
         "Gunakan tombol menu atau nomor produk di bawah untuk akses cepat.\n\n"
         f"<i>{STORE_FOOTER}</i>",
@@ -1678,6 +1733,184 @@ async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_
 
 
 
+
+def rating_keyboard(order_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⭐ 1", callback_data=f"rate:{order_id}:1"),
+            InlineKeyboardButton(text="⭐⭐ 2", callback_data=f"rate:{order_id}:2"),
+            InlineKeyboardButton(text="⭐⭐⭐ 3", callback_data=f"rate:{order_id}:3"),
+        ],
+        [
+            InlineKeyboardButton(text="⭐⭐⭐⭐ 4", callback_data=f"rate:{order_id}:4"),
+            InlineKeyboardButton(text="⭐⭐⭐⭐⭐ 5", callback_data=f"rate:{order_id}:5"),
+        ],
+        [
+            InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")
+        ]
+    ])
+
+
+def review_after_rating_keyboard(order_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="💬 Tulis Ulasan",
+                callback_data=f"reviewcomment:{order_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⏭️ Lewati",
+                callback_data=f"reviewskip:{order_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")
+        ]
+    ])
+
+
+def review_done_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
+        [InlineKeyboardButton(text="🏠 Menu Utama", callback_data="home")]
+    ])
+
+
+def store_rating_summary(conn=None):
+    own_conn=conn is None
+    if own_conn:
+        conn=db()
+    try:
+        row=conn.execute(
+            """SELECT COUNT(*) AS n,
+                      COALESCE(AVG(rating),0) AS avg_rating,
+                      SUM(CASE WHEN rating=5 THEN 1 ELSE 0 END) AS five_star,
+                      SUM(CASE WHEN COALESCE(comment,'')!='' THEN 1 ELSE 0 END) AS with_comment
+               FROM reviews"""
+        ).fetchone()
+        return {
+            "count": int(row["n"] or 0),
+            "average": float(row["avg_rating"] or 0),
+            "five_star": int(row["five_star"] or 0),
+            "with_comment": int(row["with_comment"] or 0),
+        }
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def store_rating_text() -> str:
+    summary=store_rating_summary()
+    if summary["count"] <= 0:
+        return "⭐ Rating Toko: <b>Belum ada penilaian</b>"
+    return (
+        f"⭐ Rating Toko: <b>{summary['average']:.1f}/5</b> "
+        f"({summary['count']} penilaian)"
+    )
+
+
+def review_order_snapshot(order_id: int, user_id: int | None = None):
+    conn=db()
+    try:
+        sql=(
+            """SELECT o.*,p.name AS product_name,v.name AS variant_name,
+                      EXISTS(
+                          SELECT 1 FROM reviews r WHERE r.order_id=o.id
+                      ) AS reviewed
+               FROM orders o
+               LEFT JOIN products p ON p.id=o.product_id
+               LEFT JOIN product_variants v ON v.id=o.variant_id
+               WHERE o.id=?"""
+        )
+        params=[int(order_id)]
+        if user_id is not None:
+            sql += " AND o.user_id=?"
+            params.append(int(user_id))
+        return conn.execute(sql,tuple(params)).fetchone()
+    finally:
+        conn.close()
+
+
+def review_prompt_text(order):
+    return (
+        "⭐ <b>NILAI MABOYY DIGITAL</b>\n\n"
+        f"🧾 {invoice(order['id'])}\n"
+        f"📦 Transaksi: {html.escape(order['product_name'] or 'Produk Digital')} — "
+        f"{html.escape(order['variant_name'] or 'Standard')}\n\n"
+        "Bagaimana pengalaman belanja Anda di Maboyy Digital?\n"
+        "Rating ini untuk <b>toko</b>, bukan untuk produk."
+    )
+
+
+async def send_review_prompt_if_needed(bot: Bot, order_id: int) -> bool:
+    """
+    Cosmetic post-fulfillment step.
+    Never controls fulfillment success.
+    Prompt is sent only for a completed + delivered order and only once.
+    """
+    conn=db()
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,v.name AS variant_name,
+                  EXISTS(
+                      SELECT 1 FROM reviews r WHERE r.order_id=o.id
+                  ) AS reviewed
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=?""",
+        (int(order_id),)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return False
+
+    if row["status"]!="completed" or row["fulfillment_status"]!="delivered":
+        return False
+
+    if int(row["reviewed"] or 0)==1:
+        if int(row["review_prompt_sent"] or 0)==0:
+            conn=db()
+            conn.execute(
+                "UPDATE orders SET review_prompt_sent=1 WHERE id=?",
+                (int(order_id),)
+            )
+            conn.commit()
+            conn.close()
+        return True
+
+    if int(row["review_prompt_sent"] or 0)==1:
+        return True
+
+    try:
+        await bot.send_message(
+            int(row["user_id"]),
+            review_prompt_text(row),
+            reply_markup=rating_keyboard(int(order_id)),
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        logging.warning(
+            "Review prompt gagal dikirim order=%s: %s",
+            order_id,
+            exc
+        )
+        return False
+
+    conn=db()
+    conn.execute(
+        """UPDATE orders
+           SET review_prompt_sent=1
+           WHERE id=? AND review_prompt_sent=0""",
+        (int(order_id),)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
 async def fulfill_order(order_id: int, bot: Bot) -> bool:
     """
     Safe fulfillment:
@@ -1700,6 +1933,10 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
     if order["fulfillment_status"] == "delivered":
         conn.rollback()
         conn.close()
+        try:
+            await send_review_prompt_if_needed(bot,order_id)
+        except Exception:
+            logging.exception("Review prompt recovery failed order=%s",order_id)
         return True
 
     if order["payment_status"] != "paid":
@@ -1882,6 +2119,13 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
 
     conn.commit()
     conn.close()
+
+    # Rating/review is best-effort and cannot roll back a successful delivery.
+    try:
+        await send_review_prompt_if_needed(bot,order_id)
+    except Exception:
+        logging.exception("Post-delivery review prompt failed order=%s",order_id)
+
     return True
 
 
@@ -4839,6 +5083,77 @@ def create_database_backup() -> Path:
     return backup_path
 
 
+PROJECT_BACKUP_FILES = (
+    "main.py",
+    "bot.py",
+    "requirements.txt",
+    ".env.example",
+    "README.md",
+    "VARIABLE_RAILWAY.md",
+)
+
+
+def create_project_backup() -> tuple[Path, Path]:
+    """
+    Create a flat ZIP containing the deployed project source files plus
+    a consistent SQLite snapshot. Real .env/secrets are intentionally excluded.
+    Returns (zip_path, database_snapshot_path).
+    """
+    project_root=Path(__file__).resolve().parent
+    missing=[
+        name for name in PROJECT_BACKUP_FILES
+        if not (project_root / name).is_file()
+    ]
+    if missing:
+        raise RuntimeError(
+            "File project tidak lengkap: " + ", ".join(missing)
+        )
+
+    db_snapshot=create_database_backup()
+    if not db_snapshot.exists():
+        raise RuntimeError("Snapshot database gagal dibuat.")
+
+    backup_dir=Path(BACKUP_DIR)
+    backup_dir.mkdir(parents=True,exist_ok=True)
+
+    stamp=datetime.now(JAKARTA_TZ).strftime("%Y%m%d_%H%M%S")
+    zip_path=backup_dir / f"MaboyyDigital_Project_v{BOT_VERSION}_{stamp}.zip"
+
+    try:
+        with zipfile.ZipFile(
+            zip_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            for name in PROJECT_BACKUP_FILES:
+                archive.write(project_root / name,arcname=name)
+
+            # Keep the project backup flat and give the database a stable name.
+            archive.write(db_snapshot,arcname="shop.db")
+    except Exception:
+        try:
+            zip_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+    # Keep manual project backup retention bounded, separate from DB backups.
+    project_backups=sorted(
+        backup_dir.glob("MaboyyDigital_Project_v*.zip"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    for old_file in project_backups[BACKUP_RETENTION:]:
+        try:
+            old_file.unlink()
+        except Exception:
+            pass
+
+    return zip_path,db_snapshot
+
+
+
+
 async def send_backup(bot: Bot, backup_path: Path):
     # Backup hanya dikirim ke PM owner berdasarkan ADMIN_ID.
     if not ADMIN_ID:
@@ -5161,6 +5476,68 @@ async def shopeepay_generate_qr(order_id: int, amount: int):
             }
 
 
+
+def payment_confirmation_snapshot(order_id: int):
+    conn=db()
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=?""",
+        (int(order_id),)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def payment_confirmation_text(order_id: int):
+    row=payment_confirmation_snapshot(order_id)
+    if not row:
+        return "⚠️ Order tidak ditemukan setelah konfirmasi."
+
+    delivered = (
+        row["payment_status"]=="paid"
+        and row["fulfillment_status"]=="delivered"
+        and row["status"]=="completed"
+    )
+
+    delivery_label = (
+        "✅ <b>DELIVERED / SELESAI</b>"
+        if delivered
+        else "⏳ <b>PAID • MENUNGGU PENGIRIMAN AKUN</b>"
+    )
+
+    return (
+        "✅ <b>PEMBAYARAN SUDAH DIKONFIRMASI</b>\n\n"
+        f"🧾 {invoice(row['id'])}\n"
+        f"👤 <code>{int(row['user_id'])}</code>\n"
+        f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
+        f"{html.escape(row['variant_name'] or 'Standard')}\n"
+        f"💰 {rupiah(row['payment_total'] or row['total'])}\n"
+        f"💳 Payment: <b>PAID</b>\n"
+        f"📨 Fulfillment: {delivery_label}\n\n"
+        "Order sudah masuk ke <b>✅ History Sukses</b>."
+    )
+
+
+def owner_payment_success_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ History Sukses",
+            callback_data="owner:success_history"
+        )],
+        [InlineKeyboardButton(
+            text="⏳ Order Pending",
+            callback_data="owner:pending_orders"
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ Order & Pembayaran",
+            callback_data="owner:menu_orders"
+        )],
+    ])
+
+
 async def mark_order_paid(
     order_id: int,
     bot: Bot,
@@ -5237,6 +5614,10 @@ class CheckoutState(StatesGroup):
     waiting_payment_proof = State()
 
 
+class ReviewState(StatesGroup):
+    waiting_comment = State()
+
+
 class ShopToolsState(StatesGroup):
     search_product = State()
 
@@ -5261,6 +5642,8 @@ class OwnerState(StatesGroup):
     add_variant_price = State()
     add_variant_name = State()
     stock_add_items = State()
+    stock_duplicate_count = State()
+    stock_duplicate_content = State()
     set_price = State()
     mark_popular = State()
     mark_flash = State()
@@ -5563,6 +5946,43 @@ def owner_stock_variants_keyboard(product_id: int):
     kb.adjust(1)
     return kb.as_markup()
 
+
+def owner_stock_duplicate_qty_keyboard(variant_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="2x",callback_data=f"ownerstockdupqty:{variant_id}:2"),
+            InlineKeyboardButton(text="5x",callback_data=f"ownerstockdupqty:{variant_id}:5"),
+            InlineKeyboardButton(text="10x",callback_data=f"ownerstockdupqty:{variant_id}:10"),
+        ],
+        [
+            InlineKeyboardButton(text="20x",callback_data=f"ownerstockdupqty:{variant_id}:20"),
+            InlineKeyboardButton(text="50x",callback_data=f"ownerstockdupqty:{variant_id}:50"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Custom",callback_data=f"ownerstockdupcustom:{variant_id}")
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Kembali",callback_data=f"ownerstockvar:{variant_id}")
+        ]
+    ])
+
+
+def duplicate_inventory_items(conn, variant_id: int, content: str, qty: int):
+    qty=int(qty)
+    if qty < 2 or qty > 500:
+        raise ValueError("Jumlah duplikat harus 2 sampai 500.")
+
+    now=datetime.now().isoformat(timespec="seconds")
+    conn.executemany(
+        """INSERT INTO inventory_items
+           (variant_id, content, status, created_at)
+           VALUES(?,?,'available',?)""",
+        [(int(variant_id),content,now) for _ in range(qty)]
+    )
+    sync_variant_stock_from_inventory(conn,int(variant_id))
+    return qty
+
+
 def owner_stock_variant_actions(variant_id: int):
     conn=db()
     row=conn.execute(
@@ -5621,6 +6041,7 @@ def owner_products_menu():
 def owner_orders_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🧾 Pesanan", callback_data="owner:orders")
+    kb.button(text="✅ History Sukses", callback_data="owner:success_history")
     kb.button(text="🔎 Cari Order/User", callback_data="owner:search_orders")
     kb.button(text="⏳ Order Pending", callback_data="owner:pending_orders")
     kb.button(text="✅ Verifikasi Pembayaran", callback_data="owner:verify_payments")
@@ -5641,7 +6062,7 @@ def owner_customers_menu():
     kb.button(text="📣 Broadcast", callback_data="owner:broadcast")
     kb.button(text="👥 Segmentasi", callback_data="owner:segments")
     kb.button(text="🎯 Promo Otomatis", callback_data="owner:auto_promo")
-    kb.button(text="⭐ Ulasan", callback_data="owner:reviews")
+    kb.button(text="⭐ Rating Toko & Ulasan", callback_data="owner:reviews")
     kb.button(text="🛡️ Anti-Fraud", callback_data="owner:security")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
     kb.adjust(2, 2, 2, 1)
@@ -5685,14 +6106,19 @@ def validate_system_schema():
     required = {
         "orders": {
             "id","user_id","status","payment_status","fulfillment_status",
-            "variant_id","qty","stock_reserved","reserved_until","created_at"
+            "variant_id","qty","stock_reserved","reserved_until","created_at",
+            "review_prompt_sent"
         },
         "topups": {"id","user_id","status","expires_at","created_at"},
-        "product_variants": {"id","stock","reserved_stock","active"},
+        "product_variants": {"id","stock","reserved_stock","active","sharing_mode"},
         "inventory_items": {"id","variant_id","status","order_id"},
         "settings": {"key","value"},
         "system_errors": {"id","error_text","created_at"},
         "payment_proof_sessions": {"user_id","entity_type","entity_id"},
+        "reviews": {
+            "id","order_id","user_id","product_id","rating","comment",
+            "product_name_snapshot","variant_name_snapshot","created_at"
+        },
     }
 
     conn=db()
@@ -6443,7 +6869,8 @@ def owner_system_menu():
     kb.button(text="🧹 Repair Inventory", callback_data="owner:repair_inventory")
     kb.button(text="♻️ Auto Recovery", callback_data="owner:auto_recovery_now")
     kb.button(text="🔧 Maintenance", callback_data="owner:maintenance")
-    kb.button(text="🗄️ Backup Sekarang", callback_data="owner:backup_now")
+    kb.button(text="🗄️ Backup Database", callback_data="owner:backup_now")
+    kb.button(text="📦 Backup Project", callback_data="owner:backup_project")
     kb.button(text="📢 Sinkron Stok Channel", callback_data="owner:sync_stock")
     kb.button(text="📅 Laporan Harian", callback_data="owner:daily_report")
     kb.button(text="🗑️ Hapus Data", callback_data="owner:cleanup_data")
@@ -6627,6 +7054,16 @@ def variants_keyboard(product_id):
     return kb.as_markup()
 
 
+
+def variant_is_sharing(variant) -> bool:
+    if not variant:
+        return False
+    try:
+        return int(variant["sharing_mode"] or 0) == 1
+    except Exception:
+        return False
+
+
 def qty_keyboard(variant_id, qty):
     conn = db()
     variant = conn.execute(
@@ -6637,29 +7074,37 @@ def qty_keyboard(variant_id, qty):
 
     stock = available_stock(variant) if variant else 0
     stock = max(0, stock)
-    qty = max(1, min(qty, stock if stock > 0 else 1))
+    sharing = variant_is_sharing(variant)
+    qty = 1 if sharing else max(1, min(qty, stock if stock > 0 else 1))
 
     kb = InlineKeyboardBuilder()
 
-    # Pilih jumlah langsung dari menu angka.
-    quick_max = min(stock, 20)
-    for number in range(1, quick_max + 1):
-        prefix = "✅ " if number == qty else ""
-        kb.button(
-            text=f"{prefix}{number}",
-            callback_data=("noop" if number == qty else f"qty:{variant_id}:{number}")
-        )
-
-    if quick_max > 0:
-        kb.adjust(5)
-
-    if stock > 20:
-        kb.row(
-            InlineKeyboardButton(
-                text=f"📦 MAX {stock}",
-                callback_data=("noop" if qty == stock else f"qty:{variant_id}:{stock}")
+    if sharing:
+        if stock > 0:
+            kb.button(
+                text="✅ Qty 1 • Akun Sharing",
+                callback_data="noop"
             )
-        )
+            kb.adjust(1)
+    else:
+        quick_max = min(stock, 20)
+        for number in range(1, quick_max + 1):
+            prefix = "✅ " if number == qty else ""
+            kb.button(
+                text=f"{prefix}{number}",
+                callback_data=("noop" if number == qty else f"qty:{variant_id}:{number}")
+            )
+
+        if quick_max > 0:
+            kb.adjust(5)
+
+        if stock > 20:
+            kb.row(
+                InlineKeyboardButton(
+                    text=f"📦 MAX {stock}",
+                    callback_data=("noop" if qty == stock else f"qty:{variant_id}:{stock}")
+                )
+            )
 
     if stock > 0:
         kb.row(
@@ -6689,15 +7134,10 @@ def qty_keyboard(variant_id, qty):
 # RENDER HELPERS
 # =========================
 def product_card(product):
-    rating = (
-        f"{product['rating']:.1f}/5 ({product['rating_count']} ulasan)"
-        if product["rating_count"] > 0 else "Belum ada ulasan"
-    )
     return (
         "┌────────────────────\n"
         f"• Produk : <b>{product['name']}</b>\n"
         f"• Stok Terjual : <b>{product['sold']}</b>\n"
-        f"• Rating : <b>{rating}</b>\n"
         f"• Desk : {product['description'] or '-'}\n"
         "└────────────────────\n\n"
         f"<i>{STORE_FOOTER}</i>"
@@ -6705,19 +7145,31 @@ def product_card(product):
 
 
 def variant_card(product, variant, qty=1):
+    sharing = variant_is_sharing(variant)
+    qty = 1 if sharing else max(1, int(qty))
     unit = effective_unit_price(variant, qty)
     total = unit * qty
+
     grossir = []
-    if variant["wholesale10"] > 0:
+    if not sharing and variant["wholesale10"] > 0:
         grossir.append(f"• Min 10 : {rupiah(variant['wholesale10'])}")
-    if variant["wholesale20"] > 0:
+    if not sharing and variant["wholesale20"] > 0:
         grossir.append(f"• Min 20 : {rupiah(variant['wholesale20'])}")
-    grossir_text = "\n".join(grossir) if grossir else "• Belum ada harga grosir"
+
+    if sharing:
+        grossir_text = "• Tidak berlaku untuk akun sharing"
+    else:
+        grossir_text = "\n".join(grossir) if grossir else "• Belum ada harga grosir"
+
+    account_type = "👥 Sharing" if sharing else "🔐 Private / Unique"
+    buy_limit = "Maks. Qty 1 / checkout" if sharing else "Sesuai stok tersedia"
 
     return (
         "┌────────────────────\n"
         f"• Produk : <b>{product['name']}</b>\n"
         f"• Variasi : <b>{variant['name']}</b>\n"
+        f"• Jenis Akun : <b>{account_type}</b>\n"
+        f"• Batas Beli : <b>{buy_limit}</b>\n"
         f"• Kode : <code>{variant['code'] or '-'}</code>\n"
         f"• Sisa Produk : <b>{available_stock(variant)}</b>\n"
         f"• Desk : {product['description'] or '-'}\n"
@@ -6883,7 +7335,7 @@ async def cart_add(call: CallbackQuery):
         conn.close()
         return await call.answer("Variasi tidak tersedia.", show_alert=True)
 
-    qty = min(qty, max(1, available_stock(variant)))
+    qty = 1 if variant_is_sharing(variant) else min(qty, max(1, available_stock(variant)))
     conn.execute(
         """INSERT INTO cart_items(user_id,variant_id,qty,created_at)
            VALUES(?,?,?,?)
@@ -7010,7 +7462,7 @@ async def cart_checkout_wallet(call: CallbackQuery, bot: Bot):
             """SELECT c.id AS cart_id, c.user_id, c.variant_id, c.qty, c.created_at AS cart_created_at,
                   v.id AS vid, v.product_id, v.name AS variant_name, v.code, v.price,
                   v.stock, v.wholesale10, v.wholesale20, v.active, v.reserved_stock,
-                  v.button_label, p.id AS pid, p.name AS product_name,
+                  v.button_label, v.sharing_mode, p.id AS pid, p.name AS product_name,
                   p.active AS product_active
                FROM cart_items c
                JOIN product_variants v ON v.id=c.variant_id
@@ -7027,7 +7479,7 @@ async def cart_checkout_wallet(call: CallbackQuery, bot: Bot):
         total_all=0
         prepared=[]
         for row in rows:
-            qty=max(1,int(row["qty"]))
+            qty=1 if variant_is_sharing(row) else max(1,int(row["qty"]))
             if available_stock(row) < qty:
                 conn.rollback(); conn.close()
                 return await call.answer(
@@ -7121,18 +7573,19 @@ async def repeat_last_order(call: CallbackQuery):
         return await call.answer("Belum ada order selesai untuk dibeli lagi.",show_alert=True)
     variant=conn.execute("SELECT * FROM product_variants WHERE id=? AND active=1",(row["variant_id"],)).fetchone()
     conn.close()
-    if not variant or available_stock(variant) < int(row["qty"]):
+    repeat_qty = 1 if variant_is_sharing(variant) else int(row["qty"])
+    if not variant or available_stock(variant) < repeat_qty:
         return await call.answer("Produk terakhir sedang tidak tersedia.",show_alert=True)
 
     await safe_edit_or_answer(call, 
         "🔁 <b>BELI LAGI</b>\n\n"
         f"Invoice sebelumnya: <b>{invoice(row['id'])}</b>\n"
-        f"Qty: <b>{row['qty']}</b>\n\n"
+        f"Qty: <b>{repeat_qty}</b>\n\n"
         "Lanjut menggunakan alur order biasa:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
                 text="🛒 Lanjut",
-                callback_data=f"confirm:{row['variant_id']}:{row['qty']}"
+                callback_data=f"confirm:{row['variant_id']}:{repeat_qty}"
             )],
             [InlineKeyboardButton(text="⬅️ Kembali",callback_data="shop:cart")]
         ]),
@@ -7568,22 +8021,39 @@ async def ping_command(message: Message):
         return await message.answer("⛔ Command /ping khusus owner.")
 
     fp=deployment_fingerprint()
-    re_ok=False
+
+    parser_ok=False
+    db_ok=False
+
     try:
-        re_ok=parse_rupiah_input("Rp2.500")==2500
+        parser_ok=parse_rupiah_input("Rp2.500")==2500
     except Exception:
-        re_ok=False
+        parser_ok=False
+
+    try:
+        conn=db()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        db_ok=True
+    except Exception:
+        db_ok=False
+
+    system_ok=parser_ok and db_ok
+    deployment=str(fp["deployment_id"] or "-")
+    if deployment!="-" and len(deployment)>12:
+        deployment=deployment[-12:]
+
+    now_jakarta=datetime.now(JAKARTA_TZ)
+    date_text=now_jakarta.strftime("%d/%m/%Y")
+    time_text=now_jakarta.strftime("%H:%M:%S WIB")
 
     await message.answer(
-        "🏓 <b>MABOYY DIGITAL STATUS</b>\n\n"
-        f"Versi aktif: <b>v{html.escape(BOT_VERSION)}</b>\n"
-        f"Deployment: <code>{html.escape(fp['deployment_id'])}</code>\n"
-        f"Replica: <code>{html.escape(fp['replica_id'])}</code>\n"
-        f"Commit: <code>{html.escape(fp['commit'])}</code>\n"
-        f"Environment: <b>{html.escape(fp['environment'])}</b>\n"
-        f"Parser harga/re: <b>{'OK' if re_ok else 'ERROR'}</b>\n"
-        f"Database: <code>{html.escape(DB_PATH)}</code>\n\n"
-        "Jika versi di sini bukan versi ZIP terbaru, Railway masih menjalankan deployment lama.",
+        "🏓 <b>MABOYY DIGITAL</b>\n"
+        f"{'✅ ONLINE' if system_ok else '⚠️ DEGRADED'} • <b>v{html.escape(BOT_VERSION)}</b>\n"
+        f"📅 {date_text} • 🕒 {time_text}\n"
+        f"🗄️ DB: <b>{'OK' if db_ok else 'ERROR'}</b>\n"
+        f"🚀 Deploy: <code>{html.escape(deployment)}</code> • "
+        f"<code>{html.escape(fp['commit'])}</code>",
         parse_mode="HTML"
     )
 
@@ -7808,7 +8278,6 @@ async def product_detail(call: CallbackQuery):
         "╭────────────────────╮\n"
         f"• <b>Produk:</b> {html.escape(product['name'])}\n"
         f"• <b>Terjual:</b> {sold}\n"
-        f"• ⭐ <b>Rating:</b> {float(product['rating'] or 0):.1f}/5 ({int(product['rating_count'] or 0)} ulasan)\n"
         f"• <b>Deskripsi:</b> {html.escape(product['description'] or '-')}\n"
         "╰────────────────────╯\n\n"
         "╭────────────────────╮\n"
@@ -7915,7 +8384,13 @@ async def change_qty(call: CallbackQuery):
         return await call.answer("Variasi tidak ditemukan.", show_alert=True)
 
     current_available = available_stock(variant)
-    if current_available > 0 and qty > current_available:
+    if variant_is_sharing(variant):
+        qty = 1
+        await call.answer(
+            "Akun sharing maksimal Qty 1 per checkout.",
+            show_alert=True
+        )
+    elif current_available > 0 and qty > current_available:
         qty = current_available
         await call.answer("Jumlah disesuaikan dengan stok tersedia.", show_alert=True)
     else:
@@ -8018,6 +8493,9 @@ async def confirm_order(call: CallbackQuery, state: FSMContext):
     if not variant or not product:
         return await call.answer("Produk tidak tersedia.", show_alert=True)
 
+    if variant_is_sharing(variant):
+        qty = 1
+
     if available_stock(variant) < qty:
         return await call.answer("Stok tidak mencukupi.", show_alert=True)
 
@@ -8034,6 +8512,7 @@ async def confirm_order(call: CallbackQuery, state: FSMContext):
         "🧾 <b>KONFIRMASI PESANAN</b>\n\n"
         f"📦 Produk: <b>{product['name']}</b>\n"
         f"🧩 Variasi: <b>{variant['name']}</b>\n"
+        f"👤 Jenis: <b>{'Sharing' if variant_is_sharing(variant) else 'Private / Unique'}</b>\n"
         f"🔢 Jumlah: <b>{qty}</b>\n"
         f"💰 Harga/unit: <b>{rupiah(unit)}</b>\n"
         f"💵 Total: <b>{rupiah(total)}</b>\n\n"
@@ -8098,6 +8577,7 @@ async def checkout_note_input(message: Message, state: FSMContext):
     await message.answer(
         "✅ <b>CATATAN DISIMPAN</b>\n\n"
         f"<blockquote>{html.escape(note)}</blockquote>\n\n"
+        f"{CHECKOUT_TERMS_SHORT}\n\n"
         "Silakan pilih metode pembayaran:",
         reply_markup=payment_method_keyboard(variant_id, qty),
         parse_mode="HTML"
@@ -8119,6 +8599,7 @@ async def checkout_note_skip(call: CallbackQuery, state: FSMContext):
     await safe_edit_or_answer(call, 
         "💳 <b>PILIH METODE PEMBAYARAN</b>\n\n"
         "Catatan pesanan dilewati.\n\n"
+        f"{CHECKOUT_TERMS_SHORT}\n\n"
         "Silakan pilih metode pembayaran:",
         reply_markup=payment_method_keyboard(variant_id, qty),
         parse_mode="HTML"
@@ -8215,6 +8696,14 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
             "SELECT * FROM products WHERE id=? AND active=1",
             (variant["product_id"],)
         ).fetchone() if variant else None
+
+        if variant and variant_is_sharing(variant) and qty != 1:
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                "Akun sharing maksimal Qty 1 per checkout.",
+                show_alert=True
+            )
 
         if not variant or not product or available_stock(variant) < qty:
             conn.rollback()
@@ -8470,6 +8959,14 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             (variant["product_id"],)
         ).fetchone() if variant else None
 
+        if variant and variant_is_sharing(variant) and qty != 1:
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                "Akun sharing maksimal Qty 1 per checkout.",
+                show_alert=True
+            )
+
         if not variant or not product or not product["active"] or available_stock(variant) < qty:
             conn.rollback()
             conn.close()
@@ -8653,6 +9150,14 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             (variant["product_id"],)
         ).fetchone() if variant else None
 
+        if variant and variant_is_sharing(variant) and qty != 1:
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                "Akun sharing maksimal Qty 1 per checkout.",
+                show_alert=True
+            )
+
         if not variant or not product or not product["active"] or available_stock(variant) < qty:
             conn.rollback()
             conn.close()
@@ -8752,6 +9257,7 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             "⚠️ Transfer harus sesuai total hingga kode unik.\n"
             f"📝 {payment_note}\n\n"
             "Setelah pembayaran, kirim bukti pembayaran melalui tombol di bawah.\n\n"
+            f"{CHECKOUT_TERMS_SHORT}\n\n"
             f"<i>{STORE_FOOTER}</i>"
         )
 
@@ -8856,6 +9362,14 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             "SELECT * FROM products WHERE id=?",
             (variant["product_id"],)
         ).fetchone() if variant else None
+
+        if variant and variant_is_sharing(variant) and qty != 1:
+            conn.rollback()
+            conn.close()
+            return await call.answer(
+                "Akun sharing maksimal Qty 1 per checkout.",
+                show_alert=True
+            )
 
         if not variant or not product or not product["active"] or available_stock(variant) < qty:
             conn.rollback()
@@ -8964,6 +9478,7 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             f"{note_text}"
             f"⏳ Stok direservasi <b>{ORDER_RESERVATION_MINUTES} menit</b>.\n\n"
             "Setelah pembayaran sukses dan callback tervalidasi, status order berubah otomatis.\n\n"
+            f"{CHECKOUT_TERMS_SHORT}\n\n"
             f"<i>{STORE_FOOTER}</i>"
         )
 
@@ -9004,7 +9519,10 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
 async def my_orders(call: CallbackQuery):
     conn = db()
     rows = conn.execute("""
-        SELECT o.*, p.name AS product_name, v.name AS variant_name
+        SELECT o.*, p.name AS product_name, v.name AS variant_name,
+               EXISTS(
+                   SELECT 1 FROM reviews r WHERE r.order_id=o.id
+               ) AS reviewed
         FROM orders o
         JOIN products p ON p.id=o.product_id
         LEFT JOIN product_variants v ON v.id=o.variant_id
@@ -9025,21 +9543,45 @@ async def my_orders(call: CallbackQuery):
                 "expired": "⌛",
                 "cancelled": "❌",
                 "payment_error": "⚠️",
+                "paid_pending_delivery": "💰",
             }
             icon = status_icons.get(row["status"], "🔵")
+            if row["payment_status"]=="paid" and row["fulfillment_status"]!="delivered":
+                display_status="Pembayaran Berhasil • Menunggu Akun"
+            elif row["status"]=="completed" and row["fulfillment_status"]=="delivered":
+                display_status="Sukses • Selesai"
+            else:
+                display_status=row["status"].replace("_"," ").title()
+
             lines.append(
                 f"{icon} <b>{invoice(row['id'])}</b>\n"
                 f"   {row['product_name']} — {row['variant_name'] or 'Standard'}\n"
                 f"   Qty {row['qty']} • {rupiah(row['total'])}\n"
-                f"   Status: {row['status'].title()}\n"
+                f"   Status: {display_status}\n"
             )
         lines.append(f"<i>{STORE_FOOTER}</i>")
         text = "\n".join(lines)
 
     kb = InlineKeyboardBuilder()
+
+    # Fallback review entry in case the automatic post-delivery prompt was missed.
+    pending_reviews=[
+        row for row in rows
+        if row["status"]=="completed"
+        and row["fulfillment_status"]=="delivered"
+        and int(row["reviewed"] or 0)==0
+    ] if rows else []
+
+    for row in pending_reviews[:3]:
+        kb.button(
+            text=f"⭐ Nilai {invoice(row['id'])}",
+            callback_data=f"reviewopen:{row['id']}"
+        )
+
     has_delivery = any((row["delivery_text"] or "").strip() for row in rows) if rows else False
     if has_delivery:
         kb.button(text="📩 Kirim Ulang Akun Terakhir", callback_data="resend:last")
+
     kb.button(text="⬅️ Menu Utama", callback_data="home")
     kb.adjust(1)
 
@@ -10574,7 +11116,7 @@ async def owner_backup_now(call: CallbackQuery, bot: Bot):
             ADMIN_ID,
             document=FSInputFile(str(backup_path)),
             caption=(
-                "🗄️ <b>BACKUP MANUAL MABOYY DIGITAL</b>\n\n"
+                "🗄️ <b>BACKUP DATABASE MABOYY DIGITAL</b>\n\n"
                 f"📦 Versi bot: <b>v{BOT_VERSION}</b>\n"
                 f"🕒 {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
             ),
@@ -10592,6 +11134,57 @@ async def owner_backup_now(call: CallbackQuery, bot: Bot):
     except Exception as exc:
         await owner_system_error_view(call, "Backup Sekarang", exc)
 
+
+
+
+@router.callback_query(F.data == "owner:backup_project")
+async def owner_backup_project(call: CallbackQuery,bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        if not ADMIN_ID:
+            raise RuntimeError("ADMIN_ID belum dikonfigurasi.")
+
+        zip_path,db_snapshot=create_project_backup()
+
+        if not zip_path.exists():
+            raise RuntimeError("ZIP backup project tidak berhasil dibuat.")
+
+        await bot.send_document(
+            ADMIN_ID,
+            document=FSInputFile(str(zip_path)),
+            caption=(
+                "📦 <b>BACKUP PROJECT MABOYY DIGITAL</b>\n\n"
+                f"🤖 Versi: <b>v{BOT_VERSION}</b>\n"
+                f"📅 {datetime.now(JAKARTA_TZ).strftime('%d/%m/%Y • %H:%M:%S WIB')}\n"
+                "📁 Isi ZIP: <b>6 file project + 1 database</b>\n"
+                "🔐 <code>.env</code> dan secret Railway tidak disertakan.\n\n"
+                "File project:\n"
+                "• main.py\n"
+                "• bot.py\n"
+                "• requirements.txt\n"
+                "• .env.example\n"
+                "• README.md\n"
+                "• VARIABLE_RAILWAY.md\n"
+                "• shop.db"
+            ),
+            parse_mode="HTML"
+        )
+
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>BACKUP PROJECT BERHASIL</b>\n\n"
+            "ZIP lengkap sudah dikirim ke PM owner.\n"
+            "Isi: <b>6 file project + snapshot database</b>.\n\n"
+            "🔐 Token, password, dan <code>.env</code> asli tidak dimasukkan.",
+            reply_markup=owner_system_menu(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+
+    except Exception as exc:
+        await owner_system_error_view(call,"Backup Project",exc)
 
 
 @router.callback_query(F.data == "owner:sync_stock")
@@ -11080,15 +11673,39 @@ async def owner_verify_payment_confirm(call: CallbackQuery, bot: Bot):
             show_alert=True
         )
 
-    if ok:
-        await call.answer("Pembayaran dikonfirmasi.",show_alert=True)
-    else:
-        await call.answer(
-            "Pembayaran dikonfirmasi, fulfillment masih pending.",
+    if not ok:
+        return await call.answer(
+            "Konfirmasi gagal. Status order tidak berubah.",
             show_alert=True
         )
 
-    await owner_verify_payments(call)
+    snapshot=payment_confirmation_snapshot(order_id)
+    delivered=bool(
+        snapshot
+        and snapshot["status"]=="completed"
+        and snapshot["fulfillment_status"]=="delivered"
+    )
+
+    await call.answer(
+        "✅ Pembayaran dikonfirmasi & order selesai."
+        if delivered
+        else "✅ Pembayaran dikonfirmasi. Akun masih menunggu fulfillment.",
+        show_alert=True
+    )
+
+    owner_audit(
+        call.from_user.id,
+        "payment_confirm",
+        "ok",
+        f"order_id={order_id}"
+    )
+
+    await safe_edit_or_answer(
+        call,
+        payment_confirmation_text(order_id),
+        reply_markup=owner_payment_success_keyboard(),
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data.startswith("verifypay:reject:"))
@@ -11191,6 +11808,69 @@ async def owner_verify_payment_pending(call: CallbackQuery, bot: Bot):
 
     await call.answer("Status pembayaran tetap pending.",show_alert=True)
     await owner_verify_payments(call)
+
+
+
+@router.callback_query(F.data == "owner:success_history")
+async def owner_success_history(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    conn=db()
+    rows=conn.execute(
+        """SELECT o.*,p.name AS product_name,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.payment_status='paid'
+           ORDER BY COALESCE(NULLIF(o.payment_verified_at,''),o.created_at) DESC,o.id DESC
+           LIMIT 30"""
+    ).fetchall()
+    conn.close()
+
+    lines=["✅ <b>HISTORY SUKSES PEMBAYARAN</b>",""]
+
+    if not rows:
+        lines.append("Belum ada pembayaran sukses.")
+    else:
+        for row in rows:
+            delivered=(
+                row["status"]=="completed"
+                and row["fulfillment_status"]=="delivered"
+            )
+            status_label="✅ DELIVERED" if delivered else "⏳ PAID • MENUNGGU AKUN"
+            verified_at=(
+                row["payment_verified_at"]
+                or row["completed_at"]
+                or row["created_at"]
+                or "-"
+            )
+
+            lines.append(
+                f"<b>{invoice(row['id'])}</b> • {status_label}\n"
+                f"👤 <code>{int(row['user_id'])}</code>\n"
+                f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
+                f"{html.escape(row['variant_name'] or 'Standard')}\n"
+                f"💰 {rupiah(row['payment_total'] or row['total'])}\n"
+                f"🕒 {html.escape(str(verified_at)[:19])}"
+            )
+
+    await safe_edit_or_answer(
+        call,
+        "\n\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔄 Refresh",
+                callback_data="owner:success_history"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Order & Pembayaran",
+                callback_data="owner:menu_orders"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data == "owner:orders")
@@ -11298,13 +11978,14 @@ async def owner_persisted_price_input(message: Message, state: FSMContext):
                 await state.clear()
                 return await status.edit_text("❌ Data produk tidak lengkap.",reply_markup=owner_products_menu())
 
-            product_id,_,name,variant_name,final_price=result
+            product_id,variant_id,name,variant_name,final_price=result
             clear_owner_input_session(message.from_user.id)
             return await status.edit_text(
                 "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
                 f"📦 {html.escape(name)}\n🧩 {html.escape(variant_name)}\n💰 {rupiah(final_price)}\n"
                 "📊 Stok awal: <b>0</b>",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔁 Isi Stok Banyak",callback_data=f"ownerstockdup:{variant_id}")],
                     [InlineKeyboardButton(text="➕ Tambah Variasi Lagi",callback_data=f"addvariantprod:{product_id}")],
                     [InlineKeyboardButton(text="📦 Atur Stok",callback_data="owner:set_stock")],
                     [InlineKeyboardButton(text="⬅️ Produk & Stok",callback_data="owner:back_products")]
@@ -11569,6 +12250,10 @@ async def owner_new_product_price_button(call: CallbackQuery, state: FSMContext)
         "Selanjutnya tambahkan akun dari menu Atur Stok.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
+                text="🔁 Isi Stok Banyak",
+                callback_data=f"ownerstockdup:{variant_id}"
+            )],
+            [InlineKeyboardButton(
                 text="➕ Tambah Variasi Lagi",
                 callback_data=f"addvariantprod:{product_id}"
             )],
@@ -11655,7 +12340,7 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
             reply_markup=owner_products_menu()
         )
 
-    product_id,_,name,variant_name,price=result
+    product_id,variant_id,name,variant_name,price=result
     clear_owner_input_session(message.from_user.id)
 
     await message.answer(
@@ -11666,6 +12351,10 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
         "📊 Stok awal: <b>0</b>\n\n"
         "Tambahkan akun dari menu Atur Stok.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔁 Isi Stok Banyak",
+                callback_data=f"ownerstockdup:{variant_id}"
+            )],
             [InlineKeyboardButton(
                 text="➕ Tambah Variasi Lagi",
                 callback_data=f"addvariantprod:{product_id}"
@@ -11892,7 +12581,20 @@ async def owner_add_variant_price_button(call: CallbackQuery, state: FSMContext)
         f"🏷️ Kode: <code>{html.escape(result['code'])}</code>\n"
         "📊 Stok awal: <b>0</b>\n\n"
         "Tambahkan akun dari menu Atur Stok.",
-        reply_markup=owner_products_menu(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔁 Isi Stok Banyak",
+                callback_data=f"ownerstockdup:{result['variant_id']}"
+            )],
+            [InlineKeyboardButton(
+                text="➕ Tambah Variasi Lagi",
+                callback_data=f"addvariantprod:{result['product_id']}"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Produk & Stok",
+                callback_data="owner:back_products"
+            )]
+        ]),
         parse_mode="HTML"
     )
     await safe_callback_notice(call)
@@ -11958,6 +12660,10 @@ async def owner_add_variant_price_custom(message: Message, state: FSMContext):
         f"🏷️ Kode: <code>{html.escape(result['code'])}</code>\n"
         "📊 Stok awal: <b>0</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔁 Isi Stok Banyak",
+                callback_data=f"ownerstockdup:{result['variant_id']}"
+            )],
             [InlineKeyboardButton(
                 text="➕ Tambah Variasi Lagi",
                 callback_data=f"addvariantprod:{result['product_id']}"
@@ -12086,6 +12792,199 @@ async def owner_stock_add(call: CallbackQuery, state: FSMContext):
     )
     await call.answer()
 
+
+
+
+@router.message(OwnerState.stock_duplicate_count)
+async def owner_stock_duplicate_count_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    raw=(message.text or "").strip()
+    qty=parse_rupiah_input(raw)
+
+    if not qty or qty < 2 or qty > 500:
+        return await message.answer(
+            "❌ <b>JUMLAH TIDAK VALID</b>\n\n"
+            "Kirim angka antara <b>2 sampai 500</b>.",
+            parse_mode="HTML"
+        )
+
+    data=await state.get_data()
+    variant_id=int(data.get("stock_variant_id",0) or 0)
+
+    if not variant_id:
+        await state.clear()
+        return await message.answer(
+            "❌ Varian stok tidak ditemukan.",
+            reply_markup=owner_products_menu()
+        )
+
+    await state.update_data(stock_duplicate_qty=int(qty))
+    await state.set_state(OwnerState.stock_duplicate_content)
+
+    await message.answer(
+        "🔁 <b>KIRIM AKUN SEKALI</b>\n\n"
+        f"Jumlah: <b>{int(qty)} stok</b>\n\n"
+        "Sekarang kirim isi akun satu kali.\n"
+        "Isi yang sama akan dibuat sebanyak jumlah tersebut.\n\n"
+        "⚠️ Gunakan hanya untuk akun sharing.",
+        reply_markup=back_owner(f"ownerstockdup:{variant_id}"),
+        parse_mode="HTML"
+    )
+
+
+@router.message(OwnerState.stock_duplicate_content)
+async def owner_stock_duplicate_content_input(message: Message, state: FSMContext, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return
+
+    data=await state.get_data()
+    variant_id=int(data.get("stock_variant_id",0) or 0)
+    qty=int(data.get("stock_duplicate_qty",0) or 0)
+    content=(message.text or message.caption or "").strip()
+
+    if not variant_id or qty < 2 or qty > 500:
+        await state.clear()
+        return await message.answer(
+            "❌ Session duplikat stok tidak valid. Silakan ulangi.",
+            reply_markup=owner_products_menu()
+        )
+
+    if not content:
+        return await message.answer(
+            "❌ Isi akun kosong. Kirim akun yang ingin diduplikat."
+        )
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+
+    try:
+        variant=conn.execute(
+            """SELECT v.*,p.id AS product_id,p.name AS product_name
+               FROM product_variants v
+               JOIN products p ON p.id=v.product_id
+               WHERE v.id=? AND v.active=1 AND p.active=1""",
+            (variant_id,)
+        ).fetchone()
+
+        if not variant:
+            conn.rollback()
+            conn.close()
+            await state.clear()
+            return await message.answer(
+                "❌ Produk/varian tidak ditemukan atau sudah nonaktif.",
+                reply_markup=owner_products_menu()
+            )
+
+        old_available=available_stock(variant)
+
+        same_before=conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM inventory_items
+               WHERE variant_id=? AND content=?""",
+            (variant_id,content)
+        ).fetchone()["n"]
+
+        inserted=duplicate_inventory_items(
+            conn,
+            variant_id,
+            content,
+            qty
+        )
+
+        conn.execute(
+            "UPDATE product_variants SET sharing_mode=1 WHERE id=?",
+            (variant_id,)
+        )
+
+        conn.commit()
+        product_id=int(variant["product_id"])
+        product_name=variant["product_name"]
+        variant_name=variant["name"]
+
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+
+    conn.close()
+    await state.clear()
+
+    inventory_log(
+        variant_id,
+        "RESTOCK_DUPLICATE",
+        inserted,
+        "OWNER",
+        f"Duplikat akun sharing x{inserted}"
+    )
+
+    await fulfill_pending_for_variant(variant_id,bot)
+
+    conn=db()
+    variant_after=conn.execute(
+        "SELECT * FROM product_variants WHERE id=?",
+        (variant_id,)
+    ).fetchone()
+    same_after=conn.execute(
+        """SELECT COUNT(*) AS n
+           FROM inventory_items
+           WHERE variant_id=? AND content=?""",
+        (variant_id,content)
+    ).fetchone()["n"]
+    conn.close()
+
+    new_available=available_stock(variant_after) if variant_after else 0
+
+    if old_available <= 0 and new_available > 0:
+        asyncio.create_task(
+            notify_restock_subscribers(
+                bot,
+                product_id,
+                variant_id,
+                new_available
+            )
+        )
+        asyncio.create_task(
+            broadcast_restock_to_verified(
+                bot,
+                product_id,
+                variant_id,
+                new_available
+            )
+        )
+
+    preview=html.escape(content[:400])
+    if len(content)>400:
+        preview+="…"
+
+    await message.answer(
+        "✅ <b>STOK DUPLIKAT BERHASIL DITAMBAHKAN</b>\n\n"
+        f"📦 Produk: <b>{html.escape(product_name)}</b>\n"
+        f"🧩 Varian: <b>{html.escape(variant_name)}</b>\n"
+        f"🔁 Ditambahkan: <b>{inserted} stok</b>\n"
+        f"📚 Salinan akun ini sebelum: <b>{int(same_before or 0)}</b>\n"
+        f"📚 Total salinan tersimpan: <b>{int(same_after or 0)}</b>\n"
+        f"📊 Stok tersedia sekarang: <b>{new_available}</b>\n\n"
+        f"<blockquote>{preview}</blockquote>\n\n"
+        "👥 Varian otomatis menjadi <b>SHARING</b>.\n"
+        "🛡️ Pembelian user otomatis dibatasi <b>Qty 1</b>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔁 Tambah Duplikat Lagi",
+                callback_data=f"ownerstockdup:{variant_id}"
+            )],
+            [InlineKeyboardButton(
+                text="➕ Tambah 1 Akun Private",
+                callback_data=f"ownerstockadd:{variant_id}"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Produk & Stok",
+                callback_data="owner:back_products"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
 
 
 @router.message(OwnerState.stock_add_items)
@@ -13259,11 +14158,22 @@ async def owner_verify_order_button(call: CallbackQuery, bot: Bot):
     )
 
     if success:
-        await call.answer("Pembayaran berhasil diverifikasi.", show_alert=True)
-        await safe_edit_or_answer(call, 
-            f"✅ <b>{invoice(order_id)} TERVERIFIKASI</b>\n\n"
-            "Pembayaran dicatat sekali dan fulfillment diproses secara idempotent.",
-            reply_markup=owner_orders_menu(),
+        snapshot=payment_confirmation_snapshot(order_id)
+        delivered=bool(
+            snapshot
+            and snapshot["status"]=="completed"
+            and snapshot["fulfillment_status"]=="delivered"
+        )
+        await call.answer(
+            "✅ Pembayaran dikonfirmasi & order selesai."
+            if delivered
+            else "✅ Pembayaran dikonfirmasi. Menunggu fulfillment.",
+            show_alert=True
+        )
+        await safe_edit_or_answer(
+            call,
+            payment_confirmation_text(order_id),
+            reply_markup=owner_payment_success_keyboard(),
             parse_mode="HTML"
         )
     else:
@@ -13751,58 +14661,345 @@ async def reply_menu_owner_contact(message: Message):
 
 
 
-@router.callback_query(F.data.startswith("rate:"))
-async def submit_rating(call: CallbackQuery):
+@router.callback_query(F.data.startswith("reviewopen:"))
+async def review_open(call: CallbackQuery):
     try:
-        _, order_id, stars = call.data.split(":")
-        order_id, stars = int(order_id), int(stars)
+        order_id=int(call.data.split(":")[-1])
     except Exception:
-        return await call.answer("Rating tidak valid.", show_alert=True)
+        return await call.answer("Order tidak valid.",show_alert=True)
 
-    if stars < 1 or stars > 5:
-        return await call.answer("Rating tidak valid.", show_alert=True)
-
-    conn = db()
-    order = conn.execute(
-        "SELECT * FROM orders WHERE id=? AND user_id=? AND status='completed'",
-        (order_id, call.from_user.id)
-    ).fetchone()
+    order=review_order_snapshot(order_id,call.from_user.id)
     if not order:
-        conn.close()
-        return await call.answer("Pesanan tidak ditemukan.", show_alert=True)
+        return await call.answer("Pesanan tidak ditemukan.",show_alert=True)
 
-    exists = conn.execute(
-        "SELECT id FROM reviews WHERE order_id=?",
-        (order_id,)
-    ).fetchone()
-    if exists:
-        conn.close()
-        return await call.answer("Pesanan ini sudah dinilai.", show_alert=True)
-
-    conn.execute(
-        """INSERT INTO reviews(order_id,user_id,product_id,rating,comment,created_at)
-           VALUES(?,?,?,?,?,?)""",
-        (
-            order_id, call.from_user.id, order["product_id"], stars, "",
-            datetime.now().isoformat(timespec="seconds")
+    if order["status"]!="completed" or order["fulfillment_status"]!="delivered":
+        return await call.answer(
+            "Rating tersedia setelah akun berhasil dikirim.",
+            show_alert=True
         )
-    )
-    stats = conn.execute(
-        "SELECT AVG(rating) AS avg_rating, COUNT(*) AS n FROM reviews WHERE product_id=?",
-        (order["product_id"],)
-    ).fetchone()
-    conn.execute(
-        "UPDATE products SET rating=?, rating_count=? WHERE id=?",
-        (float(stats["avg_rating"] or 0), int(stats["n"] or 0), order["product_id"])
-    )
-    conn.commit()
-    conn.close()
 
-    await safe_edit_or_answer(call, 
-        f"⭐ <b>Terima kasih!</b>\n\nPenilaian Anda: <b>{stars}/5</b>",
+    if int(order["reviewed"] or 0)==1:
+        return await call.answer(
+            "Pesanan ini sudah pernah dinilai.",
+            show_alert=True
+        )
+
+    await safe_edit_or_answer(
+        call,
+        review_prompt_text(order),
+        reply_markup=rating_keyboard(order_id),
         parse_mode="HTML"
     )
-    await call.answer("Rating tersimpan.")
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("rate:"))
+async def submit_rating(call: CallbackQuery, state: FSMContext):
+    try:
+        _,order_id,stars=call.data.split(":")
+        order_id,stars=int(order_id),int(stars)
+    except Exception:
+        return await call.answer("Rating tidak valid.",show_alert=True)
+
+    if stars < 1 or stars > 5:
+        return await call.answer("Rating tidak valid.",show_alert=True)
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+
+    order=conn.execute(
+        """SELECT o.*,p.name AS product_name,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=? AND o.user_id=?
+             AND o.status='completed'
+             AND o.fulfillment_status='delivered'""",
+        (order_id,call.from_user.id)
+    ).fetchone()
+
+    if not order:
+        conn.rollback()
+        conn.close()
+        return await call.answer(
+            "Rating hanya tersedia untuk pesanan yang sudah selesai.",
+            show_alert=True
+        )
+
+    existing=conn.execute(
+        "SELECT * FROM reviews WHERE order_id=?",
+        (order_id,)
+    ).fetchone()
+
+    if existing:
+        conn.rollback()
+        conn.close()
+
+        stars_existing=int(existing["rating"] or 0)
+        comment=(existing["comment"] or "").strip()
+
+        if comment:
+            return await call.answer(
+                "Pesanan ini sudah memiliki rating dan ulasan.",
+                show_alert=True
+            )
+
+        await safe_edit_or_answer(
+            call,
+            "⭐ <b>RATING TOKO SUDAH TERSIMPAN</b>\n\n"
+            f"Penilaian: <b>{'⭐' * stars_existing} ({stars_existing}/5)</b>\n\n"
+            "Anda masih dapat menambahkan ulasan singkat.",
+            reply_markup=review_after_rating_keyboard(order_id),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
+    try:
+        conn.execute(
+            """INSERT INTO reviews(
+                   order_id,user_id,product_id,rating,comment,
+                   product_name_snapshot,variant_name_snapshot,created_at
+               ) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                order_id,
+                call.from_user.id,
+                int(order["product_id"] or 0),
+                stars,
+                "",
+                str(order["product_name"] or "Produk Digital"),
+                str(order["variant_name"] or "Standard"),
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+
+        conn.execute(
+            "UPDATE orders SET review_prompt_sent=1 WHERE id=?",
+            (order_id,)
+        )
+
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        conn.close()
+        return await call.answer(
+            "Pesanan ini sudah pernah dinilai.",
+            show_alert=True
+        )
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+
+    conn.close()
+    await state.clear()
+
+    await safe_edit_or_answer(
+        call,
+        "✅ <b>RATING TOKO TERSIMPAN</b>\n\n"
+        f"{'⭐' * stars} <b>{stars}/5</b>\n\n"
+        "Ingin menambahkan ulasan singkat?",
+        reply_markup=review_after_rating_keyboard(order_id),
+        parse_mode="HTML"
+    )
+    await call.answer("Rating toko berhasil disimpan.")
+
+
+@router.callback_query(F.data.startswith("reviewcomment:"))
+async def review_comment_begin(call: CallbackQuery,state: FSMContext):
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    review=conn.execute(
+        """SELECT r.*,o.status,o.fulfillment_status
+           FROM reviews r
+           JOIN orders o ON o.id=r.order_id
+           WHERE r.order_id=? AND r.user_id=?""",
+        (order_id,call.from_user.id)
+    ).fetchone()
+    conn.close()
+
+    if not review:
+        return await call.answer(
+            "Pilih rating terlebih dahulu.",
+            show_alert=True
+        )
+
+    if review["status"]!="completed" or review["fulfillment_status"]!="delivered":
+        return await call.answer("Pesanan belum selesai.",show_alert=True)
+
+    if (review["comment"] or "").strip():
+        return await call.answer(
+            "Ulasan untuk pesanan ini sudah tersimpan.",
+            show_alert=True
+        )
+
+    await state.update_data(review_order_id=order_id)
+    await state.set_state(ReviewState.waiting_comment)
+
+    await safe_edit_or_answer(
+        call,
+        "💬 <b>TULIS ULASAN</b>\n\n"
+        f"🧾 {invoice(order_id)}\n"
+        f"🏪 Rating untuk: <b>Maboyy Digital</b>\n"
+        f"🧾 Transaksi: {html.escape(review['product_name_snapshot'] or 'Produk Digital')}\n"
+        f"⭐ Rating: <b>{int(review['rating'])}/5</b>\n\n"
+        "Kirim ulasan singkat Anda.\n"
+        "Maksimal <b>500 karakter</b>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⏭️ Lewati",
+                    callback_data=f"reviewskip:{order_id}"
+                )
+            ]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("reviewskip:"))
+async def review_skip(call: CallbackQuery,state: FSMContext):
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        order_id=0
+
+    if order_id:
+        conn=db()
+        review=conn.execute(
+            "SELECT * FROM reviews WHERE order_id=? AND user_id=?",
+            (order_id,call.from_user.id)
+        ).fetchone()
+        conn.close()
+        if not review:
+            return await call.answer(
+                "Rating belum tersimpan.",
+                show_alert=True
+            )
+        rating=int(review["rating"] or 0)
+    else:
+        rating=0
+
+    await state.clear()
+
+    await safe_edit_or_answer(
+        call,
+        "✅ <b>TERIMA KASIH!</b>\n\n"
+        + (f"{'⭐' * rating} <b>{rating}/5</b>\n\n" if rating else "")
+        + "Rating toko Anda membantu Maboyy Digital meningkatkan layanan.",
+        reply_markup=review_done_keyboard(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(ReviewState.waiting_comment)
+async def review_comment_input(message: Message,state: FSMContext,bot: Bot):
+    data=await state.get_data()
+    order_id=int(data.get("review_order_id",0) or 0)
+    comment=(message.text or "").strip()
+
+    if not order_id:
+        await state.clear()
+        return await message.answer(
+            "❌ Session ulasan sudah tidak aktif.",
+            reply_markup=user_reply_menu()
+        )
+
+    if not comment:
+        return await message.answer(
+            "❌ Ulasan kosong. Kirim teks singkat atau pilih Lewati."
+        )
+
+    if len(comment)>500:
+        return await message.answer(
+            f"❌ Ulasan terlalu panjang ({len(comment)}/500 karakter). "
+            "Silakan ringkas."
+        )
+
+    conn=db()
+    conn.execute("BEGIN IMMEDIATE")
+
+    review=conn.execute(
+        """SELECT r.*
+           FROM reviews r
+           WHERE r.order_id=? AND r.user_id=?""",
+        (order_id,message.from_user.id)
+    ).fetchone()
+
+    if not review:
+        conn.rollback()
+        conn.close()
+        await state.clear()
+        return await message.answer(
+            "❌ Rating pesanan tidak ditemukan.",
+            reply_markup=user_reply_menu()
+        )
+
+    if (review["comment"] or "").strip():
+        conn.rollback()
+        conn.close()
+        await state.clear()
+        return await message.answer(
+            "ℹ️ Ulasan untuk pesanan ini sudah pernah disimpan.",
+            reply_markup=user_reply_menu()
+        )
+
+    updated=conn.execute(
+        """UPDATE reviews
+           SET comment=?
+           WHERE order_id=? AND user_id=?
+             AND COALESCE(comment,'')=''""",
+        (comment,order_id,message.from_user.id)
+    ).rowcount
+
+    conn.commit()
+    conn.close()
+    await state.clear()
+
+    if updated != 1:
+        return await message.answer(
+            "ℹ️ Ulasan sudah diproses sebelumnya.",
+            reply_markup=user_reply_menu()
+        )
+
+    stars=int(review["rating"] or 0)
+    safe_comment=html.escape(comment)
+
+    await message.answer(
+        "✅ <b>ULASAN BERHASIL DISIMPAN</b>\n\n"
+        f"{'⭐' * stars} <b>{stars}/5</b>\n"
+        f"💬 <blockquote>{safe_comment}</blockquote>\n\n"
+        "Terima kasih sudah memberi rating untuk Maboyy Digital.",
+        reply_markup=review_done_keyboard(),
+        parse_mode="HTML"
+    )
+
+    if ADMIN_ID:
+        try:
+            user_label=(
+                f"@{message.from_user.username}"
+                if message.from_user.username
+                else str(message.from_user.id)
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                "⭐ <b>ULASAN BARU</b>\n\n"
+                f"🧾 {invoice(order_id)}\n"
+                f"👤 {html.escape(user_label)}\n"
+                "🏪 <b>Maboyy Digital</b>\n"
+                f"🧾 Transaksi: {html.escape(review['product_name_snapshot'] or 'Produk Digital')}\n"
+                f"{'⭐' * stars} <b>{stars}/5</b>\n"
+                f"💬 <blockquote>{safe_comment}</blockquote>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            logging.exception("Owner review notification failed order=%s",order_id)
+
 
 
 @router.callback_query(F.data == "owner:low_stock")
@@ -13969,35 +15166,83 @@ async def owner_security_user_toggle(call: CallbackQuery):
 @router.callback_query(F.data == "owner:reviews")
 async def owner_reviews(call: CallbackQuery):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+        return await call.answer("Akses ditolak.",show_alert=True)
 
-    conn = db()
-    rows = conn.execute(
-        """SELECT r.*, p.name AS product_name
+    conn=db()
+    summary=store_rating_summary(conn)
+
+    rows=conn.execute(
+        """SELECT r.*,o.username
            FROM reviews r
-           JOIN products p ON p.id=r.product_id
-           ORDER BY r.id DESC LIMIT 20"""
+           LEFT JOIN orders o ON o.id=r.order_id
+           ORDER BY r.id DESC
+           LIMIT 30"""
     ).fetchall()
     conn.close()
 
-    lines = ["⭐ <b>ULASAN TERBARU</b>", ""]
+    lines=[
+        "⭐ <b>RATING TOKO & ULASAN</b>",
+        "",
+        "🏪 <b>Maboyy Digital</b>",
+        f"⭐ Rating toko: <b>{summary['average']:.1f}/5</b>",
+        f"📊 Total penilaian: <b>{summary['count']}</b>",
+        f"🌟 Rating 5: <b>{summary['five_star']}</b>",
+        f"💬 Dengan komentar: <b>{summary['with_comment']}</b>",
+        ""
+    ]
+
     if not rows:
-        lines.append("Belum ada ulasan.")
+        lines.append("Belum ada rating toko.")
     else:
+        lines.append("📝 <b>ULASAN TERBARU</b>")
         for row in rows:
-            lines.append(
-                f"{'⭐' * int(row['rating'])} • {html.escape(row['product_name'])}\n"
-                f"Order {invoice(row['order_id'])} • User <code>{row['user_id']}</code>"
+            stars=max(1,min(5,int(row["rating"] or 0)))
+            username=(row["username"] or "").strip()
+            user_label=f"@{username}" if username else str(row["user_id"])
+            comment=(row["comment"] or "").strip()
+            product_snapshot=(
+                row["product_name_snapshot"]
+                or "Produk Digital"
+            )
+            variant_snapshot=(
+                row["variant_name_snapshot"]
+                or "Standard"
+            )
+            comment_text=(
+                f"\n💬 <i>{html.escape(comment[:300])}</i>"
+                if comment
+                else "\n💬 <i>Tanpa komentar</i>"
             )
 
-    await safe_edit_or_answer(call, 
+            lines.append(
+                f"{'⭐' * stars} <b>{stars}/5</b> • Maboyy Digital\n"
+                f"🧾 {invoice(row['order_id'])} • "
+                f"👤 {html.escape(user_label)}\n"
+                f"📦 Transaksi: {html.escape(product_snapshot)} — "
+                f"{html.escape(variant_snapshot)}"
+                f"{comment_text}"
+            )
+
+    await safe_edit_or_answer(
+        call,
         "\n\n".join(lines),
-        reply_markup=back_owner(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Refresh",
+                    callback_data="owner:reviews"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Pelanggan & Promo",
+                    callback_data="owner:menu_customers"
+                )
+            ]
+        ]),
         parse_mode="HTML"
     )
-    await call.answer()
-
-
+    await safe_callback_notice(call)
 
 @router.callback_query(F.data == "owner:wallet_reject")
 async def owner_wallet_reject(call: CallbackQuery, state: FSMContext):
@@ -14646,14 +15891,39 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
         if not ok:
             return await call.answer("Verifikasi order gagal.", show_alert=True)
 
-        await call.answer("Pembayaran dikonfirmasi.", show_alert=True)
+        snapshot=payment_confirmation_snapshot(entity_id)
+        delivered=bool(
+            snapshot
+            and snapshot["status"]=="completed"
+            and snapshot["fulfillment_status"]=="delivered"
+        )
+
+        await call.answer(
+            "✅ Pembayaran dikonfirmasi & order selesai."
+            if delivered
+            else "✅ Pembayaran dikonfirmasi. Akun masih menunggu fulfillment.",
+            show_alert=True
+        )
+
+        owner_audit(
+            call.from_user.id,
+            "payment_confirm",
+            "ok",
+            f"order_id={entity_id}"
+        )
+        success_text=payment_confirmation_text(entity_id)
         try:
             await call.message.edit_caption(
-                caption=payment_proof_caption("order", row) + "\n\n✅ <b>DIKONFIRMASI OWNER</b>",
+                caption=success_text,
+                reply_markup=owner_payment_success_keyboard(),
                 parse_mode="HTML"
             )
         except Exception:
-            pass
+            await call.message.answer(
+                success_text,
+                reply_markup=owner_payment_success_keyboard(),
+                parse_mode="HTML"
+            )
         return
 
     if entity == "topup":
@@ -15406,7 +16676,7 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
 
     conn=db()
     row=conn.execute(
-        """SELECT v.id,v.name,v.stock,v.reserved_stock,p.name AS product_name
+        """SELECT v.id,v.name,v.stock,v.reserved_stock,v.sharing_mode,p.name AS product_name
            FROM product_variants v
            JOIN products p ON p.id=v.product_id
            WHERE v.id=? AND v.active=1 AND p.active=1""",
@@ -15426,17 +16696,121 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
         "📦 <b>ATUR STOK</b>\n\n"
         f"Produk: <b>{html.escape(row['product_name'])}</b>\n"
         f"Varian: <b>{html.escape(row['name'])}</b>\n"
+        f"Jenis: <b>{'👥 Sharing' if int(row['sharing_mode'] or 0)==1 else '🔐 Private / Unique'}</b>\n"
         f"Stok tersedia: <b>{available}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="➕ Tambah Akun",
+                text="➕ Tambah 1 Akun",
                 callback_data=f"ownerstockadd:{variant_id}"
+            )],
+            [InlineKeyboardButton(
+                text="🔁 Duplikat Akun / Stok Banyak",
+                callback_data=f"ownerstockdup:{variant_id}"
             )],
             [InlineKeyboardButton(
                 text="⬅️ Kembali",
                 callback_data="owner:set_stock"
             )]
         ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+
+@router.callback_query(F.data.startswith("ownerstockdup:"))
+async def owner_stock_duplicate_begin(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT v.id,v.name,p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Varian tidak ditemukan.",show_alert=True)
+
+    await state.clear()
+    await state.update_data(stock_variant_id=variant_id)
+
+    await safe_edit_or_answer(
+        call,
+        "🔁 <b>DUPLIKAT AKUN / STOK BANYAK</b>\n\n"
+        f"📦 Produk: <b>{html.escape(row['product_name'])}</b>\n"
+        f"🧩 Varian: <b>{html.escape(row['name'])}</b>\n\n"
+        "Pilih akun yang sama ingin dijadikan berapa stok.\n\n"
+        "⚠️ Gunakan fitur ini untuk akun <b>SHARING</b>.",
+        reply_markup=owner_stock_duplicate_qty_keyboard(variant_id),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstockdupqty:"))
+async def owner_stock_duplicate_qty(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        _,variant_id,qty=call.data.split(":")
+        variant_id=int(variant_id)
+        qty=int(qty)
+    except Exception:
+        return await call.answer("Jumlah tidak valid.",show_alert=True)
+
+    if qty < 2 or qty > 500:
+        return await call.answer("Jumlah harus 2 sampai 500.",show_alert=True)
+
+    await state.update_data(
+        stock_variant_id=variant_id,
+        stock_duplicate_qty=qty
+    )
+    await state.set_state(OwnerState.stock_duplicate_content)
+
+    await safe_edit_or_answer(
+        call,
+        "🔁 <b>KIRIM AKUN SEKALI</b>\n\n"
+        f"Jumlah: <b>{qty} stok</b>\n\n"
+        "Sekarang kirim isi akun satu kali.\n"
+        "Bot akan membuat stok identik sesuai jumlah yang dipilih.\n\n"
+        "⚠️ Pastikan akun ini memang akun sharing.",
+        reply_markup=back_owner(f"ownerstockdup:{variant_id}"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstockdupcustom:"))
+async def owner_stock_duplicate_custom(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.",show_alert=True)
+
+    await state.update_data(stock_variant_id=variant_id)
+    await state.set_state(OwnerState.stock_duplicate_count)
+
+    await safe_edit_or_answer(
+        call,
+        "✏️ <b>JUMLAH DUPLIKAT CUSTOM</b>\n\n"
+        "Kirim jumlah stok yang ingin dibuat.\n"
+        "Contoh: <code>7</code>, <code>25</code>, atau <code>100</code>.\n\n"
+        "Batas: <b>2–500 stok</b>.",
+        reply_markup=back_owner(f"ownerstockdup:{variant_id}"),
         parse_mode="HTML"
     )
     await safe_callback_notice(call)
@@ -15457,9 +16831,10 @@ async def owner_stock_add_begin(call: CallbackQuery, state: FSMContext):
 
     await safe_edit_or_answer(
         call,
-        "➕ <b>TAMBAH AKUN</b>\n\n"
+        "➕ <b>TAMBAH 1 AKUN / PRIVATE</b>\n\n"
         "Kirim isi akun bebas format.\n"
-        "Satu pesan = satu akun = satu stok.\n\n"
+        "Satu pesan = satu akun = satu stok.\n"
+        "Mode ini tetap menolak akun identik yang sudah tersimpan.\n\n"
         "Boleh multi-baris dan tidak perlu tanda <code>|</code>.",
         reply_markup=back_owner("owner:back_products"),
         parse_mode="HTML"
@@ -16040,7 +17415,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "12.3"
+EXPECTED_SOURCE_VERSION = "13.2"
 
 
 def source_integrity_self_test():
@@ -16088,6 +17463,8 @@ def runtime_dependency_self_test():
     checks.append(("fulfill_order", callable(fulfill_order)))
     checks.append(("database_health_report", callable(database_health_report)))
     checks.append(("demo_isolation_self_test", callable(demo_isolation_self_test)))
+    checks.append(("send_review_prompt_if_needed", callable(send_review_prompt_if_needed)))
+    checks.append(("store_rating_summary", callable(store_rating_summary)))
 
     failed=[name for name,ok in checks if not ok]
     if failed:

@@ -752,3 +752,283 @@ Command bot tetap hanya `/start`, `/owner`, `/ping`. Tidak ada Railway Variable 
 ## v7.4 — Pillow Crash Fix
 
 Tidak ada Railway Variable baru. Pastikan `requirements.txt` terbaru ikut di-upload dan Railway diredeploy.
+
+
+## v7.5 — Simple Selection Menu
+
+Tidak ada Railway Variable baru.
+
+
+## v7.6 — QRIS Upload Reliability
+
+Tidak ada Railway Variable baru.
+
+
+## v7.7 — Payment Proof PM Fix
+
+Tidak ada Railway Variable baru. Pastikan owner pernah membuka/start bot agar bot dapat mengirim PM ke owner.
+
+
+## v7.8 — Channel Verification Fix
+
+Tidak ada Railway Variable baru. REQUIRED_CHANNEL_ID harus mengarah ke channel yang sama dengan tombol Join Channel.
+
+
+## v7.9 — Pre-Launch Stability
+
+Tidak ada Railway Variable baru. Gunakan `/owner → ⚙️ Sistem → 🚦 Launch Readiness` sebelum membuka bot ke user.
+
+
+## v8.0 — Readiness via Ping
+
+Gunakan `/ping` untuk pengecekan kesiapan bot. Tidak ada Railway Variable baru.
+
+
+## v8.1 — Required Channel Admin Check
+
+Agar verifikasi membership user di channel dapat bekerja konsisten, bot harus ditambahkan sebagai admin pada REQUIRED_CHANNEL_ID. Tidak ada Railway Variable baru.
+
+
+## v8.2 — Ping Owner Only
+
+`/ping` hanya dapat digunakan owner. Tidak ada Railway Variable baru.
+
+
+## v8.3 — Owner System Menu Fix
+
+Tidak ada Railway Variable baru.
+
+
+## v8.4 — Add Variant Wizard
+
+Tidak ada Railway Variable baru.
+
+
+## v8.5 — Variant Merge
+
+Menu Tambah Variasi digabung ke Tambah Produk. Tidak ada Railway Variable baru.
+
+
+## v8.6 — Variant Price Input Fix
+
+Tidak ada Railway Variable baru.
+
+
+## v8.7 — Detailed Ping
+
+`/ping` menampilkan waktu WIB, tanggal lengkap, waktu mulai bot, dan runtime detail. Tidak ada Railway Variable baru.
+
+
+## v8.8 — Compact Ping Info
+
+Tanggal dan jam sekarang digabung ke Informasi Bot. Tidak ada Railway Variable baru.
+
+
+## v8.9 — Ping Cleanup
+
+Bagian Mulai aktif dihapus dari `/ping`. Tidak ada Railway Variable baru.
+
+
+## v9.0 — Safe Data Cleanup
+
+Menu Sistem owner memiliki fitur Hapus Data dengan preview dan konfirmasi. Data paid/completed tidak dihapus. Tidak ada Railway Variable baru.
+
+
+## v9.1 — Pending Order Cleanup
+
+Menu Hapus Data sekarang memiliki opsi Pesanan Pending. Hanya order belum bayar yang dapat dihapus dan reservasi stok dilepas terlebih dahulu. Tidak ada Railway Variable baru.
+
+
+## v9.2 — System Stability Audit
+
+Memperbaiki query cleanup order dari `expires_at` menjadi `reserved_until` dan menambah schema check pada Diagnostik. Tidak ada Railway Variable baru.
+
+
+## v9.3 — Product Wizard Database Fix
+
+Menambahkan migration `products.created_at` dan memperkuat handler harga pada Tambah Produk. Tidak ada Railway Variable baru.
+
+
+## v9.4 — Keyboard Refresh
+
+Ditambahkan tombol `🔄 Perbarui Keyboard` untuk menghapus keyboard lama dan mengirim ulang keyboard terbaru di Android/iOS. Tidak ada Railway Variable baru.
+
+
+## v9.5 — Owner System Callback Routing Fix
+
+Handler callback catch-all dipindahkan ke posisi terakhir agar tidak menelan callback Sistem owner yang valid. Tidak ada Railway Variable baru.
+
+
+## v9.6 — Full Stability Audit
+
+Audit callback, OwnerState, QRIS routing, wizard, payment, inventory, dan fallback. Tidak ada Railway Variable baru.
+
+
+## v9.7 — Custom Price State Fix
+
+Handler harga custom dipastikan lebih dulu dari generic fallback dan ditambahkan recovery jika FSM state hilang. Tidak ada Railway Variable baru.
+
+
+## v9.8 — Free Variant Pricing
+
+Atur Harga Varian sekarang menerima nominal bebas setelah memilih produk dan varian. Tidak ada Railway Variable baru.
+
+
+## v9.9 — Recovery Status Clarification
+
+Startup Recovery sekarang membedakan order unpaid pending dan order paid yang belum terkirim. Data SQLite tetap persisten selama Railway Volume `/data` terpasang. Tidak ada Railway Variable baru.
+
+
+## v10.0 — Product Menu Stability
+
+Seluruh menu Produk & Stok diperkuat. Produk Populer/Flash Sale sekarang toggle tombol. Tidak ada Railway Variable baru.
+
+
+## v10.1 — Auto Recovery Layer
+
+Self-healing aman ditambahkan untuk order recovery, inventory repair, topup processing reset, proof-session cleanup, DB integrity check, dan Safe Mode fallback. Tidak ada Railway Variable baru.
+
+
+## v10.2 — Persistent Price Input
+
+Sesi input Harga Custom owner sekarang disimpan di SQLite sehingga tidak hilang ketika FSM terganggu atau bot redeploy. Tidak ada Railway Variable baru.
+
+
+## v10.3 — Keyboard Helper Audit
+
+Memperbaiki helper Hapus Produk dan Atur Stok yang belum didefinisikan, serta audit semua helper keyboard. Tidak ada Railway Variable baru.
+
+
+## v10.4 — Stability Audit
+
+Memperbaiki helper `owner_stock_variant_actions` yang hilang dan melakukan audit direct function calls serta helper keyboard. Tidak ada Railway Variable baru.
+
+
+## v10.5 — Error Analytics
+
+Structured error logging menyimpan update ID, event, callback, user, exception type dan traceback ringkas ke system_errors. Diagnostik menampilkan 5 error terakhir. Tidak ada Railway Variable baru.
+
+
+## v10.6 — Production State Fix
+
+FSM sekarang menggunakan SQLite persisten di DB_PATH yang sama. `drop_pending_updates` diubah menjadi `False` agar update Telegram yang antre tidak dibuang saat restart/redeploy. Tidak ada Railway Variable baru.
+
+
+## v10.7 — Production Hardening
+
+Event isolation, polling backoff/concurrency limit, SQLite WAL+busy_timeout, dan pemisahan Telegram transient errors diterapkan. Tidak ada Railway Variable baru.
+
+
+## v10.8 — Button Reliability Pack
+
+`allowed_updates` eksplisit menerima callback_query, semua callback handler diaudit untuk acknowledgement, dan Callback Trace Middleware ditambahkan. Tidak ada Railway Variable baru.
+
+
+## v10.9 — Price Routing Fix
+
+Broad F.text recovery handlers dihapus dan diganti custom filter yang hanya aktif pada persisted owner price session. Smoke test SQLite harga 2500 berhasil. Tidak ada Railway Variable baru.
+
+
+## v11.0 — Runtime NameError Audit
+
+Memperbaiki missing `re`, `JAKARTA_TZ`, `main_menu`, dan `expiry_text`, serta membuang dead startup recovery code. Symbol-table audit sekarang wajib 0 unresolved global symbol sebelum ZIP rilis. Tidak ada Railway Variable baru.
+
+
+## v11.1 — Pending Order / Delete Product Fix
+
+Produk boleh soft-delete walau ada pending order. Unpaid pending dibatalkan dan reservation dilepas; paid pending dipertahankan. Menu Order Pending ditambahkan untuk restock/fulfillment. Tidak ada Railway Variable baru.
+
+
+## v11.2 — Verifikasi Pembayaran
+
+Menu Order & Pembayaran sekarang punya verifikasi pembayaran terpusat: lihat bukti, confirm, reject, pending. Confirm memakai `mark_order_paid()` existing flow. Tidak ada Railway Variable baru.
+
+
+## v11.3 — Paid Pending Purge
+
+Paid-undelivered orders dapat dipurge dari Hapus Data dan otomatis dibersihkan saat Hapus Produk. Allocated inventory dikembalikan ke available, reservation dilepas, dan data orphan tetap terdeteksi langsung dari orders. Tidak ada Railway Variable baru.
+
+
+## v11.4 — Demo & Report Cleanup
+
+Menambahkan /demo owner untuk seed/clear data uji pembayaran dan topup. Laporan harian mulai disimpan ke daily_report_history. Hapus Data diperluas untuk riwayat laporan, log operasional, dan data demo. Tidak ada Railway Variable baru.
+
+
+## v11.5 — Pure Demo Simulation
+
+/demo sekarang sepenuhnya simulasi. Tidak membuat produk/order/topup/stok/saldo/transaksi asli dan tidak mengubah produk di /start. Hanya session navigasi demo ringan yang disimpan. Tidak ada Railway Variable baru.
+
+
+## v11.6 — Demo Isolation Lock
+
+Demo diperketat dengan namespace userdemo:* dan safety-net. AST audit memastikan handler demo tidak memanggil DB/fulfillment/payment/topup/inventory produksi dan tidak membuat callback menuju flow toko asli. /start juga diaudit bebas referensi demo. Tidak ada Railway Variable baru.
+
+
+## v11.7 — Runtime Import Guard
+
+Memastikan import re tersedia, parser memakai local fallback import, dan startup dependency self-test dijalankan sebelum polling. Tidak ada Railway Variable baru.
+
+
+## v12.0 — Major Hardening
+
+Fulfillment resume-safe, stale-topup guard, single-instance conflict protection, graceful shutdown, QRIS transient cleanup, unified payment review state, database health/repair, owner audit log, demo isolation self-test, statistik produk, serta pencarian order/user/produk. Tidak ada Railway Variable baru.
+
+
+## v12.1 — Deployment Fingerprint
+
+Menggunakan Railway-provided variables (`RAILWAY_DEPLOYMENT_ID`, `RAILWAY_REPLICA_ID`, `RAILWAY_GIT_COMMIT_SHA`, `RAILWAY_ENVIRONMENT_NAME`) untuk menandai versi runtime pada log, /ping, /health, dan Diagnostik. Tidak ada Railway Variable manual baru.
+
+
+## v12.2 — Railway Entrypoint Fix
+
+Menambahkan root `main.py` launcher. Ini penting karena Railway/Railpack dapat otomatis memilih `main.py` untuk aplikasi Python. Launcher memastikan `bot.py` yang diimpor harus versi 12.2 dan parser harga harus lolos self-test sebelum polling. Upload `main.py` dan `bot.py` bersama ke root repository. Tidak ada Railway Variable baru.
+
+
+## v12.3 — Startup Demo Constant Hotfix
+
+Memperbaiki konstanta demo self-reference yang menyebabkan crash saat `import bot`. Tidak ada Railway Variable baru. Upload `main.py` dan `bot.py` v12.3 bersama.
+
+
+## v12.4 — Payment Confirmation History
+
+Setelah owner mengonfirmasi pembayaran, bot memberikan feedback final dan order masuk ke `History Sukses` berbasis payment_status=paid. Status fulfillment tetap dibedakan antara delivered dan menunggu akun. Tidak ada Railway Variable baru.
+
+
+## v12.5 — Checkout Terms
+
+Menambahkan syarat singkat akun Sharing/Private ke layar checkout dan invoice pembayaran. Tidak ada perubahan pada alur transaksi atau Railway Variable.
+
+
+## v12.6 — Duplicate Stock
+
+Mode sharing dapat menduplikasi satu akun menjadi 2/5/10/20/50/custom hingga 500 stok dalam satu kali input. Mode private/single tetap menolak duplikat. Tidak ada Railway Variable baru.
+
+
+## v12.7 — Sharing Qty Guard
+
+Varian yang memakai duplicate stock otomatis menjadi sharing dan maksimal Qty 1 pada seluruh checkout. Legacy duplicated inventory otomatis ditandai sharing. Tidak ada Railway Variable baru.
+
+
+## v12.8 — Rating & Ulasan
+
+Menambahkan prompt rating otomatis setelah fulfillment delivered, ulasan teks hingga 500 karakter, fallback rating dari Pesanan Saya, statistik owner, dan notifikasi ulasan. Review tidak memengaruhi keberhasilan fulfillment. Tidak ada Railway Variable baru.
+
+
+## v12.9 — Rating Toko
+
+Rating sekarang dihitung untuk Maboyy Digital secara keseluruhan, bukan per produk. Review menyimpan snapshot nama produk/varian hanya sebagai konteks transaksi dan tetap bertahan meskipun produk dihapus/nonaktifkan. Tidak ada Railway Variable baru.
+
+
+## v13.0 — Compact Ping
+
+Tampilan /ping diringkas menjadi status, versi, database, deployment singkat, dan commit. Pemeriksaan teknis tetap berjalan secara internal. Tidak ada Railway Variable baru.
+
+
+## v13.1 — Compact Ping + Tanggal
+
+Tanggal dan waktu WIB dikembalikan ke /ping tanpa mengembalikan detail teknis panjang. Tidak ada Railway Variable baru.
+
+
+## v13.2 — Backup Project
+
+Menambahkan tombol manual `📦 Backup Project` pada menu Sistem. ZIP berisi 6 file project yang dideploy + snapshot `shop.db`. `.env`/secret Railway sengaja tidak disertakan. Backup database otomatis 48 jam tetap aktif. Tidak ada Railway Variable baru.

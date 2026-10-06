@@ -1,25 +1,25 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v12.2  
+**Versi aktif:** v13.2  
 **Platform:** Telegram Bot + Railway + SQLite
 
-## Update Terbaru — v12.2 Railway Entrypoint Fix
-- Menambahkan `main.py` root launcher khusus Railway/Railpack.
-- Railway yang otomatis memilih `main.py` sekarang tetap menjalankan `bot.py` terbaru.
-- `main.py` memeriksa bahwa `bot.py` benar-benar versi v12.2 sebelum bot dijalankan.
-- Jika `main.py` baru tetapi `bot.py` masih lama, deployment gagal dengan pesan `bot.py version mismatch` yang jelas.
-- Launcher juga mengetes parser `Rp2.500 -> 2500` sebelum polling.
-- Startup log menampilkan `main.py -> bot.py v12.2`, Railway Deployment ID, dan commit SHA.
-- `bot.py` tetap memiliki global `import re` + local fallback `_re`.
-- Semua hardening v12.1/v12.0 tetap dipertahankan.
+## Update Terbaru — v13.2 Backup Project
+- Menu `/owner → ⚙️ Sistem` sekarang memiliki dua backup terpisah:
+  - `🗄️ Backup Database`
+  - `📦 Backup Project`
+- `📦 Backup Project` membuat ZIP flat berisi:
+  - `main.py`
+  - `bot.py`
+  - `requirements.txt`
+  - `.env.example`
+  - `README.md`
+  - `VARIABLE_RAILWAY.md`
+  - `shop.db` (snapshot database saat tombol ditekan)
+- ZIP dikirim langsung ke PM owner.
+- `.env`, BOT_TOKEN, password, private key, dan secret Railway tidak dimasukkan ke ZIP.
+- Backup database otomatis setiap 48 jam tetap berjalan seperti sebelumnya.
+- Project backup manual memakai retention yang sama agar folder backup tidak tumbuh tanpa batas.
 - Tidak ada Railway Variable baru.
-
-## WAJIB DI-UPLOAD KE ROOT GITHUB
-`main.py` dan `bot.py` harus di-upload bersama. Jangan hanya mengganti `bot.py`.
-
-## Command
-User: `/start` • `/demo`  
-Owner: `/owner` • `/ping` • `/demo`
 
 ## File Project
 `main.py` • `bot.py` • `requirements.txt` • `.env.example` • `README.md` • `VARIABLE_RAILWAY.md`
