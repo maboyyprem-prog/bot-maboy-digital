@@ -139,8 +139,8 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.38"
-SCHEMA_VERSION = 174
+BOT_VERSION = "16.40"
+SCHEMA_VERSION = 175
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -859,6 +859,28 @@ def init_db():
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_tool_provision_email "
         "ON tool_provision_logs(target_email, created_at)"
+    )
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tool_activity_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            target_email TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            http_status INTEGER NOT NULL DEFAULT 0,
+            detail TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_activity_owner_time "
+        "ON tool_activity_logs(owner_id, created_at)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_activity_email "
+        "ON tool_activity_logs(target_email, created_at)"
     )
 
     # migrations from previous versions
@@ -6380,6 +6402,27 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Tools Stats & Quota",False,str(exc)[:100]))
 
+    # Owner tools advanced recovery/history
+    try:
+        conn=db()
+        activity_table=bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_activity_logs'"
+        ).fetchone())
+        conn.close()
+        tools_adv_ok=(
+            activity_table
+            and callable(render_tools_history)
+            and callable(tools_diagnostics_text)
+            and TOOLS_HISTORY_PAGE_SIZE==5
+        )
+        checks.append((
+            "Tools Recovery & History",
+            tools_adv_ok,
+            "activity log + pagination + resume + diagnostics"
+        ))
+    except Exception as exc:
+        checks.append(("Tools Recovery & History",False,str(exc)[:100]))
+
     # Schema version
     try:
         current_schema=schema_version_info()
@@ -9125,6 +9168,7 @@ def validate_system_schema():
         },
         "order_login_proofs": {"id","order_id","user_id","file_id","created_at"},
         "tool_provision_logs": {"id","owner_id","tool_name","target_email","plan","status","created_at"},
+        "tool_activity_logs": {"id","owner_id","action","target_email","status","http_status","created_at"},
         "settings": {"key","value"},
         "system_errors": {"id","error_text","created_at"},
         "payment_proof_sessions": {"user_id","entity_type","entity_id"},
@@ -11372,7 +11416,7 @@ def tools_provider_status_text() -> str:
     if not TOOLS_PROVIDER_API_KEY:
         missing.append("API_KEY")
     if not TOOLS_PROVIDER_MAGICLINK_URL:
-        missing.append("MAGICLINK_URL")
+        missing.append("LINK_VERIFIKASI_URL")
     if not TOOLS_PROVIDER_VERIFY_URL:
         missing.append("VERIFY_URL")
 
@@ -11385,8 +11429,9 @@ def owner_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎬 Alight Motion Tools",callback_data="tools:alight")],
         [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
-        [InlineKeyboardButton(text="🔌 Cek API",callback_data="tools:status")],
-        [InlineKeyboardButton(text="📦 Riwayat Provision",callback_data="tools:history")],
+        [InlineKeyboardButton(text="🧪 Diagnostik",callback_data="tools:diagnostics")],
+        [InlineKeyboardButton(text="♻️ Lanjutkan Terakhir",callback_data="tools:resume")],
+        [InlineKeyboardButton(text="📦 Riwayat Tools",callback_data="tools:history")],
         [InlineKeyboardButton(text="⚙️ Status Provider",callback_data="tools:provider")],
         [InlineKeyboardButton(text="⬅️ Owner Panel",callback_data="owner:panel")],
     ])
@@ -11394,8 +11439,8 @@ def owner_tools_menu():
 
 def alight_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📧 Kirim Magic Link",callback_data="tools:magiclink")],
-        [InlineKeyboardButton(text="✅ Verifikasi Magic Link",callback_data="tools:verify")],
+        [InlineKeyboardButton(text="📧 Kirim Link Verifikasi",callback_data="tools:magiclink")],
+        [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
         [InlineKeyboardButton(text="🚀 Provision 1 Tahun",callback_data="tools:alight:1y")],
         [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
         [InlineKeyboardButton(text="📦 Riwayat Alight Motion",callback_data="tools:history")],
@@ -11514,6 +11559,159 @@ def tools_stats_text(owner_id: int) -> str:
 def tools_quota_can_process(owner_id: int) -> tuple[bool,dict]:
     s=tools_stats_snapshot(owner_id)
     return s["remaining_requests"] >= s["request_cost"],s
+
+
+TOOLS_HISTORY_PAGE_SIZE = 5
+
+
+def create_tool_activity(owner_id: int, action: str, email: str="", status: str="pending") -> int:
+    now=datetime.now().isoformat(timespec="seconds")
+    conn=db()
+    cur=conn.execute(
+        """INSERT INTO tool_activity_logs(
+               owner_id,action,target_email,status,http_status,detail,created_at,updated_at
+           ) VALUES(?,?,?,?,0,'',?,?)""",
+        (int(owner_id),str(action),str(email or "").lower(),str(status),now,now)
+    )
+    activity_id=int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return activity_id
+
+
+def update_tool_activity(activity_id: int, *, status: str, http_status: int=0, detail: str=""):
+    conn=db()
+    conn.execute(
+        """UPDATE tool_activity_logs
+           SET status=?,http_status=?,detail=?,updated_at=?
+           WHERE id=?""",
+        (
+            str(status),
+            int(http_status or 0),
+            tool_response_preview(detail)[:900],
+            datetime.now().isoformat(timespec="seconds"),
+            int(activity_id)
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def tools_last_activity(owner_id: int):
+    conn=db()
+    row=conn.execute(
+        """SELECT * FROM tool_activity_logs
+           WHERE owner_id=?
+           ORDER BY id DESC LIMIT 1""",
+        (int(owner_id),)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def tools_history_keyboard(page: int, total_pages: int):
+    page=max(1,int(page or 1))
+    total_pages=max(1,int(total_pages or 1))
+    rows=[]
+    nav=[]
+    if page>1:
+        nav.append(InlineKeyboardButton(text="⬅️",callback_data=f"toolshistory:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page}/{total_pages}",callback_data=f"toolshistory:{page}"))
+    if page<total_pages:
+        nav.append(InlineKeyboardButton(text="➡️",callback_data=f"toolshistory:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 Refresh",callback_data=f"toolshistory:{page}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def render_tools_history(call: CallbackQuery, page: int=1):
+    conn=db()
+    total=int(conn.execute(
+        "SELECT COUNT(*) AS n FROM tool_activity_logs WHERE owner_id=?",
+        (int(call.from_user.id),)
+    ).fetchone()["n"] or 0)
+    total_pages=max(1,(total+TOOLS_HISTORY_PAGE_SIZE-1)//TOOLS_HISTORY_PAGE_SIZE)
+    page=max(1,min(int(page or 1),total_pages))
+    offset=(page-1)*TOOLS_HISTORY_PAGE_SIZE
+    rows=conn.execute(
+        """SELECT * FROM tool_activity_logs
+           WHERE owner_id=?
+           ORDER BY id DESC
+           LIMIT ? OFFSET ?""",
+        (int(call.from_user.id),TOOLS_HISTORY_PAGE_SIZE,offset)
+    ).fetchall()
+    conn.close()
+
+    lines=[
+        "📦 <b>RIWAYAT AKTIVITAS TOOLS</b>",
+        f"Halaman: <b>{page}/{total_pages}</b> • Total: <b>{total}</b>",
+        ""
+    ]
+    if not rows:
+        lines.append("Belum ada aktivitas.")
+    else:
+        action_map={
+            "send_verification_link":"Kirim Link Verifikasi",
+            "verify_account":"Verifikasi Akun",
+        }
+        for row in rows:
+            status=str(row["status"] or "")
+            icon="✅" if status=="success" else ("⏳" if status=="pending" else "❌")
+            action=action_map.get(str(row["action"] or ""),str(row["action"] or "-"))
+            lines.append(
+                f"{icon} <b>#{row['id']}</b> • {html.escape(action)}\n"
+                f"📧 {html.escape(str(row['target_email'] or '-'))}\n"
+                f"🌐 HTTP: {int(row['http_status'] or 0) or '-'}\n"
+                f"🕒 {html.escape(format_wib_datetime(row['created_at'],compact=True))}"
+            )
+
+    await safe_edit_or_answer(
+        call,
+        "\n\n".join(lines),
+        reply_markup=tools_history_keyboard(page,total_pages),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+def tools_diagnostics_text(owner_id: int) -> str:
+    missing=[]
+    if not TOOLS_PROVIDER_ENABLED:
+        missing.append("Provider disabled")
+    if not TOOLS_PROVIDER_API_KEY:
+        missing.append("API key belum tersedia")
+    if not TOOLS_PROVIDER_MAGICLINK_URL:
+        missing.append("URL kirim link belum tersedia")
+    if not TOOLS_PROVIDER_VERIFY_URL:
+        missing.append("URL verifikasi belum tersedia")
+
+    stats=tools_stats_snapshot(owner_id)
+    last=tools_last_activity(owner_id)
+
+    lines=[
+        "🧪 <b>DIAGNOSTIK OWNER TOOLS</b>",
+        "",
+        f"Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>",
+        f"Status config: <b>{'🟢 READY' if not missing else '🟠 BELUM LENGKAP'}</b>",
+        f"Auth: <b>{html.escape(TOOLS_PROVIDER_AUTH_MODE)}</b>",
+        f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b>",
+        f"Retry: <b>{TOOLS_PROVIDER_MAX_RETRIES}</b>",
+        f"Kuota lokal: <b>{stats['used_requests']}/{stats['hourly_limit']}</b>",
+        f"Sisa kapasitas: <b>{stats['remaining_accounts']} akun</b>",
+    ]
+    if missing:
+        lines += ["","⚠️ <b>Yang perlu diperiksa:</b>"] + [f"• {html.escape(x)}" for x in missing]
+    if last:
+        lines += [
+            "",
+            "🕘 <b>Aktivitas terakhir</b>",
+            f"Action: <b>{html.escape(str(last['action']))}</b>",
+            f"Status: <b>{html.escape(str(last['status']))}</b>",
+            f"HTTP: <b>{int(last['http_status'] or 0) or '-'}</b>",
+            f"Waktu: <b>{html.escape(format_wib_datetime(last['created_at'],compact=True))}</b>",
+        ]
+    return "\n".join(lines)
 
 
 def valid_tools_email(value: str) -> bool:
@@ -11712,8 +11910,12 @@ async def owner_tools_alight(call: CallbackQuery,state: FSMContext):
     await safe_edit_or_answer(
         call,
         "🎬 <b>ALIGHT MOTION TOOLS</b>\n\n"
-        "Provision hanya akan dikirim ke endpoint provider yang kamu konfigurasi sendiri.\n"
-        "Bot tidak memiliki generator/bypass premium bawaan.\n\n"
+        "Alur verifikasi akun:\n"
+        "1. Kirim Link Verifikasi ke email\n"
+        "2. Buka inbox email\n"
+        "3. Salin link verifikasi\n"
+        "4. Masukkan link ke bot\n"
+        "5. Verifikasi akun\n\n"
         f"API: <b>{tools_provider_status_text()}</b>\n"
         f"Kuota: <b>{tools_stats_snapshot(call.from_user.id)['used_requests']}/{TOOLS_PROVIDER_HOURLY_LIMIT} request</b>\n"
         f"Sisa kapasitas: <b>{tools_stats_snapshot(call.from_user.id)['remaining_accounts']} akun</b>",
@@ -11731,7 +11933,7 @@ async def owner_tools_magiclink_begin(call: CallbackQuery,state: FSMContext):
         return await call.answer("Provider belum diaktifkan.",show_alert=True)
     if not TOOLS_PROVIDER_MAGICLINK_URL or not TOOLS_PROVIDER_API_KEY:
         return await call.answer(
-            "Endpoint Magic Link/API key belum dikonfigurasi.",
+            "Endpoint Link Verifikasi/API key belum dikonfigurasi.",
             show_alert=True
         )
 
@@ -11739,8 +11941,8 @@ async def owner_tools_magiclink_begin(call: CallbackQuery,state: FSMContext):
     await state.set_state(OwnerState.tools_magiclink_email)
     await safe_edit_or_answer(
         call,
-        "📧 <b>KIRIM MAGIC LINK</b>\n\n"
-        "Kirim email akun yang ingin menerima Magic Link.\n\n"
+        "📧 <b>KIRIM LINK VERIFIKASI</b>\n\n"
+        "Kirim email akun yang ingin menerima Link Verifikasi.\n\n"
         "Bot hanya meneruskan request ke provider yang kamu konfigurasi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")]
@@ -11763,7 +11965,7 @@ async def owner_tools_magiclink_email_input(message: Message,state: FSMContext):
     await state.set_state(None)
 
     await message.answer(
-        "⚠️ <b>KONFIRMASI KIRIM MAGIC LINK</b>\n\n"
+        "⚠️ <b>KONFIRMASI KIRIM LINK VERIFIKASI</b>\n\n"
         f"📧 Email: <b>{html.escape(email)}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Kirim",callback_data="tools:magiclink:confirm")],
@@ -11784,9 +11986,16 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
         await state.clear()
         return await call.answer("Session email tidak valid.",show_alert=True)
 
+    activity_id=create_tool_activity(
+        call.from_user.id,
+        "send_verification_link",
+        email,
+        "pending"
+    )
+
     await safe_edit_or_answer(
         call,
-        "⏳ <b>MENGIRIM MAGIC LINK...</b>\n\n"
+        "⏳ <b>MENGIRIM LINK VERIFIKASI...</b>\n\n"
         f"📧 {html.escape(email)}",
         parse_mode="HTML"
     )
@@ -11797,26 +12006,32 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
         payload={"email":email},
     )
     preview=tool_response_preview(result)
+    update_tool_activity(
+        activity_id,
+        status="success" if ok else "failed",
+        http_status=http_status,
+        detail=preview,
+    )
 
     if ok:
         await state.update_data(tools_verify_email=email)
         await safe_edit_or_answer(
             call,
-            "✅ <b>MAGIC LINK REQUEST BERHASIL</b>\n\n"
+            "✅ <b>LINK VERIFIKASI REQUEST BERHASIL</b>\n\n"
             f"📧 Email: <b>{html.escape(email)}</b>\n"
             f"🌐 HTTP: <b>{http_status}</b>\n\n"
-            "Setelah menerima Magic Link, pilih tombol Verifikasi lalu tempel URL lengkap.",
+            "Setelah link masuk ke email, pilih tombol Verifikasi Akun lalu kirim URL verifikasi lengkap.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Verifikasi Magic Link",callback_data="tools:verify")],
+                [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
                 [InlineKeyboardButton(text="⬅️ Alight Tools",callback_data="tools:alight")],
             ]),
             parse_mode="HTML"
         )
-        return await safe_callback_notice(call,"Magic Link dikirim.")
+        return await safe_callback_notice(call,"Link Verifikasi dikirim.")
 
     await safe_edit_or_answer(
         call,
-        "❌ <b>MAGIC LINK GAGAL</b>\n\n"
+        "❌ <b>LINK VERIFIKASI GAGAL</b>\n\n"
         f"📧 Email: <b>{html.escape(email)}</b>\n"
         f"🌐 HTTP: <b>{http_status or '-'}</b>\n"
         f"Detail: <code>{html.escape(preview[:500])}</code>",
@@ -11851,7 +12066,7 @@ async def owner_tools_verify_begin(call: CallbackQuery,state: FSMContext):
         await state.set_state(OwnerState.tools_magiclink_email)
         return await safe_edit_or_answer(
             call,
-            "📧 <b>VERIFIKASI MAGIC LINK</b>\n\n"
+            "📧 <b>VERIFIKASI LINK VERIFIKASI</b>\n\n"
             "Kirim email akun terlebih dahulu.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")]
@@ -11863,10 +12078,10 @@ async def owner_tools_verify_begin(call: CallbackQuery,state: FSMContext):
     await state.set_state(OwnerState.tools_verify_link)
     await safe_edit_or_answer(
         call,
-        "🔗 <b>TEMPEL MAGIC LINK</b>\n\n"
+        "🔗 <b>MASUKKAN LINK VERIFIKASI</b>\n\n"
         f"📧 Email: <b>{html.escape(email)}</b>\n\n"
-        "Kirim URL Magic Link lengkap.\n"
-        "Link digunakan sekali untuk request verifikasi dan tidak disimpan permanen.",
+        "Kirim URL Link Verifikasi lengkap.\n"
+        "Link digunakan sekali untuk proses verifikasi dan tidak disimpan permanen.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")]
         ]),
@@ -11882,7 +12097,7 @@ async def owner_tools_verify_link_input(message: Message,state: FSMContext):
 
     raw_link=(message.text or "").strip()
     if not raw_link.startswith(("https://","http://")) or len(raw_link) > 3000:
-        return await message.answer("❌ Magic Link tidak valid. Kirim URL lengkap.")
+        return await message.answer("❌ Link Verifikasi tidak valid. Kirim URL lengkap.")
 
     data=await state.get_data()
     email=str(data.get("tools_verify_email") or "").strip().lower()
@@ -11896,8 +12111,8 @@ async def owner_tools_verify_link_input(message: Message,state: FSMContext):
     await message.answer(
         "⚠️ <b>KONFIRMASI VERIFIKASI</b>\n\n"
         f"📧 Email: <b>{html.escape(email)}</b>\n"
-        "🔗 Magic Link: <b>TERSIMPAN SEMENTARA</b>\n\n"
-        "Link tidak akan ditampilkan kembali.",
+        "🔗 Link Verifikasi: <b>TERSIMPAN SEMENTARA</b>\n\n"
+        "Link verifikasi tidak akan ditampilkan kembali.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Verifikasi Sekarang",callback_data="tools:verify:confirm")],
             [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")],
@@ -11919,6 +12134,13 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         await state.clear()
         return await call.answer("Session verifikasi tidak valid.",show_alert=True)
 
+    activity_id=create_tool_activity(
+        call.from_user.id,
+        "verify_account",
+        email,
+        "pending"
+    )
+
     await safe_edit_or_answer(
         call,
         "⏳ <b>MEMVERIFIKASI AKUN...</b>\n\n"
@@ -11935,6 +12157,12 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         },
     )
     preview=tool_response_preview(result)
+    update_tool_activity(
+        activity_id,
+        status="success" if ok else "failed",
+        http_status=http_status,
+        detail=preview,
+    )
 
     # Never retain raw link after the request.
     await state.clear()
@@ -11982,7 +12210,7 @@ async def owner_tools_alight_1y(call: CallbackQuery,state: FSMContext):
     await safe_edit_or_answer(
         call,
         "ℹ️ <b>PROVISION 1 TAHUN</b>\n\n"
-        "Flow Magic Link dan verifikasi akun sudah tersedia.\n"
+        "Flow Link Verifikasi dan verifikasi akun sudah tersedia.\n"
         "Aktivasi Premium otomatis tidak disambungkan di bot ini.\n\n"
         "Gunakan hanya endpoint provisioning resmi/berizin jika tersedia.",
         reply_markup=alight_tools_menu(),
@@ -12142,9 +12370,9 @@ async def owner_tools_status(call: CallbackQuery):
     if not TOOLS_PROVIDER_API_KEY:
         missing.append("TOOLS_PROVIDER_API_KEY")
     if not TOOLS_PROVIDER_MAGICLINK_URL:
-        missing.append("TOOLS_PROVIDER_MAGICLINK_URL")
+        missing.append("TOOLS_PROVIDER_MAGICLINK_URL (URL kirim link verifikasi)")
     if not TOOLS_PROVIDER_VERIFY_URL:
-        missing.append("TOOLS_PROVIDER_VERIFY_URL")
+        missing.append("TOOLS_PROVIDER_VERIFY_URL (URL verifikasi akun)")
 
     if missing:
         text=(
@@ -12160,7 +12388,7 @@ async def owner_tools_status(call: CallbackQuery):
             f"Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
             f"Auth: <b>{html.escape(TOOLS_PROVIDER_AUTH_MODE)}</b>\n"
             "API key: <b>✅ SET</b>\n"
-            "Magic Link endpoint: <b>✅ SET</b>\n"
+            "Link Verifikasi endpoint: <b>✅ SET</b>\n"
             "Verify endpoint: <b>✅ SET</b>\n"
             f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b>\n"
             f"Retry: <b>{TOOLS_PROVIDER_MAX_RETRIES}</b>"
@@ -12183,7 +12411,7 @@ async def owner_tools_provider_info(call: CallbackQuery):
         f"Nama: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
         f"Enabled: <b>{'YA' if TOOLS_PROVIDER_ENABLED else 'TIDAK'}</b>\n"
         f"Status endpoint: <b>{'SET' if TOOLS_PROVIDER_STATUS_URL else 'BELUM'}</b>\n"
-        f"Magic Link endpoint: <b>{'SET' if TOOLS_PROVIDER_MAGICLINK_URL else 'BELUM'}</b>\n"
+        f"Link Verifikasi endpoint: <b>{'SET' if TOOLS_PROVIDER_MAGICLINK_URL else 'BELUM'}</b>\n"
         f"Verify endpoint: <b>{'SET' if TOOLS_PROVIDER_VERIFY_URL else 'BELUM'}</b>\n"
         f"Provision endpoint: <b>{'SET' if TOOLS_PROVIDER_PROVISION_URL else 'BELUM'}</b>\n"
         f"API key: <b>{'SET' if TOOLS_PROVIDER_API_KEY else 'BELUM'}</b>\n"
@@ -12198,32 +12426,92 @@ async def owner_tools_provider_info(call: CallbackQuery):
 
 @router.callback_query(F.data == "tools:history")
 async def owner_tools_history(call: CallbackQuery):
-    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
-    conn=db()
-    rows=conn.execute(
-        """SELECT * FROM tool_provision_logs
-           WHERE owner_id=?
-           ORDER BY id DESC LIMIT 10""",
-        (int(call.from_user.id),)
-    ).fetchall()
-    conn.close()
-    lines=["📦 <b>RIWAYAT PROVISION</b>",""]
-    if not rows:
-        lines.append("Belum ada request provisioning.")
-    else:
-        for row in rows:
-            icon="✅" if row["status"]=="success" else ("⏳" if row["status"]=="pending" else "❌")
-            lines.append(
-                f"{icon} <b>#{row['id']}</b> • {html.escape(str(row['status']).upper())}\n"
-                f"🎬 Alight Motion • 1 Tahun\n"
-                f"📧 {html.escape(str(row['target_email']))}\n"
-                f"🌐 HTTP: {int(row['http_status'] or 0) or '-'}\n"
-                f"🕒 {html.escape(format_wib_datetime(row['created_at'],compact=True))}"
-            )
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await render_tools_history(call,1)
+
+
+@router.callback_query(F.data.startswith("toolshistory:"))
+async def owner_tools_history_page(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        page=int(call.data.split(":")[-1])
+    except Exception:
+        page=1
+    await render_tools_history(call,page)
+
+
+
+@router.callback_query(F.data == "tools:diagnostics")
+async def owner_tools_diagnostics(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
     await safe_edit_or_answer(
-        call,"\n\n".join(lines),reply_markup=owner_tools_menu(),parse_mode="HTML"
+        call,
+        tools_diagnostics_text(call.from_user.id),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Refresh",callback_data="tools:diagnostics")],
+            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+        ]),
+        parse_mode="HTML"
     )
     await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:resume")
+async def owner_tools_resume(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    last=tools_last_activity(call.from_user.id)
+    if not last:
+        return await call.answer("Belum ada aktivitas yang bisa dilanjutkan.",show_alert=True)
+
+    action=str(last["action"] or "")
+    email=str(last["target_email"] or "").strip().lower()
+    status=str(last["status"] or "")
+
+    if action=="send_verification_link":
+        await state.clear()
+        if valid_tools_email(email):
+            await state.update_data(tools_magic_email=email,tools_verify_email=email)
+        await safe_edit_or_answer(
+            call,
+            "♻️ <b>LANJUTKAN PROSES TERAKHIR</b>\n\n"
+            f"📧 Email: <b>{html.escape(email or '-')}</b>\n"
+            f"Status terakhir: <b>{html.escape(status.upper())}</b>\n\n"
+            "Jika link sudah masuk ke email, lanjutkan ke Verifikasi Akun.\n"
+            "Jika belum, kirim ulang Link Verifikasi.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
+                [InlineKeyboardButton(text="📧 Kirim Ulang Link",callback_data="tools:magiclink")],
+                [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+            ]),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
+    if action=="verify_account":
+        await state.clear()
+        if valid_tools_email(email):
+            await state.update_data(tools_verify_email=email)
+        await safe_edit_or_answer(
+            call,
+            "♻️ <b>LANJUTKAN VERIFIKASI</b>\n\n"
+            f"📧 Email: <b>{html.escape(email or '-')}</b>\n"
+            f"Status terakhir: <b>{html.escape(status.upper())}</b>\n\n"
+            "Link verifikasi tidak disimpan permanen, jadi kirim kembali link dari inbox untuk mencoba lagi.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Masukkan Link Verifikasi",callback_data="tools:verify")],
+                [InlineKeyboardButton(text="📧 Kirim Ulang Link",callback_data="tools:magiclink")],
+                [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+            ]),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
+    await call.answer("Aktivitas terakhir tidak memiliki recovery otomatis.",show_alert=True)
 
 
 @router.message(Command("owner"))
@@ -26439,7 +26727,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.38"
+EXPECTED_SOURCE_VERSION = "16.40"
 
 
 def source_integrity_self_test():
