@@ -157,7 +157,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.43"
+BOT_VERSION = "16.45"
 SCHEMA_VERSION = 176
 
 CHECKOUT_TERMS_SHORT = (
@@ -6477,6 +6477,28 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Tools Advanced Controls",False,str(exc)[:100]))
 
+    # Tools Pro License Stage
+    try:
+        pro_stage_ok=(
+            callable(parse_provider_license_status)
+            and callable(tools_pro_license_text)
+            and callable(tools_final_result_text)
+        )
+        checks.append((
+            "Tools Pro License Stage",
+            pro_stage_ok,
+            "provider-status parser + pro stage + final result"
+        ))
+    except Exception as exc:
+        checks.append(("Tools Pro License Stage",False,str(exc)[:100]))
+
+    # Compact Tools UI
+    try:
+        compact_tools_ok=callable(owner_tools_more_menu) and callable(tools_compact_summary_text)
+        checks.append(("Compact Tools UI",compact_tools_ok,"grouped menu + compact summary"))
+    except Exception as exc:
+        checks.append(("Compact Tools UI",False,str(exc)[:100]))
+
     # Schema version
     try:
         current_schema=schema_version_info()
@@ -11483,25 +11505,47 @@ def tools_provider_status_text() -> str:
 
 def owner_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎬 Alight Motion Tools",callback_data="tools:alight")],
-        [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
-        [InlineKeyboardButton(text="❤️ Health Summary",callback_data="tools:health")],
-        [InlineKeyboardButton(text="🧪 Diagnostik",callback_data="tools:diagnostics")],
-        [InlineKeyboardButton(text="♻️ Lanjutkan Terakhir",callback_data="tools:resume")],
-        [InlineKeyboardButton(text="🔐 Status idToken",callback_data="tools:token_status")],
-        [InlineKeyboardButton(text="📋 Hasil Final",callback_data="tools:final_result")],
-        [InlineKeyboardButton(text="📦 Riwayat Tools",callback_data="tools:history")],
-        [InlineKeyboardButton(text="⚙️ Status Provider",callback_data="tools:provider")],
+        [
+            InlineKeyboardButton(text="📧 Kirim Link",callback_data="tools:magiclink"),
+            InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify"),
+        ],
+        [
+            InlineKeyboardButton(text="⭐ Lisensi Pro",callback_data="tools:pro_license"),
+            InlineKeyboardButton(text="📋 Hasil Final",callback_data="tools:final_result"),
+        ],
+        [
+            InlineKeyboardButton(text="📊 Status",callback_data="tools:summary"),
+            InlineKeyboardButton(text="📦 Riwayat",callback_data="tools:history"),
+        ],
+        [InlineKeyboardButton(text="⚙️ Lainnya",callback_data="tools:more")],
         [InlineKeyboardButton(text="⬅️ Owner Panel",callback_data="owner:panel")],
+    ])
+
+
+def owner_tools_more_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔐 idToken",callback_data="tools:token_status"),
+            InlineKeyboardButton(text="♻️ Lanjutkan",callback_data="tools:resume"),
+        ],
+        [
+            InlineKeyboardButton(text="🧪 Diagnostik",callback_data="tools:diagnostics"),
+            InlineKeyboardButton(text="❤️ Health",callback_data="tools:health"),
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ Provider",callback_data="tools:provider"),
+            InlineKeyboardButton(text="🔌 Config",callback_data="tools:status"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Kembali",callback_data="tools:home")],
     ])
 
 
 def alight_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📧 Kirim Link Verifikasi",callback_data="tools:magiclink")],
-        [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
+        [InlineKeyboardButton(text="📧 Kirim Link",callback_data="tools:magiclink")],
+        [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
         [InlineKeyboardButton(text="🚀 Provision 1 Tahun",callback_data="tools:alight:1y")],
-        [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
+        [InlineKeyboardButton(text="📊 Status",callback_data="tools:stats")],
         [InlineKeyboardButton(text="📦 Riwayat Alight Motion",callback_data="tools:history")],
         [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
     ])
@@ -11872,6 +11916,113 @@ async def render_tools_filtered_history(call: CallbackQuery, page: int=1, status
     await safe_callback_notice(call)
 
 
+def normalize_provider_bool(value):
+    if isinstance(value,bool):
+        return value
+    if isinstance(value,(int,float)):
+        return bool(value)
+    text=str(value or "").strip().lower()
+    if text in {"1","true","yes","y","active","activated","premium","pro","success","berhasil","aktif"}:
+        return True
+    if text in {"0","false","no","n","inactive","failed","gagal","tidak aktif","expired"}:
+        return False
+    return None
+
+
+def find_provider_value(result, keys):
+    if not isinstance(result,dict):
+        return None
+    lowered={str(k).lower():v for k,v in result.items()}
+    for key in keys:
+        if key.lower() in lowered:
+            return lowered[key.lower()]
+    for nested_key in ("data","result","user","account","subscription","license","premium"):
+        nested=result.get(nested_key)
+        if isinstance(nested,dict):
+            value=find_provider_value(nested,keys)
+            if value is not None:
+                return value
+    return None
+
+
+def parse_provider_license_status(result) -> dict:
+    if not isinstance(result,dict):
+        return {"known":False,"active":False,"plan":"","expires_at":"","message":""}
+
+    raw_status=find_provider_value(
+        result,
+        (
+            "premium","isPremium","is_premium","pro","isPro","is_pro",
+            "active","isActive","is_active","status","subscriptionStatus",
+            "licenseStatus","premiumStatus"
+        )
+    )
+    active=normalize_provider_bool(raw_status)
+
+    plan=find_provider_value(
+        result,
+        ("plan","package","packageName","subscription","tier","membership","license")
+    )
+    expires=find_provider_value(
+        result,
+        ("expiresAt","expires_at","expiry","expiryDate","expirationDate","validUntil","valid_until")
+    )
+    message=find_provider_value(
+        result,
+        ("message","detail","statusMessage","description")
+    )
+
+    return {
+        "known":active is not None,
+        "active":bool(active) if active is not None else False,
+        "plan":str(plan or "").strip(),
+        "expires_at":str(expires or "").strip(),
+        "message":str(message or "").strip(),
+    }
+
+
+def tools_pro_license_text(data: dict) -> str:
+    email=str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "")
+    verify_status=str(data.get("tools_final_status") or "")
+    token=str(data.get("tools_verify_id_token") or "")
+    provider_status=dict(data.get("tools_provider_license_status") or {})
+
+    lines=[
+        "⭐ <b>TAHAP LISENSI PRO</b>",
+        "",
+        f"📧 Email Target: <b>{html.escape(email or '-')}</b>",
+        f"✅ Verifikasi: <b>{'BERHASIL' if verify_status=='success' else 'BELUM BERHASIL'}</b>",
+        f"🔐 idToken: <b>{masked_id_token(token)}</b>",
+        "",
+    ]
+
+    if provider_status.get("known"):
+        lines.append(
+            "⭐ Status Lisensi: <b>✅ AKTIF</b>"
+            if provider_status.get("active")
+            else "⭐ Status Lisensi: <b>❌ TIDAK AKTIF</b>"
+        )
+    else:
+        lines.append("⭐ Status Lisensi: <b>➖ BELUM DIKONFIRMASI PROVIDER</b>")
+
+    plan=str(provider_status.get("plan") or "").strip()
+    expires=str(provider_status.get("expires_at") or "").strip()
+    message=str(provider_status.get("message") or "").strip()
+
+    if plan:
+        lines.append(f"📦 Paket: <b>{html.escape(plan)}</b>")
+    if expires:
+        lines.append(f"📅 Berlaku sampai: <b>{html.escape(expires)}</b>")
+    if message:
+        lines += ["",f"Provider: <code>{html.escape(message[:500])}</code>"]
+
+    lines += [
+        "",
+        "Status Premium/Pro hanya ditampilkan AKTIF jika provider mengembalikan status lisensi/subscription secara eksplisit."
+    ]
+    return "\n".join(lines)
+
+
 def tools_final_result_text(data: dict) -> str:
     email=str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "")
     status=str(data.get("tools_final_status") or "")
@@ -11879,25 +12030,66 @@ def tools_final_result_text(data: dict) -> str:
     final_at=str(data.get("tools_final_at") or "")
     preview=str(data.get("tools_final_preview") or "")
     token=str(data.get("tools_verify_id_token") or "")
+    license_status=dict(data.get("tools_provider_license_status") or {})
 
     status_text={"success":"✅ BERHASIL","failed":"❌ GAGAL"}.get(status,"➖ BELUM ADA HASIL")
     lines=[
         "📋 <b>HASIL FINAL TOOLS</b>",
         "",
-        f"Status Verify: <b>{status_text}</b>",
         f"📧 Email Target: <b>{html.escape(email or '-')}</b>",
+        f"✅ Status Verify: <b>{status_text}</b>",
         f"🔐 idToken: <b>{masked_id_token(token)}</b>",
         f"🌐 HTTP Provider: <b>{http_status or '-'}</b>",
     ]
+
+    if license_status.get("known"):
+        lines.append(
+            "⭐ Status Premium/Pro: <b>✅ AKTIF</b>"
+            if license_status.get("active")
+            else "⭐ Status Premium/Pro: <b>❌ TIDAK AKTIF</b>"
+        )
+    else:
+        lines.append("⭐ Status Premium/Pro: <b>➖ BELUM DIKONFIRMASI</b>")
+
+    plan=str(license_status.get("plan") or "").strip()
+    expires=str(license_status.get("expires_at") or "").strip()
+    message=str(license_status.get("message") or "").strip()
+
+    if plan:
+        lines.append(f"📦 Paket: <b>{html.escape(plan)}</b>")
+    if expires:
+        lines.append(f"📅 Berlaku sampai: <b>{html.escape(expires)}</b>")
     if final_at:
         lines.append(f"🕒 Waktu: <b>{html.escape(format_wib_datetime(final_at,compact=True))}</b>")
     if preview:
-        lines += ["",f"Provider: <code>{html.escape(preview[:500])}</code>"]
+        lines += ["",f"Provider Verify: <code>{html.escape(preview[:500])}</code>"]
+    if message:
+        lines += [f"Provider Lisensi: <code>{html.escape(message[:500])}</code>"]
+
     lines += [
         "",
-        "Catatan: ini adalah hasil proses verifikasi akun dari provider.",
-        "Status Premium hanya dinyatakan aktif jika provider mengembalikan status lisensi/subscription yang eksplisit."
+        "Status Premium/Pro hanya dinyatakan AKTIF bila response provider mengonfirmasinya secara eksplisit."
     ]
+    return "\n".join(lines)
+
+def tools_compact_summary_text(owner_id: int) -> str:
+    stats=tools_stats_snapshot(owner_id)
+    daily=tools_daily_stats(owner_id)
+    last=tools_last_activity(owner_id)
+
+    lines=[
+        "📊 <b>STATUS TOOLS</b>",
+        "",
+        f"Provider: <b>{tools_provider_status_text()}</b>",
+        f"Kuota jam ini: <b>{stats['used_requests']}/{stats['hourly_limit']}</b>",
+        f"Sisa akun: <b>{stats['remaining_accounts']}</b>",
+        f"Hari ini: <b>{daily['success']} sukses / {daily['failed']} gagal</b>",
+    ]
+    if last:
+        lines.append(
+            f"Terakhir: <b>{html.escape(str(last['action']))}</b> • "
+            f"{html.escape(str(last['status']))}"
+        )
     return "\n".join(lines)
 
 
@@ -12437,7 +12629,7 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
             f"🌐 HTTP: <b>{http_status}</b>\n\n"
             "Setelah link masuk ke email, pilih tombol Verifikasi Akun lalu kirim URL verifikasi lengkap.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
+                [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
                 [InlineKeyboardButton(text="⬅️ Alight Tools",callback_data="tools:alight")],
             ]),
             parse_mode="HTML"
@@ -12593,6 +12785,7 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
             tools_verify_id_token_at=datetime.now().isoformat(timespec="seconds"),
         )
 
+    provider_license_status=parse_provider_license_status(result)
     preview=tool_response_preview(result)
     final_at=datetime.now().isoformat(timespec="seconds")
     await state.update_data(
@@ -12601,6 +12794,7 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         tools_final_http_status=int(http_status or 0),
         tools_final_at=final_at,
         tools_final_preview=preview[:900],
+        tools_provider_license_status=provider_license_status,
     )
     release_tool_email_lock(email)
     update_tool_activity(
@@ -12632,7 +12826,16 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
             f"📧 Email Target: <b>{html.escape(email)}</b>\n"
             f"🔐 idToken: <b>{masked_id_token(verify_id_token)}</b>\n"
             f"🌐 HTTP Provider: <b>{http_status}</b>\n"
-            f"🕒 Waktu: <b>{html.escape(format_wib_datetime(final_at,compact=True))}</b>\n"
+            + (
+                "⭐ Status Premium/Pro: <b>✅ AKTIF</b>\n"
+                if provider_license_status.get("known") and provider_license_status.get("active")
+                else (
+                    "⭐ Status Premium/Pro: <b>❌ TIDAK AKTIF</b>\n"
+                    if provider_license_status.get("known")
+                    else "⭐ Status Premium/Pro: <b>➖ BELUM DIKONFIRMASI</b>\n"
+                )
+            )
+            + f"🕒 Waktu: <b>{html.escape(format_wib_datetime(final_at,compact=True))}</b>\n"
             + (f"🔎 Ref: <code>{html.escape(safe_ref)}</code>\n" if safe_ref else "")
             + "\nToken/link sensitif tidak ditampilkan atau disimpan permanen.",
             reply_markup=alight_tools_menu(),
@@ -12716,7 +12919,7 @@ async def owner_tools_alight_confirm(call: CallbackQuery,state: FSMContext):
             f"Hitung mundur: <b>{quota['reset_countdown']}</b>\n\n"
             "Bot tidak mengirim request baru agar provider tidak terkena limit.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
+                [InlineKeyboardButton(text="📊 Status",callback_data="tools:stats")],
                 [InlineKeyboardButton(text="⬅️ Alight Tools",callback_data="tools:alight")],
             ]),
             parse_mode="HTML"
@@ -12958,6 +13161,55 @@ async def owner_tools_history_search_input(message: Message,state: FSMContext):
 
 
 
+@router.callback_query(F.data == "tools:summary")
+async def owner_tools_summary(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await safe_edit_or_answer(
+        call,
+        tools_compact_summary_text(call.from_user.id),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Refresh",callback_data="tools:summary")],
+            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:more")
+async def owner_tools_more(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await safe_edit_or_answer(
+        call,
+        "⚙️ <b>TOOLS LAINNYA</b>\n\n"
+        "Diagnostik, recovery, token, dan status provider.",
+        reply_markup=owner_tools_more_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:pro_license")
+async def owner_tools_pro_license(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    data=await state.get_data()
+    await safe_edit_or_answer(
+        call,
+        tools_pro_license_text(data),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Refresh Status",callback_data="tools:pro_license")],
+            [InlineKeyboardButton(text="📋 Hasil Final",callback_data="tools:final_result")],
+            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
 @router.callback_query(F.data == "tools:final_result")
 async def owner_tools_final_result(call: CallbackQuery,state: FSMContext):
     if not is_owner(call.from_user.id):
@@ -12968,7 +13220,7 @@ async def owner_tools_final_result(call: CallbackQuery,state: FSMContext):
         tools_final_result_text(data),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Refresh",callback_data="tools:final_result")],
-            [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
+            [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
             [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
         ]),
         parse_mode="HTML"
@@ -13005,7 +13257,7 @@ async def owner_tools_token_status(call: CallbackQuery,state: FSMContext):
         call,
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
+            [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
             [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
         ]),
         parse_mode="HTML"
@@ -13072,7 +13324,7 @@ async def owner_tools_resume(call: CallbackQuery,state: FSMContext):
             "Jika link sudah masuk ke email, lanjutkan ke Verifikasi Akun.\n"
             "Jika belum, kirim ulang Link Verifikasi.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
+                [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
                 [InlineKeyboardButton(text="📧 Kirim Ulang Link",callback_data="tools:magiclink")],
                 [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
             ]),
@@ -27315,7 +27567,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.43"
+EXPECTED_SOURCE_VERSION = "16.45"
 
 
 def source_integrity_self_test():

@@ -1,22 +1,27 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v16.38
+**Versi aktif:** v16.45
 
-## v16.38 — Fix `/tools` Konfigurasi Belum Lengkap
+## v16.45 — `/tools` Compact UI
 
-Bug diperbaiki:
-- status READY sebelumnya masih bergantung pada `TOOLS_PROVIDER_PROVISION_URL`;
-- padahal flow aktif sekarang hanya Magic Link + Verify.
+Menu utama `/tools` sekarang lebih ringkas:
 
-Sekarang `/tools` dianggap READY jika:
-- `TOOLS_PROVIDER_ENABLED=true`
-- `TOOLS_PROVIDER_API_KEY` tersedia di Railway Secret
-- `TOOLS_PROVIDER_MAGICLINK_URL` terisi
-- `TOOLS_PROVIDER_VERIFY_URL` terisi
+```text
+📧 Kirim Link   | ✅ Verifikasi
+⭐ Lisensi Pro  | 📋 Hasil Final
+📊 Status       | 📦 Riwayat
+⚙️ Lainnya
+⬅️ Owner Panel
+```
 
-`TOOLS_PROVIDER_STATUS_URL` dan `TOOLS_PROVIDER_PROVISION_URL` tidak lagi diwajibkan.
+`⚙️ Lainnya` menampung fitur lanjutan:
+- idToken
+- lanjutkan proses
+- diagnostik
+- health
+- provider
+- config
 
-Menu `Cek API` sekarang memeriksa konfigurasi aktif tersebut dan menampilkan
-variable mana yang benar-benar belum tersedia jika ada.
-
-Schema tetap 174.
+Semua fitur v16.44 tetap dipertahankan.
+Tidak ada Railway Variable baru.
+Schema tetap 176.

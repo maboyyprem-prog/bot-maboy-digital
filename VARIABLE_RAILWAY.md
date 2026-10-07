@@ -1445,3 +1445,118 @@ TOOLS_PROVIDER_VERIFY_URL=https://alightfree.my.id/api/v1/verify-account
 
 `TOOLS_PROVIDER_STATUS_URL` dan `TOOLS_PROVIDER_PROVISION_URL` tidak lagi digunakan
 untuk menentukan kesiapan `/tools`.
+
+
+## v16.39 — Nama Alur `/tools`
+
+Nama yang tampil di Telegram disederhanakan:
+
+```text
+📧 Kirim Link Verifikasi
+✅ Verifikasi Akun
+```
+
+Variable internal tetap sama:
+
+```text
+TOOLS_PROVIDER_MAGICLINK_URL=https://alightfree.my.id/api/v1/send-magiclink
+TOOLS_PROVIDER_VERIFY_URL=https://alightfree.my.id/api/v1/verify-account
+```
+
+Tidak perlu mengganti nama variable Railway yang sudah ada.
+
+
+## v16.40 — Advanced `/tools`
+
+Tidak ada Railway Variable baru.
+
+Schema:
+```text
+SCHEMA_VERSION=175
+```
+
+Tambahan internal:
+- `tool_activity_logs`
+- pagination riwayat tools
+- recovery step terakhir
+- diagnostik provider/config
+
+
+## v16.41 — Advanced `/tools`
+
+Tambahkan:
+
+```text
+TOOLS_SESSION_EXPIRY_MINUTES=15
+TOOLS_EMAIL_LOCK_SECONDS=300
+TOOLS_PROVIDER_STATUS_CACHE_SECONDS=60
+```
+
+Tidak ada notifikasi owner otomatis.
+Tidak ada export riwayat.
+
+Schema:
+```text
+SCHEMA_VERSION=176
+```
+
+
+## v16.42 — Secure idToken Capture
+
+Tidak ada Railway Variable baru.
+
+Setelah `verify-account` berhasil, bot mencoba mengambil `idToken` dari response.
+Token hanya disimpan sementara di session owner dan tidak dipersistenkan ke database/log.
+
+Schema tetap:
+```text
+SCHEMA_VERSION=176
+```
+
+
+## v16.43 — Email Target & Final Result
+
+Tidak ada Railway Variable baru.
+
+Flow:
+```text
+Email Target
+→ Kirim Link Verifikasi
+→ Verifikasi Akun
+→ idToken terdeteksi sementara
+→ Hasil Final
+```
+
+Schema tetap:
+```text
+SCHEMA_VERSION=176
+```
+
+
+## v16.44 — Pro License Stage
+
+Tidak ada Railway Variable baru.
+
+Flow:
+```text
+Email Target
+→ Kirim Link Verifikasi
+→ Verifikasi Akun
+→ idToken terdeteksi
+→ Tahap Lisensi Pro
+→ Hasil Final
+```
+
+Status Premium/Pro hanya ditampilkan aktif jika provider mengembalikan status eksplisit.
+
+Schema tetap:
+```text
+SCHEMA_VERSION=176
+```
+
+
+## v16.45 — Compact `/tools`
+
+Tidak ada Railway Variable baru.
+Perubahan hanya pada UI dan pengelompokan menu `/tools`.
+Schema tetap `176`.
