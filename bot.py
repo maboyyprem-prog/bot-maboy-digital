@@ -93,7 +93,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.16"
+BOT_VERSION = "16.23"
 SCHEMA_VERSION = 169
 
 CHECKOUT_TERMS_SHORT = (
@@ -2071,7 +2071,7 @@ async def notify_fulfillment_pending(bot: Bot, order, missing: int):
                 f"📦 Variant ID: <code>{order['variant_id']}</code>\n"
                 f"🔢 Qty: <b>{order['qty']}</b>\n"
                 f"❗ Kekurangan akun: <b>{missing}</b>\n\n"
-                "Buka /owner → 📦 Atur Stok → pilih produk/variasi → ➕ Tambah Akun.",
+                "Buka /owner → 📦 Atur Stok → pilih produk/variasi → ➕ Tambah Akun / Stok.",
                 parse_mode="HTML"
             )
         except Exception:
@@ -5710,6 +5710,38 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Bank Copy Button",False,str(exc)[:100]))
 
+    # Stock input modes
+    try:
+        checks.append((
+            "Stock Input Modes",
+            callable(owner_stock_duplicate_qty_keyboard) and callable(duplicate_inventory_items),
+            "private target sequence + sharing duplicate"
+        ))
+    except Exception as exc:
+        checks.append(("Stock Input Modes",False,str(exc)[:100]))
+
+    # Unified account-stock model
+    try:
+        conn=db()
+        mismatches=int(conn.execute(
+            """SELECT COUNT(*) AS n
+               FROM product_variants v
+               WHERE COALESCE(v.stock,0) != (
+                   SELECT COUNT(*)
+                   FROM inventory_items i
+                   WHERE i.variant_id=v.id
+                     AND i.status='available'
+               )"""
+        ).fetchone()["n"] or 0)
+        conn.close()
+        checks.append((
+            "Account Stock 1:1",
+            mismatches==0,
+            f"{mismatches} mismatch"
+        ))
+    except Exception as exc:
+        checks.append(("Account Stock 1:1",False,str(exc)[:100]))
+
     # Owner proof action UX
     try:
         proof_ui_ok=(
@@ -7584,10 +7616,6 @@ class ReviewState(StatesGroup):
     waiting_comment = State()
 
 
-class ShopToolsState(StatesGroup):
-    search_product = State()
-
-
 class BroadcastState(StatesGroup):
     waiting_message = State()
 
@@ -9281,29 +9309,53 @@ def qris_settings_menu():
     return kb.as_markup()
 
 
-def products_keyboard(filter_sql=""):
-    conn = db()
-    rows = conn.execute(
-        f"SELECT * FROM products WHERE active=1 {filter_sql} ORDER BY id"
-    ).fetchall()
-    stock_map = product_stock_map(conn, filter_sql)
-    conn.close()
+PRODUCTS_PAGE_SIZE = 5
 
-    kb = InlineKeyboardBuilder()
-    for row in rows:
-        total_stock = stock_map.get(int(row["id"]), 0)
-        kb.button(
-            text=product_stock_button_label(row["name"],total_stock),
-            callback_data=f"product:{row['id']}"
+
+def product_view_filter(view: str) -> str:
+    view=str(view or "all").lower()
+    if view=="popular":
+        return "AND is_popular=1"
+    if view=="flash":
+        return "AND is_flash_sale=1"
+    return ""
+
+
+def products_keyboard(page: int = 1, total_pages: int = 1, view: str = "all"):
+    page=max(1,int(page or 1))
+    total_pages=max(1,int(total_pages or 1))
+    view=view if view in {"all","popular","flash"} else "all"
+
+    kb=InlineKeyboardBuilder()
+
+    nav=[]
+    if page>1:
+        nav.append(
+            InlineKeyboardButton(
+                text="⬅️ Halaman Sebelumnya",
+                callback_data=f"productspage:{view}:{page-1}"
+            )
         )
-    kb.adjust(1)
+    if page<total_pages:
+        nav.append(
+            InlineKeyboardButton(
+                text="Halaman Berikutnya ➡️",
+                callback_data=f"productspage:{view}:{page+1}"
+            )
+        )
+    if nav:
+        kb.row(*nav)
+
     kb.row(
-        InlineKeyboardButton(text="🔎 Cari", callback_data="shop:search"),
-        InlineKeyboardButton(text="🛒 Keranjang", callback_data="shop:cart"),
-        InlineKeyboardButton(text="⭐ Favorit", callback_data="shop:favorites")
+        InlineKeyboardButton(text="🛒 Keranjang",callback_data="shop:cart"),
+        InlineKeyboardButton(text="⭐ Favorit",callback_data="shop:favorites")
     )
-    kb.row(InlineKeyboardButton(text="🎁 Paket Hemat", callback_data="shop:bundles"))
-    kb.row(InlineKeyboardButton(text="⬅️ Menu Utama", callback_data="home"))
+    kb.row(
+        InlineKeyboardButton(text="🎁 Paket Hemat",callback_data="shop:bundles")
+    )
+    kb.row(
+        InlineKeyboardButton(text="⬅️ Menu Utama",callback_data="home")
+    )
     return kb.as_markup()
 
 
@@ -9560,49 +9612,6 @@ async def start(message: Message, bot: Bot):
     await show_main_menu_message(message)
 
 
-
-@router.callback_query(F.data == "shop:search")
-async def shop_search_start(call: CallbackQuery, state: FSMContext):
-    await state.set_state(ShopToolsState.search_product)
-    await safe_edit_or_answer(call, 
-        "🔎 <b>CARI PRODUK</b>\n\nKirim nama atau kata kunci produk.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Kembali", callback_data="products")]
-        ]),
-        parse_mode="HTML"
-    )
-    await call.answer()
-
-
-@router.message(ShopToolsState.search_product)
-async def shop_search_input(message: Message, state: FSMContext):
-    query = (message.text or "").strip()
-    if not query:
-        return await message.answer("❌ Kata kunci kosong.")
-
-    conn = db()
-    rows = conn.execute(
-        """SELECT * FROM products
-           WHERE active=1 AND lower(name) LIKE lower(?)
-           ORDER BY sold DESC, id
-           LIMIT 20""",
-        (f"%{query}%",)
-    ).fetchall()
-    conn.close()
-    await state.clear()
-
-    kb = InlineKeyboardBuilder()
-    for row in rows:
-        kb.button(text=row["name"], callback_data=f"product:{row['id']}")
-    kb.button(text="⬅️ List Produk", callback_data="products")
-    kb.adjust(1)
-
-    await message.answer(
-        "🔎 <b>HASIL PENCARIAN</b>\n\n"
-        + (f"Ditemukan <b>{len(rows)}</b> produk." if rows else "Produk tidak ditemukan."),
-        reply_markup=kb.as_markup(),
-        parse_mode="HTML"
-    )
 
 
 @router.callback_query(F.data.startswith("cartadd:"))
@@ -11073,43 +11082,92 @@ async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.answer()
 
 
-def compact_product_list_text(rows, stock_map, *, title="LIST PRODUK") -> str:
-    total=len(rows)
+def compact_product_list_text(
+    rows,
+    stock_map,
+    *,
+    title="LIST PRODUK",
+    total=0,
+    page=1,
+    total_pages=1,
+    global_number_map=None
+) -> str:
+    total=max(0,int(total or 0))
+    page=max(1,int(page or 1))
+    total_pages=max(1,int(total_pages or 1))
+    number_map=global_number_map or {}
+
     lines=[
         "╭────────────────────╮",
         f"│ 🛍️ <b>{html.escape(title)}</b>",
         f"│ Total: <b>{total} Produk</b>",
-        "│ Halaman: <b>1/1</b>",
+        f"│ Halaman: <b>{page}/{total_pages}</b>",
         "├────────────────────┤",
     ]
 
     if not rows:
         lines.append("│ Belum ada produk aktif.")
     else:
-        for index,row in enumerate(rows,start=1):
+        for row in rows:
             stock=max(0,int(stock_map.get(int(row["id"]),0)))
-            lines.append(
-                f"│ [{index}] <b>{html.escape(str(row['name']))}</b> "
-                f"({stock} stok)"
-            )
+            number=int(number_map.get(int(row["id"]),0) or 0)
+            if number>0:
+                lines.append(
+                    f"│ [{number}] <b>{html.escape(str(row['name']))}</b> "
+                    f"({stock} stok)"
+                )
+            else:
+                lines.append(
+                    f"│ <b>{html.escape(str(row['name']))}</b> ({stock} stok)"
+                )
 
     lines += [
         "╰────────────────────╯",
         "",
         "Silakan pilih nomor produk di keyboard bawah",
-        "atau pilih tombol produk.",
+        "atau ketik nomor produk secara manual.",
         "",
         f"<i>{STORE_FOOTER}</i>",
     ]
     return "\n".join(lines)
 
 
-async def show_product_list(call, title, filter_sql=""):
-    conn = db()
-    rows = conn.execute(
-        f"SELECT * FROM products WHERE active=1 {filter_sql} ORDER BY id"
+async def show_product_list(
+    call,
+    title,
+    filter_sql="",
+    *,
+    page: int = 1,
+    view: str = "all"
+):
+    conn=db()
+
+    all_active=conn.execute(
+        "SELECT id FROM products WHERE active=1 ORDER BY id"
     ).fetchall()
-    stock_map = product_stock_map(conn, filter_sql)
+    global_number_map={
+        int(row["id"]): index
+        for index,row in enumerate(all_active,start=1)
+    }
+
+    total=int(conn.execute(
+        f"""SELECT COUNT(*) AS n
+            FROM products
+            WHERE active=1 {filter_sql}"""
+    ).fetchone()["n"] or 0)
+
+    total_pages=max(1,(total + PRODUCTS_PAGE_SIZE - 1)//PRODUCTS_PAGE_SIZE)
+    page=max(1,min(int(page or 1),total_pages))
+    offset=(page-1)*PRODUCTS_PAGE_SIZE
+
+    rows=conn.execute(
+        f"""SELECT * FROM products
+            WHERE active=1 {filter_sql}
+            ORDER BY id
+            LIMIT ? OFFSET ?""",
+        (PRODUCTS_PAGE_SIZE,offset)
+    ).fetchall()
+    stock_map=product_stock_map(conn,filter_sql)
     conn.close()
 
     clean_title=re.sub(r"<[^>]+>","",str(title or "LIST PRODUK"))
@@ -11118,13 +11176,17 @@ async def show_product_list(call, title, filter_sql=""):
     text=compact_product_list_text(
         rows,
         stock_map,
-        title=clean_title or "LIST PRODUK"
+        title=clean_title or "LIST PRODUK",
+        total=total,
+        page=page,
+        total_pages=total_pages,
+        global_number_map=global_number_map
     )
 
     await safe_edit_or_answer(
         call,
         text,
-        reply_markup=products_keyboard(filter_sql),
+        reply_markup=products_keyboard(page,total_pages,view),
         parse_mode="HTML"
     )
     await safe_callback_notice(call)
@@ -11173,20 +11235,61 @@ async def public_store_rating(call: CallbackQuery):
 
 @router.callback_query(F.data == "products")
 async def products(call: CallbackQuery):
-    await safe_callback_notice(call)
-    await show_product_list(call, "🏷️ <b>LIST PRODUK</b>")
+    await show_product_list(
+        call,
+        "🏷️ <b>LIST PRODUK</b>",
+        page=1,
+        view="all"
+    )
 
 
 @router.callback_query(F.data == "popular")
 async def popular(call: CallbackQuery):
-    await safe_callback_notice(call)
-    await show_product_list(call, "🔥 <b>PRODUK POPULER</b>", "AND is_popular=1")
+    await show_product_list(
+        call,
+        "🔥 <b>PRODUK POPULER</b>",
+        product_view_filter("popular"),
+        page=1,
+        view="popular"
+    )
 
 
 @router.callback_query(F.data == "flash")
 async def flash(call: CallbackQuery):
-    await safe_callback_notice(call)
-    await show_product_list(call, "⚡ <b>FLASH SALE</b>", "AND is_flash_sale=1")
+    await show_product_list(
+        call,
+        "⚡ <b>FLASH SALE</b>",
+        product_view_filter("flash"),
+        page=1,
+        view="flash"
+    )
+
+
+@router.callback_query(F.data.startswith("productspage:"))
+async def products_page(call: CallbackQuery):
+    try:
+        _,view,page_raw=call.data.split(":")
+        page=int(page_raw)
+    except Exception:
+        return await call.answer("Halaman tidak valid.",show_alert=True)
+
+    if view not in {"all","popular","flash"}:
+        return await call.answer("Daftar produk tidak valid.",show_alert=True)
+
+    titles={
+        "all":"🏷️ <b>LIST PRODUK</b>",
+        "popular":"🔥 <b>PRODUK POPULER</b>",
+        "flash":"⚡ <b>FLASH SALE</b>",
+    }
+
+    await show_product_list(
+        call,
+        titles[view],
+        product_view_filter(view),
+        page=page,
+        view=view
+    )
+
 
 
 @router.callback_query(F.data.startswith("product:"))
@@ -16481,140 +16584,14 @@ async def owner_stock_duplicate_content_input(message: Message, state: FSMContex
                 callback_data=f"ownerstockdup:{variant_id}"
             )],
             [InlineKeyboardButton(
-                text="➕ Tambah 1 Akun Private",
-                callback_data=f"ownerstockadd:{variant_id}"
+                text="➕ Tambah Akun Berbeda",
+                callback_data=f"ownerstockunified:{variant_id}"
             )],
             [InlineKeyboardButton(
                 text="⬅️ Produk & Stok",
                 callback_data="owner:back_products"
             )]
         ]),
-        parse_mode="HTML"
-    )
-
-
-@router.message(OwnerState.stock_add_items)
-async def owner_stock_add_input(message: Message, state: FSMContext, bot: Bot):
-    if not is_owner(message.from_user.id):
-        return
-
-    data = await state.get_data()
-    variant_id = int(data.get("stock_variant_id", 0))
-
-    # Free-form account text:
-    # everything owner sends is preserved as ONE inventory item.
-    content = (message.text or message.caption or "").strip()
-
-    if not variant_id:
-        await state.clear()
-        return await message.answer(
-            "❌ Variasi stok tidak ditemukan.",
-            reply_markup=owner_products_menu()
-        )
-
-    if not content:
-        return await message.answer(
-            "❌ Teks akun kosong.\n"
-            "Kirim teks akun bebas yang ingin disimpan."
-        )
-
-    conn = db()
-    conn.execute("BEGIN IMMEDIATE")
-
-    variant = conn.execute(
-        "SELECT * FROM product_variants WHERE id=?",
-        (variant_id,)
-    ).fetchone()
-
-    if not variant:
-        conn.rollback()
-        conn.close()
-        await state.clear()
-        return await message.answer(
-            "❌ Variasi tidak ditemukan.",
-            reply_markup=owner_products_menu()
-        )
-
-    old_available = available_stock(variant)
-    product_id = int(variant["product_id"])
-
-    # Prevent exact duplicate of the full free-form text.
-    exists = conn.execute(
-        """SELECT id FROM inventory_items
-           WHERE variant_id=? AND content=?""",
-        (variant_id, content)
-    ).fetchone()
-
-    if exists:
-        conn.rollback()
-        conn.close()
-        await state.clear()
-        return await message.answer(
-            "ℹ️ Teks akun yang sama persis sudah tersimpan di variasi ini.",
-            reply_markup=owner_products_menu()
-        )
-
-    now = datetime.now().isoformat(timespec="seconds")
-    conn.execute(
-        """INSERT INTO inventory_items
-           (variant_id, content, status, created_at)
-           VALUES(?,?,'available',?)""",
-        (variant_id, content, now)
-    )
-
-    sync_variant_stock_from_inventory(conn, variant_id)
-    conn.commit()
-    conn.close()
-
-    await state.clear()
-    await fulfill_pending_for_variant(variant_id, bot)
-
-    conn = db()
-    variant_after = conn.execute(
-        "SELECT * FROM product_variants WHERE id=?",
-        (variant_id,)
-    ).fetchone()
-    conn.close()
-
-    new_available = available_stock(variant_after)
-
-    inventory_log(
-        variant_id,
-        "RESTOCK",
-        1,
-        "OWNER",
-        "Tambah 1 akun teks bebas"
-    )
-
-    if old_available <= 0 and new_available > 0:
-        asyncio.create_task(
-            notify_restock_subscribers(
-                bot,
-                product_id,
-                variant_id,
-                new_available
-            )
-        )
-        asyncio.create_task(
-            broadcast_restock_to_verified(
-                bot,
-                product_id,
-                variant_id,
-                new_available
-            )
-        )
-
-    preview = html.escape(content[:500])
-    if len(content) > 500:
-        preview += "…"
-
-    await message.answer(
-        "✅ <b>AKUN BERHASIL DITAMBAHKAN</b>\n\n"
-        "Teks disimpan utuh sebagai <b>1 akun / 1 stok</b>.\n\n"
-        f"<blockquote>{preview}</blockquote>\n"
-        f"📦 Stok tersedia sekarang: <b>{new_available}</b>\n\n"
-        "Untuk menambah akun berikutnya, buka lagi menu Tambah Akun.",
-        reply_markup=owner_products_menu(),
         parse_mode="HTML"
     )
 
@@ -17822,25 +17799,43 @@ async def owner_search_products_input(message: Message, state: FSMContext):
 
 @router.message(F.text == "🏷️ List Produk")
 async def reply_menu_products(message: Message, bot: Bot):
-    if not await is_channel_member(bot, message.from_user.id):
+    if not await is_channel_member(bot,message.from_user.id):
         return await send_join_required(message)
 
-    mark_user_verified(message.from_user.id, message.from_user.username or "")
+    mark_user_verified(message.from_user.id,message.from_user.username or "")
 
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM products WHERE active=1 ORDER BY id"
+    conn=db()
+    all_active=conn.execute(
+        "SELECT id FROM products WHERE active=1 ORDER BY id"
     ).fetchall()
-    stock_map = product_stock_map(conn)
+    total=len(all_active)
+    total_pages=max(1,(total + PRODUCTS_PAGE_SIZE - 1)//PRODUCTS_PAGE_SIZE)
+    rows=conn.execute(
+        """SELECT * FROM products
+           WHERE active=1
+           ORDER BY id
+           LIMIT ?""",
+        (PRODUCTS_PAGE_SIZE,)
+    ).fetchall()
+    stock_map=product_stock_map(conn)
     conn.close()
+
+    number_map={
+        int(row["id"]): index
+        for index,row in enumerate(all_active,start=1)
+    }
 
     await message.answer(
         compact_product_list_text(
             rows,
             stock_map,
-            title="LIST PRODUK"
+            title="LIST PRODUK",
+            total=total,
+            page=1,
+            total_pages=total_pages,
+            global_number_map=number_map
         ),
-        reply_markup=products_keyboard(""),
+        reply_markup=products_keyboard(1,total_pages,"all"),
         parse_mode="HTML"
     )
 
@@ -20516,12 +20511,8 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
         f"Stok tersedia: <b>{available}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="➕ Tambah 1 Akun",
-                callback_data=f"ownerstockadd:{variant_id}"
-            )],
-            [InlineKeyboardButton(
-                text="📥 Tambah Stok Banyak",
-                callback_data=f"ownerstockbulk:{variant_id}"
+                text="➕ Tambah Akun / Stok",
+                callback_data=f"ownerstockunified:{variant_id}"
             )],
             [InlineKeyboardButton(
                 text="🔁 Duplikat Akun Sharing",
@@ -20540,44 +20531,14 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("ownerstockbulk:"))
-async def owner_stock_bulk_begin(call: CallbackQuery, state: FSMContext):
+async def owner_stock_bulk_legacy(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
-
-    try:
-        variant_id = int(call.data.split(":")[-1])
-    except Exception:
-        return await call.answer("Varian tidak valid.", show_alert=True)
-
-    conn = db()
-    row = conn.execute(
-        """SELECT v.id,v.name,v.sharing_mode,p.name AS product_name
-           FROM product_variants v
-           JOIN products p ON p.id=v.product_id
-           WHERE v.id=? AND v.active=1 AND p.active=1""",
-        (variant_id,)
-    ).fetchone()
-    conn.close()
-
-    if not row:
-        return await call.answer("Varian tidak ditemukan.", show_alert=True)
-
-    await state.clear()
-    await state.update_data(stock_variant_id=variant_id)
-
-    await safe_edit_or_answer(
-        call,
-        "📥 <b>TAMBAH STOK BANYAK • PRIVATE</b>\n\n"
-        f"📦 Produk: <b>{html.escape(row['product_name'])}</b>\n"
-        f"🧩 Varian: <b>{html.escape(row['name'])}</b>\n\n"
-        "Pilih jumlah akun berbeda yang ingin ditambahkan.\n"
-        "Setelah itu bot akan meminta akun <b>satu per satu</b>.\n\n"
-        "🔐 Setiap akun = 1 stok = 1 pembeli.\n"
-        "🚫 Akun yang sama tidak boleh digunakan dua kali.",
-        reply_markup=owner_stock_bulk_unique_qty_keyboard(variant_id),
-        parse_mode="HTML"
+    await call.answer(
+        "Tambah stok sekarang digabung dengan Tambah Akun / Stok.",
+        show_alert=True
     )
-    await safe_callback_notice(call)
+
 
 
 @router.callback_query(F.data.startswith("ownerstockbulkqty:"))
@@ -20728,57 +20689,102 @@ async def owner_stock_bulk_custom_input(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    raw = (message.text or "").strip()
-    if not raw.isdigit():
-        return await message.answer("❌ Kirim angka antara 2–500.")
+    data=await state.get_data()
+    variant_id=int(data.get("stock_variant_id",0) or 0)
+    target_mode=bool(data.get("stock_target_custom_mode"))
 
-    qty = int(raw)
-    if qty < 2 or qty > 500:
-        return await message.answer("❌ Jumlah harus antara 2–500.")
-
-    data = await state.get_data()
-    variant_id = int(data.get("stock_variant_id", 0) or 0)
-    if not variant_id:
+    raw=(message.text or "").strip()
+    if not target_mode or not variant_id:
         await state.clear()
-        return await message.answer("❌ Varian stok tidak valid.")
+        return await message.answer(
+            "❌ Session jumlah akun tidak valid. Silakan mulai ulang."
+        )
 
-    conn = db()
-    variant = conn.execute(
+    if not raw.isdigit():
+        return await message.answer("❌ Kirim angka antara 1–500.")
+
+    qty=int(raw)
+    if qty < 1 or qty > 500:
+        return await message.answer("❌ Jumlah harus antara 1–500.")
+
+    conn=db()
+    variant=conn.execute(
         "SELECT id FROM product_variants WHERE id=? AND active=1",
         (variant_id,)
     ).fetchone()
     conn.close()
+
     if not variant:
         await state.clear()
         return await message.answer("❌ Varian tidak ditemukan.")
 
-    session_id = stock_bulk_session_start(
-        message.from_user.id,
-        variant_id,
-        qty
-    )
-
     await state.clear()
     await state.update_data(
         stock_variant_id=variant_id,
-        stock_bulk_session_id=session_id,
-        stock_bulk_target_qty=qty
+        stock_unified_mode=True,
+        stock_target_qty=qty,
+        stock_session_added=0
     )
     await state.set_state(OwnerState.stock_bulk_unique_collect)
 
     await message.answer(
         "📥 <b>MASUKKAN AKUN 1/{}</b>\n\n"
         "Kirim akun pertama sekarang.\n"
-        "Setiap pesan = <b>1 akun / 1 stok</b>.\n\n"
-        "🚫 Akun duplikat akan ditolak.".format(qty),
+        "Isi akun bebas dan boleh multi-baris.\n\n"
+        "📌 1 pesan = 1 akun = 1 stok\n"
+        "✅ Setiap akun langsung tersimpan.\n"
+        "🚫 Akun yang sama persis akan ditolak.".format(qty),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="❌ Batalkan Tambah Stok",
-                callback_data=f"ownerstockbulkcancel:{session_id}"
+                text="❌ Batalkan Sesi",
+                callback_data=f"ownerstocktargetcancel:{variant_id}"
             )]
         ]),
         parse_mode="HTML"
     )
+
+
+
+@router.callback_query(F.data.startswith("ownerstockunifieddone:"))
+async def owner_stock_unified_done(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        variant_id=0
+
+    data=await state.get_data()
+    added=int(data.get("stock_session_added",0) or 0)
+    target=int(data.get("stock_target_qty",0) or 0)
+    await state.clear()
+
+    await call.answer(
+        f"Sesi dihentikan. Tersimpan {added}" + (f"/{target} akun." if target else " akun."),
+        show_alert=True
+    )
+
+    if variant_id:
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>SESI TAMBAH AKUN DITUTUP</b>\n\n"
+            f"👤 Akun tersimpan: <b>{added}</b>"
+            + (f" dari target <b>{target}</b>" if target else "")
+            + ".",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="➕ Tambah Akun / Stok",
+                    callback_data=f"ownerstockunified:{variant_id}"
+                )],
+                [InlineKeyboardButton(
+                    text="📦 Kembali ke Varian",
+                    callback_data=f"ownerstockvar:{variant_id}"
+                )]
+            ]),
+            parse_mode="HTML"
+        )
+
 
 
 @router.message(OwnerState.stock_bulk_unique_collect)
@@ -20787,132 +20793,36 @@ async def owner_stock_bulk_collect(message: Message, state: FSMContext, bot: Bot
         await state.clear()
         return
 
-    data = await state.get_data()
-    session_id = int(data.get("stock_bulk_session_id", 0) or 0)
-    variant_id = int(data.get("stock_variant_id", 0) or 0)
-    target_qty = int(data.get("stock_bulk_target_qty", 0) or 0)
+    data=await state.get_data()
+    variant_id=int(data.get("stock_variant_id",0) or 0)
+    unified_mode=bool(data.get("stock_unified_mode"))
+    target_qty=int(data.get("stock_target_qty",0) or 0)
+    session_added=int(data.get("stock_session_added",0) or 0)
 
-    if not session_id or not variant_id or target_qty < 2:
+    if not variant_id or not unified_mode or target_qty < 1:
         await state.clear()
         return await message.answer(
-            "❌ Session tambah stok tidak valid. Silakan mulai ulang dari menu Atur Stok."
+            "❌ Session Tambah Akun / Stok tidak valid. Silakan mulai ulang."
         )
 
-    content = (message.text or message.caption or "").strip()
+    if session_added >= target_qty:
+        await state.clear()
+        return await message.answer(
+            "✅ Target akun pada sesi ini sudah terpenuhi."
+        )
+
+    # One full Telegram message = one free-text account.
+    content=(message.text or message.caption or "").strip()
     if not content:
         return await message.answer(
-            "❌ Data akun kosong. Kirim teks akun yang ingin dimasukkan."
+            "❌ Data akun kosong. Kirim teks akun yang ingin disimpan."
         )
 
-    conn = db()
-    conn.execute("BEGIN IMMEDIATE")
+    conn=db()
+    begin_immediate_retry(conn)
 
     try:
-        session = conn.execute(
-            """SELECT * FROM stock_bulk_sessions
-               WHERE id=? AND owner_id=? AND variant_id=?
-                 AND status='collecting'""",
-            (session_id, message.from_user.id, variant_id)
-        ).fetchone()
-
-        if not session:
-            conn.rollback()
-            conn.close()
-            await state.clear()
-            return await message.answer(
-                "❌ Session tambah stok sudah tidak aktif. Silakan mulai ulang."
-            )
-
-        # Never allow same account already present in this product variant,
-        # regardless of available/reserved/sold state.
-        existing = conn.execute(
-            """SELECT id FROM inventory_items
-               WHERE variant_id=? AND content=? LIMIT 1""",
-            (variant_id, content)
-        ).fetchone()
-        if existing:
-            conn.rollback()
-            conn.close()
-            current_conn = db()
-            accepted = stock_bulk_session_count(current_conn, session_id)
-            current_conn.close()
-            return await message.answer(
-                "❌ <b>AKUN DUPLIKAT</b>\n\n"
-                "Akun yang sama sudah pernah tersimpan pada varian ini.\n"
-                f"Progress tetap: <b>{accepted}/{target_qty}</b>.\n\n"
-                "Silakan kirim akun berbeda untuk slot berikutnya.",
-                parse_mode="HTML"
-            )
-
-        staged = conn.execute(
-            """SELECT id FROM stock_bulk_items
-               WHERE session_id=? AND content=? LIMIT 1""",
-            (session_id, content)
-        ).fetchone()
-        if staged:
-            conn.rollback()
-            conn.close()
-            current_conn = db()
-            accepted = stock_bulk_session_count(current_conn, session_id)
-            current_conn.close()
-            return await message.answer(
-                "❌ <b>AKUN DUPLIKAT</b>\n\n"
-                "Akun ini sudah dimasukkan dalam proses stok saat ini.\n"
-                f"Progress tetap: <b>{accepted}/{target_qty}</b>.\n\n"
-                "Silakan kirim akun yang berbeda.",
-                parse_mode="HTML"
-            )
-
-        now = datetime.now().isoformat(timespec="seconds")
-        conn.execute(
-            """INSERT INTO stock_bulk_items(session_id,content,created_at)
-               VALUES(?,?,?)""",
-            (session_id, content, now)
-        )
-        conn.execute(
-            """UPDATE stock_bulk_sessions
-               SET updated_at=?
-               WHERE id=?""",
-            (now, session_id)
-        )
-
-        accepted = stock_bulk_session_count(conn, session_id)
-
-        if accepted < target_qty:
-            conn.commit()
-            conn.close()
-
-            await message.answer(
-                "✅ <b>AKUN {}/{}</b> tersimpan sementara.\n\n"
-                "Sekarang kirim akun berikutnya: <b>{}/{}</b>.\n\n"
-                "📦 Stok produk belum berubah sampai semua akun lengkap.".format(
-                    accepted, target_qty, accepted + 1, target_qty
-                ),
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text="❌ Batalkan Tambah Stok",
-                        callback_data=f"ownerstockbulkcancel:{session_id}"
-                    )]
-                ]),
-                parse_mode="HTML"
-            )
-            return
-
-        # Finalization is atomic: re-check every staged item against
-        # inventory, then insert all credentials in one transaction.
-        staged_items = conn.execute(
-            """SELECT content FROM stock_bulk_items
-               WHERE session_id=?
-               ORDER BY id ASC""",
-            (session_id,)
-        ).fetchall()
-
-        if len(staged_items) != target_qty:
-            raise RuntimeError(
-                f"Jumlah staging tidak sesuai target ({len(staged_items)}/{target_qty})"
-            )
-
-        variant = conn.execute(
+        variant=conn.execute(
             """SELECT v.*,p.name AS product_name
                FROM product_variants v
                JOIN products p ON p.id=v.product_id
@@ -20921,134 +20831,148 @@ async def owner_stock_bulk_collect(message: Message, state: FSMContext, bot: Bot
         ).fetchone()
 
         if not variant:
-            raise RuntimeError("Varian tidak ditemukan atau sudah nonaktif.")
+            conn.rollback(); conn.close(); await state.clear()
+            return await message.answer("❌ Varian tidak ditemukan atau sudah nonaktif.")
 
-        old_available = available_stock(variant)
+        old_available=available_stock(variant)
 
-        for item in staged_items:
-            duplicate = conn.execute(
-                """SELECT id FROM inventory_items
-                   WHERE variant_id=? AND content=? LIMIT 1""",
-                (variant_id, item["content"])
-            ).fetchone()
-            if duplicate:
-                raise RuntimeError(
-                    "Ada akun staging yang sudah tersimpan di inventory. "
-                    "Batalkan dan mulai ulang agar tidak terjadi duplikat."
-                )
+        existing=conn.execute(
+            """SELECT id FROM inventory_items
+               WHERE variant_id=? AND content=?
+               LIMIT 1""",
+            (variant_id,content)
+        ).fetchone()
 
-        now = datetime.now().isoformat(timespec="seconds")
-        conn.executemany(
+        if existing:
+            conn.rollback(); conn.close()
+            return await message.answer(
+                "⚠️ <b>AKUN DUPLIKAT</b>\n\n"
+                "Akun yang sama persis sudah pernah tersimpan.\n"
+                f"Progress tetap: <b>{session_added}/{target_qty}</b>.\n\n"
+                f"Silakan kirim akun berbeda untuk <b>{session_added + 1}/{target_qty}</b>.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="❌ Batalkan Sesi",
+                        callback_data=f"ownerstocktargetcancel:{variant_id}"
+                    )]
+                ]),
+                parse_mode="HTML"
+            )
+
+        now=datetime.now().isoformat(timespec="seconds")
+        conn.execute(
             """INSERT INTO inventory_items
                (variant_id,content,status,created_at)
                VALUES(?,?,'available',?)""",
-            [(variant_id, item["content"], now) for item in staged_items]
+            (variant_id,content,now)
         )
 
-        # This flow is explicitly Private/Unique.
+        # Different accounts are Private / Unique.
         conn.execute(
             "UPDATE product_variants SET sharing_mode=0 WHERE id=?",
             (variant_id,)
         )
-        sync_variant_stock_from_inventory(conn, variant_id)
+        sync_variant_stock_from_inventory(conn,variant_id)
 
-        conn.execute(
-            """UPDATE stock_bulk_sessions
-               SET status='completed', updated_at=?
-               WHERE id=?""",
-            (now, session_id)
-        )
-        conn.execute(
-            "DELETE FROM stock_bulk_items WHERE session_id=?",
-            (session_id,)
-        )
-
-        product_id = int(variant["product_id"])
-        product_name = str(variant["product_name"])
-        variant_name = str(variant["name"])
-
+        product_id=int(variant["product_id"])
+        product_name=str(variant["product_name"])
+        variant_name=str(variant["name"])
         conn.commit()
     except Exception as exc:
-        conn.rollback()
-        conn.close()
-        logging.exception("Bulk unique stock finalize failed: %s", exc)
+        conn.rollback(); conn.close()
+        logging.exception("Target account stock insert failed: %s",exc)
         return await message.answer(
-            "❌ <b>STOK BELUM DITAMBAHKAN</b>\n\n"
-            "Semua akun tetap aman dan tidak ada stok parsial yang dibuat.\n"
-            f"Error: <code>{html.escape(str(exc)[:400])}</code>\n\n"
-            "Gunakan tombol batal lalu ulangi proses jika diperlukan.",
+            "❌ <b>AKUN BELUM DITAMBAHKAN</b>\n\n"
+            f"Error: <code>{html.escape(str(exc)[:350])}</code>",
+            parse_mode="HTML"
+        )
+
+    conn.close()
+
+    session_added += 1
+    await state.update_data(stock_session_added=session_added)
+
+    owner_action_log(
+        "RESTOCK_ACCOUNT",
+        f"variant={variant_id} qty=1 progress={session_added}/{target_qty}",
+        message.from_user.id
+    )
+    inventory_log(
+        variant_id,
+        "RESTOCK_ACCOUNT",
+        1,
+        "OWNER",
+        f"Tambah akun {session_added}/{target_qty}"
+    )
+
+    try:
+        await fulfill_pending_for_variant(variant_id,bot)
+    except Exception:
+        logging.exception(
+            "Fulfill pending after target stock insert failed variant=%s",
+            variant_id
+        )
+
+    conn=db()
+    variant_after=conn.execute(
+        "SELECT * FROM product_variants WHERE id=?",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+    new_available=available_stock(variant_after) if variant_after else 0
+
+    if old_available<=0 and new_available>0:
+        asyncio.create_task(
+            notify_restock_subscribers(bot,product_id,variant_id,new_available)
+        )
+        asyncio.create_task(
+            broadcast_restock_to_verified(bot,product_id,variant_id,new_available)
+        )
+
+    if session_added >= target_qty:
+        await state.clear()
+        return await message.answer(
+            "✅ <b>TAMBAH AKUN SELESAI</b>\n\n"
+            f"📦 Produk: <b>{html.escape(product_name)}</b>\n"
+            f"🧩 Varian: <b>{html.escape(variant_name)}</b>\n"
+            f"👤 Akun masuk: <b>{session_added}</b>\n"
+            f"📈 Stok bertambah: <b>{session_added}</b>\n"
+            f"📦 Stok tersedia sekarang: <b>{new_available}</b>\n\n"
+            "Semua akun pada target sudah tersimpan.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
-                    text="❌ Batalkan & Ulangi",
-                    callback_data=f"ownerstockbulkcancel:{session_id}"
+                    text="➕ Tambah Akun / Stok Lagi",
+                    callback_data=f"ownerstockunified:{variant_id}"
+                )],
+                [InlineKeyboardButton(
+                    text="🔁 Duplikat Akun Sharing",
+                    callback_data=f"ownerstockdup:{variant_id}"
+                )],
+                [InlineKeyboardButton(
+                    text="📦 Kembali ke Varian",
+                    callback_data=f"ownerstockvar:{variant_id}"
                 )]
             ]),
             parse_mode="HTML"
         )
 
-    conn.close()
-    await state.clear()
-
-    owner_action_log("RESTOCK_BULK_UNIQUE", f"variant={variant_id} qty={target_qty}", message.from_user.id)
-
-    inventory_log(
-        variant_id,
-        "RESTOCK_BULK_UNIQUE",
-        target_qty,
-        "OWNER",
-        f"Tambah {target_qty} akun Private/Unique"
-    )
-
-    # Give paid-pending orders first chance to consume the newly inserted stock.
-    try:
-        await fulfill_pending_for_variant(variant_id, bot)
-    except Exception:
-        logging.exception(
-            "Fulfill pending after bulk restock failed variant=%s",
-            variant_id
-        )
-
-    conn = db()
-    variant_after = conn.execute(
-        "SELECT * FROM product_variants WHERE id=?",
-        (variant_id,)
-    ).fetchone()
-    conn.close()
-
-    new_available = available_stock(variant_after) if variant_after else 0
-
-    if old_available <= 0 and new_available > 0:
-        asyncio.create_task(
-            notify_restock_subscribers(
-                bot, product_id, variant_id, new_available
-            )
-        )
-        asyncio.create_task(
-            broadcast_restock_to_verified(
-                bot, product_id, variant_id, new_available
-            )
-        )
-
     await message.answer(
-        "✅ <b>STOK BANYAK BERHASIL DITAMBAHKAN</b>\n\n"
-        f"📦 Produk: <b>{html.escape(product_name)}</b>\n"
-        f"🧩 Varian: <b>{html.escape(variant_name)}</b>\n"
-        f"📥 Akun masuk: <b>{target_qty}</b>\n"
-        f"📊 Stok tersedia sekarang: <b>{new_available}</b>\n"
-        "🔐 Mode: <b>Private / Unique</b>\n\n"
-        "Setiap pembelian mengambil <b>1 akun berbeda</b> dan stok berkurang 1.",
+        "✅ <b>AKUN {}/{}</b> TERSIMPAN\n\n"
+        "📈 Stok bertambah: <b>1</b>\n"
+        f"📦 Stok tersedia sekarang: <b>{new_available}</b>\n\n"
+        "Sekarang kirim akun berikutnya: <b>{}/{}</b>.\n"
+        "Isi tetap teks bebas.".format(
+            session_added,target_qty,session_added + 1,target_qty
+        ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
-                text="📥 Tambah Stok Banyak Lagi",
-                callback_data=f"ownerstockbulk:{variant_id}"
-            )],
-            [InlineKeyboardButton(
-                text="📦 Kembali ke Varian",
-                callback_data=f"ownerstockvar:{variant_id}"
+                text="❌ Batalkan Sesi",
+                callback_data=f"ownerstocktargetcancel:{variant_id}"
             )]
         ]),
         parse_mode="HTML"
     )
+
 
 
 @router.callback_query(F.data.startswith("ownerstockdup:"))
@@ -21070,7 +20994,6 @@ async def owner_stock_duplicate_begin(call: CallbackQuery, state: FSMContext):
         (variant_id,)
     ).fetchone()
     conn.close()
-
     if not row:
         return await call.answer("Varian tidak ditemukan.",show_alert=True)
 
@@ -21082,12 +21005,13 @@ async def owner_stock_duplicate_begin(call: CallbackQuery, state: FSMContext):
         "🔁 <b>DUPLIKAT AKUN SHARING</b>\n\n"
         f"📦 Produk: <b>{html.escape(row['product_name'])}</b>\n"
         f"🧩 Varian: <b>{html.escape(row['name'])}</b>\n\n"
-        "Pilih akun yang sama ingin dijadikan berapa stok.\n\n"
-        "⚠️ Gunakan fitur ini untuk akun <b>SHARING</b>.",
+        "Gunakan untuk <b>satu akun yang sama</b> yang memang boleh dipakai beberapa pembeli.\n\n"
+        "Pilih jumlah stok sharing:",
         reply_markup=owner_stock_duplicate_qty_keyboard(variant_id),
         parse_mode="HTML"
     )
     await safe_callback_notice(call)
+
 
 
 @router.callback_query(F.data.startswith("ownerstockdupqty:"))
@@ -21149,30 +21073,215 @@ async def owner_stock_duplicate_custom(call: CallbackQuery, state: FSMContext):
     await safe_callback_notice(call)
 
 
-@router.callback_query(F.data.startswith("ownerstockadd:"))
-async def owner_stock_add_begin(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("ownerstockunified:"))
+async def owner_stock_unified_begin(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
     try:
         variant_id=int(call.data.split(":")[-1])
     except Exception:
-        return await call.answer("Varian tidak valid.", show_alert=True)
+        return await call.answer("Varian tidak valid.",show_alert=True)
 
+    conn=db()
+    row=conn.execute(
+        """SELECT v.id,v.name,p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Varian tidak ditemukan.",show_alert=True)
+
+    await state.clear()
     await state.update_data(stock_variant_id=variant_id)
-    await state.set_state(OwnerState.stock_add_items)
 
     await safe_edit_or_answer(
         call,
-        "➕ <b>TAMBAH 1 AKUN / PRIVATE</b>\n\n"
-        "Kirim isi akun bebas format.\n"
-        "Satu pesan = satu akun = satu stok.\n"
-        "Mode ini tetap menolak akun identik yang sudah tersimpan.\n\n"
-        "Boleh multi-baris dan tidak perlu tanda <code>|</code>.",
-        reply_markup=back_owner("owner:back_products"),
+        "➕ <b>TAMBAH AKUN / STOK</b>\n\n"
+        f"📦 Produk: <b>{html.escape(row['product_name'])}</b>\n"
+        f"🧩 Varian: <b>{html.escape(row['name'])}</b>\n\n"
+        "Pilih berapa <b>akun berbeda</b> yang ingin dimasukkan.\n\n"
+        "Setelah memilih jumlah, bot akan meminta akun secara berurutan.\n"
+        "Setiap pesan tetap <b>teks bebas</b> dan disimpan sebagai:\n"
+        "<b>1 pesan = 1 akun = 1 stok</b>.\n\n"
+        "Contoh pilih <b>5 akun</b> → kirim akun 1/5, 2/5, 3/5, 4/5, 5/5.\n"
+        "Masing-masing langsung tersimpan tanpa membuka menu lagi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="1",callback_data=f"ownerstocktarget:{variant_id}:1"),
+                InlineKeyboardButton(text="2",callback_data=f"ownerstocktarget:{variant_id}:2"),
+                InlineKeyboardButton(text="5",callback_data=f"ownerstocktarget:{variant_id}:5"),
+            ],
+            [
+                InlineKeyboardButton(text="10",callback_data=f"ownerstocktarget:{variant_id}:10"),
+                InlineKeyboardButton(text="20",callback_data=f"ownerstocktarget:{variant_id}:20"),
+                InlineKeyboardButton(text="50",callback_data=f"ownerstocktarget:{variant_id}:50"),
+            ],
+            [InlineKeyboardButton(
+                text="✏️ Custom",
+                callback_data=f"ownerstocktargetcustom:{variant_id}"
+            )],
+            [InlineKeyboardButton(
+                text="🔁 Duplikat Akun Sharing",
+                callback_data=f"ownerstockdup:{variant_id}"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Kembali",
+                callback_data=f"ownerstockvar:{variant_id}"
+            )]
+        ]),
         parse_mode="HTML"
     )
     await safe_callback_notice(call)
+
+
+
+@router.callback_query(F.data.startswith("ownerstocktarget:"))
+async def owner_stock_target_qty(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        _,variant_raw,qty_raw=call.data.split(":")
+        variant_id=int(variant_raw)
+        qty=int(qty_raw)
+    except Exception:
+        return await call.answer("Jumlah tidak valid.",show_alert=True)
+
+    if qty < 1 or qty > 500:
+        return await call.answer("Jumlah harus 1–500.",show_alert=True)
+
+    conn=db()
+    variant=conn.execute(
+        """SELECT v.id,v.name,p.name AS product_name
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
+        (variant_id,)
+    ).fetchone()
+    conn.close()
+
+    if not variant:
+        return await call.answer("Varian tidak ditemukan.",show_alert=True)
+
+    await state.clear()
+    await state.update_data(
+        stock_variant_id=variant_id,
+        stock_unified_mode=True,
+        stock_target_qty=qty,
+        stock_session_added=0
+    )
+    await state.set_state(OwnerState.stock_bulk_unique_collect)
+
+    await safe_edit_or_answer(
+        call,
+        "📥 <b>MASUKKAN AKUN 1/{}</b>\n\n"
+        "Kirim akun pertama sekarang.\n"
+        "Isi akun bebas dan boleh multi-baris.\n\n"
+        "📌 1 pesan = 1 akun = 1 stok\n"
+        "✅ Setiap akun langsung tersimpan.\n"
+        "🚫 Akun yang sama persis akan ditolak.".format(qty),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="❌ Batalkan Sesi",
+                callback_data=f"ownerstocktargetcancel:{variant_id}"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstocktargetcustom:"))
+async def owner_stock_target_custom(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.",show_alert=True)
+
+    await state.clear()
+    await state.update_data(
+        stock_variant_id=variant_id,
+        stock_target_custom_mode=True
+    )
+    await state.set_state(OwnerState.stock_bulk_unique_count)
+
+    await safe_edit_or_answer(
+        call,
+        "✏️ <b>JUMLAH AKUN</b>\n\n"
+        "Kirim jumlah akun berbeda yang ingin dimasukkan.\n"
+        "Batas: <b>1–500 akun</b>.\n\n"
+        "Contoh: <code>3</code>, <code>5</code>, <code>25</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="⬅️ Kembali",
+                callback_data=f"ownerstockunified:{variant_id}"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstocktargetcancel:"))
+async def owner_stock_target_cancel(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        variant_id=0
+
+    data=await state.get_data()
+    added=int(data.get("stock_session_added",0) or 0)
+    target=int(data.get("stock_target_qty",0) or 0)
+    await state.clear()
+
+    text=(
+        "❌ <b>SESI TAMBAH AKUN DIHENTIKAN</b>\n\n"
+        f"✅ Akun yang sudah tersimpan: <b>{added}</b>"
+    )
+    if target:
+        text += f" dari target <b>{target}</b>"
+    text += ".\nAkun yang sudah masuk tetap tersimpan sebagai stok."
+
+    markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="➕ Mulai Lagi",
+            callback_data=f"ownerstockunified:{variant_id}"
+        )],
+        [InlineKeyboardButton(
+            text="📦 Kembali ke Varian",
+            callback_data=f"ownerstockvar:{variant_id}"
+        )]
+    ]) if variant_id else owner_products_menu()
+
+    await safe_edit_or_answer(call,text,reply_markup=markup,parse_mode="HTML")
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerstockadd:"))
+async def owner_stock_add_legacy(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.",show_alert=True)
+    await call.answer(
+        "Tambah akun dan stok sekarang digabung menjadi satu menu.",
+        show_alert=True
+    )
+    call.data=f"ownerstockunified:{variant_id}"
+
 
 
 @router.callback_query(F.data.startswith("ownerdelete:"))
@@ -22684,7 +22793,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.16"
+EXPECTED_SOURCE_VERSION = "16.23"
 
 
 def source_integrity_self_test():
