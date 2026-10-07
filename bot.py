@@ -93,8 +93,8 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.23"
-SCHEMA_VERSION = 169
+BOT_VERSION = "16.28"
+SCHEMA_VERSION = 172
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -782,6 +782,17 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS order_login_proofs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            file_id TEXT NOT NULL,
+            caption TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+
     # migrations from previous versions
     add_column_if_missing(conn, "products", "created_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "products", "sold", "INTEGER NOT NULL DEFAULT 0")
@@ -789,9 +800,15 @@ def init_db():
     add_column_if_missing(conn, "products", "rating_count", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "is_popular", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "is_flash_sale", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "products", "fulfillment_mode", "TEXT NOT NULL DEFAULT 'ready'")
+    add_column_if_missing(conn, "products", "preorder_estimate", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "products", "preorder_instructions", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "products", "product_type", "TEXT NOT NULL DEFAULT 'standard'")
     add_column_if_missing(conn, "product_variants", "reserved_stock", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "product_variants", "button_label", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "product_variants", "sharing_mode", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "inventory_items", "content_fingerprint", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "inventory_items", "inventory_mode", "TEXT NOT NULL DEFAULT 'unique'")
     add_column_if_missing(conn, "orders", "variant_id", "INTEGER DEFAULT 0")
     add_column_if_missing(conn, "orders", "unit_price", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "payment_method", "TEXT DEFAULT 'QRIS'")
@@ -856,6 +873,9 @@ def init_db():
     add_column_if_missing(conn, "orders", "invoice_sent", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "delivery_footer_sent", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "payment_review_status", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "preorder_status", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "preorder_owner_notified", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "orders", "preorder_user_notified", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "reviews", "product_name_snapshot", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "reviews", "variant_name_snapshot", "TEXT DEFAULT ''")
 
@@ -874,6 +894,10 @@ def init_db():
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_reviews_product "
         "ON reviews(product_id, created_at)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_login_proofs_user "
+        "ON order_login_proofs(user_id, created_at)"
     )
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_inventory_logs_variant "
@@ -1039,6 +1063,17 @@ def init_db():
             WHERE id=NEW.id;
         END
     """)
+
+    # v16.26 inventory hardening:
+    # fingerprint private credentials, quarantine old accidental duplicates,
+    # and enforce DB-level uniqueness for future private inventory.
+    harden_existing_inventory_fingerprints(conn)
+    cur.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_unique_fingerprint
+           ON inventory_items(variant_id,content_fingerprint)
+           WHERE inventory_mode='unique'
+             AND content_fingerprint!=''"""
+    )
 
     cur.execute(
         """INSERT OR IGNORE INTO schema_migrations(version,app_version,applied_at)
@@ -1835,6 +1870,12 @@ def inventory_integrity_v2(conn):
              AND COALESCE(o.account_sent,0)=1
              AND COALESCE(o.payment_method,'')!='OWNER_FREE'
              AND NOT EXISTS(
+               SELECT 1
+               FROM products p
+               WHERE p.id=o.product_id
+                 AND COALESCE(p.fulfillment_mode,'ready')='preorder'
+             )
+             AND NOT EXISTS(
                SELECT 1 FROM inventory_items i
                WHERE i.order_id=o.id AND i.status='sold'
              )"""
@@ -2024,21 +2065,31 @@ def inventory_mode(conn, variant_id: int) -> bool:
 
 
 def sync_variant_stock_from_inventory(conn, variant_id: int):
-    # Physical stock for account-based products equals credentials not yet sold.
-    row = conn.execute(
+    # Ready-stock variants use inventory items as physical stock.
+    # Pre-order variants use product_variants.stock as remaining PO slots.
+    mode_row=conn.execute(
+        """SELECT COALESCE(p.fulfillment_mode,'ready') AS fulfillment_mode
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE v.id=?""",
+        (int(variant_id),)
+    ).fetchone()
+    if mode_row and str(mode_row["fulfillment_mode"] or "ready")=="preorder":
+        return
+
+    row=conn.execute(
         """SELECT COUNT(*) AS n
            FROM inventory_items
-           WHERE variant_id=? AND status='available'""",
+           WHERE variant_id=?
+             AND status='available'
+             AND inventory_mode IN ('unique','sharing')""",
         (variant_id,)
     ).fetchone()
-    available_items = int(row["n"] or 0)
-    # Physical stock equals credentials that have not been sold.
-    # reserved_stock is subtracted separately by available_stock().
+    available_items=int(row["n"] or 0)
     conn.execute(
         "UPDATE product_variants SET stock=? WHERE id=?",
-        (available_items, variant_id)
+        (available_items,variant_id)
     )
-
 
 
 def reconcile_all_inventory_stock(conn):
@@ -2213,7 +2264,9 @@ async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_
         await bot.send_message(
             user_id,
             "🔒 Simpan akun dengan aman dan jangan membagikannya kepada orang lain.\n\n"
+            "Jika akun tidak valid / bermasalah, gunakan tombol komplain di bawah.\n\n"
             f"<i>{STORE_FOOTER}</i>",
+            reply_markup=user_delivery_actions_keyboard(order_id),
             parse_mode="HTML"
         )
         conn=db()
@@ -2226,6 +2279,40 @@ async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_
 
 
 
+def user_complaint_button(order_id: int):
+    return InlineKeyboardButton(
+        text="⚠️ Komplain Akun",
+        callback_data=f"usercomplaint:{int(order_id)}"
+    )
+
+
+def user_delivery_actions_keyboard(order_id: int):
+    conn=db()
+    row=conn.execute(
+        """SELECT COALESCE(p.product_type,'standard') AS product_type
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           WHERE o.id=?""",
+        (int(order_id),)
+    ).fetchone()
+    conn.close()
+    famhead=bool(row and str(row["product_type"] or "standard")=="famhead")
+
+    rows=[
+        [InlineKeyboardButton(text="📸 Kirim Bukti Login",callback_data=f"loginproof:{int(order_id)}")]
+    ]
+    if not famhead:
+        rows.append([user_complaint_button(order_id)])
+    btn=owner_contact_button()
+    if btn:
+        rows.append([btn])
+    rows.extend([
+        [InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")],
+        [InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def rating_keyboard(order_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -2236,6 +2323,9 @@ def rating_keyboard(order_id: int):
         [
             InlineKeyboardButton(text="⭐⭐⭐⭐ 4", callback_data=f"rate:{order_id}:4"),
             InlineKeyboardButton(text="⭐⭐⭐⭐⭐ 5", callback_data=f"rate:{order_id}:5"),
+        ],
+        [
+            user_complaint_button(order_id)
         ],
         [
             InlineKeyboardButton(text="🧾 Riwayat", callback_data="my_orders")
@@ -2415,6 +2505,142 @@ async def send_review_prompt_if_needed(bot: Bot, order_id: int) -> bool:
     return True
 
 
+def family_owner_keyboard(order_id: int, username: str = ""):
+    rows=[
+        [InlineKeyboardButton(text="▶️ Proses Pesanan",callback_data=f"preorderprocess:{order_id}")],
+        [InlineKeyboardButton(text="✅ Sudah Diundang",callback_data=f"familyinvited:{order_id}")],
+        [InlineKeyboardButton(text="🧾 Detail Order",callback_data=f"preorderdetail:{order_id}")],
+    ]
+    if username:
+        rows.append([InlineKeyboardButton(text="💬 Hubungi User",url=f"https://t.me/{username.lstrip('@')}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def preorder_owner_keyboard(order_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Proses Pesanan",callback_data=f"preorderprocess:{order_id}")],
+        [InlineKeyboardButton(text="📦 Kirim Akun / Produk",callback_data=f"preorderdeliver:{order_id}")],
+        [InlineKeyboardButton(text="🧾 Detail Order",callback_data=f"preorderdetail:{order_id}")],
+    ])
+
+
+async def prepare_preorder_paid_order(order_id: int, bot: Bot) -> bool:
+    conn=db()
+    begin_immediate_retry(conn)
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,p.fulfillment_mode,
+                  p.preorder_estimate,p.preorder_instructions,p.product_type,
+                  v.name AS variant_name
+           FROM orders o
+           JOIN products p ON p.id=o.product_id
+           JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=?""",
+        (int(order_id),)
+    ).fetchone()
+
+    if not row or str(row["fulfillment_mode"] or "ready")!="preorder":
+        conn.rollback(); conn.close()
+        return False
+    if row["payment_status"]!="paid":
+        conn.rollback(); conn.close()
+        return False
+    if row["status"]=="completed" or row["preorder_status"]=="completed":
+        conn.rollback(); conn.close()
+        return True
+
+    first_transition=not bool(str(row["preorder_status"] or "").strip())
+    if first_transition:
+        qty=max(1,int(row["qty"] or 1))
+        if int(row["stock_reserved"] or 0)==1:
+            conn.execute(
+                """UPDATE product_variants
+                   SET stock=MAX(0,stock-?),
+                       reserved_stock=MAX(0,reserved_stock-?)
+                   WHERE id=?""",
+                (qty,qty,int(row["variant_id"]))
+            )
+        conn.execute(
+            """UPDATE orders
+               SET status='preorder_waiting',
+                   fulfillment_status='preorder_waiting',
+                   preorder_status='waiting',
+                   stock_reserved=0,
+                   reserved_until=''
+               WHERE id=?""",
+            (int(order_id),)
+        )
+
+    conn.commit(); conn.close()
+
+    # User notification, idempotent.
+    conn=db()
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,p.preorder_estimate,p.preorder_instructions,p.product_type,
+                  v.name AS variant_name
+           FROM orders o
+           JOIN products p ON p.id=o.product_id
+           JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=?""",(int(order_id),)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return False
+
+    if int(row["preorder_user_notified"] or 0)==0:
+        try:
+            await bot.send_message(
+                int(row["user_id"]),
+                "✅ <b>PEMBAYARAN PRE-ORDER DITERIMA</b>\n\n"
+                f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+                f"📦 Produk: <b>{html.escape(str(row['product_name']))}</b>\n"
+                f"🧩 Varian: <b>{html.escape(str(row['variant_name']))}</b>\n"
+                f"🔢 Qty: <b>{int(row['qty'] or 1)}</b>\n"
+                f"⏱ Estimasi: <b>{html.escape(str(row['preorder_estimate'] or '-'))}</b>\n\n"
+                f"📝 Arahan: {html.escape(str(row['preorder_instructions'] or '-'))}\n\n"
+                + (
+                    "⏳ Status: <b>Menunggu owner mengundang Gmail ke Family</b>."
+                    if str(row["product_type"] or "")=="famhead"
+                    else "⏳ Status: <b>Menunggu diproses owner</b>."
+                ),
+                parse_mode="HTML"
+            )
+            conn=db()
+            conn.execute("UPDATE orders SET preorder_user_notified=1 WHERE id=?",(int(order_id),))
+            conn.commit(); conn.close()
+        except Exception:
+            logging.exception("PO user notification failed order=%s",order_id)
+
+    if ADMIN_ID and int(row["preorder_owner_notified"] or 0)==0:
+        try:
+            user=f"@{row['username']}" if row["username"] else f"ID {row['user_id']}"
+            await bot.send_message(
+                ADMIN_ID,
+                "🟠 <b>PRE-ORDER BARU</b>\n\n"
+                f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+                f"👤 User: {html.escape(str(user))}\n"
+                f"📦 Produk: <b>{html.escape(str(row['product_name']))}</b>\n"
+                f"🧩 Varian: <b>{html.escape(str(row['variant_name']))}</b>\n"
+                f"🔢 Qty: <b>{int(row['qty'] or 1)}</b>\n"
+                f"💰 Total: <b>{rupiah(int(row['payment_total'] or row['total'] or 0))}</b>\n"
+                f"⏱ Estimasi: <b>{html.escape(str(row['preorder_estimate'] or '-'))}</b>\n"
+                + (f"📧 Gmail User: <b>{html.escape(order_family_gmail(row) or '-')}</b>\n" if str(row["product_type"] or "")=="famhead" else "")
+                + "\nStatus: ⏳ <b>Menunggu Diproses</b>",
+                reply_markup=(
+                    family_owner_keyboard(int(order_id),str(row["username"] or ""))
+                    if str(row["product_type"] or "")=="famhead"
+                    else preorder_owner_keyboard(int(order_id))
+                ),
+                parse_mode="HTML"
+            )
+            conn=db()
+            conn.execute("UPDATE orders SET preorder_owner_notified=1 WHERE id=?",(int(order_id),))
+            conn.commit(); conn.close()
+        except Exception:
+            logging.exception("PO owner notification failed order=%s",order_id)
+
+    return False
+
+
 async def fulfill_order(order_id: int, bot: Bot) -> bool:
     """
     Safe fulfillment:
@@ -2448,6 +2674,15 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
         conn.close()
         return False
 
+    product_mode=conn.execute(
+        "SELECT COALESCE(fulfillment_mode,'ready') AS mode FROM products WHERE id=?",
+        (int(order["product_id"]),)
+    ).fetchone()
+    if product_mode and str(product_mode["mode"] or "ready")=="preorder":
+        conn.rollback()
+        conn.close()
+        return await prepare_preorder_paid_order(order_id,bot)
+
     qty = int(order["qty"])
 
     # Reuse credentials already allocated to this order.
@@ -2461,13 +2696,36 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
     if allocated:
         items = allocated
     else:
+        variant_row=conn.execute(
+            "SELECT sharing_mode FROM product_variants WHERE id=?",
+            (int(order["variant_id"]),)
+        ).fetchone()
+        sharing_mode=bool(variant_row and int(variant_row["sharing_mode"] or 0)==1)
+
         items = conn.execute(
             """SELECT * FROM inventory_items
-               WHERE variant_id=? AND status='available'
+               WHERE variant_id=?
+                 AND status='available'
+                 AND inventory_mode IN ('unique','sharing')
                ORDER BY id ASC
                LIMIT ?""",
-            (order["variant_id"], qty)
+            (order["variant_id"],qty)
         ).fetchall()
+
+        if not sharing_mode:
+            fingerprints=[
+                str(item["content_fingerprint"] or "")
+                for item in items
+                if str(item["content_fingerprint"] or "")
+            ]
+            if len(fingerprints)!=len(set(fingerprints)):
+                conn.rollback()
+                conn.close()
+                logging.error(
+                    "Duplicate private credentials blocked during fulfillment order=%s",
+                    order_id
+                )
+                return False
 
         if len(items) < qty:
             missing = qty - len(items)
@@ -2488,12 +2746,21 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
         # Allocate, don't mark sold yet.
         item_ids = [item["id"] for item in items]
         placeholders = ",".join("?" for _ in item_ids)
-        conn.execute(
+        allocated_count=conn.execute(
             f"""UPDATE inventory_items
                 SET status='allocated', order_id=?
                 WHERE id IN ({placeholders}) AND status='available'""",
-            (order_id, *item_ids)
-        )
+            (order_id,*item_ids)
+        ).rowcount
+
+        if int(allocated_count or 0)!=len(item_ids):
+            conn.rollback()
+            conn.close()
+            logging.warning(
+                "Inventory allocation race blocked order=%s expected=%s actual=%s",
+                order_id,len(item_ids),allocated_count
+            )
+            return False
 
         # Convert reservation into allocated credentials.
         if int(order["stock_reserved"] or 0) == 1:
@@ -2685,6 +2952,12 @@ def database_health_report():
             "SELECT COUNT(*) AS n FROM product_variants WHERE reserved_stock<0"
         ).fetchone()["n"]
 
+        quarantined_duplicates=conn.execute(
+            """SELECT COUNT(*) AS n FROM inventory_items
+               WHERE status='duplicate'
+                  OR inventory_mode='legacy_duplicate'"""
+        ).fetchone()["n"]
+
         return {
             "integrity":integrity,
             "foreign_key_issues":len(fk_rows),
@@ -2693,6 +2966,7 @@ def database_health_report():
             "paid_no_variant":int(paid_no_variant or 0),
             "completed_not_delivered":int(completed_not_delivered or 0),
             "negative_reserved":int(negative_reserved or 0),
+            "quarantined_duplicates":int(quarantined_duplicates or 0),
         }
     finally:
         conn.close()
@@ -2710,7 +2984,11 @@ def repair_database_health():
     try:
         cur=conn.execute(
             """UPDATE inventory_items
-               SET status='available', order_id=NULL
+               SET status=CASE
+                            WHEN inventory_mode IN ('unique','sharing') THEN 'available'
+                            ELSE 'duplicate'
+                          END,
+                   order_id=NULL
                WHERE status='allocated'
                  AND (
                     order_id IS NULL
@@ -2812,8 +3090,10 @@ def system_health_snapshot():
 
     stock_mismatch = 0
     variants = conn.execute(
-        """SELECT id, stock, reserved_stock
-           FROM product_variants"""
+        """SELECT v.id,v.stock,v.reserved_stock
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id
+           WHERE COALESCE(p.fulfillment_mode,'ready')!='preorder'"""
     ).fetchall()
 
     for row in variants:
@@ -3007,15 +3287,48 @@ def user_order_visible_sql(alias: str = "o") -> str:
 
 
 
-def format_expiry_time(value: str) -> str:
-    if not value:
-        return "-"
+DISPLAY_TIMEZONE = ZoneInfo("Asia/Jakarta")
+
+
+def parse_stored_datetime(value):
+    """
+    Database timestamps historically use a mix of:
+    - naive datetime.now() values from Railway (UTC)
+    - timezone-aware ISO strings.
+    For DISPLAY only, naive historical values are interpreted as UTC and
+    converted to Asia/Jakarta. Storage/comparison logic remains unchanged.
+    """
+    if value is None:
+        return None
+    raw=str(value).strip()
+    if not raw or raw=="-":
+        return None
     try:
-        dt = datetime.fromisoformat(value)
-        jakarta = dt.astimezone(ZoneInfo("Asia/Jakarta"))
-        return jakarta.strftime("%d-%m-%Y %H:%M WIB")
+        # Python fromisoformat accepts +00:00. Normalize trailing Z explicitly.
+        if raw.endswith("Z"):
+            raw=raw[:-1] + "+00:00"
+        dt=datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
-        return value
+        return None
+
+
+def format_wib_datetime(value, *, seconds: bool = False, compact: bool = False) -> str:
+    dt=parse_stored_datetime(value)
+    if not dt:
+        return "-" if value in (None,"","-") else str(value)
+    local=dt.astimezone(DISPLAY_TIMEZONE)
+    if compact:
+        fmt="%d/%m/%Y • %H:%M:%S WIB" if seconds else "%d/%m/%Y • %H:%M WIB"
+    else:
+        fmt="%d-%m-%Y %H:%M:%S WIB" if seconds else "%d-%m-%Y %H:%M WIB"
+    return local.strftime(fmt)
+
+
+def format_expiry_time(value: str) -> str:
+    return format_wib_datetime(value,compact=False)
 
 
 def order_expiry_text(order) -> str:
@@ -3366,8 +3679,14 @@ def payment_method_keyboard(variant_id: int, qty: int):
 
 
 def get_checkout_note_from_state(data: dict) -> str:
-    note = str(data.get("checkout_note", "") or "").strip()
-    return note[:500]
+    note=str(data.get("checkout_note","") or "").strip()
+    gmail=str(data.get("family_gmail","") or "").strip()
+    parts=[]
+    if gmail:
+        parts.append(f"[FAMHEAD GMAIL] {gmail}")
+    if note:
+        parts.append(note[:500])
+    return "\n".join(parts)[:700]
 
 
 def purchase_lock(user_id: int):
@@ -3954,13 +4273,7 @@ def invoice_success_datetime(order) -> str:
         or order["created_at"]
         or ""
     )
-    if not raw:
-        return "-"
-    try:
-        dt = datetime.fromisoformat(str(raw))
-        return dt.strftime("%d %b %Y • %H:%M")
-    except Exception:
-        return str(raw)
+    return format_wib_datetime(raw,compact=True)
 
 
 def invoice_image_font(size: int, bold: bool = False):
@@ -5720,17 +6033,55 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Stock Input Modes",False,str(exc)[:100]))
 
+    # Private inventory duplicate safety
+    try:
+        conn=db()
+        duplicate_private=int(conn.execute(
+            """SELECT COUNT(*) AS n FROM (
+                   SELECT i.variant_id,i.content_fingerprint,COUNT(*) AS c
+                   FROM inventory_items i
+                   JOIN product_variants v ON v.id=i.variant_id
+                   JOIN products p ON p.id=v.product_id
+                   WHERE COALESCE(p.fulfillment_mode,'ready')!='preorder'
+                     AND COALESCE(v.sharing_mode,0)=0
+                     AND i.inventory_mode='unique'
+                     AND COALESCE(i.content_fingerprint,'')!=''
+                   GROUP BY i.variant_id,i.content_fingerprint
+                   HAVING COUNT(*)>1
+               )"""
+        ).fetchone()["n"] or 0)
+        quarantined=int(conn.execute(
+            """SELECT COUNT(*) AS n FROM inventory_items
+               WHERE status='duplicate'
+                  OR inventory_mode='legacy_duplicate'"""
+        ).fetchone()["n"] or 0)
+        index_ok=bool(conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type='index' AND name='idx_inventory_unique_fingerprint'"""
+        ).fetchone())
+        conn.close()
+        checks.append((
+            "Private Duplicate Guard",
+            duplicate_private==0 and index_ok,
+            f"dup={duplicate_private}, quarantine={quarantined}, index={'OK' if index_ok else 'missing'}"
+        ))
+    except Exception as exc:
+        checks.append(("Private Duplicate Guard",False,str(exc)[:100]))
+
     # Unified account-stock model
     try:
         conn=db()
         mismatches=int(conn.execute(
             """SELECT COUNT(*) AS n
                FROM product_variants v
-               WHERE COALESCE(v.stock,0) != (
+               JOIN products p ON p.id=v.product_id
+               WHERE COALESCE(p.fulfillment_mode,'ready')!='preorder'
+                 AND COALESCE(v.stock,0) != (
                    SELECT COUNT(*)
                    FROM inventory_items i
                    WHERE i.variant_id=v.id
                      AND i.status='available'
+                     AND i.inventory_mode IN ('unique','sharing')
                )"""
         ).fetchone()["n"] or 0)
         conn.close()
@@ -5755,6 +6106,84 @@ async def transaction_self_test():
         ))
     except Exception as exc:
         checks.append(("Owner Proof UX",False,str(exc)[:100]))
+
+    # Pre-order schema and flow
+    try:
+        conn=db()
+        po_schema_ok=(
+            all(has_column(conn,"products",c) for c in (
+                "fulfillment_mode","preorder_estimate","preorder_instructions"
+            ))
+            and all(has_column(conn,"orders",c) for c in (
+                "preorder_status","preorder_owner_notified","preorder_user_notified"
+            ))
+        )
+        conn.close()
+        checks.append((
+            "Pre-Order Flow",
+            po_schema_ok and callable(prepare_preorder_paid_order),
+            "schema + owner fulfillment"
+        ))
+    except Exception as exc:
+        checks.append(("Pre-Order Flow",False,str(exc)[:100]))
+
+    # User complaint flow
+    try:
+        complaint_ok=(
+            callable(user_complaint_button)
+            and callable(user_delivery_actions_keyboard)
+            and getattr(UserComplaintState,"waiting_reason",None) is not None
+        )
+        checks.append((
+            "User Complaint Flow",
+            complaint_ok,
+            "delivered order -> owner PM"
+        ))
+    except Exception as exc:
+        checks.append(("User Complaint Flow",False,str(exc)[:100]))
+
+    # Famhead checkout / fulfillment flow
+    try:
+        conn=db()
+        famhead_schema=has_column(conn,"products","product_type")
+        proof_table=bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='order_login_proofs'"
+        ).fetchone())
+        conn.close()
+        checks.append((
+            "Famhead Flow",
+            famhead_schema and callable(valid_family_gmail) and callable(family_owner_keyboard),
+            "gmail -> invite -> user confirm"
+        ))
+        checks.append((
+            "Login Proof Flow",
+            proof_table and getattr(LoginProofState,"waiting_photo",None) is not None,
+            "post-login screenshot -> owner PM"
+        ))
+    except Exception as exc:
+        checks.append(("Famhead Flow",False,str(exc)[:100]))
+
+    # WIB display normalization + compact owner order pagination
+    try:
+        sample=format_wib_datetime("2026-10-07T08:37:35",compact=True)
+        wib_ok=(sample=="07/10/2026 • 15:37 WIB")
+        pagination_ok=(
+            OWNER_ORDERS_PAGE_SIZE==4
+            and callable(owner_orders_page_keyboard)
+            and callable(render_owner_orders_page)
+        )
+        checks.append((
+            "WIB Display",
+            wib_ok,
+            sample
+        ))
+        checks.append((
+            "Owner Orders Pagination",
+            pagination_ok,
+            f"{OWNER_ORDERS_PAGE_SIZE}/page"
+        ))
+    except Exception as exc:
+        checks.append(("WIB Display",False,str(exc)[:100]))
 
     # Schema version
     try:
@@ -6695,8 +7124,8 @@ def order_user_status_label(order) -> str:
 def order_detail_text(order) -> str:
     product_name=order["product_name"] or "Produk lama"
     variant_name=order["variant_name"] or "Standard"
-    created=order["created_at"] or "-"
-    completed=order["completed_at"] or "-"
+    created=format_wib_datetime(order["created_at"] or "-",compact=True)
+    completed=format_wib_datetime(order["completed_at"] or "-",compact=True)
     note=order["note"] or "-"
     method=payment_method_label(order["payment_method"])
     total=int(order["payment_total"] or order["total"] or 0)
@@ -7587,14 +8016,18 @@ async def mark_order_paid(
 
     if first_payment:
         try:
-            await bot.send_message(
-                int(order["user_id"]),
-                "✅ <b>PEMBAYARAN DIKONFIRMASI</b>\n\n"
-                f"🧾 {invoice(order_id)}\n"
-                "Pembayaran Anda sudah dikonfirmasi. "
-                "Akun sedang diproses dan akan dikirim otomatis.",
-                parse_mode="HTML"
-            )
+            conn=db()
+            product=conn.execute("SELECT * FROM products WHERE id=?",(int(order["product_id"]),)).fetchone()
+            conn.close()
+            if not product_is_preorder(product):
+                await bot.send_message(
+                    int(order["user_id"]),
+                    "✅ <b>PEMBAYARAN DIKONFIRMASI</b>\n\n"
+                    f"🧾 {invoice(order_id)}\n"
+                    "Pembayaran Anda sudah dikonfirmasi. "
+                    "Akun sedang diproses dan akan dikirim otomatis.",
+                    parse_mode="HTML"
+                )
         except Exception:
             logging.exception("Payment confirmation user notification failed order=%s",order_id)
 
@@ -7610,10 +8043,23 @@ class CheckoutState(StatesGroup):
     waiting_note = State()
     waiting_voucher = State()
     waiting_payment_proof = State()
+    waiting_family_gmail = State()
 
 
 class ReviewState(StatesGroup):
     waiting_comment = State()
+
+
+class UserComplaintState(StatesGroup):
+    waiting_reason = State()
+
+
+class LoginProofState(StatesGroup):
+    waiting_photo = State()
+
+
+class FamilySupportState(StatesGroup):
+    waiting_issue_reason = State()
 
 
 class BroadcastState(StatesGroup):
@@ -7662,6 +8108,11 @@ class OwnerState(StatesGroup):
     global_search = State()
     claim_order_id = State()
     claim_reason = State()
+    preorder_slots = State()
+    preorder_estimate = State()
+    preorder_instructions = State()
+    preorder_delivery = State()
+    preorder_slot_adjust = State()
 
 
 
@@ -8055,6 +8506,126 @@ def owner_stock_duplicate_qty_keyboard(variant_id: int):
     ])
 
 
+def normalize_inventory_content(content: str) -> str:
+    """
+    Stable private-account normalization:
+    - preserves letter case/password case
+    - normalizes line endings
+    - trims outer whitespace
+    - trims trailing spaces on each line
+    This catches accidental copy/paste duplicates without changing credentials.
+    """
+    raw=str(content or "").replace("\r\n","\n").replace("\r","\n").strip()
+    lines=[line.rstrip() for line in raw.split("\n")]
+    return "\n".join(lines).strip()
+
+
+def inventory_content_fingerprint(content: str) -> str:
+    normalized=normalize_inventory_content(content)
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def private_inventory_duplicate(conn, variant_id: int, content: str):
+    fingerprint=inventory_content_fingerprint(content)
+    if not fingerprint:
+        return None
+    row=conn.execute(
+        """SELECT id,status,order_id
+           FROM inventory_items
+           WHERE variant_id=?
+             AND inventory_mode='unique'
+             AND content_fingerprint=?
+           ORDER BY id ASC
+           LIMIT 1""",
+        (int(variant_id),fingerprint)
+    ).fetchone()
+    return row
+
+
+def harden_existing_inventory_fingerprints(conn):
+    """
+    Safe migration for existing DBs.
+    Sharing rows remain intentionally duplicable.
+    Private rows get a stable fingerprint.
+    If old private duplicates already exist, only the first keeps the fingerprint.
+    Extra AVAILABLE copies are quarantined as status='duplicate' so they cannot
+    be fulfilled to another buyer. Historical sold/allocated rows are preserved.
+    """
+    variants=conn.execute(
+        """SELECT v.id,v.sharing_mode,COALESCE(p.fulfillment_mode,'ready') AS fulfillment_mode
+           FROM product_variants v
+           JOIN products p ON p.id=v.product_id"""
+    ).fetchall()
+
+    quarantined=0
+    for variant in variants:
+        variant_id=int(variant["id"])
+        if str(variant["fulfillment_mode"] or "ready")=="preorder":
+            continue
+
+        rows=conn.execute(
+            """SELECT id,content,status
+               FROM inventory_items
+               WHERE variant_id=?
+               ORDER BY id ASC""",
+            (variant_id,)
+        ).fetchall()
+
+        if int(variant["sharing_mode"] or 0)==1:
+            conn.execute(
+                """UPDATE inventory_items
+                   SET inventory_mode='sharing',content_fingerprint=''
+                   WHERE variant_id=?""",
+                (variant_id,)
+            )
+            continue
+
+        seen=set()
+        for row in rows:
+            fp=inventory_content_fingerprint(row["content"])
+            if not fp:
+                conn.execute(
+                    """UPDATE inventory_items
+                       SET inventory_mode='legacy',content_fingerprint=''
+                       WHERE id=?""",
+                    (int(row["id"]),)
+                )
+                continue
+
+            if fp in seen:
+                if str(row["status"] or "")=="available":
+                    conn.execute(
+                        """UPDATE inventory_items
+                           SET status='duplicate',
+                               inventory_mode='legacy_duplicate',
+                               content_fingerprint=''
+                           WHERE id=?""",
+                        (int(row["id"]),)
+                    )
+                    quarantined+=1
+                else:
+                    conn.execute(
+                        """UPDATE inventory_items
+                           SET inventory_mode='legacy_duplicate',
+                               content_fingerprint=''
+                           WHERE id=?""",
+                        (int(row["id"]),)
+                    )
+                continue
+
+            seen.add(fp)
+            conn.execute(
+                """UPDATE inventory_items
+                   SET inventory_mode='unique',content_fingerprint=?
+                   WHERE id=?""",
+                (fp,int(row["id"]))
+            )
+
+    return quarantined
+
+
 def duplicate_inventory_items(conn, variant_id: int, content: str, qty: int):
     qty=int(qty)
     if qty < 2 or qty > 500:
@@ -8063,8 +8634,8 @@ def duplicate_inventory_items(conn, variant_id: int, content: str, qty: int):
     now=datetime.now().isoformat(timespec="seconds")
     conn.executemany(
         """INSERT INTO inventory_items
-           (variant_id, content, status, created_at)
-           VALUES(?,?,'available',?)""",
+           (variant_id,content,status,created_at,inventory_mode,content_fingerprint)
+           VALUES(?,?,'available',?,'sharing','')""",
         [(int(variant_id),content,now) for _ in range(qty)]
     )
     sync_variant_stock_from_inventory(conn,int(variant_id))
@@ -8269,7 +8840,11 @@ def validate_system_schema():
         },
         "topups": {"id","user_id","status","expires_at","created_at"},
         "product_variants": {"id","stock","reserved_stock","active","sharing_mode"},
-        "inventory_items": {"id","variant_id","status","order_id"},
+        "inventory_items": {
+            "id","variant_id","status","order_id",
+            "content_fingerprint","inventory_mode"
+        },
+        "order_login_proofs": {"id","order_id","user_id","file_id","created_at"},
         "settings": {"key","value"},
         "system_errors": {"id","error_text","created_at"},
         "payment_proof_sessions": {"user_id","entity_type","entity_id"},
@@ -9477,6 +10052,55 @@ def product_card(product):
     )
 
 
+def product_is_famhead(product) -> bool:
+    try:
+        return str(product["product_type"] or "standard").lower()=="famhead"
+    except Exception:
+        return False
+
+
+def valid_family_gmail(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9._%+-]+@gmail\.com",str(value or "").strip(),re.I))
+
+
+def family_gmail_from_note(note: str) -> str:
+    text=str(note or "")
+    m=re.search(r"\[FAMHEAD GMAIL\]\s*([^\s]+@gmail\.com)",text,re.I)
+    return m.group(1).strip() if m else ""
+
+
+def order_family_gmail(order) -> str:
+    try:
+        return family_gmail_from_note(order["note"] or "")
+    except Exception:
+        return ""
+
+
+def owner_contact_button():
+    if ADMIN_USERNAME:
+        return InlineKeyboardButton(text="💬 Hubungi Owner",url=f"https://t.me/{ADMIN_USERNAME}")
+    return None
+
+
+def product_is_preorder(product) -> bool:
+    try:
+        return str(product["fulfillment_mode"] or "ready").lower()=="preorder"
+    except Exception:
+        return False
+
+
+def preorder_product_info(product) -> str:
+    if not product_is_preorder(product):
+        return ""
+    estimate=html.escape(str(product["preorder_estimate"] or "-"))
+    instructions=html.escape(str(product["preorder_instructions"] or "-"))
+    return (
+        "\n\n🕒 <b>PRE-ORDER</b>\n"
+        f"⏱ Estimasi: <b>{estimate}</b>\n"
+        f"📝 Arahan: {instructions}"
+    )
+
+
 def variant_card(product, variant, qty=1):
     sharing = variant_is_sharing(variant)
     qty = 1 if sharing else max(1, int(qty))
@@ -9494,8 +10118,9 @@ def variant_card(product, variant, qty=1):
     else:
         grossir_text = "\n".join(grossir) if grossir else "• Belum ada harga grosir"
 
-    account_type = "👥 Sharing" if sharing else "🔐 Private / Unique"
-    buy_limit = "Maks. Qty 1 / checkout" if sharing else "Sesuai stok tersedia"
+    preorder=product_is_preorder(product)
+    account_type = "🕒 Pre-Order" if preorder else ("👥 Sharing" if sharing else "🔐 Private / Unique")
+    buy_limit = "Sesuai slot tersedia" if preorder else ("Maks. Qty 1 / checkout" if sharing else "Sesuai stok tersedia")
 
     return (
         "┌────────────────────\n"
@@ -9506,7 +10131,12 @@ def variant_card(product, variant, qty=1):
         f"• Kode : <code>{variant['code'] or '-'}</code>\n"
         f"• Sisa Produk : <b>{available_stock(variant)}</b>\n"
         f"• Desk : {product['description'] or '-'}\n"
-        "└────────────────────\n\n"
+        + (
+            f"• Estimasi PO : <b>{html.escape(str(product['preorder_estimate'] or '-'))}</b>\n"
+            f"• Arahan PO : {html.escape(str(product['preorder_instructions'] or '-'))}\n"
+            if preorder else ""
+        )
+        + "└────────────────────\n\n"
         "┌────────────────────\n"
         f"• Jumlah dipilih : <b>{qty}</b>\n"
         f"• Harga/unit : <b>{rupiah(unit)}</b>\n"
@@ -10689,7 +11319,7 @@ async def owner_free_history(call: CallbackQuery):
                 f"{html.escape(row['variant_name'] or 'Standard')}\n"
                 f"🔢 Qty {int(row['qty'] or 0)} • "
                 f"{'Terkirim' if delivered else 'Menunggu/Recovery'}\n"
-                f"🕒 <code>{html.escape(str(row['created_at'] or '-'))}</code>"
+                f"🕒 <code>{html.escape(format_wib_datetime(row['created_at'] or '-',compact=True))}</code>"
             )
 
     await safe_edit_or_answer(
@@ -11326,7 +11956,13 @@ async def product_detail(call: CallbackQuery):
         f"• <b>Produk:</b> {html.escape(product['name'])}\n"
         f"• <b>Terjual:</b> {sold}\n"
         f"• <b>Deskripsi:</b> {html.escape(product['description'] or '-')}\n"
-        "╰────────────────────╯\n\n"
+        + (
+            f"• <b>Sistem:</b> 🕒 Pre-Order\n"
+            f"• <b>Estimasi:</b> {html.escape(str(product['preorder_estimate'] or '-'))}\n"
+            f"• <b>Arahan:</b> {html.escape(str(product['preorder_instructions'] or '-'))}\n"
+            if product_is_preorder(product) else ""
+        )
+        + "╰────────────────────╯\n\n"
         "╭────────────────────╮\n"
         "📦 <b>Varian | Harga - (Stok)</b>\n"
         f"{compact_variant_price_stock_text(variants)}\n"
@@ -11550,11 +12186,13 @@ async def confirm_order(call: CallbackQuery, state: FSMContext):
             checkout_variant_id=variant_id,
             checkout_qty=qty,
             checkout_note="",
-            checkout_voucher_code=""
+            checkout_voucher_code="",
+            family_gmail=""
         )
 
     checkout_data = await state.get_data()
-    saved_note = get_checkout_note_from_state(checkout_data)
+    saved_note = str(checkout_data.get("checkout_note","") or "").strip()
+    family_gmail=str(checkout_data.get("family_gmail","") or "").strip()
     voucher_code = str(checkout_data.get("checkout_voucher_code", "") or "").strip().upper()
 
     note_line = (
@@ -11564,6 +12202,11 @@ async def confirm_order(call: CallbackQuery, state: FSMContext):
     voucher_line = (
         f"🎟️ Voucher: <b>{html.escape(voucher_code)}</b>\n"
         if voucher_code else "🎟️ Voucher: <i>Belum digunakan</i>\n"
+    )
+    family_line=(
+        f"📧 Gmail Family: <b>{html.escape(family_gmail)}</b>\n"
+        if product_is_famhead(product) and family_gmail
+        else ("📧 Gmail Family: <i>Wajib diisi sebelum pembayaran</i>\n" if product_is_famhead(product) else "")
     )
 
     await safe_edit_or_answer(
@@ -11576,6 +12219,7 @@ async def confirm_order(call: CallbackQuery, state: FSMContext):
         f"💰 Harga/unit: <b>{rupiah(unit)}</b>\n"
         f"💵 Subtotal: <b>{rupiah(total)}</b>\n"
         f"{voucher_line}"
+        f"{family_line}"
         f"{note_line}\n"
         "Periksa pesanan sebelum melanjutkan ke pembayaran.",
         reply_markup=checkout_transaction_keyboard(variant_id, qty),
@@ -11591,6 +12235,33 @@ async def checkout_go_payment(call: CallbackQuery, state: FSMContext):
     variant_id, qty = int(variant_id), max(1, int(qty))
 
     data=await state.get_data()
+
+    conn=db()
+    variant=conn.execute("SELECT * FROM product_variants WHERE id=?",(variant_id,)).fetchone()
+    product=conn.execute("SELECT * FROM products WHERE id=?",(int(variant["product_id"]),)).fetchone() if variant else None
+    conn.close()
+    if not variant or not product:
+        return await call.answer("Produk tidak ditemukan.",show_alert=True)
+
+    family_gmail=str(data.get("family_gmail","") or "").strip()
+    if product_is_famhead(product) and not valid_family_gmail(family_gmail):
+        await state.update_data(checkout_variant_id=variant_id,checkout_qty=qty)
+        await state.set_state(CheckoutState.waiting_family_gmail)
+        await safe_edit_or_answer(
+            call,
+            "📧 <b>GMAIL WAJIB FAMHEAD</b>\n\n"
+            f"📦 Produk: <b>{html.escape(str(product['name']))}</b>\n"
+            f"🧩 Varian: <b>{html.escape(str(variant['name']))}</b>\n\n"
+            "Kirim Gmail yang akan diundang ke Family.\n"
+            "Contoh: <code>nama@gmail.com</code>\n\n"
+            "Pembayaran baru dapat dilanjutkan setelah Gmail valid.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Kembali",callback_data=f"confirm:{variant_id}:{qty}")]
+            ]),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
     note=get_checkout_note_from_state(data)
     voucher=str(data.get("checkout_voucher_code","") or "").strip().upper()
 
@@ -11611,6 +12282,49 @@ async def checkout_go_payment(call: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await safe_callback_notice(call)
+
+
+@router.message(CheckoutState.waiting_family_gmail)
+async def checkout_family_gmail_input(message: Message, state: FSMContext):
+    data=await state.get_data()
+    variant_id=int(data.get("checkout_variant_id",0) or 0)
+    qty=max(1,int(data.get("checkout_qty",1) or 1))
+    gmail=(message.text or "").strip()
+
+    if not valid_family_gmail(gmail):
+        return await message.answer(
+            "❌ <b>GMAIL TIDAK VALID</b>\n\n"
+            "Gunakan alamat Gmail yang benar, contoh <code>nama@gmail.com</code>.",
+            parse_mode="HTML"
+        )
+
+    conn=db()
+    variant=conn.execute("SELECT * FROM product_variants WHERE id=?",(variant_id,)).fetchone()
+    product=conn.execute("SELECT * FROM products WHERE id=?",(int(variant["product_id"]),)).fetchone() if variant else None
+    conn.close()
+    if not variant or not product or not product_is_famhead(product):
+        await state.set_state(None)
+        return await message.answer("❌ Produk Famhead tidak ditemukan. Silakan ulangi checkout.")
+
+    await state.update_data(family_gmail=gmail)
+    await state.set_state(None)
+
+    rows=[
+        [InlineKeyboardButton(text="💳 Lanjut Pembayaran",callback_data=f"checkoutpay:{variant_id}:{qty}")]
+    ]
+    btn=owner_contact_button()
+    if btn:
+        rows.append([btn])
+    rows.append([InlineKeyboardButton(text="⬅️ Ringkasan Pesanan",callback_data=f"confirm:{variant_id}:{qty}")])
+
+    await message.answer(
+        "✅ <b>GMAIL BERHASIL DISIMPAN</b>\n\n"
+        f"📦 Produk: <b>{html.escape(str(product['name']))}</b>\n"
+        f"📧 Gmail: <b>{html.escape(gmail)}</b>\n\n"
+        "Pastikan Gmail benar sebelum melanjutkan pembayaran.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data.startswith("checkoutcancel:"))
@@ -11977,6 +12691,7 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
         record_voucher_usage(voucher_code, call.from_user.id, order_id, discount_amount)
 
         delivered = await fulfill_order(order_id, bot)
+        is_preorder=product_is_preorder(product)
 
         if delivered:
             text = (
@@ -11991,6 +12706,12 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
             )
         else:
             text = (
+                "🟠 <b>PEMBAYARAN PRE-ORDER BERHASIL</b>\n\n"
+                f"🧾 Invoice: <b>{ref}</b>\n"
+                f"💰 Total: <b>{rupiah(total)}</b>\n"
+                f"💵 Sisa saldo: <b>{rupiah(new_balance)}</b>\n\n"
+                "Pembayaran sudah tercatat. Pesanan menunggu diproses owner."
+                if is_preorder else
                 "🟡 <b>PEMBAYARAN SALDO BERHASIL</b>\n\n"
                 f"🧾 Invoice: <b>{ref}</b>\n"
                 f"💰 Total: <b>{rupiah(total)}</b>\n"
@@ -14929,7 +15650,7 @@ async def owner_pending_orders(call: CallbackQuery):
                 f"💳 Payment: <b>{html.escape(row['payment_status'] or '-')}</b> • "
                 f"Fulfillment: <b>{html.escape(row['fulfillment_status'] or '-')}</b>\n"
                 f"💰 {rupiah(row['payment_total'] or row['total'])} • "
-                f"🕒 {html.escape((row['created_at'] or '-')[:19])}"
+                f"🕒 {html.escape(format_wib_datetime(row['created_at'] or '-',compact=True))}"
             )
 
             if paid and int(row["variant_id"] or 0):
@@ -15461,7 +16182,7 @@ async def owner_success_history(call: CallbackQuery):
                 f"📦 {html.escape(row['product_name'] or 'Produk lama')} — "
                 f"{html.escape(row['variant_name'] or 'Standard')}\n"
                 f"💰 {rupiah(row['payment_total'] or row['total'])}\n"
-                f"🕒 {html.escape(str(verified_at)[:19])}"
+                f"🕒 {html.escape(format_wib_datetime(verified_at,compact=True))}"
             )
 
     await safe_edit_or_answer(
@@ -15482,40 +16203,124 @@ async def owner_success_history(call: CallbackQuery):
     await safe_callback_notice(call)
 
 
-@router.callback_query(F.data == "owner:orders")
-async def owner_orders(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+OWNER_ORDERS_PAGE_SIZE = 4
 
-    conn = db()
-    rows = conn.execute("""
-        SELECT o.*, p.name AS product_name, v.name AS variant_name
-        FROM orders o
-        JOIN products p ON p.id=o.product_id
-        LEFT JOIN product_variants v ON v.id=o.variant_id
-        ORDER BY o.id DESC
-        LIMIT 15
-    """).fetchall()
+
+def owner_orders_page_keyboard(page: int, total_pages: int):
+    page=max(1,int(page))
+    total_pages=max(1,int(total_pages))
+    nav=[]
+    if page>1:
+        nav.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"ownerorderspage:{page-1}"
+            )
+        )
+    nav.append(
+        InlineKeyboardButton(
+            text=f"{page}/{total_pages}",
+            callback_data=f"ownerorderspage:{page}"
+        )
+    )
+    if page<total_pages:
+        nav.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"ownerorderspage:{page+1}"
+            )
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        nav,
+        [InlineKeyboardButton(text="🔄 Refresh",callback_data=f"ownerorderspage:{page}")],
+        [InlineKeyboardButton(text="⬅️ Order",callback_data="owner:menu_orders")],
+    ])
+
+
+async def render_owner_orders_page(call: CallbackQuery, page: int = 1):
+    page=max(1,int(page))
+    conn=db()
+    total=int(conn.execute("SELECT COUNT(*) AS n FROM orders").fetchone()["n"] or 0)
+    total_pages=max(1,(total + OWNER_ORDERS_PAGE_SIZE - 1)//OWNER_ORDERS_PAGE_SIZE)
+    page=min(page,total_pages)
+    offset=(page-1)*OWNER_ORDERS_PAGE_SIZE
+
+    rows=conn.execute(
+        """SELECT o.*,p.name AS product_name,v.name AS variant_name
+           FROM orders o
+           JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           ORDER BY o.id DESC
+           LIMIT ? OFFSET ?""",
+        (OWNER_ORDERS_PAGE_SIZE,offset)
+    ).fetchall()
     conn.close()
 
     if not rows:
-        text = f"🧾 <b>PESANAN</b>\n\nBelum ada order.\n\n<i>{STORE_FOOTER}</i>"
+        text=(
+            "🧾 <b>PESANAN TERBARU</b>\n\n"
+            "Belum ada order.\n\n"
+            f"<i>{STORE_FOOTER}</i>"
+        )
     else:
-        lines = ["🧾 <b>PESANAN TERBARU</b>\n"]
+        lines=[
+            "🧾 <b>PESANAN TERBARU</b>",
+            f"📄 Halaman <b>{page}/{total_pages}</b> • Total <b>{total}</b> order",
+            ""
+        ]
         for row in rows:
-            user = f"@{row['username']}" if row["username"] else str(row["user_id"])
-            lines.append(
-                f"<b>{invoice(row['id'])}</b> • {row['status'].upper()}\n"
-                f"👤 {user}\n"
-                f"📦 {row['product_name']} — {row['variant_name'] or 'Standard'}\n"
-                f"🔢 {row['qty']} • 💰 {rupiah(row['total'])}\n"
-                f"💳 Transfer: {rupiah(row['payment_total'] or row['total'])}\n"
+            user=(
+                f"@{html.escape(str(row['username']))}"
+                if row["username"]
+                else f"<code>{int(row['user_id'])}</code>"
             )
-        lines.append(f"<i>{STORE_FOOTER}</i>")
-        text = "\n".join(lines)
+            raw_time=(
+                row["completed_at"]
+                or row["payment_verified_at"]
+                or row["created_at"]
+                or "-"
+            )
+            lines.append(
+                f"<b>{invoice(row['id'])}</b> • {html.escape(str(row['status']).upper())}\n"
+                f"👤 {user}\n"
+                f"📦 {html.escape(str(row['product_name'] or 'Produk lama'))} — "
+                f"{html.escape(str(row['variant_name'] or 'Standard'))}\n"
+                f"🔢 {int(row['qty'] or 0)} • 💰 {rupiah(row['total'])}\n"
+                f"💳 Transfer: {rupiah(row['payment_total'] or row['total'])}\n"
+                f"🕒 {html.escape(format_wib_datetime(raw_time,compact=True))}"
+            )
+        lines.extend(["",f"<i>{STORE_FOOTER}</i>"])
+        text="\n\n".join(lines)
 
-    await safe_edit_or_answer(call, text, reply_markup=back_owner(), parse_mode="HTML")
-    await call.answer()
+    await safe_edit_or_answer(
+        call,
+        text,
+        reply_markup=owner_orders_page_keyboard(page,total_pages),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "owner:orders")
+async def owner_orders(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.",show_alert=True)
+    await render_owner_orders_page(call,1)
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("ownerorderspage:"))
+async def owner_orders_page(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        page=max(1,int(call.data.split(":")[-1]))
+    except Exception:
+        page=1
+    await render_owner_orders_page(call,page)
+    await safe_callback_notice(call)
+
+
 
 
 async def prompt_state(call, state, target_state, text):
@@ -15531,23 +16336,86 @@ async def owner_add_product(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    try:
-        await state.clear()
-        await state.set_state(OwnerState.add_product_name)
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "➕ <b>TAMBAH PRODUK</b>\n\n"
+        "Pilih jenis pemenuhan produk:\n\n"
+        "⚡ <b>Produk Langsung</b>\n"
+        "Akun diambil dari stok dan dikirim otomatis setelah pembayaran.\n\n"
+        "🕒 <b>Produk Pre-Order</b>\n"
+        "Stok berarti kuota PO. Setelah dibayar, owner memproses lalu mengirim hasil secara manual.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Produk Langsung",callback_data="owner:add_product_mode:ready")],
+            [InlineKeyboardButton(text="🕒 Produk Pre-Order",callback_data="owner:add_product_mode:preorder")],
+            [InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:back_products")],
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
-        await safe_edit_or_answer(
-            call,
-            "➕ <b>TAMBAH PRODUK</b>\n\n"
-            "Langkah 1/4\n"
-            "Kirim <b>nama produk</b>.\n\n"
-            "Contoh: <code>Alight Motion</code>",
-            reply_markup=back_owner("owner:back_products"),
-            parse_mode="HTML"
-        )
-        await safe_callback_notice(call)
-    except Exception as exc:
-        await owner_product_error_view(call, "Tambah Produk", exc)
 
+@router.callback_query(F.data.startswith("owner:add_product_mode:"))
+async def owner_add_product_mode(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    mode=call.data.split(":")[-1]
+    if mode not in {"ready","preorder"}:
+        return await call.answer("Jenis produk tidak valid.",show_alert=True)
+
+    await state.clear()
+    await state.update_data(product_fulfillment_mode=mode)
+
+    await safe_edit_or_answer(
+        call,
+        "➕ <b>TAMBAH PRODUK • TIPE PRODUK</b>\n\n"
+        f"Fulfillment: <b>{'🕒 Pre-Order' if mode=='preorder' else '⚡ Produk Langsung'}</b>\n\n"
+        "Apakah produk ini tipe <b>Famhead / Family</b>?\n\n"
+        "👨‍👩‍👧‍👦 <b>Famhead</b> → user wajib mengirim Gmail sebelum pembayaran, "
+        "owner mengundang Gmail lalu user konfirmasi berhasil.\n\n"
+        "📦 <b>Bukan Famhead</b> → alur produk normal.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👨‍👩‍👧‍👦 Famhead",callback_data="owner:add_product_type:famhead")],
+            [InlineKeyboardButton(text="📦 Bukan Famhead",callback_data="owner:add_product_type:standard")],
+            [InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:add_product")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("owner:add_product_type:"))
+async def owner_add_product_type(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    product_type=call.data.split(":")[-1]
+    if product_type not in {"standard","famhead"}:
+        return await call.answer("Tipe produk tidak valid.",show_alert=True)
+
+    data=await state.get_data()
+    mode=str(data.get("product_fulfillment_mode") or "ready")
+    if product_type=="famhead":
+        # Famhead always requires manual invite/confirmation, so use PO-style slot handling.
+        mode="preorder"
+
+    await state.update_data(
+        product_fulfillment_mode=mode,
+        product_type=product_type
+    )
+    await state.set_state(OwnerState.add_product_name)
+
+    await safe_edit_or_answer(
+        call,
+        "➕ <b>TAMBAH PRODUK</b>\n\n"
+        f"Jenis: <b>{'👨‍👩‍👧‍👦 Famhead' if product_type=='famhead' else '📦 Bukan Famhead'}</b>\n"
+        f"Fulfillment: <b>{'🕒 Pre-Order / Manual' if mode=='preorder' else '⚡ Produk Langsung'}</b>\n\n"
+        "Langkah 1/4\nKirim <b>nama produk</b>.",
+        reply_markup=back_owner("owner:add_product"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
 
 
@@ -15580,6 +16448,8 @@ async def owner_persisted_price_input(message: Message, state: FSMContext):
                 product_name=payload.get("product_name",""),
                 product_description=payload.get("product_description",""),
                 product_variant_name=payload.get("product_variant_name",""),
+                product_fulfillment_mode=payload.get("product_fulfillment_mode","ready"),
+                product_type=payload.get("product_type","standard"),
             )
             result=await create_product_from_wizard(state,message.from_user.id,price)
             if not result:
@@ -15589,6 +16459,12 @@ async def owner_persisted_price_input(message: Message, state: FSMContext):
 
             product_id,variant_id,name,variant_name,final_price=result
             clear_owner_input_session(message.from_user.id)
+            if await begin_preorder_product_setup(state,product_id,variant_id):
+                return await status.edit_text(
+                    preorder_setup_slot_text(name,variant_name,final_price),
+                    reply_markup=back_owner("owner:back_products"),
+                    parse_mode="HTML"
+                )
             return await status.edit_text(
                 "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
                 f"📦 {html.escape(name)}\n🧩 {html.escape(variant_name)}\n💰 {rupiah(final_price)}\n"
@@ -15723,6 +16599,14 @@ async def create_product_from_wizard(state: FSMContext, owner_id: int, price: in
     name=(data.get("product_name") or "").strip()
     description=(data.get("product_description") or "").strip()
     variant_name=(data.get("product_variant_name") or "").strip()
+    fulfillment_mode=str(data.get("product_fulfillment_mode") or "ready")
+    product_type=str(data.get("product_type") or "standard")
+    if fulfillment_mode not in {"ready","preorder"}:
+        fulfillment_mode="ready"
+    if product_type not in {"standard","famhead"}:
+        product_type="standard"
+    if product_type=="famhead":
+        fulfillment_mode="preorder"
 
     if not name or not variant_name or price <= 0:
         return None
@@ -15739,15 +16623,15 @@ async def create_product_from_wizard(state: FSMContext, owner_id: int, price: in
 
         if "created_at" in product_columns:
             cur=conn.execute(
-                """INSERT INTO products(name,description,active,created_at)
-                   VALUES(?,?,1,?)""",
-                (name,description,now)
+                """INSERT INTO products(name,description,active,created_at,fulfillment_mode,product_type)
+                   VALUES(?,?,1,?,?,?)""",
+                (name,description,now,fulfillment_mode,product_type)
             )
         else:
             cur=conn.execute(
-                """INSERT INTO products(name,description,active)
-                   VALUES(?,?,1)""",
-                (name,description)
+                """INSERT INTO products(name,description,active,fulfillment_mode,product_type)
+                   VALUES(?,?,1,?,?)""",
+                (name,description,fulfillment_mode,product_type)
             )
 
         product_id=cur.lastrowid
@@ -15773,6 +16657,36 @@ async def create_product_from_wizard(state: FSMContext, owner_id: int, price: in
 
 
 
+async def begin_preorder_product_setup(state: FSMContext, product_id: int, variant_id: int) -> bool:
+    conn=db()
+    product=conn.execute(
+        "SELECT fulfillment_mode FROM products WHERE id=?",
+        (int(product_id),)
+    ).fetchone()
+    conn.close()
+    if not product or str(product["fulfillment_mode"] or "ready")!="preorder":
+        return False
+
+    await state.clear()
+    await state.update_data(
+        preorder_product_id=int(product_id),
+        preorder_variant_id=int(variant_id)
+    )
+    await state.set_state(OwnerState.preorder_slots)
+    return True
+
+
+def preorder_setup_slot_text(name: str, variant_name: str, price: int) -> str:
+    return (
+        "🕒 <b>SETUP PRE-ORDER • 1/3</b>\n\n"
+        f"📦 Produk: <b>{html.escape(name)}</b>\n"
+        f"🧩 Varian: <b>{html.escape(variant_name)}</b>\n"
+        f"💰 Harga: <b>{rupiah(price)}</b>\n\n"
+        "Kirim <b>jumlah kuota/slot Pre-Order</b>.\n"
+        "Contoh: <code>10</code>."
+    )
+
+
 @router.callback_query(F.data.startswith("newprodprice:"))
 async def owner_new_product_price_button(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
@@ -15789,6 +16703,8 @@ async def owner_new_product_price_button(call: CallbackQuery, state: FSMContext)
                 "product_name": data.get("product_name",""),
                 "product_description": data.get("product_description",""),
                 "product_variant_name": data.get("product_variant_name",""),
+                "product_fulfillment_mode": data.get("product_fulfillment_mode","ready"),
+                "product_type": data.get("product_type","standard"),
             }
         )
         await state.set_state(OwnerState.add_product_variant_price)
@@ -15848,6 +16764,16 @@ async def owner_new_product_price_button(call: CallbackQuery, state: FSMContext)
         return
 
     product_id,variant_id,name,variant_name,price=result
+
+    if await begin_preorder_product_setup(state,product_id,variant_id):
+        await safe_edit_or_answer(
+            call,
+            preorder_setup_slot_text(name,variant_name,price),
+            reply_markup=back_owner("owner:back_products"),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+        return
 
     await safe_edit_or_answer(
         call,
@@ -15951,6 +16877,13 @@ async def owner_new_product_price_custom(message: Message, state: FSMContext):
 
     product_id,variant_id,name,variant_name,price=result
     clear_owner_input_session(message.from_user.id)
+
+    if await begin_preorder_product_setup(state,product_id,variant_id):
+        return await message.answer(
+            preorder_setup_slot_text(name,variant_name,price),
+            reply_markup=back_owner("owner:back_products"),
+            parse_mode="HTML"
+        )
 
     await message.answer(
         "✅ <b>PRODUK BERHASIL DIBUAT</b>\n\n"
@@ -16289,6 +17222,107 @@ async def owner_add_variant_price_custom(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
+
+
+@router.message(OwnerState.preorder_slots)
+async def owner_preorder_slots_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    raw=(message.text or "").strip()
+    if not raw.isdigit() or not (1 <= int(raw) <= 10000):
+        return await message.answer("❌ Kuota harus angka 1–10000.")
+
+    data=await state.get_data()
+    product_id=int(data.get("preorder_product_id",0) or 0)
+    variant_id=int(data.get("preorder_variant_id",0) or 0)
+    if not product_id or not variant_id:
+        await state.clear()
+        return await message.answer("❌ Session setup Pre-Order tidak valid.")
+
+    conn=db()
+    conn.execute(
+        "UPDATE product_variants SET stock=?,reserved_stock=0 WHERE id=?",
+        (int(raw),variant_id)
+    )
+    conn.commit(); conn.close()
+
+    await state.set_state(OwnerState.preorder_estimate)
+    await message.answer(
+        "🕒 <b>SETUP PRE-ORDER • 2/3</b>\n\n"
+        "Kirim estimasi pengerjaan.\n"
+        "Contoh: <code>1–3 jam</code> atau <code>1–3 hari</code>.",
+        parse_mode="HTML"
+    )
+
+
+@router.message(OwnerState.preorder_estimate)
+async def owner_preorder_estimate_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    estimate=(message.text or "").strip()
+    if not estimate:
+        return await message.answer("❌ Estimasi tidak boleh kosong.")
+
+    data=await state.get_data()
+    product_id=int(data.get("preorder_product_id",0) or 0)
+    if not product_id:
+        await state.clear()
+        return await message.answer("❌ Session setup Pre-Order tidak valid.")
+
+    conn=db()
+    conn.execute(
+        "UPDATE products SET preorder_estimate=? WHERE id=?",
+        (estimate[:160],product_id)
+    )
+    conn.commit(); conn.close()
+
+    await state.set_state(OwnerState.preorder_instructions)
+    await message.answer(
+        "🕒 <b>SETUP PRE-ORDER • 3/3</b>\n\n"
+        "Kirim <b>arahan/catatan untuk pembeli</b>.\n"
+        "Boleh teks bebas. Ketik <code>-</code> jika tidak ada.",
+        parse_mode="HTML"
+    )
+
+
+@router.message(OwnerState.preorder_instructions)
+async def owner_preorder_instructions_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    instructions=(message.text or "").strip()
+    if instructions=="-":
+        instructions=""
+
+    data=await state.get_data()
+    product_id=int(data.get("preorder_product_id",0) or 0)
+    variant_id=int(data.get("preorder_variant_id",0) or 0)
+    if not product_id or not variant_id:
+        await state.clear()
+        return await message.answer("❌ Session setup Pre-Order tidak valid.")
+
+    conn=db()
+    conn.execute(
+        "UPDATE products SET preorder_instructions=? WHERE id=?",
+        (instructions[:1500],product_id)
+    )
+    product=conn.execute("SELECT * FROM products WHERE id=?",(product_id,)).fetchone()
+    variant=conn.execute("SELECT * FROM product_variants WHERE id=?",(variant_id,)).fetchone()
+    conn.commit(); conn.close()
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>PRODUK PRE-ORDER SIAP</b>\n\n"
+        f"📦 Produk: <b>{html.escape(str(product['name']))}</b>\n"
+        f"🧩 Varian: <b>{html.escape(str(variant['name']))}</b>\n"
+        f"📦 Kuota/Stok: <b>{available_stock(variant)}</b>\n"
+        f"⏱ Estimasi: <b>{html.escape(str(product['preorder_estimate'] or '-'))}</b>\n"
+        f"📝 Arahan: {html.escape(str(product['preorder_instructions'] or '-'))}\n\n"
+        "Di List Produk tampilannya tetap sama seperti stok biasa.",
+        reply_markup=owner_products_menu(),
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data == "owner:set_stock")
@@ -18140,7 +19174,13 @@ async def reply_menu_product_number(message: Message, bot: Bot):
         f"• <b>Produk:</b> {html.escape(product['name'])}\n"
         f"• <b>Terjual:</b> {int(product['sold'] or 0)}\n"
         f"• <b>Deskripsi:</b> {html.escape(product['description'] or '-')}\n"
-        "╰────────────────────╯\n\n"
+        + (
+            f"• <b>Sistem:</b> 🕒 Pre-Order\n"
+            f"• <b>Estimasi:</b> {html.escape(str(product['preorder_estimate'] or '-'))}\n"
+            f"• <b>Arahan:</b> {html.escape(str(product['preorder_instructions'] or '-'))}\n"
+            if product_is_preorder(product) else ""
+        )
+        + "╰────────────────────╯\n\n"
         "╭────────────────────╮\n"
         "📦 <b>Varian | Harga - (Stok)</b>\n"
         f"{compact_variant_price_stock_text(variants)}\n"
@@ -18620,7 +19660,7 @@ async def owner_inventory_log(call: CallbackQuery):
                 product_name=row["product_name"] or "Produk lama"
                 variant_name=row["variant_name"] or "Varian lama"
                 lines.append(
-                    f"{str(row['created_at'] or '-')[:16]} • {html.escape(str(row['action'] or '-'))}\n"
+                    f"{format_wib_datetime(row['created_at'] or '-',compact=True)} • {html.escape(str(row['action'] or '-'))}\n"
                     f"{html.escape(product_name)} — {html.escape(variant_name)}\n"
                     f"{sign}{int(row['qty'] or 0)} • {html.escape(str(row['reference'] or '-'))}"
                 )
@@ -19967,7 +21007,7 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
         lines.append("✅ Belum ada error tercatat.")
     else:
         for row in recent_errors:
-            stamp=str(row["created_at"] or "-").replace("T"," ")[:19]
+            stamp=format_wib_datetime(row["created_at"] or "-",compact=True)
             lines.append(
                 f"• <b>#{row['id']} {html.escape(row['exception_type'] or 'Exception')}</b> • "
                 f"{html.escape(stamp)}\n"
@@ -20487,7 +21527,8 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
 
     conn=db()
     row=conn.execute(
-        """SELECT v.id,v.name,v.stock,v.reserved_stock,v.sharing_mode,p.name AS product_name
+        """SELECT v.id,v.name,v.stock,v.reserved_stock,v.sharing_mode,
+                  p.name AS product_name,p.fulfillment_mode
            FROM product_variants v
            JOIN products p ON p.id=v.product_id
            WHERE v.id=? AND v.active=1 AND p.active=1""",
@@ -20501,6 +21542,26 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
     available=max(0,int(row["stock"] or 0)-int(row["reserved_stock"] or 0))
 
     await state.update_data(stock_variant_id=variant_id)
+
+    if str(row["fulfillment_mode"] or "ready")=="preorder":
+        await safe_edit_or_answer(
+            call,
+            "🕒 <b>ATUR SLOT PRE-ORDER</b>\n\n"
+            f"Produk: <b>{html.escape(row['product_name'])}</b>\n"
+            f"Varian: <b>{html.escape(row['name'])}</b>\n"
+            f"Slot tersedia: <b>{available}</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="+1",callback_data=f"ownerposlotadd:{variant_id}:1"),
+                    InlineKeyboardButton(text="+5",callback_data=f"ownerposlotadd:{variant_id}:5"),
+                    InlineKeyboardButton(text="+10",callback_data=f"ownerposlotadd:{variant_id}:10"),
+                ],
+                [InlineKeyboardButton(text="✏️ Tambah Custom",callback_data=f"ownerposlotcustom:{variant_id}")],
+                [InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:set_stock")]
+            ]),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
 
     await safe_edit_or_answer(
         call,
@@ -20528,6 +21589,87 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
     await safe_callback_notice(call)
 
 
+
+
+@router.callback_query(F.data.startswith("ownerposlotadd:"))
+async def owner_preorder_slot_add(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        _,variant_raw,qty_raw=call.data.split(":")
+        variant_id=int(variant_raw); qty=int(qty_raw)
+    except Exception:
+        return await call.answer("Data slot tidak valid.",show_alert=True)
+    if qty < 1 or qty > 10000:
+        return await call.answer("Jumlah slot tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT v.id,p.fulfillment_mode
+           FROM product_variants v JOIN products p ON p.id=v.product_id
+           WHERE v.id=?""",(variant_id,)
+    ).fetchone()
+    if not row or str(row["fulfillment_mode"] or "ready")!="preorder":
+        conn.close()
+        return await call.answer("Varian bukan Pre-Order.",show_alert=True)
+    conn.execute("UPDATE product_variants SET stock=stock+? WHERE id=?",(qty,variant_id))
+    conn.commit(); conn.close()
+    call.data=f"ownerstockvar:{variant_id}"
+    await owner_stock_variant_pick(call,FSMContext) if False else None
+    return await call.answer(f"✅ Slot Pre-Order +{qty}.",show_alert=True)
+
+
+@router.callback_query(F.data.startswith("ownerposlotcustom:"))
+async def owner_preorder_slot_custom(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        variant_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Varian tidak valid.",show_alert=True)
+    await state.clear()
+    await state.update_data(preorder_slot_variant_id=variant_id)
+    await state.set_state(OwnerState.preorder_slot_adjust)
+    await safe_edit_or_answer(
+        call,
+        "✏️ <b>TAMBAH SLOT PRE-ORDER</b>\n\n"
+        "Kirim jumlah slot yang ingin ditambahkan.\n"
+        "Contoh: <code>25</code>.",
+        reply_markup=back_owner(f"ownerstockvar:{variant_id}"),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.preorder_slot_adjust)
+async def owner_preorder_slot_adjust_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    raw=(message.text or "").strip()
+    if not raw.isdigit() or not (1 <= int(raw) <= 10000):
+        return await message.answer("❌ Jumlah slot harus 1–10000.")
+    data=await state.get_data()
+    variant_id=int(data.get("preorder_slot_variant_id",0) or 0)
+    if not variant_id:
+        await state.clear()
+        return await message.answer("❌ Varian tidak valid.")
+    conn=db()
+    row=conn.execute(
+        """SELECT p.fulfillment_mode FROM product_variants v
+           JOIN products p ON p.id=v.product_id WHERE v.id=?""",(variant_id,)
+    ).fetchone()
+    if not row or str(row["fulfillment_mode"] or "ready")!="preorder":
+        conn.close(); await state.clear()
+        return await message.answer("❌ Varian bukan Pre-Order.")
+    conn.execute("UPDATE product_variants SET stock=stock+? WHERE id=?",(int(raw),variant_id))
+    variant=conn.execute("SELECT * FROM product_variants WHERE id=?",(variant_id,)).fetchone()
+    conn.commit(); conn.close(); await state.clear()
+    await message.answer(
+        f"✅ Slot Pre-Order ditambah <b>{int(raw)}</b>.\n"
+        f"📦 Slot tersedia sekarang: <b>{available_stock(variant)}</b>",
+        reply_markup=owner_products_menu(),
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data.startswith("ownerstockbulk:"))
@@ -20836,18 +21978,14 @@ async def owner_stock_bulk_collect(message: Message, state: FSMContext, bot: Bot
 
         old_available=available_stock(variant)
 
-        existing=conn.execute(
-            """SELECT id FROM inventory_items
-               WHERE variant_id=? AND content=?
-               LIMIT 1""",
-            (variant_id,content)
-        ).fetchone()
+        fingerprint=inventory_content_fingerprint(content)
+        existing=private_inventory_duplicate(conn,variant_id,content)
 
         if existing:
             conn.rollback(); conn.close()
             return await message.answer(
                 "⚠️ <b>AKUN DUPLIKAT</b>\n\n"
-                "Akun yang sama persis sudah pernah tersimpan.\n"
+                "Akun yang sama sudah pernah tersimpan / terjual sebelumnya.\n"
                 f"Progress tetap: <b>{session_added}/{target_qty}</b>.\n\n"
                 f"Silakan kirim akun berbeda untuk <b>{session_added + 1}/{target_qty}</b>.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -20862,9 +22000,9 @@ async def owner_stock_bulk_collect(message: Message, state: FSMContext, bot: Bot
         now=datetime.now().isoformat(timespec="seconds")
         conn.execute(
             """INSERT INTO inventory_items
-               (variant_id,content,status,created_at)
-               VALUES(?,?,'available',?)""",
-            (variant_id,content,now)
+               (variant_id,content,status,created_at,inventory_mode,content_fingerprint)
+               VALUES(?,?,'available',?,'unique',?)""",
+            (variant_id,content,now,fingerprint)
         )
 
         # Different accounts are Private / Unique.
@@ -20878,6 +22016,21 @@ async def owner_stock_bulk_collect(message: Message, state: FSMContext, bot: Bot
         product_name=str(variant["product_name"])
         variant_name=str(variant["name"])
         conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback(); conn.close()
+        if "idx_inventory_unique_fingerprint" in str(exc) or "UNIQUE constraint failed" in str(exc):
+            return await message.answer(
+                "⚠️ <b>AKUN DUPLIKAT DIBLOKIR</b>\n\n"
+                "Akun tersebut sudah tersimpan sebelumnya.\n"
+                "Stok dan progress tidak bertambah.",
+                parse_mode="HTML"
+            )
+        logging.exception("Private inventory integrity error: %s",exc)
+        return await message.answer(
+            "❌ <b>AKUN BELUM DITAMBAHKAN</b>\n\n"
+            "Database menolak data yang tidak konsisten.",
+            parse_mode="HTML"
+        )
     except Exception as exc:
         conn.rollback(); conn.close()
         logging.exception("Target account stock insert failed: %s",exc)
@@ -21632,7 +22785,7 @@ async def owner_sold_accounts(call: CallbackQuery):
             f"{html.escape(row['variant_name'])}\n"
             f"👤 User: <code>{int(row['user_id'] or 0)}</code>\n"
             f"🔐 Akun: <code>{html.escape(account_preview)}</code>\n"
-            f"🕒 {html.escape(str(when))}\n"
+            f"🕒 {html.escape(format_wib_datetime(when,compact=True))}\n"
         )
 
     await safe_edit_or_answer(
@@ -21772,6 +22925,357 @@ async def owner_payment_reconcile(call: CallbackQuery):
         parse_mode="HTML"
     )
     await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("loginproof:"))
+async def user_login_proof_start(call: CallbackQuery, state: FSMContext):
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=? AND o.user_id=?""",
+        (order_id,int(call.from_user.id))
+    ).fetchone()
+    existing=conn.execute(
+        "SELECT id FROM order_login_proofs WHERE order_id=? AND user_id=?",
+        (order_id,int(call.from_user.id))
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await call.answer("Pesanan tidak ditemukan.",show_alert=True)
+    if existing:
+        return await call.answer("Bukti login untuk invoice ini sudah tersimpan.",show_alert=True)
+    if row["payment_status"]!="paid" or row["status"]!="completed":
+        return await call.answer("Bukti login dapat dikirim setelah pesanan selesai.",show_alert=True)
+
+    await state.clear()
+    await state.update_data(login_proof_order_id=order_id)
+    await state.set_state(LoginProofState.waiting_photo)
+    await safe_edit_or_answer(
+        call,
+        "📸 <b>KIRIM BUKTI LOGIN</b>\n\n"
+        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+        f"📦 Produk: <b>{html.escape(str(row['product_name'] or '-'))}</b>\n\n"
+        "Setelah berhasil login/aktif, kirim <b>screenshot profil atau halaman status premium</b>.\n\n"
+        "Screenshot ini disimpan sebagai bukti kondisi awal jika ada claim di kemudian hari.\n"
+        "⚠️ Jangan tampilkan password, OTP, kode recovery, atau data rahasia.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Riwayat",callback_data="my_orders")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(LoginProofState.waiting_photo)
+async def user_login_proof_photo(message: Message, state: FSMContext, bot: Bot):
+    data=await state.get_data()
+    order_id=int(data.get("login_proof_order_id",0) or 0)
+
+    if not order_id:
+        await state.clear()
+        return await message.answer("❌ Session bukti login tidak valid.")
+
+    if not message.photo:
+        return await message.answer(
+            "❌ Kirim dalam bentuk <b>foto/screenshot</b>, bukan teks atau file lain.",
+            parse_mode="HTML"
+        )
+
+    file_id=message.photo[-1].file_id
+    caption=(message.caption or "").strip()[:500]
+
+    conn=db(); begin_immediate_retry(conn)
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,p.product_type,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=? AND o.user_id=?""",
+        (order_id,int(message.from_user.id))
+    ).fetchone()
+    if not row or row["payment_status"]!="paid" or row["status"]!="completed":
+        conn.rollback(); conn.close(); await state.clear()
+        return await message.answer("❌ Order belum memenuhi syarat bukti login.")
+
+    existing=conn.execute("SELECT id FROM order_login_proofs WHERE order_id=?",(order_id,)).fetchone()
+    if existing:
+        conn.rollback(); conn.close(); await state.clear()
+        return await message.answer("ℹ️ Bukti login invoice ini sudah tersimpan.")
+
+    conn.execute(
+        """INSERT INTO order_login_proofs(order_id,user_id,file_id,caption,created_at)
+           VALUES(?,?,?,?,?)""",
+        (order_id,int(message.from_user.id),file_id,caption,datetime.now().isoformat(timespec="seconds"))
+    )
+    conn.commit(); conn.close()
+    await state.clear()
+
+    if ADMIN_ID:
+        try:
+            username=f"@{message.from_user.username}" if message.from_user.username else f"ID {message.from_user.id}"
+            await bot.send_photo(
+                ADMIN_ID,
+                file_id,
+                caption=(
+                    "📸 <b>BUKTI LOGIN USER</b>\n\n"
+                    f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+                    f"👤 User: <b>{html.escape(username)}</b>\n"
+                    f"📦 Produk: <b>{html.escape(str(row['product_name'] or '-'))}</b>\n"
+                    f"🧩 Varian: <b>{html.escape(str(row['variant_name'] or '-'))}</b>\n"
+                    f"🏷️ Tipe: <b>{'Famhead' if str(row['product_type'] or '')=='famhead' else 'Standard'}</b>\n\n"
+                    "✅ Disimpan sebagai bukti kondisi awal untuk referensi claim."
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            logging.exception("Forward login proof failed order=%s",order_id)
+
+    await message.answer(
+        "✅ <b>BUKTI LOGIN TERSIMPAN</b>\n\n"
+        f"🧾 {invoice(order_id)}\n"
+        "Screenshot sudah disimpan sebagai referensi jika ada claim di kemudian hari.",
+        reply_markup=user_delivery_actions_keyboard(order_id),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("usercomplaint:"))
+async def user_complaint_start(call: CallbackQuery, state: FSMContext):
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,p.product_type,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=? AND o.user_id=?""",
+        (order_id,int(call.from_user.id))
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return await call.answer("Pesanan tidak ditemukan.",show_alert=True)
+
+    if str(row["product_type"] or "standard")=="famhead":
+        conn.close()
+        rows=[]
+        btn=owner_contact_button()
+        if btn:
+            rows.append([btn])
+        rows.append([InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")])
+        await safe_edit_or_answer(
+            call,
+            "⚠️ <b>KOMPLAIN AKUN TIDAK TERSEDIA</b>\n\n"
+            "Produk Famhead menggunakan Gmail milik pembeli sendiri sehingga tidak memakai sistem penggantian akun.\n\n"
+            "Jika undangan Family belum masuk atau Premium bermasalah, gunakan <b>Hubungi Owner</b> / alur kendala aktivasi.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
+    delivered=(
+        row["payment_status"]=="paid"
+        and (
+            row["status"]=="completed"
+            or row["fulfillment_status"]=="delivered"
+            or int(row["account_sent"] or 0)==1
+        )
+    )
+    if not delivered:
+        conn.close()
+        return await call.answer(
+            "Komplain tersedia setelah produk berhasil dikirim.",
+            show_alert=True
+        )
+
+    existing=conn.execute(
+        """SELECT id FROM support_claims
+           WHERE order_id=? AND user_id=? AND status='open'
+           ORDER BY id DESC LIMIT 1""",
+        (order_id,int(call.from_user.id))
+    ).fetchone()
+    conn.close()
+
+    if existing:
+        return await call.answer(
+            f"Komplain #{int(existing['id'])} masih menunggu owner.",
+            show_alert=True
+        )
+
+    await state.clear()
+    await state.update_data(user_complaint_order_id=order_id)
+    await state.set_state(UserComplaintState.waiting_reason)
+
+    await safe_edit_or_answer(
+        call,
+        "⚠️ <b>KOMPLAIN AKUN / PRODUK</b>\n\n"
+        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+        f"📦 Produk: <b>{html.escape(str(row['product_name'] or '-'))}</b>\n"
+        f"🧩 Varian: <b>{html.escape(str(row['variant_name'] or '-'))}</b>\n\n"
+        "Kirim alasan komplain sebagai teks.\n"
+        "Contoh: akun tidak bisa login, password salah, akun expired, atau produk tidak sesuai.\n\n"
+        "Keluhan akan langsung dikirim ke PM owner.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Batalkan",callback_data=f"usercomplaintcancel:{order_id}")],
+            [InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("usercomplaintcancel:"))
+async def user_complaint_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer("Komplain dibatalkan.",show_alert=True)
+    await safe_edit_or_answer(
+        call,
+        "Komplain dibatalkan.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")],
+            [InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")]
+        ])
+    )
+
+
+@router.message(UserComplaintState.waiting_reason)
+async def user_complaint_reason(message: Message, state: FSMContext, bot: Bot):
+    data=await state.get_data()
+    order_id=int(data.get("user_complaint_order_id",0) or 0)
+    reason=(message.text or message.caption or "").strip()
+
+    if not order_id:
+        await state.clear()
+        return await message.answer("❌ Session komplain tidak valid. Silakan buka Riwayat.")
+
+    if not reason:
+        return await message.answer("❌ Alasan komplain tidak boleh kosong.")
+
+    if len(reason)>1500:
+        return await message.answer("❌ Komplain terlalu panjang. Maksimal 1500 karakter.")
+
+    conn=db()
+    begin_immediate_retry(conn)
+    order=conn.execute(
+        """SELECT o.*,p.name AS product_name,v.name AS variant_name
+           FROM orders o
+           LEFT JOIN products p ON p.id=o.product_id
+           LEFT JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=? AND o.user_id=?""",
+        (order_id,int(message.from_user.id))
+    ).fetchone()
+
+    if not order:
+        conn.rollback(); conn.close(); await state.clear()
+        return await message.answer("❌ Pesanan tidak ditemukan.")
+
+    delivered=(
+        order["payment_status"]=="paid"
+        and (
+            order["status"]=="completed"
+            or order["fulfillment_status"]=="delivered"
+            or int(order["account_sent"] or 0)==1
+        )
+    )
+    if not delivered:
+        conn.rollback(); conn.close(); await state.clear()
+        return await message.answer("❌ Komplain hanya tersedia untuk produk yang sudah dikirim.")
+
+    existing=conn.execute(
+        """SELECT id FROM support_claims
+           WHERE order_id=? AND user_id=? AND status='open'
+           ORDER BY id DESC LIMIT 1""",
+        (order_id,int(message.from_user.id))
+    ).fetchone()
+
+    if existing:
+        claim_id=int(existing["id"])
+        conn.rollback(); conn.close(); await state.clear()
+        return await message.answer(
+            f"ℹ️ Komplain <b>#{claim_id}</b> masih menunggu owner.",
+            parse_mode="HTML"
+        )
+
+    cur=conn.execute(
+        """INSERT INTO support_claims
+           (order_id,user_id,claim_type,reason,status,created_at)
+           VALUES(?,?, 'invalid_account', ?, 'open', ?)""",
+        (
+            order_id,
+            int(message.from_user.id),
+            reason[:1500],
+            datetime.now().isoformat(timespec="seconds")
+        )
+    )
+    claim_id=int(cur.lastrowid)
+    conn.commit(); conn.close()
+    await state.clear()
+
+    username=message.from_user.username or ""
+    user_label=f"@{username}" if username else f"ID {message.from_user.id}"
+
+    conn=db()
+    login_proof=conn.execute(
+        "SELECT * FROM order_login_proofs WHERE order_id=?",
+        (order_id,)
+    ).fetchone()
+    conn.close()
+
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "⚠️ <b>KOMPLAIN USER BARU</b>\n\n"
+                f"🆔 Claim: <b>#{claim_id}</b>\n"
+                f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+                f"👤 User: <b>{html.escape(user_label)}</b>\n"
+                f"📦 Produk: <b>{html.escape(str(order['product_name'] or '-'))}</b>\n"
+                f"🧩 Varian: <b>{html.escape(str(order['variant_name'] or '-'))}</b>\n"
+                f"💰 Pembayaran: <b>{html.escape(str(order['payment_status']))}</b>\n"
+                f"📸 Bukti login awal: <b>{'TERSEDIA' if login_proof else 'TIDAK ADA'}</b>\n\n"
+                "📝 <b>Keluhan:</b>\n"
+                f"<blockquote>{html.escape(reason[:1500])}</blockquote>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="♻️ Ganti Akun",callback_data=f"claimact:{claim_id}:replace")],
+                    [InlineKeyboardButton(text="💰 Refund ke Saldo",callback_data=f"claimact:{claim_id}:refund")],
+                    [InlineKeyboardButton(text="❌ Tolak Komplain",callback_data=f"claimact:{claim_id}:reject")],
+                ]),
+                parse_mode="HTML"
+            )
+            if login_proof:
+                await bot.send_photo(
+                    ADMIN_ID,
+                    str(login_proof["file_id"]),
+                    caption=f"📸 Bukti login awal • {invoice(order_id)} • Claim #{claim_id}"
+                )
+        except Exception:
+            logging.exception("Failed to forward user complaint claim=%s",claim_id)
+
+    await message.answer(
+        "✅ <b>KOMPLAIN TERKIRIM KE OWNER</b>\n\n"
+        f"🆔 Claim: <b>#{claim_id}</b>\n"
+        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n\n"
+        "Owner sudah menerima laporan komplain melalui PM. "
+        "Tunggu proses dari owner.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")],
+            [InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")]
+        ]),
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data == "owner:claims")
@@ -22154,6 +23658,16 @@ async def owner_claim_action(call: CallbackQuery,bot: Bot):
         )
         conn.commit(); conn.close()
         owner_audit(call.from_user.id,"CLAIM_REJECT","ok",f"claim={claim_id}")
+        try:
+            await bot.send_message(
+                int(order["user_id"]),
+                "❌ <b>KOMPLAIN DITOLAK OWNER</b>\n\n"
+                f"🧾 {invoice(order['id'])}\n"
+                "Jika masih ada kendala, hubungi owner melalui menu toko.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
         await call.answer("Klaim ditolak.",show_alert=True)
         return await safe_edit_or_answer(
             call,"❌ <b>KLAIM DITOLAK</b>",
@@ -22534,6 +24048,476 @@ async def owner_recovery_selftest(call: CallbackQuery):
     await safe_callback_notice(call)
 
 
+@router.callback_query(F.data.startswith("preorderdetail:"))
+async def owner_preorder_detail(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+    conn=db()
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,p.fulfillment_mode,p.preorder_estimate,
+                  p.preorder_instructions,p.product_type,v.name AS variant_name
+           FROM orders o JOIN products p ON p.id=o.product_id
+           JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=?""",(order_id,)
+    ).fetchone()
+    conn.close()
+    if not row or str(row["fulfillment_mode"] or "ready")!="preorder":
+        return await call.answer("Pre-Order tidak ditemukan.",show_alert=True)
+    labels={"waiting":"⏳ Menunggu Diproses","processing":"🔄 Sedang Diproses","completed":"✅ Selesai"}
+    status=labels.get(str(row["preorder_status"] or ""),str(row["preorder_status"] or "-"))
+    await safe_edit_or_answer(
+        call,
+        "🟠 <b>DETAIL PRE-ORDER</b>\n\n"
+        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+        f"📦 Produk: <b>{html.escape(str(row['product_name']))}</b>\n"
+        f"🧩 Varian: <b>{html.escape(str(row['variant_name']))}</b>\n"
+        f"🔢 Qty: <b>{int(row['qty'] or 1)}</b>\n"
+        f"💰 Pembayaran: <b>{html.escape(str(row['payment_status']))}</b>\n"
+        f"📌 Status: <b>{status}</b>\n"
+        f"⏱ Estimasi: <b>{html.escape(str(row['preorder_estimate'] or '-'))}</b>\n"
+        f"📝 Arahan: {html.escape(str(row['preorder_instructions'] or '-'))}\n"
+        + (f"📧 Gmail: <b>{html.escape(order_family_gmail(row) or '-')}</b>" if str(row["product_type"] or "")=="famhead" else ""),
+        reply_markup=(
+            family_owner_keyboard(order_id,str(row["username"] or ""))
+            if row["preorder_status"]!="completed" and str(row["product_type"] or "")=="famhead"
+            else (preorder_owner_keyboard(order_id) if row["preorder_status"]!="completed" else owner_orders_menu())
+        ),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("preorderprocess:"))
+async def owner_preorder_process(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db(); begin_immediate_retry(conn)
+    row=conn.execute(
+        """SELECT o.*,p.fulfillment_mode,p.product_type,p.name AS product_name
+           FROM orders o JOIN products p ON p.id=o.product_id WHERE o.id=?""",
+        (order_id,)
+    ).fetchone()
+    if not row or str(row["fulfillment_mode"] or "ready")!="preorder":
+        conn.rollback(); conn.close()
+        return await call.answer("Pre-Order tidak ditemukan.",show_alert=True)
+    if row["payment_status"]!="paid":
+        conn.rollback(); conn.close()
+        return await call.answer("Pembayaran belum lunas.",show_alert=True)
+    if row["preorder_status"]=="completed":
+        conn.rollback(); conn.close()
+        return await call.answer("Pre-Order sudah selesai.",show_alert=True)
+
+    conn.execute(
+        """UPDATE orders SET preorder_status='processing',
+           status='preorder_processing',fulfillment_status='preorder_processing'
+           WHERE id=?""",(order_id,)
+    )
+    conn.commit(); conn.close()
+
+    try:
+        await bot.send_message(
+            int(row["user_id"]),
+            "🔄 <b>PRE-ORDER SEDANG DIPROSES</b>\n\n"
+            f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+            f"📦 {html.escape(str(row['product_name']))}\n\n"
+            "Owner sudah mulai memproses pesanan Anda.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        logging.exception("PO processing user notification failed order=%s",order_id)
+
+    await call.answer("✅ Status diubah menjadi Sedang Diproses.",show_alert=True)
+    await safe_edit_or_answer(
+        call,
+        f"🔄 <b>PRE-ORDER SEDANG DIPROSES</b>\n\n🧾 {invoice(order_id)}",
+        reply_markup=(
+            family_owner_keyboard(order_id,str(row["username"] or ""))
+            if str(row["product_type"] or "")=="famhead"
+            else preorder_owner_keyboard(order_id)
+        ),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("familyinvited:"))
+async def owner_family_invited(call: CallbackQuery, bot: Bot):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db(); begin_immediate_retry(conn)
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,p.product_type,v.name AS variant_name
+           FROM orders o JOIN products p ON p.id=o.product_id
+           JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=?""",(order_id,)
+    ).fetchone()
+    if not row or str(row["product_type"] or "")!="famhead":
+        conn.rollback(); conn.close()
+        return await call.answer("Order bukan Famhead.",show_alert=True)
+    if row["payment_status"]!="paid":
+        conn.rollback(); conn.close()
+        return await call.answer("Pembayaran belum lunas.",show_alert=True)
+    if row["status"]=="completed":
+        conn.rollback(); conn.close()
+        return await call.answer("Order sudah selesai.",show_alert=True)
+
+    conn.execute(
+        """UPDATE orders
+           SET status='family_waiting_user',
+               fulfillment_status='family_waiting_user',
+               preorder_status='invited'
+           WHERE id=?""",(order_id,)
+    )
+    conn.commit(); conn.close()
+
+    gmail=order_family_gmail(row) or "-"
+    rows=[
+        [
+            InlineKeyboardButton(text="✅ Sudah Berhasil",callback_data=f"familyconfirm:{order_id}"),
+            InlineKeyboardButton(text="💬 Ada Kendala",callback_data=f"familyissue:{order_id}")
+        ]
+    ]
+    btn=owner_contact_button()
+    if btn: rows.append([btn])
+    rows.append([InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")])
+
+    try:
+        await bot.send_message(
+            int(row["user_id"]),
+            "✅ <b>UNDANGAN FAMILY SUDAH DIKIRIM</b>\n\n"
+            f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+            f"📦 Produk: <b>{html.escape(str(row['product_name']))}</b>\n"
+            f"📧 Gmail: <b>{html.escape(gmail)}</b>\n\n"
+            "Silakan cek email / Family Group dan terima undangan.\n"
+            "Setelah Premium aktif, tekan <b>Sudah Berhasil</b>.\n"
+            "Jika ada kendala, pilih <b>Ada Kendala</b>.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        return await call.answer(f"Gagal mengirim notifikasi user: {str(exc)[:100]}",show_alert=True)
+
+    await call.answer("✅ User diberi notifikasi undangan.",show_alert=True)
+    await safe_edit_or_answer(
+        call,
+        "✅ <b>UNDANGAN DITANDAI TERKIRIM</b>\n\n"
+        f"🧾 {invoice(order_id)}\n"
+        f"📧 {html.escape(gmail)}\n\n"
+        "Menunggu konfirmasi user.",
+        reply_markup=family_owner_keyboard(order_id,str(row["username"] or "")),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("familyconfirm:"))
+async def user_family_confirm(call: CallbackQuery, bot: Bot):
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db(); begin_immediate_retry(conn)
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,p.product_type
+           FROM orders o JOIN products p ON p.id=o.product_id
+           WHERE o.id=? AND o.user_id=?""",
+        (order_id,int(call.from_user.id))
+    ).fetchone()
+    if not row or str(row["product_type"] or "")!="famhead":
+        conn.rollback(); conn.close()
+        return await call.answer("Order Famhead tidak ditemukan.",show_alert=True)
+    if row["payment_status"]!="paid":
+        conn.rollback(); conn.close()
+        return await call.answer("Pembayaran belum lunas.",show_alert=True)
+    if row["status"]=="completed":
+        conn.rollback(); conn.close()
+        return await call.answer("Pesanan sudah selesai.",show_alert=True)
+    if str(row["preorder_status"] or "") not in {"invited","activation_issue","processing"}:
+        conn.rollback(); conn.close()
+        return await call.answer("Owner belum menandai undangan terkirim.",show_alert=True)
+
+    now=datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """UPDATE orders
+           SET status='completed',fulfillment_status='delivered',
+               preorder_status='completed',account_sent=1,
+               delivery_sent_at=?,completed_at=?
+           WHERE id=?""",
+        (now,now,order_id)
+    )
+    sync_product_sold_from_history(conn,int(row["product_id"]))
+    conn.commit(); conn.close()
+
+    await safe_edit_or_answer(
+        call,
+        "✅ <b>FAMHEAD BERHASIL AKTIF</b>\n\n"
+        f"🧾 {invoice(order_id)}\n"
+        f"📦 {html.escape(str(row['product_name']))}\n\n"
+        "Pesanan telah selesai.\n\n"
+        "📸 Silakan kirim screenshot profil/halaman Premium yang sudah aktif sebagai bukti kondisi awal untuk referensi claim.",
+        reply_markup=user_delivery_actions_keyboard(order_id),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call,"Pesanan selesai")
+
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "✅ <b>FAMHEAD DIKONFIRMASI USER</b>\n\n"
+                f"🧾 {invoice(order_id)}\n"
+                f"👤 User ID: <code>{call.from_user.id}</code>\n"
+                "Status: <b>Completed</b>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    try:
+        await send_review_prompt_if_needed(bot,order_id)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("familyissue:"))
+async def user_family_issue_begin(call: CallbackQuery, state: FSMContext):
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT o.id,p.product_type FROM orders o
+           JOIN products p ON p.id=o.product_id
+           WHERE o.id=? AND o.user_id=? AND o.payment_status='paid'""",
+        (order_id,int(call.from_user.id))
+    ).fetchone()
+    conn.close()
+    if not row or str(row["product_type"] or "")!="famhead":
+        return await call.answer("Order Famhead tidak ditemukan.",show_alert=True)
+
+    await state.clear()
+    await state.update_data(family_issue_order_id=order_id)
+    await state.set_state(FamilySupportState.waiting_issue_reason)
+    await safe_edit_or_answer(
+        call,
+        "💬 <b>KENDALA AKTIVASI FAMHEAD</b>\n\n"
+        f"🧾 {invoice(order_id)}\n\n"
+        "Jelaskan kendalanya, misalnya undangan belum masuk, Family tidak bisa diterima, atau Premium belum aktif.\n"
+        "Pesan akan langsung diteruskan ke PM owner.",
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(FamilySupportState.waiting_issue_reason)
+async def user_family_issue_reason(message: Message, state: FSMContext, bot: Bot):
+    data=await state.get_data()
+    order_id=int(data.get("family_issue_order_id",0) or 0)
+    reason=(message.text or "").strip()
+    if not order_id or not reason:
+        return await message.answer("❌ Jelaskan kendala dengan teks.")
+
+    conn=db(); begin_immediate_retry(conn)
+    row=conn.execute(
+        """SELECT o.*,p.name AS product_name,p.product_type,v.name AS variant_name
+           FROM orders o JOIN products p ON p.id=o.product_id
+           JOIN product_variants v ON v.id=o.variant_id
+           WHERE o.id=? AND o.user_id=?""",
+        (order_id,int(message.from_user.id))
+    ).fetchone()
+    if not row or str(row["product_type"] or "")!="famhead":
+        conn.rollback(); conn.close(); await state.clear()
+        return await message.answer("❌ Order Famhead tidak ditemukan.")
+
+    conn.execute(
+        """UPDATE orders SET status='family_activation_issue',
+           fulfillment_status='family_activation_issue',
+           preorder_status='activation_issue' WHERE id=?""",(order_id,)
+    )
+    conn.commit(); conn.close(); await state.clear()
+
+    if ADMIN_ID:
+        try:
+            username=f"@{message.from_user.username}" if message.from_user.username else f"ID {message.from_user.id}"
+            await bot.send_message(
+                ADMIN_ID,
+                "⚠️ <b>KENDALA AKTIVASI FAMHEAD</b>\n\n"
+                f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+                f"👤 User: <b>{html.escape(username)}</b>\n"
+                f"📧 Gmail: <b>{html.escape(order_family_gmail(row) or '-')}</b>\n"
+                f"📦 Produk: <b>{html.escape(str(row['product_name']))}</b>\n"
+                f"🧩 Varian: <b>{html.escape(str(row['variant_name']))}</b>\n\n"
+                f"📝 Kendala:\n<blockquote>{html.escape(reason[:1500])}</blockquote>",
+                reply_markup=family_owner_keyboard(order_id,str(row["username"] or "")),
+                parse_mode="HTML"
+            )
+        except Exception:
+            logging.exception("Family issue owner PM failed order=%s",order_id)
+
+    rows=[]
+    btn=owner_contact_button()
+    if btn: rows.append([btn])
+    rows.append([InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")])
+    await message.answer(
+        "✅ <b>KENDALA TERKIRIM KE OWNER</b>\n\n"
+        f"🧾 {invoice(order_id)}\n"
+        "Owner sudah menerima laporan dan dapat memproses ulang undangan.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("preorderdeliver:"))
+async def owner_preorder_deliver_begin(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        order_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Order tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT o.*,p.fulfillment_mode,p.product_type,p.name AS product_name,v.name AS variant_name
+           FROM orders o JOIN products p ON p.id=o.product_id
+           JOIN product_variants v ON v.id=o.variant_id WHERE o.id=?""",
+        (order_id,)
+    ).fetchone()
+    conn.close()
+    if not row or str(row["fulfillment_mode"] or "ready")!="preorder":
+        return await call.answer("Pre-Order tidak ditemukan.",show_alert=True)
+    if str(row["product_type"] or "")=="famhead":
+        return await call.answer(
+            "Famhead tidak memakai Kirim Akun. Gunakan ✅ Sudah Diundang.",
+            show_alert=True
+        )
+    if row["payment_status"]!="paid":
+        return await call.answer("Pembayaran belum lunas.",show_alert=True)
+    if row["preorder_status"]=="completed" or row["status"]=="completed":
+        return await call.answer("Produk sudah pernah dikirim.",show_alert=True)
+
+    await state.clear()
+    await state.update_data(preorder_delivery_order_id=order_id)
+    await state.set_state(OwnerState.preorder_delivery)
+    await safe_edit_or_answer(
+        call,
+        "📦 <b>KIRIM PRODUK PRE-ORDER</b>\n\n"
+        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+        f"📦 Produk: <b>{html.escape(str(row['product_name']))}</b>\n"
+        f"🧩 Varian: <b>{html.escape(str(row['variant_name']))}</b>\n\n"
+        "Kirim data akun/produk sebagai <b>teks bebas</b>.\n"
+        "Setelah berhasil dikirim ke user, order otomatis menjadi selesai.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Batal",callback_data=f"preorderdetail:{order_id}")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.preorder_delivery)
+async def owner_preorder_delivery_input(message: Message, state: FSMContext, bot: Bot):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+
+    data=await state.get_data()
+    order_id=int(data.get("preorder_delivery_order_id",0) or 0)
+    content=(message.text or message.caption or "").strip()
+    if not order_id or not content:
+        return await message.answer("❌ Data pengiriman tidak valid.")
+
+    conn=db()
+    row=conn.execute(
+        """SELECT o.*,p.fulfillment_mode,p.name AS product_name,v.name AS variant_name
+           FROM orders o JOIN products p ON p.id=o.product_id
+           JOIN product_variants v ON v.id=o.variant_id WHERE o.id=?""",
+        (order_id,)
+    ).fetchone()
+    conn.close()
+    if not row or str(row["fulfillment_mode"] or "ready")!="preorder":
+        await state.clear()
+        return await message.answer("❌ Pre-Order tidak ditemukan.")
+    if row["payment_status"]!="paid":
+        await state.clear()
+        return await message.answer("❌ Pembayaran belum lunas.")
+    if row["status"]=="completed" or row["preorder_status"]=="completed":
+        await state.clear()
+        return await message.answer("ℹ️ Produk sudah pernah dikirim.")
+
+    try:
+        await bot.send_message(
+            int(row["user_id"]),
+            "✅ <b>PRE-ORDER SELESAI</b>\n\n"
+            f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+            f"📦 Produk: <b>{html.escape(str(row['product_name']))}</b>\n"
+            f"🧩 Varian: <b>{html.escape(str(row['variant_name']))}</b>\n\n"
+            "🎁 <b>DETAIL PRODUK</b>\n"
+            f"<pre>{html.escape(content)}</pre>\n\n"
+            "Jika akun/produk tidak valid, gunakan tombol komplain.\n\n"
+            f"<i>{STORE_FOOTER}</i>",
+            reply_markup=user_delivery_actions_keyboard(order_id),
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        logging.exception("PO delivery send failed order=%s: %s",order_id,exc)
+        return await message.answer(
+            "❌ Pengiriman ke user gagal. Order belum ditandai selesai. Silakan coba lagi."
+        )
+
+    now=datetime.now().isoformat(timespec="seconds")
+    conn=db(); begin_immediate_retry(conn)
+    fresh=conn.execute("SELECT * FROM orders WHERE id=?",(order_id,)).fetchone()
+    if not fresh or fresh["status"]=="completed":
+        conn.rollback(); conn.close(); await state.clear()
+        return await message.answer("ℹ️ Order sudah selesai.")
+    conn.execute(
+        """UPDATE orders
+           SET status='completed',
+               fulfillment_status='delivered',
+               preorder_status='completed',
+               delivery_text=?,
+               account_sent=1,
+               delivery_sent_at=?,
+               completed_at=?,
+               last_delivery_error=''
+           WHERE id=?""",
+        (content,now,now,order_id)
+    )
+    sync_product_sold_from_history(conn,int(fresh["product_id"]))
+    conn.commit(); conn.close()
+    await state.clear()
+
+    try:
+        await send_review_prompt_if_needed(bot,order_id)
+    except Exception:
+        logging.exception("PO review prompt failed order=%s",order_id)
+
+    await message.answer(
+        "✅ <b>PRE-ORDER BERHASIL DIKIRIM</b>\n\n"
+        f"🧾 Invoice: <b>{invoice(order_id)}</b>\n"
+        "✅ Data sudah dikirim ke user.\n"
+        "✅ Status order menjadi Completed.",
+        reply_markup=owner_orders_menu(),
+        parse_mode="HTML"
+    )
+
+
 @router.callback_query()
 async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
     """
@@ -22793,7 +24777,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.23"
+EXPECTED_SOURCE_VERSION = "16.28"
 
 
 def source_integrity_self_test():
