@@ -114,6 +114,24 @@ try:
     )
 except Exception:
     TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT = 3
+try:
+    TOOLS_SESSION_EXPIRY_MINUTES = max(
+        2, min(120, int(os.getenv("TOOLS_SESSION_EXPIRY_MINUTES", "15")))
+    )
+except Exception:
+    TOOLS_SESSION_EXPIRY_MINUTES = 15
+try:
+    TOOLS_EMAIL_LOCK_SECONDS = max(
+        30, min(1800, int(os.getenv("TOOLS_EMAIL_LOCK_SECONDS", "300")))
+    )
+except Exception:
+    TOOLS_EMAIL_LOCK_SECONDS = 300
+try:
+    TOOLS_PROVIDER_STATUS_CACHE_SECONDS = max(
+        10, min(300, int(os.getenv("TOOLS_PROVIDER_STATUS_CACHE_SECONDS", "60")))
+    )
+except Exception:
+    TOOLS_PROVIDER_STATUS_CACHE_SECONDS = 60
 TOOLS_PROVIDER_AUTH_MODE = os.getenv("TOOLS_PROVIDER_AUTH_MODE", "bearer").strip().lower()
 if TOOLS_PROVIDER_AUTH_MODE not in {"bearer","x-api-key"}:
     TOOLS_PROVIDER_AUTH_MODE = "bearer"
@@ -139,8 +157,8 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.40"
-SCHEMA_VERSION = 175
+BOT_VERSION = "16.43"
+SCHEMA_VERSION = 176
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -881,6 +899,20 @@ def init_db():
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_tool_activity_email "
         "ON tool_activity_logs(target_email, created_at)"
+    )
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tool_email_locks (
+            email TEXT PRIMARY KEY,
+            owner_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            locked_until TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_email_locks_until "
+        "ON tool_email_locks(locked_until)"
     )
 
     # migrations from previous versions
@@ -6423,6 +6455,28 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Tools Recovery & History",False,str(exc)[:100]))
 
+    # Advanced tools controls
+    try:
+        conn=db()
+        lock_table=bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_email_locks'"
+        ).fetchone())
+        conn.close()
+        advanced_tools_ok=(
+            lock_table
+            and callable(classify_tools_error)
+            and callable(tools_daily_stats)
+            and callable(tools_health_summary)
+            and getattr(OwnerState,"tools_history_search",None) is not None
+        )
+        checks.append((
+            "Tools Advanced Controls",
+            advanced_tools_ok,
+            "filter/search + locks + expiry + health + classifier"
+        ))
+    except Exception as exc:
+        checks.append(("Tools Advanced Controls",False,str(exc)[:100]))
+
     # Schema version
     try:
         current_schema=schema_version_info()
@@ -8412,6 +8466,7 @@ class OwnerState(StatesGroup):
     tools_alight_email = State()
     tools_magiclink_email = State()
     tools_verify_link = State()
+    tools_history_search = State()
     set_qris = State()
     set_payment_note = State()
     topup_amount = State()
@@ -9169,6 +9224,7 @@ def validate_system_schema():
         "order_login_proofs": {"id","order_id","user_id","file_id","created_at"},
         "tool_provision_logs": {"id","owner_id","tool_name","target_email","plan","status","created_at"},
         "tool_activity_logs": {"id","owner_id","action","target_email","status","http_status","created_at"},
+        "tool_email_locks": {"email","owner_id","action","locked_until","created_at"},
         "settings": {"key","value"},
         "system_errors": {"id","error_text","created_at"},
         "payment_proof_sessions": {"user_id","entity_type","entity_id"},
@@ -11429,8 +11485,11 @@ def owner_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎬 Alight Motion Tools",callback_data="tools:alight")],
         [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
+        [InlineKeyboardButton(text="❤️ Health Summary",callback_data="tools:health")],
         [InlineKeyboardButton(text="🧪 Diagnostik",callback_data="tools:diagnostics")],
         [InlineKeyboardButton(text="♻️ Lanjutkan Terakhir",callback_data="tools:resume")],
+        [InlineKeyboardButton(text="🔐 Status idToken",callback_data="tools:token_status")],
+        [InlineKeyboardButton(text="📋 Hasil Final",callback_data="tools:final_result")],
         [InlineKeyboardButton(text="📦 Riwayat Tools",callback_data="tools:history")],
         [InlineKeyboardButton(text="⚙️ Status Provider",callback_data="tools:provider")],
         [InlineKeyboardButton(text="⬅️ Owner Panel",callback_data="owner:panel")],
@@ -11552,7 +11611,15 @@ def tools_stats_text(owner_id: int) -> str:
         f"Total request akun: <b>{s['lifetime_total']}</b>\n"
         f"✅ Sukses: <b>{s['lifetime_success']}</b>\n"
         f"❌ Gagal: <b>{s['lifetime_failed']}</b>\n"
-        f"🎯 Tingkat keberhasilan: <b>{s['success_rate']:.1f}%</b>"
+        f"🎯 Tingkat keberhasilan: <b>{s['success_rate']:.1f}%</b>\n\n"
+        + (
+            lambda d: (
+                "📅 <b>HARI INI</b>\n"
+                f"Total: <b>{d['total']}</b> • "
+                f"✅ {d['success']} • ❌ {d['failed']} • ⏳ {d['pending']}\n"
+                f"Success rate: <b>{d['rate']:.1f}%</b>"
+            )
+        )(tools_daily_stats(owner_id))
     )
 
 
@@ -11562,6 +11629,298 @@ def tools_quota_can_process(owner_id: int) -> tuple[bool,dict]:
 
 
 TOOLS_HISTORY_PAGE_SIZE = 5
+
+
+TOOLS_STATUS_CACHE = {
+    "at": 0.0,
+    "ok": None,
+    "http_status": 0,
+    "preview": "",
+}
+
+
+def tools_session_expired(data: dict) -> bool:
+    raw=str(data.get("tools_session_started_at") or "")
+    if not raw:
+        return False
+    try:
+        started=datetime.fromisoformat(raw)
+        now=datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
+        return (now-started).total_seconds() > TOOLS_SESSION_EXPIRY_MINUTES*60
+    except Exception:
+        return True
+
+
+def cleanup_expired_tool_locks():
+    now=datetime.now().isoformat(timespec="seconds")
+    conn=db()
+    conn.execute("DELETE FROM tool_email_locks WHERE locked_until<=?",(now,))
+    conn.commit()
+    conn.close()
+
+
+def acquire_tool_email_lock(owner_id: int, email: str, action: str) -> tuple[bool,str]:
+    cleanup_expired_tool_locks()
+    email=str(email or "").strip().lower()
+    now=datetime.now()
+    until=now + timedelta(seconds=TOOLS_EMAIL_LOCK_SECONDS)
+
+    conn=db()
+    begin_immediate_retry(conn)
+    try:
+        row=conn.execute(
+            "SELECT * FROM tool_email_locks WHERE email=?",
+            (email,)
+        ).fetchone()
+        if row:
+            conn.rollback()
+            return False,str(row["locked_until"] or "")
+
+        conn.execute(
+            """INSERT INTO tool_email_locks(email,owner_id,action,locked_until,created_at)
+               VALUES(?,?,?,?,?)""",
+            (
+                email,
+                int(owner_id),
+                str(action),
+                until.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds")
+            )
+        )
+        conn.commit()
+        return True,until.isoformat(timespec="seconds")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def release_tool_email_lock(email: str):
+    conn=db()
+    conn.execute(
+        "DELETE FROM tool_email_locks WHERE email=?",
+        (str(email or "").strip().lower(),)
+    )
+    conn.commit()
+    conn.close()
+
+
+def classify_tools_error(http_status: int, data) -> tuple[str,str]:
+    status=int(http_status or 0)
+    text=tool_response_preview(data).lower()
+
+    if status==429:
+        return "rate_limit","Provider sedang membatasi request."
+    if status in {401,403}:
+        return "auth","API key/otorisasi ditolak provider."
+    if status==400:
+        return "bad_request","Data request ditolak provider."
+    if status==404:
+        return "endpoint","Endpoint provider tidak ditemukan."
+    if status>=500:
+        return "provider_server","Server provider sedang bermasalah."
+    if status==0 and "timeout" in text:
+        return "timeout","Provider tidak merespons sebelum timeout."
+    if status==0:
+        return "network","Koneksi ke provider gagal."
+    return "unknown","Provider mengembalikan error yang belum diklasifikasikan."
+
+
+def tools_retry_hint(http_status: int, result) -> str:
+    category,message=classify_tools_error(http_status,result)
+    if category in {"timeout","provider_server","network"}:
+        return message + " Aman mencoba lagi."
+    if category=="rate_limit":
+        retry_after=""
+        if isinstance(result,dict):
+            retry_after=str(result.get("_retry_after") or "")
+        return message + (f" Coba lagi setelah {retry_after} detik." if retry_after else " Tunggu hingga limit provider reset.")
+    if category=="auth":
+        return message + " Periksa Railway Secret API key."
+    if category=="endpoint":
+        return message + " Periksa URL endpoint di Railway."
+    if category=="bad_request":
+        return message + " Periksa email/link yang dikirim."
+    return message
+
+
+def tools_daily_stats(owner_id: int) -> dict:
+    now_wib=datetime.now(DISPLAY_TIMEZONE)
+    start_wib=now_wib.replace(hour=0,minute=0,second=0,microsecond=0)
+    next_wib=start_wib+timedelta(days=1)
+    start_utc=start_wib.astimezone(timezone.utc).replace(tzinfo=None)
+    next_utc=next_wib.astimezone(timezone.utc).replace(tzinfo=None)
+
+    conn=db()
+    row=conn.execute(
+        """SELECT
+             COUNT(*) AS total,
+             SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
+             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+             SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending
+           FROM tool_activity_logs
+           WHERE owner_id=? AND created_at>=? AND created_at<?""",
+        (
+            int(owner_id),
+            start_utc.isoformat(timespec="seconds"),
+            next_utc.isoformat(timespec="seconds"),
+        )
+    ).fetchone()
+    conn.close()
+    success=int(row["success"] or 0)
+    failed=int(row["failed"] or 0)
+    decided=success+failed
+    return {
+        "total":int(row["total"] or 0),
+        "success":success,
+        "failed":failed,
+        "pending":int(row["pending"] or 0),
+        "rate":(success/decided*100.0) if decided else 0.0,
+    }
+
+
+def tools_history_filter_keyboard(page: int, total_pages: int, status_filter: str="all"):
+    page=max(1,int(page or 1))
+    total_pages=max(1,int(total_pages or 1))
+    status_filter=status_filter if status_filter in {"all","success","failed","pending"} else "all"
+    rows=[
+        [
+            InlineKeyboardButton(text=("✅ Semua" if status_filter=="all" else "Semua"),callback_data=f"toolsfilter:all:1"),
+            InlineKeyboardButton(text=("✅ Sukses" if status_filter=="success" else "Sukses"),callback_data=f"toolsfilter:success:1"),
+        ],
+        [
+            InlineKeyboardButton(text=("✅ Gagal" if status_filter=="failed" else "Gagal"),callback_data=f"toolsfilter:failed:1"),
+            InlineKeyboardButton(text=("✅ Pending" if status_filter=="pending" else "Pending"),callback_data=f"toolsfilter:pending:1"),
+        ],
+        [InlineKeyboardButton(text="🔎 Cari Email",callback_data="tools:history_search")],
+    ]
+    nav=[]
+    if page>1:
+        nav.append(InlineKeyboardButton(text="⬅️",callback_data=f"toolsfilter:{status_filter}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page}/{total_pages}",callback_data=f"toolsfilter:{status_filter}:{page}"))
+    if page<total_pages:
+        nav.append(InlineKeyboardButton(text="➡️",callback_data=f"toolsfilter:{status_filter}:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def render_tools_filtered_history(call: CallbackQuery, page: int=1, status_filter: str="all", email_query: str=""):
+    status_filter=status_filter if status_filter in {"all","success","failed","pending"} else "all"
+    clauses=["owner_id=?"]
+    params=[int(call.from_user.id)]
+    if status_filter!="all":
+        clauses.append("status=?")
+        params.append(status_filter)
+    if email_query:
+        clauses.append("LOWER(target_email) LIKE ?")
+        params.append(f"%{email_query.lower()}%")
+    where=" AND ".join(clauses)
+
+    conn=db()
+    total=int(conn.execute(
+        f"SELECT COUNT(*) AS n FROM tool_activity_logs WHERE {where}",
+        tuple(params)
+    ).fetchone()["n"] or 0)
+    total_pages=max(1,(total+TOOLS_HISTORY_PAGE_SIZE-1)//TOOLS_HISTORY_PAGE_SIZE)
+    page=max(1,min(int(page or 1),total_pages))
+    offset=(page-1)*TOOLS_HISTORY_PAGE_SIZE
+    rows=conn.execute(
+        f"""SELECT * FROM tool_activity_logs
+            WHERE {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?""",
+        tuple(params+[TOOLS_HISTORY_PAGE_SIZE,offset])
+    ).fetchall()
+    conn.close()
+
+    lines=[
+        "📦 <b>RIWAYAT TOOLS</b>",
+        f"Filter: <b>{html.escape(status_filter.upper())}</b>",
+        f"Halaman: <b>{page}/{total_pages}</b> • Total: <b>{total}</b>",
+    ]
+    if email_query:
+        lines.append(f"Email: <b>{html.escape(email_query)}</b>")
+    lines.append("")
+
+    action_map={
+        "send_verification_link":"Kirim Link Verifikasi",
+        "verify_account":"Verifikasi Akun",
+    }
+
+    if not rows:
+        lines.append("Tidak ada aktivitas yang cocok.")
+    else:
+        for row in rows:
+            status=str(row["status"] or "")
+            icon="✅" if status=="success" else ("⏳" if status=="pending" else "❌")
+            action=action_map.get(str(row["action"] or ""),str(row["action"] or "-"))
+            lines.append(
+                f"{icon} <b>#{row['id']}</b> • {html.escape(action)}\n"
+                f"📧 {html.escape(str(row['target_email'] or '-'))}\n"
+                f"🌐 HTTP: {int(row['http_status'] or 0) or '-'}\n"
+                f"🕒 {html.escape(format_wib_datetime(row['created_at'],compact=True))}"
+            )
+
+    await safe_edit_or_answer(
+        call,
+        "\n\n".join(lines),
+        reply_markup=tools_history_filter_keyboard(page,total_pages,status_filter),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+def tools_final_result_text(data: dict) -> str:
+    email=str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "")
+    status=str(data.get("tools_final_status") or "")
+    http_status=int(data.get("tools_final_http_status") or 0)
+    final_at=str(data.get("tools_final_at") or "")
+    preview=str(data.get("tools_final_preview") or "")
+    token=str(data.get("tools_verify_id_token") or "")
+
+    status_text={"success":"✅ BERHASIL","failed":"❌ GAGAL"}.get(status,"➖ BELUM ADA HASIL")
+    lines=[
+        "📋 <b>HASIL FINAL TOOLS</b>",
+        "",
+        f"Status Verify: <b>{status_text}</b>",
+        f"📧 Email Target: <b>{html.escape(email or '-')}</b>",
+        f"🔐 idToken: <b>{masked_id_token(token)}</b>",
+        f"🌐 HTTP Provider: <b>{http_status or '-'}</b>",
+    ]
+    if final_at:
+        lines.append(f"🕒 Waktu: <b>{html.escape(format_wib_datetime(final_at,compact=True))}</b>")
+    if preview:
+        lines += ["",f"Provider: <code>{html.escape(preview[:500])}</code>"]
+    lines += [
+        "",
+        "Catatan: ini adalah hasil proses verifikasi akun dari provider.",
+        "Status Premium hanya dinyatakan aktif jika provider mengembalikan status lisensi/subscription yang eksplisit."
+    ]
+    return "\n".join(lines)
+
+
+def tools_health_summary(owner_id: int) -> str:
+    stats=tools_stats_snapshot(owner_id)
+    daily=tools_daily_stats(owner_id)
+    last=tools_last_activity(owner_id)
+    ready=tools_provider_ready()
+    return (
+        "❤️ <b>HEALTH SUMMARY TOOLS</b>\n\n"
+        f"Provider config: <b>{'🟢 READY' if ready else '🟠 BELUM LENGKAP'}</b>\n"
+        f"Kuota jam ini: <b>{stats['used_requests']}/{stats['hourly_limit']}</b>\n"
+        f"Sisa kapasitas: <b>{stats['remaining_accounts']} akun</b>\n"
+        f"Hari ini: <b>{daily['success']} sukses / {daily['failed']} gagal / {daily['pending']} pending</b>\n"
+        f"Success rate hari ini: <b>{daily['rate']:.1f}%</b>\n"
+        + (
+            f"Terakhir: <b>{html.escape(str(last['action']))}</b> • "
+            f"<b>{html.escape(str(last['status']))}</b> • "
+            f"{html.escape(format_wib_datetime(last['created_at'],compact=True))}"
+            if last else
+            "Terakhir: <b>Belum ada aktivitas</b>"
+        )
+    )
 
 
 def create_tool_activity(owner_id: int, action: str, email: str="", status: str="pending") -> int:
@@ -11745,6 +12104,43 @@ def tool_response_preview(data) -> str:
     return raw[:TOOLS_PROVIDER_MAX_RESPONSE_CHARS]
 
 
+
+def extract_verify_id_token(result) -> str:
+    """Extract an idToken from the verify response without logging it."""
+    if not isinstance(result, dict):
+        return ""
+
+    candidates = [
+        result.get("idToken"),
+        result.get("id_token"),
+        result.get("token"),
+    ]
+
+    for nested_key in ("data","user","result"):
+        nested=result.get(nested_key)
+        if isinstance(nested, dict):
+            candidates.extend([
+                nested.get("idToken"),
+                nested.get("id_token"),
+                nested.get("token"),
+            ])
+
+    for value in candidates:
+        if isinstance(value, str) and len(value.strip()) >= 20:
+            return value.strip()
+    return ""
+
+
+def masked_id_token(token: str) -> str:
+    token=str(token or "").strip()
+    if not token:
+        return "❌ TIDAK TERDETEKSI"
+    if len(token) <= 8:
+        return "✅ TERDETEKSI"
+    return f"✅ TERDETEKSI (…{html.escape(token[-4:])})"
+
+
+
 def tools_provider_headers(payload_present: bool=False) -> dict:
     headers={
         "Accept":"application/json",
@@ -11792,6 +12188,11 @@ async def tools_provider_request(method: str, url: str, *, payload=None):
                         data=await response.json(content_type=None)
                     except Exception:
                         data={"text":(await response.text())[:TOOLS_PROVIDER_MAX_RESPONSE_CHARS]}
+
+                    if isinstance(data,dict):
+                        retry_after=response.headers.get("Retry-After")
+                        if retry_after:
+                            data["_retry_after"]=retry_after
 
                     last=(200 <= status < 300,status,data)
 
@@ -11938,6 +12339,7 @@ async def owner_tools_magiclink_begin(call: CallbackQuery,state: FSMContext):
         )
 
     await state.clear()
+    await state.update_data(tools_session_started_at=datetime.now().isoformat(timespec="seconds"))
     await state.set_state(OwnerState.tools_magiclink_email)
     await safe_edit_or_answer(
         call,
@@ -11961,12 +12363,12 @@ async def owner_tools_magiclink_email_input(message: Message,state: FSMContext):
     if not valid_tools_email(email):
         return await message.answer("❌ Format email tidak valid. Silakan kirim ulang.")
 
-    await state.update_data(tools_magic_email=email)
+    await state.update_data(tools_magic_email=email, tools_target_email=email)
     await state.set_state(None)
 
     await message.answer(
         "⚠️ <b>KONFIRMASI KIRIM LINK VERIFIKASI</b>\n\n"
-        f"📧 Email: <b>{html.escape(email)}</b>",
+        f"📧 Email Target: <b>{html.escape(email)}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Kirim",callback_data="tools:magiclink:confirm")],
             [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")],
@@ -11982,9 +12384,21 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
 
     data=await state.get_data()
     email=str(data.get("tools_magic_email") or "").strip().lower()
+    if tools_session_expired(data):
+        await state.clear()
+        return await call.answer("Session tools kedaluwarsa. Ulangi dari /tools.",show_alert=True)
     if not valid_tools_email(email):
         await state.clear()
         return await call.answer("Session email tidak valid.",show_alert=True)
+
+    locked,locked_until=acquire_tool_email_lock(
+        call.from_user.id,email,"send_verification_link"
+    )
+    if not locked:
+        return await call.answer(
+            "Email ini sedang diproses. Tunggu beberapa menit lalu coba lagi.",
+            show_alert=True
+        )
 
     activity_id=create_tool_activity(
         call.from_user.id,
@@ -12006,6 +12420,7 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
         payload={"email":email},
     )
     preview=tool_response_preview(result)
+    release_tool_email_lock(email)
     update_tool_activity(
         activity_id,
         status="success" if ok else "failed",
@@ -12018,7 +12433,7 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
         await safe_edit_or_answer(
             call,
             "✅ <b>LINK VERIFIKASI REQUEST BERHASIL</b>\n\n"
-            f"📧 Email: <b>{html.escape(email)}</b>\n"
+            f"📧 Email Target: <b>{html.escape(email)}</b>\n"
             f"🌐 HTTP: <b>{http_status}</b>\n\n"
             "Setelah link masuk ke email, pilih tombol Verifikasi Akun lalu kirim URL verifikasi lengkap.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -12032,9 +12447,10 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
     await safe_edit_or_answer(
         call,
         "❌ <b>LINK VERIFIKASI GAGAL</b>\n\n"
-        f"📧 Email: <b>{html.escape(email)}</b>\n"
+        f"📧 Email Target: <b>{html.escape(email)}</b>\n"
         f"🌐 HTTP: <b>{http_status or '-'}</b>\n"
-        f"Detail: <code>{html.escape(preview[:500])}</code>",
+        f"Detail: <code>{html.escape(preview[:500])}</code>\n"
+        f"💡 {html.escape(tools_retry_hint(http_status,result))}",
         reply_markup=alight_tools_menu(),
         parse_mode="HTML"
     )
@@ -12075,11 +12491,12 @@ async def owner_tools_verify_begin(call: CallbackQuery,state: FSMContext):
         )
 
     await state.update_data(tools_verify_email=email)
+    await state.update_data(tools_session_started_at=datetime.now().isoformat(timespec="seconds"))
     await state.set_state(OwnerState.tools_verify_link)
     await safe_edit_or_answer(
         call,
         "🔗 <b>MASUKKAN LINK VERIFIKASI</b>\n\n"
-        f"📧 Email: <b>{html.escape(email)}</b>\n\n"
+        f"📧 Email Target: <b>{html.escape(email)}</b>\n\n"
         "Kirim URL Link Verifikasi lengkap.\n"
         "Link digunakan sekali untuk proses verifikasi dan tidak disimpan permanen.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -12110,7 +12527,7 @@ async def owner_tools_verify_link_input(message: Message,state: FSMContext):
 
     await message.answer(
         "⚠️ <b>KONFIRMASI VERIFIKASI</b>\n\n"
-        f"📧 Email: <b>{html.escape(email)}</b>\n"
+        f"📧 Email Target: <b>{html.escape(email)}</b>\n"
         "🔗 Link Verifikasi: <b>TERSIMPAN SEMENTARA</b>\n\n"
         "Link verifikasi tidak akan ditampilkan kembali.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -12127,12 +12544,25 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         return await deny_owner_callback(call)
 
     data=await state.get_data()
-    email=str(data.get("tools_verify_email") or "").strip().lower()
+    email=str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "").strip().lower()
     raw_link=str(data.get("tools_raw_link") or "").strip()
+
+    if tools_session_expired(data):
+        await state.clear()
+        return await call.answer("Session tools kedaluwarsa. Ulangi dari /tools.",show_alert=True)
 
     if not valid_tools_email(email) or not raw_link.startswith(("https://","http://")):
         await state.clear()
         return await call.answer("Session verifikasi tidak valid.",show_alert=True)
+
+    locked,locked_until=acquire_tool_email_lock(
+        call.from_user.id,email,"verify_account"
+    )
+    if not locked:
+        return await call.answer(
+            "Email ini sedang diproses. Tunggu beberapa menit lalu coba lagi.",
+            show_alert=True
+        )
 
     activity_id=create_tool_activity(
         call.from_user.id,
@@ -12156,7 +12586,23 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
             "rawLink":raw_link,
         },
     )
+    verify_id_token=extract_verify_id_token(result) if ok else ""
+    if verify_id_token:
+        await state.update_data(
+            tools_verify_id_token=verify_id_token,
+            tools_verify_id_token_at=datetime.now().isoformat(timespec="seconds"),
+        )
+
     preview=tool_response_preview(result)
+    final_at=datetime.now().isoformat(timespec="seconds")
+    await state.update_data(
+        tools_target_email=email,
+        tools_final_status="success" if ok else "failed",
+        tools_final_http_status=int(http_status or 0),
+        tools_final_at=final_at,
+        tools_final_preview=preview[:900],
+    )
+    release_tool_email_lock(email)
     update_tool_activity(
         activity_id,
         status="success" if ok else "failed",
@@ -12165,7 +12611,9 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
     )
 
     # Never retain raw link after the request.
-    await state.clear()
+    # Preserve safe final metadata and temporary idToken in the owner session.
+    await state.update_data(tools_raw_link=None)
+    await state.set_state(None)
 
     if ok:
         safe_ref=""
@@ -12179,11 +12627,14 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
 
         await safe_edit_or_answer(
             call,
-            "✅ <b>AKUN BERHASIL DIVERIFIKASI</b>\n\n"
-            f"📧 Email: <b>{html.escape(email)}</b>\n"
-            f"🌐 HTTP: <b>{http_status}</b>\n"
+            "✅ <b>HASIL FINAL VERIFIKASI</b>\n\n"
+            "Status Verify: <b>✅ BERHASIL</b>\n"
+            f"📧 Email Target: <b>{html.escape(email)}</b>\n"
+            f"🔐 idToken: <b>{masked_id_token(verify_id_token)}</b>\n"
+            f"🌐 HTTP Provider: <b>{http_status}</b>\n"
+            f"🕒 Waktu: <b>{html.escape(format_wib_datetime(final_at,compact=True))}</b>\n"
             + (f"🔎 Ref: <code>{html.escape(safe_ref)}</code>\n" if safe_ref else "")
-            + "\nToken/link sensitif tidak ditampilkan atau disimpan.",
+            + "\nToken/link sensitif tidak ditampilkan atau disimpan permanen.",
             reply_markup=alight_tools_menu(),
             parse_mode="HTML"
         )
@@ -12192,9 +12643,10 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
     await safe_edit_or_answer(
         call,
         "❌ <b>VERIFIKASI GAGAL</b>\n\n"
-        f"📧 Email: <b>{html.escape(email)}</b>\n"
+        f"📧 Email Target: <b>{html.escape(email)}</b>\n"
         f"🌐 HTTP: <b>{http_status or '-'}</b>\n"
-        f"Detail: <code>{html.escape(preview[:500])}</code>",
+        f"Detail: <code>{html.escape(preview[:500])}</code>\n"
+        f"💡 {html.escape(tools_retry_hint(http_status,result))}",
         reply_markup=alight_tools_menu(),
         parse_mode="HTML"
     )
@@ -12230,7 +12682,7 @@ async def owner_tools_alight_email_input(message: Message,state: FSMContext):
         "⚠️ <b>KONFIRMASI PROVISION</b>\n\n"
         "🎬 Produk: <b>Alight Motion</b>\n"
         "⏳ Paket: <b>1 Tahun</b>\n"
-        f"📧 Email: <b>{html.escape(email)}</b>\n\n"
+        f"📧 Email Target: <b>{html.escape(email)}</b>\n\n"
         "Pastikan endpoint yang digunakan adalah provider resmi/berizin.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Kirim ke Provider",callback_data="tools:alight:confirm")],
@@ -12320,7 +12772,7 @@ async def owner_tools_alight_confirm(call: CallbackQuery,state: FSMContext):
             call,
             "✅ <b>REQUEST BERHASIL DIKIRIM</b>\n\n"
             f"🧾 Request: <b>#{log_id}</b>\n"
-            f"📧 Email: <b>{html.escape(email)}</b>\n"
+            f"📧 Email Target: <b>{html.escape(email)}</b>\n"
             f"🌐 HTTP: <b>{http_status}</b>\n"
             + (f"🔎 Ref Provider: <code>{html.escape(reference)}</code>\n" if reference else "")
             + "\nHasil lengkap tersimpan di Riwayat Provision.",
@@ -12332,7 +12784,7 @@ async def owner_tools_alight_confirm(call: CallbackQuery,state: FSMContext):
         call,
         "❌ <b>PROVISION GAGAL</b>\n\n"
         f"🧾 Request: <b>#{log_id}</b>\n"
-        f"📧 Email: <b>{html.escape(email)}</b>\n"
+        f"📧 Email Target: <b>{html.escape(email)}</b>\n"
         f"🌐 HTTP: <b>{http_status or '-'}</b>\n"
         f"Detail: <code>{html.escape(preview[:500])}</code>\n\n"
         "Checkout toko tetap berjalan normal.",
@@ -12428,19 +12880,155 @@ async def owner_tools_provider_info(call: CallbackQuery):
 async def owner_tools_history(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
-    await render_tools_history(call,1)
+    await render_tools_filtered_history(call,1,"all")
 
 
-@router.callback_query(F.data.startswith("toolshistory:"))
-async def owner_tools_history_page(call: CallbackQuery):
+@router.callback_query(F.data.startswith("toolsfilter:"))
+async def owner_tools_history_filter(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
     try:
-        page=int(call.data.split(":")[-1])
+        _,status_filter,page_raw=call.data.split(":")
+        page=int(page_raw)
     except Exception:
+        status_filter="all"
         page=1
-    await render_tools_history(call,page)
+    await render_tools_filtered_history(call,page,status_filter)
 
+
+@router.callback_query(F.data == "tools:history_search")
+async def owner_tools_history_search_begin(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await state.clear()
+    await state.set_state(OwnerState.tools_history_search)
+    await safe_edit_or_answer(
+        call,
+        "🔎 <b>CARI RIWAYAT TOOLS</b>\n\n"
+        "Kirim email atau sebagian email yang ingin dicari.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:history")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.tools_history_search)
+async def owner_tools_history_search_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    query=(message.text or "").strip().lower()
+    if len(query)<2 or len(query)>120:
+        return await message.answer("❌ Kata pencarian harus 2–120 karakter.")
+    await state.clear()
+
+    conn=db()
+    rows=conn.execute(
+        """SELECT * FROM tool_activity_logs
+           WHERE owner_id=? AND LOWER(target_email) LIKE ?
+           ORDER BY id DESC LIMIT 10""",
+        (int(message.from_user.id),f"%{query}%")
+    ).fetchall()
+    conn.close()
+
+    lines=[
+        "🔎 <b>HASIL PENCARIAN TOOLS</b>",
+        f"Query: <b>{html.escape(query)}</b>",
+        ""
+    ]
+    if not rows:
+        lines.append("Tidak ada riwayat yang cocok.")
+    else:
+        for row in rows:
+            status=str(row["status"] or "")
+            icon="✅" if status=="success" else ("⏳" if status=="pending" else "❌")
+            lines.append(
+                f"{icon} <b>#{row['id']}</b> • {html.escape(str(row['action']))}\n"
+                f"📧 {html.escape(str(row['target_email'] or '-'))}\n"
+                f"🌐 HTTP: {int(row['http_status'] or 0) or '-'}\n"
+                f"🕒 {html.escape(format_wib_datetime(row['created_at'],compact=True))}"
+            )
+
+    await message.answer(
+        "\n\n".join(lines),
+        reply_markup=owner_tools_menu(),
+        parse_mode="HTML"
+    )
+
+
+
+@router.callback_query(F.data == "tools:final_result")
+async def owner_tools_final_result(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    data=await state.get_data()
+    await safe_edit_or_answer(
+        call,
+        tools_final_result_text(data),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Refresh",callback_data="tools:final_result")],
+            [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
+            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:token_status")
+async def owner_tools_token_status(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    data=await state.get_data()
+    token=str(data.get("tools_verify_id_token") or "")
+    token_at=str(data.get("tools_verify_id_token_at") or "")
+    email=str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "")
+
+    lines=[
+        "🔐 <b>STATUS idToken</b>",
+        "",
+        f"Status: <b>{masked_id_token(token)}</b>",
+        f"Email: <b>{html.escape(email or '-')}</b>",
+    ]
+    if token_at:
+        lines.append(f"Session: <b>{html.escape(token_at)}</b>")
+    lines += [
+        "",
+        "Token penuh tidak ditampilkan atau dikirim ke Telegram.",
+        "Token juga tidak disimpan ke database/activity log.",
+        f"Session mengikuti batas {TOOLS_SESSION_EXPIRY_MINUTES} menit."
+    ]
+
+    await safe_edit_or_answer(
+        call,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Verifikasi Akun",callback_data="tools:verify")],
+            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:health")
+async def owner_tools_health(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    await safe_edit_or_answer(
+        call,
+        tools_health_summary(call.from_user.id),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Refresh",callback_data="tools:health")],
+            [InlineKeyboardButton(text="📊 Statistik",callback_data="tools:stats")],
+            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data == "tools:diagnostics")
@@ -12479,7 +13067,7 @@ async def owner_tools_resume(call: CallbackQuery,state: FSMContext):
         await safe_edit_or_answer(
             call,
             "♻️ <b>LANJUTKAN PROSES TERAKHIR</b>\n\n"
-            f"📧 Email: <b>{html.escape(email or '-')}</b>\n"
+            f"📧 Email Target: <b>{html.escape(email or '-')}</b>\n"
             f"Status terakhir: <b>{html.escape(status.upper())}</b>\n\n"
             "Jika link sudah masuk ke email, lanjutkan ke Verifikasi Akun.\n"
             "Jika belum, kirim ulang Link Verifikasi.",
@@ -12499,7 +13087,7 @@ async def owner_tools_resume(call: CallbackQuery,state: FSMContext):
         await safe_edit_or_answer(
             call,
             "♻️ <b>LANJUTKAN VERIFIKASI</b>\n\n"
-            f"📧 Email: <b>{html.escape(email or '-')}</b>\n"
+            f"📧 Email Target: <b>{html.escape(email or '-')}</b>\n"
             f"Status terakhir: <b>{html.escape(status.upper())}</b>\n\n"
             "Link verifikasi tidak disimpan permanen, jadi kirim kembali link dari inbox untuk mencoba lagi.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -26727,7 +27315,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.40"
+EXPECTED_SOURCE_VERSION = "16.43"
 
 
 def source_integrity_self_test():
