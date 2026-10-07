@@ -36,7 +36,7 @@ from aiogram.utils.backoff import BackoffConfig
 from aiogram.filters import Command, Filter
 from aiogram.types import (
     ErrorEvent,
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile,
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton, FSInputFile,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -93,7 +93,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.11"
+BOT_VERSION = "16.16"
 SCHEMA_VERSION = 169
 
 CHECKOUT_TERMS_SHORT = (
@@ -4664,11 +4664,52 @@ def bank_transfer_text() -> str:
 
     return (
         f"🏦 Bank: <b>{bank}</b>\n"
-        f"👤 Atas Nama: <b>{holder}</b>\n\n"
-        "💳 <b>Nomor Rekening</b>\n"
-        f"<pre>{account}</pre>\n"
-        "📋 <i>Tekan lama blok nomor rekening di atas untuk menyalin.</i>"
+        f"👤 Atas Nama: <b>{holder}</b>\n"
+        f"💳 Nomor Rekening: <code>{account}</code>"
     )
+
+
+def bank_account_copy_button() -> InlineKeyboardButton:
+    account = str(get_setting("bank_account", "") or "").strip()
+    account = account.replace("\r", "").replace("\n", "").strip()
+    return InlineKeyboardButton(
+        text="📋 Salin Nomor Rekening",
+        copy_text=CopyTextButton(text=account)
+    )
+
+
+def bank_order_pending_keyboard(order_id: int):
+    base=transaction_pending_keyboard(order_id, include_proof=True)
+    rows=[
+        [bank_account_copy_button()],
+        *base.inline_keyboard
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bank_topup_pending_keyboard(topup_id: int):
+    rows=[
+        [bank_account_copy_button()],
+        [
+            InlineKeyboardButton(
+                text="📤 Kirim Bukti Pembayaran",
+                callback_data=f"proofsubmit:topup:{topup_id}"
+            )
+        ],
+    ]
+    if ADMIN_USERNAME:
+        rows.append([
+            InlineKeyboardButton(
+                text="💬 Hubungi Owner",
+                url=f"https://t.me/{ADMIN_USERNAME}"
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 
 def topup_payment_method_keyboard(amount: int):
     rows = [
@@ -4812,6 +4853,173 @@ def schema_version_info():
             "SELECT MAX(version) AS version FROM schema_migrations"
         ).fetchone()
         return int(row["version"] or 0)
+    finally:
+        conn.close()
+
+
+def repair_historical_payment_state() -> dict:
+    """Conservative normalization for historical payment/proof rows."""
+    report={
+        "reserved_flags":0,
+        "paid_review_states":0,
+        "final_waiting_states":0,
+        "completed_fulfillment":0,
+        "paid_events_backfilled":0,
+        "rejected_sessions":0,
+        "topup_states":0,
+    }
+
+    conn=db()
+    begin_immediate_retry(conn)
+    try:
+        rows=conn.execute(
+            """SELECT id FROM orders
+               WHERE status IN ('cancelled','expired','completed')
+                 AND COALESCE(stock_reserved,0)!=0"""
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE orders SET stock_reserved=0,reserved_until='' WHERE id=?",
+                (int(row["id"]),)
+            )
+        report["reserved_flags"]=len(rows)
+        sync_all_reserved_stock(conn)
+
+        cur=conn.execute(
+            """UPDATE orders
+               SET payment_review_status='verified'
+               WHERE payment_status='paid'
+                 AND COALESCE(payment_review_status,'') NOT IN ('verified','')"""
+        )
+        report["paid_review_states"]=max(0,int(cur.rowcount or 0))
+
+        # Normalize paid rows that predate payment_review_status.
+        conn.execute(
+            """UPDATE orders
+               SET payment_review_status='verified'
+               WHERE payment_status='paid'
+                 AND COALESCE(payment_review_status,'')=''"""
+        )
+
+        cur=conn.execute(
+            """UPDATE orders
+               SET payment_review_status=''
+               WHERE status IN ('cancelled','expired')
+                 AND payment_status!='paid'
+                 AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')"""
+        )
+        report["final_waiting_states"]+=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            """UPDATE orders
+               SET payment_review_status='verified'
+               WHERE status='completed'
+                 AND payment_status='paid'
+                 AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')"""
+        )
+        report["final_waiting_states"]+=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            """UPDATE orders
+               SET payment_review_status=''
+               WHERE status='completed'
+                 AND payment_status!='paid'
+                 AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')"""
+        )
+        report["final_waiting_states"]+=max(0,int(cur.rowcount or 0))
+
+        # Historical completed rows may predate fulfillment_status.
+        cur=conn.execute(
+            """UPDATE orders
+               SET fulfillment_status='delivered'
+               WHERE status='completed'
+                 AND COALESCE(fulfillment_status,'')!='delivered'"""
+        )
+        report["completed_fulfillment"]=max(0,int(cur.rowcount or 0))
+
+        paid_rows=conn.execute(
+            """SELECT o.*
+               FROM orders o
+               LEFT JOIN payment_events e
+                 ON e.entity_type='order'
+                AND e.entity_id=o.id
+                AND e.event_type='paid'
+               WHERE o.payment_status='paid'
+                 AND COALESCE(o.payment_method,'')!='OWNER_FREE'
+                 AND e.id IS NULL"""
+        ).fetchall()
+        for row in paid_rows:
+            amount=int(row["payment_total"] or row["total"] or 0)
+            actor=int(row["payment_verified_by"] or 0)
+            created=(
+                row["payment_verified_at"]
+                or row["completed_at"]
+                or row["created_at"]
+                or datetime.now().isoformat(timespec="seconds")
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO payment_events(
+                       entity_type,entity_id,event_type,amount,actor_id,detail,created_at
+                   ) VALUES('order',?,'paid',?,?,?,?)""",
+                (
+                    int(row["id"]),amount,actor,
+                    "Historical payment event backfill v16.12",created
+                )
+            )
+        report["paid_events_backfilled"]=len(paid_rows)
+
+        cur=conn.execute(
+            """DELETE FROM payment_proof_sessions
+               WHERE entity_type='order'
+                 AND entity_id IN (
+                     SELECT id FROM orders
+                     WHERE payment_status='paid'
+                        OR status IN ('cancelled','expired','completed')
+                        OR COALESCE(payment_review_status,'')='rejected'
+                 )"""
+        )
+        report["rejected_sessions"]+=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            """DELETE FROM payment_proof_sessions
+               WHERE entity_type='topup'
+                 AND entity_id IN (
+                     SELECT id FROM topups
+                     WHERE status IN ('completed','paid','rejected','cancelled','expired')
+                        OR COALESCE(payment_review_status,'')='rejected'
+                 )"""
+        )
+        report["rejected_sessions"]+=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            """UPDATE topups
+               SET payment_review_status='verified'
+               WHERE status IN ('completed','paid')
+                 AND COALESCE(payment_review_status,'') NOT IN ('verified','')"""
+        )
+        report["topup_states"]+=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            """UPDATE topups
+               SET payment_review_status='rejected'
+               WHERE status='rejected'
+                 AND COALESCE(payment_review_status,'')!='rejected'"""
+        )
+        report["topup_states"]+=max(0,int(cur.rowcount or 0))
+
+        cur=conn.execute(
+            """UPDATE topups
+               SET payment_review_status=''
+               WHERE status IN ('cancelled','expired')
+                 AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')"""
+        )
+        report["topup_states"]+=max(0,int(cur.rowcount or 0))
+
+        conn.commit()
+        return report
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -5142,6 +5350,8 @@ async def auto_recovery_cycle(bot: Bot, source: str = "periodic"):
         "proof_sessions_cleaned": 0,
         "owner_input_sessions_cleaned": 0,
         "fsm_rows_cleaned": 0,
+        "historical_payment_repaired": 0,
+        "historical_payment_repair_detail": {},
         "safe_mode_triggered": False,
         "errors": [],
     }
@@ -5266,7 +5476,14 @@ async def auto_recovery_cycle(bot: Bot, source: str = "periodic"):
         conn.close()
         report["fsm_rows_cleaned"]=max(0,int(cur.rowcount or 0))
 
-        # 7) DB integrity check.
+        # 7) Normalize historical payment/proof state from older releases.
+        historical_repair=repair_historical_payment_state()
+        report["historical_payment_repair_detail"]=historical_repair
+        report["historical_payment_repaired"]=sum(
+            int(value or 0) for value in historical_repair.values()
+        )
+
+        # 8) DB integrity check.
         conn = db()
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
         conn.close()
@@ -5327,6 +5544,7 @@ async def periodic_auto_recovery(bot: Bot):
                 or report["inventory_repaired"]
                 or report["topups_reset"]
                 or report["proof_sessions_cleaned"]
+                or report["historical_payment_repaired"]
                 or report["safe_mode_triggered"]
             ):
                 lines = [
@@ -5338,6 +5556,7 @@ async def periodic_auto_recovery(bot: Bot):
                     f"📦 Reservasi stok repaired: <b>{report['reservation_counters_repaired']}</b>",
                     f"💰 Topup reset: <b>{report['topups_reset']}</b>",
                     f"📎 Proof session cleaned: <b>{report['proof_sessions_cleaned']}</b>",
+                    f"🧾 Payment state repaired: <b>{report['historical_payment_repaired']}</b>",
                     f"🛟 Safe Mode: <b>{'ON' if report['safe_mode_triggered'] else 'tidak berubah'}</b>",
                 ]
                 try:
@@ -5424,6 +5643,8 @@ async def startup_recovery_audit(bot: Bot):
         "reservation_counters_repaired": report["reservation_counters_repaired"],
         "processing_topups_reset": report["topups_reset"],
         "proof_sessions_cleaned": report["proof_sessions_cleaned"],
+        "historical_payment_repaired": report["historical_payment_repaired"],
+        "historical_payment_repair_detail": report["historical_payment_repair_detail"],
         "safe_mode_triggered": report["safe_mode_triggered"],
     }
 
@@ -5456,6 +5677,38 @@ async def transaction_self_test():
         checks.append(("Inventory", len(mismatches)==0, f"{len(mismatches)} mismatch"))
     except Exception as exc:
         checks.append(("Inventory", False, str(exc)[:100]))
+
+    # Payment method mapping
+    try:
+        mapping_ok=(
+            payment_method_label("QRIS")=="QRIS Manual"
+            and payment_method_label("BANK_TRANSFER")=="Transfer Rekening"
+            and payment_method_label("AUTO_QRIS")=="QRIS Otomatis"
+            and payment_method_label("WALLET")=="Saldo"
+        )
+        checks.append((
+            "Payment Method Mapping",
+            mapping_ok,
+            "QRIS/BANK/AUTO/WALLET"
+        ))
+    except Exception as exc:
+        checks.append(("Payment Method Mapping",False,str(exc)[:100]))
+
+    # Bank copy button
+    try:
+        if bank_transfer_ready():
+            copy_btn=bank_account_copy_button()
+            account_expected=str(get_setting("bank_account","") or "").strip().replace("\r","").replace("\n","")
+            copy_value=str(copy_btn.copy_text.text if copy_btn.copy_text else "")
+            checks.append((
+                "Bank Copy Button",
+                bool(account_expected) and copy_value==account_expected,
+                "ready" if copy_value==account_expected else "mismatch"
+            ))
+        else:
+            checks.append(("Bank Copy Button",True,"bank belum dikonfigurasi"))
+    except Exception as exc:
+        checks.append(("Bank Copy Button",False,str(exc)[:100]))
 
     # Owner proof action UX
     try:
@@ -5537,6 +5790,33 @@ async def transaction_self_test():
         ))
     except Exception as exc:
         checks.append(("Persistent Rate Limit",False,str(exc)[:100]))
+
+    # Historical payment-state normalization
+    try:
+        conn=db()
+        historical_issues=int(conn.execute(
+            """SELECT COUNT(*) AS n FROM orders
+               WHERE (
+                   status IN ('cancelled','expired','completed')
+                   AND COALESCE(stock_reserved,0)!=0
+               )
+               OR (
+                   payment_status='paid'
+                   AND COALESCE(payment_review_status,'') NOT IN ('verified','')
+               )
+               OR (
+                   status IN ('cancelled','expired','completed')
+                   AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')
+               )"""
+        ).fetchone()["n"] or 0)
+        conn.close()
+        checks.append((
+            "Historical Payment State",
+            historical_issues==0,
+            f"{historical_issues} mismatch"
+        ))
+    except Exception as exc:
+        checks.append(("Historical Payment State",False,str(exc)[:100]))
 
     # Payment scenario invariants
     try:
@@ -6325,6 +6605,30 @@ def topup_payment_terminal(row) -> bool:
     return str(row["status"] or "") in {"completed","expired","cancelled","rejected"}
 
 
+def payment_method_label(value: str) -> str:
+    method=str(value or "").strip().upper()
+    labels={
+        "QRIS": "QRIS Manual",
+        "AUTO_QRIS": "QRIS Otomatis",
+        "BANK_TRANSFER": "Transfer Rekening",
+        "WALLET": "Saldo",
+        "OWNER_FREE": "Owner Free",
+    }
+    return labels.get(method, method or "-")
+
+
+def verify_saved_payment_method(conn, order_id: int, expected: str) -> bool:
+    row=conn.execute(
+        "SELECT payment_method FROM orders WHERE id=?",
+        (int(order_id),)
+    ).fetchone()
+    return bool(
+        row
+        and str(row["payment_method"] or "").strip().upper()
+            == str(expected or "").strip().upper()
+    )
+
+
 def order_user_status_label(order) -> str:
     payment_status=str(order["payment_status"] or "")
     fulfillment=str(order["fulfillment_status"] or "")
@@ -6362,7 +6666,7 @@ def order_detail_text(order) -> str:
     created=order["created_at"] or "-"
     completed=order["completed_at"] or "-"
     note=order["note"] or "-"
-    method=order["payment_method"] or "-"
+    method=payment_method_label(order["payment_method"])
     total=int(order["payment_total"] or order["total"] or 0)
     reject_reason=(order["payment_reject_reason"] or "").strip()
 
@@ -6607,7 +6911,7 @@ def payment_proof_caption(entity: str, row) -> str:
             "🧾 <b>BUKTI PEMBAYARAN ORDER</b>\n\n"
             f"Invoice: <b>{invoice(row['id'])}</b>\n"
             f"User ID: <code>{row['user_id']}</code>\n"
-            f"Metode: <b>{html.escape(row['payment_method'])}</b>\n"
+            f"Metode: <b>{html.escape(payment_method_label(row['payment_method']))}</b>\n"
             f"Total: <b>{rupiah(row['payment_total'] or row['total'])}</b>\n"
             f"Kode unik: <b>+{int(row['unique_code'] or 0)}</b>\n"
             f"Catatan: <b>{html.escape(row['note'] or '-')}</b>\n\n"
@@ -6618,7 +6922,7 @@ def payment_proof_caption(entity: str, row) -> str:
         "💰 <b>BUKTI PEMBAYARAN TOP UP</b>\n\n"
         f"Invoice: <b>{topup_invoice(row['id'])}</b>\n"
         f"User ID: <code>{row['user_id']}</code>\n"
-        f"Metode: <b>{html.escape(row['payment_method'])}</b>\n"
+        f"Metode: <b>{html.escape(payment_method_label(row['payment_method']))}</b>\n"
         f"Saldo masuk: <b>{rupiah(row['amount'])}</b>\n"
         f"Total transfer: <b>{rupiah(row['payment_total'])}</b>\n"
         f"Kode unik: <b>+{int(row['unique_code'] or 0)}</b>\n\n"
@@ -8992,7 +9296,7 @@ def products_keyboard(filter_sql=""):
             text=product_stock_button_label(row["name"],total_stock),
             callback_data=f"product:{row['id']}"
         )
-    kb.adjust(2)
+    kb.adjust(1)
     kb.row(
         InlineKeyboardButton(text="🔎 Cari", callback_data="shop:search"),
         InlineKeyboardButton(text="🛒 Keranjang", callback_data="shop:cart"),
@@ -9046,30 +9350,24 @@ def qty_keyboard(variant_id, qty):
 
     kb = InlineKeyboardBuilder()
 
-    if sharing:
-        if stock > 0:
-            kb.button(
-                text="✅ Qty 1 • Akun Sharing",
-                callback_data="noop"
-            )
-            kb.adjust(1)
-    else:
+    if not sharing:
         quick_max = min(stock, 20)
         for number in range(1, quick_max + 1):
-            prefix = "✅ " if number == qty else ""
+            if number == qty:
+                continue
             kb.button(
-                text=f"{prefix}{number}",
-                callback_data=("noop" if number == qty else f"qty:{variant_id}:{number}")
+                text=str(number),
+                callback_data=f"qty:{variant_id}:{number}"
             )
 
         if quick_max > 0:
             kb.adjust(5)
 
-        if stock > 20:
+        if stock > 20 and qty != stock:
             kb.row(
                 InlineKeyboardButton(
                     text=f"📦 MAX {stock}",
-                    callback_data=("noop" if qty == stock else f"qty:{variant_id}:{stock}")
+                    callback_data=f"qty:{variant_id}:{stock}"
                 )
             )
 
@@ -9158,7 +9456,7 @@ def variant_card(product, variant, qty=1):
         f"• Desk : {product['description'] or '-'}\n"
         "└────────────────────\n\n"
         "┌────────────────────\n"
-        f"• Jumlah : <b>{qty}</b>\n"
+        f"• Jumlah dipilih : <b>{qty}</b>\n"
         f"• Harga/unit : <b>{rupiah(unit)}</b>\n"
         f"• Total Harga : <b>{rupiah(total)}</b>\n"
         "└────────────────────\n\n"
@@ -10746,10 +11044,6 @@ async def verify_join(call: CallbackQuery, bot: Bot, state: FSMContext):
 
 
 
-@router.callback_query(F.data == "noop")
-async def noop(call: CallbackQuery):
-    await call.answer()
-
 
 @router.callback_query(F.data == "home")
 async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
@@ -10779,6 +11073,37 @@ async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.answer()
 
 
+def compact_product_list_text(rows, stock_map, *, title="LIST PRODUK") -> str:
+    total=len(rows)
+    lines=[
+        "╭────────────────────╮",
+        f"│ 🛍️ <b>{html.escape(title)}</b>",
+        f"│ Total: <b>{total} Produk</b>",
+        "│ Halaman: <b>1/1</b>",
+        "├────────────────────┤",
+    ]
+
+    if not rows:
+        lines.append("│ Belum ada produk aktif.")
+    else:
+        for index,row in enumerate(rows,start=1):
+            stock=max(0,int(stock_map.get(int(row["id"]),0)))
+            lines.append(
+                f"│ [{index}] <b>{html.escape(str(row['name']))}</b> "
+                f"({stock} stok)"
+            )
+
+    lines += [
+        "╰────────────────────╯",
+        "",
+        "Silakan pilih nomor produk di keyboard bawah",
+        "atau pilih tombol produk.",
+        "",
+        f"<i>{STORE_FOOTER}</i>",
+    ]
+    return "\n".join(lines)
+
+
 async def show_product_list(call, title, filter_sql=""):
     conn = db()
     rows = conn.execute(
@@ -10787,17 +11112,14 @@ async def show_product_list(call, title, filter_sql=""):
     stock_map = product_stock_map(conn, filter_sql)
     conn.close()
 
-    if not rows:
-        text = f"{title}\n\nBelum ada produk.\n\n<i>{STORE_FOOTER}</i>"
-    else:
-        lines_text = [title, ""]
-        for i, row in enumerate(rows, 1):
-            total_stock = stock_map.get(int(row["id"]), 0)
-            lines_text.append(f"[{i}] {row['name']} — {product_stock_label(total_stock)}")
-        lines_text.append(
-            f"\nPilih produk di bawah.\n\n<i>{STORE_FOOTER}</i>"
-        )
-        text = "\n".join(lines_text)
+    clean_title=re.sub(r"<[^>]+>","",str(title or "LIST PRODUK"))
+    clean_title=clean_title.replace("🏷️","").replace("🔥","").replace("⚡","").strip()
+
+    text=compact_product_list_text(
+        rows,
+        stock_map,
+        title=clean_title or "LIST PRODUK"
+    )
 
     await safe_edit_or_answer(
         call,
@@ -10805,7 +11127,7 @@ async def show_product_list(call, title, filter_sql=""):
         reply_markup=products_keyboard(filter_sql),
         parse_mode="HTML"
     )
-    await call.answer()
+    await safe_callback_notice(call)
 
 
 
@@ -11487,6 +11809,19 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
             )
         )
         order_id = cur.lastrowid
+
+        if not verify_saved_payment_method(conn, order_id, "WALLET"):
+            conn.rollback()
+            conn.close()
+            logging.error(
+                "Payment method mismatch order=%s expected=WALLET",
+                order_id
+            )
+            return await call.answer(
+                "Metode pembayaran tidak sesuai. Pesanan dibatalkan demi keamanan. Silakan coba lagi.",
+                show_alert=True
+            )
+
         ref = invoice(order_id)
 
         existing_ledger = conn.execute(
@@ -11776,6 +12111,19 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             )
         )
         order_id = cur.lastrowid
+
+        if not verify_saved_payment_method(conn, order_id, "BANK_TRANSFER"):
+            conn.rollback()
+            conn.close()
+            logging.error(
+                "Payment method mismatch order=%s expected=BANK_TRANSFER",
+                order_id
+            )
+            return await call.answer(
+                "Metode pembayaran tidak sesuai. Pesanan dibatalkan demi keamanan. Silakan coba lagi.",
+                show_alert=True
+            )
+
         conn.commit()
         conn.close()
 
@@ -11811,7 +12159,7 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             f"<i>{STORE_FOOTER}</i>"
         )
 
-        payment_kb = transaction_pending_keyboard(order_id, include_proof=True)
+        payment_kb = bank_order_pending_keyboard(order_id)
 
         await safe_edit_or_answer(
             call,
@@ -11963,6 +12311,19 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             )
         )
         order_id = cur.lastrowid
+
+        if not verify_saved_payment_method(conn, order_id, "QRIS"):
+            conn.rollback()
+            conn.close()
+            logging.error(
+                "Payment method mismatch order=%s expected=QRIS",
+                order_id
+            )
+            return await call.answer(
+                "Metode pembayaran tidak sesuai. Pesanan dibatalkan demi keamanan. Silakan coba lagi.",
+                show_alert=True
+            )
+
         conn.commit()
         conn.close()
 
@@ -12186,6 +12547,19 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             )
         )
         order_id = cur.lastrowid
+
+        if not verify_saved_payment_method(conn, order_id, "AUTO_QRIS"):
+            conn.rollback()
+            conn.close()
+            logging.error(
+                "Payment method mismatch order=%s expected=AUTO_QRIS",
+                order_id
+            )
+            return await call.answer(
+                "Metode pembayaran tidak sesuai. Pesanan dibatalkan demi keamanan. Silakan coba lagi.",
+                show_alert=True
+            )
+
         conn.commit()
         conn.close()
 
@@ -12320,7 +12694,8 @@ async def my_orders(call: CallbackQuery):
                 f"{icon} <b>{invoice(row['id'])}</b> • "
                 f"{html.escape(row['product_name'] or 'Produk')} • "
                 f"{rupiah(row['payment_total'] or row['total'])}\n"
-                f"   {html.escape(display_status)}"
+                f"   💳 {html.escape(payment_method_label(row['payment_method']))} • "
+                f"{html.escape(display_status)}"
             )
         lines.append(
             f"<i>Pesanan selesai/ditolak otomatis hilang dari daftar setelah "
@@ -13109,10 +13484,7 @@ async def wallet_topup_method_bank(call: CallbackQuery):
         + bank_transfer_text()
         + "\n\n⚠️ Transfer sesuai nominal hingga kode unik.\n"
           "⏳ Invoice berlaku 30 menit. Setelah transfer, kirim bukti pembayaran ke bot.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Kirim Bukti Pembayaran", callback_data=f"proofsubmit:topup:{topup_id}")],
-            [InlineKeyboardButton(text="💬 Hubungi Owner", url=f"https://t.me/{ADMIN_USERNAME}")]
-        ]) if ADMIN_USERNAME else payment_proof_keyboard("topup", topup_id),
+        reply_markup=bank_topup_pending_keyboard(topup_id),
         parse_mode="HTML"
     )
 
@@ -13479,7 +13851,10 @@ async def owner_bank_preview(call: CallbackQuery):
         + bank_transfer_text()
         + f"\n\nStatus: <b>{'AKTIF' if bank_transfer_ready() else 'BELUM LENGKAP'}</b>\n"
           "<i>Nomor rekening ditampilkan dalam blok agar mudah disalin user.</i>",
-        reply_markup=bank_settings_menu(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [bank_account_copy_button()],
+            [InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:qris_settings")]
+        ]),
         parse_mode="HTML"
     )
     await call.answer()
@@ -17459,26 +17834,16 @@ async def reply_menu_products(message: Message, bot: Bot):
     stock_map = product_stock_map(conn)
     conn.close()
 
-    if not rows:
-        return await message.answer(
-            f"🏷️ <b>LIST PRODUK</b>\n\nBelum ada produk aktif.\n\n<i>{STORE_FOOTER}</i>",
-            reply_markup=user_reply_menu(),
-            parse_mode="HTML"
-        )
-
-    lines_text = ["🏷️ <b>LIST PRODUK</b>", ""]
-    for i, row in enumerate(rows, 1):
-        total_stock = stock_map.get(int(row["id"]), 0)
-        lines_text.append(f"{i}. {html.escape(row['name'])} — {html.escape(product_stock_label(total_stock))}")
-    lines_text.append(
-        "\nTekan nomor produk di keyboard bawah atau pilih tombol produk berikut."
-    )
-
     await message.answer(
-        "\n".join(lines_text),
+        compact_product_list_text(
+            rows,
+            stock_map,
+            title="LIST PRODUK"
+        ),
         reply_markup=products_keyboard(""),
         parse_mode="HTML"
     )
+
 
 
 @router.message(F.text == "🔥 Produk Populer")
@@ -22299,6 +22664,7 @@ async def silent_recovery_loop(bot: Bot):
                     f"🧹 Inventory repaired: <b>{results['inventory_repaired']}</b>\n"
                     f"💰 Topup processing reset: <b>{results['processing_topups_reset']}</b>\n"
             f"📎 Proof session cleaned: <b>{results.get('proof_sessions_cleaned',0)}</b>\n"
+            f"🧾 Payment state repaired: <b>{results.get('historical_payment_repaired',0)}</b>\n"
             f"🛟 Safe Mode triggered: <b>{'YA' if results.get('safe_mode_triggered') else 'TIDAK'}</b>"
             "\n\n<i>Paid belum terkirim = pembayaran sudah diterima tetapi akun belum berhasil dikirim. Order ini tidak dihapus otomatis.</i>",
                     parse_mode="HTML"
@@ -22318,7 +22684,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.11"
+EXPECTED_SOURCE_VERSION = "16.16"
 
 
 def source_integrity_self_test():
@@ -22378,8 +22744,13 @@ def runtime_dependency_self_test():
     checks.append(("persistent_rate_limit", callable(persistent_rate_limit)))
     checks.append(("schema_version_info", callable(schema_version_info)))
     checks.append(("payment_safety_snapshot", callable(payment_safety_snapshot)))
+    checks.append(("repair_historical_payment_state", callable(repair_historical_payment_state)))
     checks.append(("owner_proof_result_screen", callable(owner_proof_result_screen)))
     checks.append(("owner_proof_home_keyboard", callable(owner_proof_home_keyboard)))
+    checks.append(("bank_account_copy_button", callable(bank_account_copy_button)))
+    checks.append(("payment_method_label", callable(payment_method_label)))
+    checks.append(("verify_saved_payment_method", callable(verify_saved_payment_method)))
+    checks.append(("CopyTextButton", CopyTextButton is not None))
 
     failed=[name for name,ok in checks if not ok]
     if failed:
