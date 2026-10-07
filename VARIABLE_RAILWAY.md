@@ -1149,3 +1149,198 @@ Indikator warna stok dihapus. List Produk tetap menampilkan jumlah stok per prod
 ## v15.7 — Buyer Transaction Menu
 - Tidak ada Railway Variable baru.
 - Perubahan fokus pada UI/callback checkout pembeli; DB dan payment credentials tetap sama.
+
+
+## v15.8 — Transaction Cleanup
+- Tidak ada Railway Variable baru.
+- Fix literal newline dan penyederhanaan UI transaksi pembeli.
+
+
+## v15.9 — Start Welcome Fix
+- Tidak ada Railway Variable baru.
+- `/start` hanya mengirim satu pesan sambutan.
+
+
+## v16.0 — Transaction & Stock Reliability
+- Tidak ada Railway Variable baru.
+- Tidak ada perubahan secret atau payment credential.
+
+
+## v16.1 — Payment Flow Hardening
+- Tidak ada Railway Variable baru.
+- Tidak ada perubahan secret/payment credential.
+
+
+## v16.2 — Stability Hardening (base v16.1)
+- Tidak ada Railway Variable baru.
+- Tidak ada perubahan alur pembayaran user.
+
+
+## v16.3 — One Proof Per Invoice
+- Tidak ada Railway Variable baru.
+- Satu invoice maksimal satu bukti pembayaran.
+
+
+## v16.4 — Payment FSM Navigation Fix
+- Tidak ada Railway Variable baru.
+- Tambah tombol Menu Utama dan perbaikan state proof upload.
+
+
+## v16.5 — Payment Recovery Fix
+- Tidak ada Railway Variable baru.
+- Perbaikan fallback bukti pembayaran dan recovery owner.
+
+
+## v16.6 — Order Cleanup + Smart Alert Control
+- Tidak ada Railway Variable baru.
+- Smart Alert default OFF dan dikontrol dari menu owner.
+- Pesanan final/rejected disembunyikan dari UI user setelah 24 jam.
+
+
+## v16.7 — Production Reliability
+- Tidak ada Railway Variable baru.
+- Penambahan schema migration record, trace transaksi, dan persistent rate limiter.
+
+
+## v16.8 — Copy-Friendly Bank Account
+- Tidak ada Railway Variable baru.
+- Nomor rekening ditampilkan dalam blok copy-friendly.
+
+
+## v16.9 — Compact Riwayat
+- Tidak ada Railway Variable baru.
+- Pesanan Saya diganti UI Riwayat yang lebih ringkas.
+
+
+## v16.10 — Owner Proof Action Fix
+- Tidak ada Railway Variable baru.
+- Perbaikan respons tombol reject/final dan Menu Awal owner.
+
+
+## v16.11 — Compact Variant Price Stock
+- Tidak ada Railway Variable baru.
+- Tampilan varian/harga/stok dibuat satu baris per varian.
+
+
+## v16.12 — Historical Payment Auto-Repair
+- Tidak ada Railway Variable baru.
+- Recovery startup menormalisasi status payment/proof historis sebelum Self-Test.
+
+
+## v16.13 — Native Copy Bank Account
+- Tidak ada Railway Variable baru.
+- Tombol Telegram native copy_text digunakan untuk menyalin nomor rekening saja.
+
+
+## v16.14 — Payment Method Consistency
+- Tidak ada Railway Variable baru.
+- Validasi metode pembayaran dilakukan sebelum commit order.
+
+
+## v16.15 — Remove Dead Quantity Buttons
+- Tidak ada Railway Variable baru.
+- Tombol qty tanpa aksi/noop dihapus dari UI user.
+
+
+## v16.16 — Compact Product Catalog
+- Tidak ada Railway Variable baru.
+- Tampilan List Produk dibuat satu blok nomor + nama + stok.
+
+
+## v16.17 — Simple Bulk Stock
+- Tidak ada Railway Variable baru.
+- Tambah Stok Banyak menerima banyak akun dalam satu pesan; 1 baris = 1 stok.
+- Duplikat Akun Sharing dihapus dari menu owner.
+
+
+## v16.18 — Unified Account & Stock
+- Tidak ada Railway Variable baru.
+- Inventory user-facing owner disatukan: 1 akun = 1 stok.
+
+
+## v16.19 — Free-Text Account Input
+- Tidak ada Railway Variable baru.
+- Input akun: 1 pesan teks bebas = 1 akun = 1 stok.
+
+
+## v16.20 — Batch Private + Sharing Duplicate
+- Tidak ada Railway Variable baru.
+- Private batch: pisahkan akun dengan `---`.
+- Duplikat Akun Sharing aktif kembali.
+
+
+## v16.21 — Free-Text Sequential Stock
+- Tidak ada Railway Variable baru.
+- Private: 1 pesan teks bebas = 1 akun = 1 stok.
+- Session tetap aktif agar owner dapat mengirim akun berikutnya tanpa membuka menu ulang.
+- Duplikat Akun Sharing tetap tersedia.
+
+
+## v16.22 — Target Quantity Account Input
+- Tidak ada Railway Variable baru.
+- Owner memilih target 1/2/5/10/20/50 atau Custom.
+- Setiap pesan teks bebas = 1 akun = 1 stok; progress otomatis sampai target.
+- Duplikat Akun Sharing tetap tersedia.
+
+
+## v16.23 — Product Catalog Pagination
+- Tidak ada Railway Variable baru.
+- Tombol produk dan Cari publik dihapus dari List Produk.
+- Pagination katalog 5 produk per halaman ditambahkan.
+
+
+## v16.24 — Pre-Order Fulfillment
+- Tidak ada Railway Variable baru.
+- Pre-Order menggunakan schema database baru otomatis saat startup.
+
+
+## v16.25 — User Complaint
+- Tidak ada Railway Variable baru.
+- Komplain user diteruskan otomatis ke PM owner.
+
+
+## v16.26 — Inventory Hardening
+- Tidak ada Railway Variable baru.
+- Schema database naik ke 171 dan migrasi berjalan otomatis saat startup.
+- Private inventory sekarang memakai fingerprint + DB unique guard.
+
+
+## v16.27 — Famhead + Login Proof
+- Tidak ada Railway Variable baru.
+- Schema naik ke 172; migrasi otomatis saat startup.
+- Produk Famhead menggunakan Gmail user dan alur undangan Family.
+- Bukti login disimpan di SQLite + file_id Telegram.
+
+
+## v16.28 — WIB + Pagination Order
+- Tidak ada Railway Variable baru.
+- Schema tetap 172.
+- Semua waktu UI dikonversi ke Asia/Jakarta (WIB).
+- Owner Pesanan Terbaru: 4 order per halaman dengan tombol kiri/kanan.
+
+
+## v16.29 — User History + Rating Entry
+- Tidak ada Railway Variable baru.
+- Schema tetap 172.
+- Riwayat user 4 transaksi per halaman dengan kiri/kanan.
+- Rating yang belum diberikan bisa dibuka dari Riwayat/detail order.
+- Rating Toko & Ulasan dipindahkan dari Menu Utama ke tampilan /start.
+
+
+## v16.30 — /start Button Cleanup
+- Tidak ada Railway Variable baru.
+- Schema tetap 172.
+- Tombol /start disederhanakan menjadi `⭐ Rating Toko` dan `🛍️ Buka Menu Utama`.
+
+
+## v16.31 — Backup Project Hardening
+- Tidak ada Railway Variable baru.
+- Schema tetap 172.
+- `.env.example`/docs tidak lagi wajib ada di container Railway agar Backup Project berhasil.
+- `.env` asli tetap tidak pernah dibackup.
+
+
+## v16.32 — Timed Flash Sale
+- Tidak ada Railway Variable baru.
+- Schema naik ke 173.
+- Timer Flash Sale disimpan di SQLite dan aman terhadap restart/redeploy.

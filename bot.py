@@ -93,8 +93,8 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.30"
-SCHEMA_VERSION = 172
+BOT_VERSION = "16.32"
+SCHEMA_VERSION = 173
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -800,6 +800,8 @@ def init_db():
     add_column_if_missing(conn, "products", "rating_count", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "is_popular", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "is_flash_sale", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "products", "flash_sale_started_ts", "INTEGER NOT NULL DEFAULT 0")
+    add_column_if_missing(conn, "products", "flash_sale_until_ts", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "products", "fulfillment_mode", "TEXT NOT NULL DEFAULT 'ready'")
     add_column_if_missing(conn, "products", "preorder_estimate", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "products", "preorder_instructions", "TEXT DEFAULT ''")
@@ -1063,6 +1065,18 @@ def init_db():
             WHERE id=NEW.id;
         END
     """)
+
+    # v16.32 timed Flash Sale migration:
+    # legacy ON flags had no expiry. Disable them safely rather than leaving
+    # an indefinite Flash Sale after deploy.
+    cur.execute(
+        """UPDATE products
+           SET is_flash_sale=0,
+               flash_sale_started_ts=0,
+               flash_sale_until_ts=0
+           WHERE is_flash_sale=1
+             AND COALESCE(flash_sale_until_ts,0)<=0"""
+    )
 
     # v16.26 inventory hardening:
     # fingerprint private credentials, quarantine old accidental duplicates,
@@ -6245,6 +6259,28 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("User History Pagination",False,str(exc)[:100]))
 
+    # Timed Flash Sale
+    try:
+        conn=db()
+        flash_schema=all(
+            has_column(conn,"products",name)
+            for name in ("flash_sale_started_ts","flash_sale_until_ts")
+        )
+        conn.close()
+        flash_flow_ok=(
+            flash_schema
+            and callable(set_flash_sale_duration)
+            and callable(expire_finished_flash_sales)
+            and getattr(OwnerState,"flash_duration_custom",None) is not None
+        )
+        checks.append((
+            "Timed Flash Sale",
+            flash_flow_ok,
+            "DB timer + presets + custom + auto expiry"
+        ))
+    except Exception as exc:
+        checks.append(("Timed Flash Sale",False,str(exc)[:100]))
+
     # Schema version
     try:
         current_schema=schema_version_info()
@@ -7524,9 +7560,12 @@ def create_database_backup() -> Path:
     return backup_path
 
 
-PROJECT_BACKUP_FILES = (
+PROJECT_BACKUP_REQUIRED_FILES = (
     "main.py",
     "bot.py",
+)
+
+PROJECT_BACKUP_OPTIONAL_FILES = (
     "requirements.txt",
     ".env.example",
     "README.md",
@@ -7536,19 +7575,35 @@ PROJECT_BACKUP_FILES = (
 
 def create_project_backup() -> tuple[Path, Path]:
     """
-    Create a flat ZIP containing the deployed project source files plus
-    a consistent SQLite snapshot. Real .env/secrets are intentionally excluded.
+    Create a resilient flat project backup.
+
+    Runtime source files are mandatory.
+    Documentation/template files are optional because Railway deployments may
+    omit hidden/template files such as .env.example even when they exist in the
+    release ZIP/GitHub repository.
+
+    Real .env/secrets are intentionally NEVER included.
     Returns (zip_path, database_snapshot_path).
     """
     project_root=Path(__file__).resolve().parent
-    missing=[
-        name for name in PROJECT_BACKUP_FILES
+
+    missing_required=[
+        name for name in PROJECT_BACKUP_REQUIRED_FILES
         if not (project_root / name).is_file()
     ]
-    if missing:
+    if missing_required:
         raise RuntimeError(
-            "File project tidak lengkap: " + ", ".join(missing)
+            "File runtime wajib tidak lengkap: " + ", ".join(missing_required)
         )
+
+    present_optional=[
+        name for name in PROJECT_BACKUP_OPTIONAL_FILES
+        if (project_root / name).is_file()
+    ]
+    skipped_optional=[
+        name for name in PROJECT_BACKUP_OPTIONAL_FILES
+        if not (project_root / name).is_file()
+    ]
 
     db_snapshot=create_database_backup()
     if not db_snapshot.exists():
@@ -7566,11 +7621,40 @@ def create_project_backup() -> tuple[Path, Path]:
             "w",
             compression=zipfile.ZIP_DEFLATED
         ) as archive:
-            for name in PROJECT_BACKUP_FILES:
+            for name in PROJECT_BACKUP_REQUIRED_FILES:
                 archive.write(project_root / name,arcname=name)
 
-            # Keep the project backup flat and give the database a stable name.
+            for name in present_optional:
+                archive.write(project_root / name,arcname=name)
+
+            # Keep project backup flat and give the database a stable name.
             archive.write(db_snapshot,arcname="shop.db")
+
+            # Include a tiny manifest instead of failing because optional
+            # deployment files are absent.
+            manifest_lines=[
+                f"Maboyy Digital Project Backup v{BOT_VERSION}",
+                f"Created WIB: {datetime.now(JAKARTA_TZ).strftime('%d-%m-%Y %H:%M:%S WIB')}",
+                "",
+                "Included runtime files:",
+                *[f"- {name}" for name in PROJECT_BACKUP_REQUIRED_FILES],
+                "",
+                "Included optional files:",
+                *([f"- {name}" for name in present_optional] or ["- (none)"]),
+                "",
+                "Optional files not present in Railway container:",
+                *([f"- {name}" for name in skipped_optional] or ["- (none)"]),
+                "",
+                "Database snapshot:",
+                "- shop.db",
+                "",
+                "Secrets:",
+                "- .env intentionally excluded",
+            ]
+            archive.writestr(
+                "BACKUP_MANIFEST.txt",
+                "\n".join(manifest_lines)
+            )
     except Exception:
         try:
             zip_path.unlink(missing_ok=True)
@@ -7578,7 +7662,6 @@ def create_project_backup() -> tuple[Path, Path]:
             pass
         raise
 
-    # Keep manual project backup retention bounded, separate from DB backups.
     project_backups=sorted(
         backup_dir.glob("MaboyyDigital_Project_v*.zip"),
         key=lambda p: p.stat().st_mtime,
@@ -7590,8 +7673,13 @@ def create_project_backup() -> tuple[Path, Path]:
         except Exception:
             pass
 
-    return zip_path,db_snapshot
+    if skipped_optional:
+        logging.info(
+            "Project backup completed with optional files skipped: %s",
+            ", ".join(skipped_optional)
+        )
 
+    return zip_path,db_snapshot
 
 
 
@@ -8178,6 +8266,7 @@ class OwnerState(StatesGroup):
     set_price = State()
     mark_popular = State()
     mark_flash = State()
+    flash_duration_custom = State()
     set_qris = State()
     set_payment_note = State()
     topup_amount = State()
@@ -9975,12 +10064,233 @@ def qris_settings_menu():
 PRODUCTS_PAGE_SIZE = 5
 
 
+FLASH_DURATION_PRESETS = (
+    (15, "15 Menit"),
+    (30, "30 Menit"),
+    (60, "1 Jam"),
+    (180, "3 Jam"),
+    (360, "6 Jam"),
+    (720, "12 Jam"),
+    (1440, "24 Jam"),
+)
+
+
+def flash_sale_is_active(product, now_ts: int | None = None) -> bool:
+    if not product:
+        return False
+    try:
+        now_ts=int(now_ts if now_ts is not None else time.time())
+        return (
+            int(product["is_flash_sale"] or 0)==1
+            and int(product["flash_sale_until_ts"] or 0)>now_ts
+        )
+    except Exception:
+        return False
+
+
+def flash_sale_end_text(product) -> str:
+    if not flash_sale_is_active(product):
+        return "-"
+    try:
+        end_dt=datetime.fromtimestamp(
+            int(product["flash_sale_until_ts"]),
+            tz=timezone.utc
+        ).astimezone(DISPLAY_TIMEZONE)
+        return end_dt.strftime("%d/%m/%Y • %H:%M WIB")
+    except Exception:
+        return "-"
+
+
+def expire_finished_flash_sales(conn=None) -> int:
+    own_conn=conn is None
+    if own_conn:
+        conn=db()
+    try:
+        now_ts=int(time.time())
+        cur=conn.execute(
+            """UPDATE products
+               SET is_flash_sale=0,
+                   flash_sale_started_ts=0,
+                   flash_sale_until_ts=0
+               WHERE is_flash_sale=1
+                 AND COALESCE(flash_sale_until_ts,0)>0
+                 AND flash_sale_until_ts<=?""",
+            (now_ts,)
+        )
+        changed=max(0,int(cur.rowcount or 0))
+        if own_conn:
+            conn.commit()
+        return changed
+    except Exception:
+        if own_conn:
+            conn.rollback()
+        raise
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def set_flash_sale_duration(product_id: int, minutes: int) -> int:
+    minutes=int(minutes)
+    if minutes < 1 or minutes > 10080:
+        raise ValueError("Durasi Flash Sale harus 1 menit sampai 7 hari.")
+
+    now_ts=int(time.time())
+    until_ts=now_ts + (minutes*60)
+
+    conn=db()
+    begin_immediate_retry(conn)
+    try:
+        row=conn.execute(
+            "SELECT id FROM products WHERE id=? AND active=1",
+            (int(product_id),)
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            raise ValueError("Produk tidak ditemukan / nonaktif.")
+
+        conn.execute(
+            """UPDATE products
+               SET is_flash_sale=1,
+                   flash_sale_started_ts=?,
+                   flash_sale_until_ts=?
+               WHERE id=?""",
+            (now_ts,until_ts,int(product_id))
+        )
+        conn.commit()
+        return until_ts
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def disable_flash_sale(product_id: int) -> bool:
+    conn=db()
+    begin_immediate_retry(conn)
+    try:
+        cur=conn.execute(
+            """UPDATE products
+               SET is_flash_sale=0,
+                   flash_sale_started_ts=0,
+                   flash_sale_until_ts=0
+               WHERE id=?""",
+            (int(product_id),)
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)>0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def flash_duration_keyboard(product_id: int):
+    rows=[
+        [
+            InlineKeyboardButton(
+                text="⏱ 15 Menit",
+                callback_data=f"flashdur:{product_id}:15"
+            ),
+            InlineKeyboardButton(
+                text="⏱ 30 Menit",
+                callback_data=f"flashdur:{product_id}:30"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="⏱ 1 Jam",
+                callback_data=f"flashdur:{product_id}:60"
+            ),
+            InlineKeyboardButton(
+                text="⏱ 3 Jam",
+                callback_data=f"flashdur:{product_id}:180"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="⏱ 6 Jam",
+                callback_data=f"flashdur:{product_id}:360"
+            ),
+            InlineKeyboardButton(
+                text="⏱ 12 Jam",
+                callback_data=f"flashdur:{product_id}:720"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="⏱ 24 Jam",
+                callback_data=f"flashdur:{product_id}:1440"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="✏️ Custom",
+                callback_data=f"flashcustom:{product_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Matikan Flash Sale",
+                callback_data=f"flashoff:{product_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ Daftar Flash Sale",
+                callback_data="owner:mark_flash"
+            )
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def flash_owner_products_keyboard():
+    conn=db()
+    expire_finished_flash_sales(conn)
+    conn.commit()
+    rows=conn.execute(
+        """SELECT id,name,is_flash_sale,flash_sale_until_ts
+           FROM products
+           WHERE active=1
+           ORDER BY id"""
+    ).fetchall()
+    conn.close()
+
+    buttons=[]
+    now_ts=int(time.time())
+    for row in rows:
+        active=flash_sale_is_active(row,now_ts)
+        label=(
+            f"⚡ {row['name']} • {flash_sale_end_text(row)}"
+            if active else f"▫️ {row['name']}"
+        )
+        buttons.append([
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"flash:toggle:{row['id']}"
+            )
+        ])
+    buttons.append([
+        InlineKeyboardButton(
+            text="⬅️ Kembali",
+            callback_data="owner:back_products"
+        )
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def product_view_filter(view: str) -> str:
     view=str(view or "all").lower()
     if view=="popular":
         return "AND is_popular=1"
     if view=="flash":
-        return "AND is_flash_sale=1"
+        return (
+            "AND is_flash_sale=1 "
+            f"AND COALESCE(flash_sale_until_ts,0)>{int(time.time())}"
+        )
     return ""
 
 
@@ -11882,6 +12192,9 @@ async def show_product_list(
     view: str = "all"
 ):
     conn=db()
+    if view=="flash":
+        expire_finished_flash_sales(conn)
+        conn.commit()
 
     all_active=conn.execute(
         "SELECT id FROM products WHERE active=1 ORDER BY id"
@@ -11923,6 +12236,20 @@ async def show_product_list(
         total_pages=total_pages,
         global_number_map=global_number_map
     )
+    if view=="flash" and rows:
+        nearest=min(
+            int(row["flash_sale_until_ts"] or 0)
+            for row in rows
+            if int(row["flash_sale_until_ts"] or 0)>0
+        )
+        nearest_text=datetime.fromtimestamp(
+            nearest,tz=timezone.utc
+        ).astimezone(DISPLAY_TIMEZONE).strftime("%d/%m/%Y • %H:%M WIB")
+        text=(
+            "⚡ <b>FLASH SALE BERJANGKA</b>\n"
+            f"⏳ Terdekat berakhir: <b>{nearest_text}</b>\n\n"
+            + text
+        )
 
     await safe_edit_or_answer(
         call,
@@ -12064,11 +12391,17 @@ async def product_detail(call: CallbackQuery):
     conn.commit()
     conn.close()
 
+    flash_info=(
+        f"• <b>Flash Sale:</b> ⚡ sampai {html.escape(flash_sale_end_text(product))}\n"
+        if flash_sale_is_active(product) else ""
+    )
+
     text = (
         "╭────────────────────╮\n"
         f"• <b>Produk:</b> {html.escape(product['name'])}\n"
         f"• <b>Terjual:</b> {sold}\n"
         f"• <b>Deskripsi:</b> {html.escape(product['description'] or '-')}\n"
+        + flash_info
         + (
             f"• <b>Sistem:</b> 🕒 Pre-Order\n"
             f"• <b>Estimasi:</b> {html.escape(str(product['preorder_estimate'] or '-'))}\n"
@@ -15570,6 +15903,16 @@ async def owner_backup_project(call: CallbackQuery,bot: Bot):
             raise RuntimeError("ZIP backup project tidak berhasil dibuat.")
 
         backup_size=int(zip_path.stat().st_size)
+        with zipfile.ZipFile(zip_path,"r") as zf:
+            archived_names=zf.namelist()
+        project_files_in_backup=[
+            name for name in archived_names
+            if name not in {"shop.db","BACKUP_MANIFEST.txt"}
+        ]
+        optional_missing=[
+            name for name in PROJECT_BACKUP_OPTIONAL_FILES
+            if name not in archived_names
+        ]
         backup_time=datetime.now(JAKARTA_TZ).strftime('%d/%m/%Y • %H:%M:%S WIB')
         set_setting("last_project_backup_name",zip_path.name)
         set_setting("last_project_backup_size",str(backup_size))
@@ -15583,16 +15926,17 @@ async def owner_backup_project(call: CallbackQuery,bot: Bot):
                 f"🤖 Versi: <b>v{BOT_VERSION}</b>\n"
                 f"📅 {backup_time}\n"
                 f"💾 Ukuran: <b>{backup_size/1024:.1f} KB</b>\n"
-                "📁 Isi ZIP: <b>6 file project + 1 database</b>\n"
-                "🔐 <code>.env</code> dan secret Railway tidak disertakan.\n\n"
-                "File project:\n"
-                "• main.py\n"
-                "• bot.py\n"
-                "• requirements.txt\n"
-                "• .env.example\n"
-                "• README.md\n"
-                "• VARIABLE_RAILWAY.md\n"
-                "• shop.db"
+                f"📁 File project tersedia: <b>{len(project_files_in_backup)}</b>\n"
+                "🗄️ Database: <b>shop.db</b>\n"
+                "🧾 Manifest: <b>BACKUP_MANIFEST.txt</b>\n"
+                + (
+                    "⚠️ File opsional tidak ada di Railway: "
+                    + ", ".join(html.escape(x) for x in optional_missing)
+                    + "\n"
+                    if optional_missing else
+                    "✅ Semua file opsional tersedia di container.\n"
+                )
+                + "🔐 <code>.env</code> dan secret Railway tidak disertakan."
             ),
             parse_mode="HTML"
         )
@@ -15600,9 +15944,16 @@ async def owner_backup_project(call: CallbackQuery,bot: Bot):
         await safe_edit_or_answer(
             call,
             "✅ <b>BACKUP PROJECT BERHASIL</b>\n\n"
-            "ZIP lengkap sudah dikirim ke PM owner.\n"
-            "Isi: <b>6 file project + snapshot database</b>.\n\n"
-            "🔐 Token, password, dan <code>.env</code> asli tidak dimasukkan.",
+            "ZIP berhasil dibuat dan dikirim ke PM owner.\n"
+            f"File project tersedia: <b>{len(project_files_in_backup)}</b>\n"
+            "Database: <b>shop.db</b>\n"
+            + (
+                "⚠️ File opsional yang tidak ada di Railway: "
+                + ", ".join(html.escape(x) for x in optional_missing)
+                + "\n\n"
+                if optional_missing else "\n"
+            )
+            + "🔐 Token, password, dan <code>.env</code> asli tidak dimasukkan.",
             reply_markup=owner_system_menu(),
             parse_mode="HTML"
         )
@@ -18436,32 +18787,20 @@ async def owner_mark_flash(call: CallbackQuery, state: FSMContext):
 
     try:
         await state.clear()
-        conn=db()
-        rows=conn.execute(
-            "SELECT id,name,is_flash_sale FROM products WHERE active=1 ORDER BY id"
-        ).fetchall()
-        conn.close()
-
-        kb=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=f"{'✅' if int(r['is_flash_sale'] or 0) else '▫️'} {r['name']}",
-                callback_data=f"flash:toggle:{r['id']}"
-            )] for r in rows
-        ] + [[InlineKeyboardButton(
-            text="⬅️ Kembali",
-            callback_data="owner:back_products"
-        )]])
-
+        expire_finished_flash_sales()
         await safe_edit_or_answer(
             call,
-            "⚡ <b>FLASH SALE</b>\n\n"
-            "Tekan produk untuk mengaktifkan / menonaktifkan Flash Sale.",
-            reply_markup=kb,
+            "⚡ <b>FLASH SALE BERJANGKA</b>\n\n"
+            "Pilih produk lalu tentukan durasi Flash Sale.\n"
+            "Flash Sale akan otomatis berakhir sesuai timer meskipun bot restart/redeploy.\n\n"
+            "⚡ = sedang aktif\n"
+            "▫️ = tidak aktif",
+            reply_markup=flash_owner_products_keyboard(),
             parse_mode="HTML"
         )
         await safe_callback_notice(call)
     except Exception as exc:
-        await owner_product_error_view(call, "Flash Sale", exc)
+        await owner_product_error_view(call,"Flash Sale",exc)
 
 
 
@@ -18469,16 +18808,12 @@ async def owner_mark_flash(call: CallbackQuery, state: FSMContext):
 async def owner_mark_flash_input(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
-    try:
-        pid, value = [x.strip() for x in message.text.split("|", 1)]
-        conn = db()
-        conn.execute("UPDATE products SET is_flash_sale=? WHERE id=?", (1 if int(value) else 0, int(pid)))
-        conn.commit()
-        conn.close()
-        await state.clear()
-        await message.answer("✅ Status Flash Sale diperbarui.", reply_markup=owner_menu())
-    except Exception:
-        await message.answer("❌ Format salah. Contoh: 1 | 1")
+    await state.clear()
+    await message.answer(
+        "⚡ Pengaturan Flash Sale sekarang menggunakan tombol durasi agar tidak aktif tanpa batas.",
+        reply_markup=owner_products_more_menu()
+    )
+
 
 
 @router.callback_query(F.data == "owner:add_voucher")
@@ -21591,49 +21926,207 @@ async def owner_popular_toggle(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("flash:toggle:"))
-async def owner_flash_toggle(call: CallbackQuery):
+async def owner_flash_toggle(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
     try:
         product_id=int(call.data.split(":")[-1])
         conn=db()
+        expire_finished_flash_sales(conn)
+        conn.commit()
         row=conn.execute(
-            "SELECT id,is_flash_sale FROM products WHERE id=? AND active=1",
+            """SELECT id,name,is_flash_sale,flash_sale_until_ts
+               FROM products
+               WHERE id=? AND active=1""",
             (product_id,)
         ).fetchone()
+        conn.close()
         if not row:
-            conn.close()
-            return await call.answer("Produk tidak ditemukan.", show_alert=True)
+            return await call.answer("Produk tidak ditemukan.",show_alert=True)
 
-        new_value=0 if int(row["is_flash_sale"] or 0) else 1
-        conn.execute(
-            "UPDATE products SET is_flash_sale=? WHERE id=?",
-            (new_value,product_id)
+        active=flash_sale_is_active(row)
+        status_text=(
+            f"⚡ Aktif sampai <b>{flash_sale_end_text(row)}</b>"
+            if active else "▫️ Tidak aktif"
         )
-        conn.commit()
-        conn.close()
 
-        await call.answer("Flash Sale diperbarui.")
-        conn=db()
-        rows=conn.execute(
-            "SELECT id,name,is_flash_sale FROM products WHERE active=1 ORDER BY id"
-        ).fetchall()
-        conn.close()
-        kb=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=f"{'✅' if int(r['is_flash_sale'] or 0) else '▫️'} {r['name']}",
-                callback_data=f"flash:toggle:{r['id']}"
-            )] for r in rows
-        ] + [[InlineKeyboardButton(text="⬅️ Kembali",callback_data="owner:back_products")]])
+        await state.clear()
         await safe_edit_or_answer(
             call,
-            "⚡ <b>FLASH SALE</b>\n\nTekan produk untuk mengaktifkan / menonaktifkan Flash Sale.",
-            reply_markup=kb,
+            "⚡ <b>ATUR FLASH SALE</b>\n\n"
+            f"📦 Produk: <b>{html.escape(str(row['name']))}</b>\n"
+            f"📌 Status: {status_text}\n\n"
+            "Pilih durasi. Memilih durasi baru akan mengganti timer lama.",
+            reply_markup=flash_duration_keyboard(product_id),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call,"Atur Durasi Flash Sale",exc)
+
+
+@router.callback_query(F.data.startswith("flashdur:"))
+async def owner_flash_duration_set(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    try:
+        _,product_raw,minutes_raw=call.data.split(":")
+        product_id=int(product_raw)
+        minutes=int(minutes_raw)
+        allowed={x[0] for x in FLASH_DURATION_PRESETS}
+        if minutes not in allowed:
+            return await call.answer("Preset durasi tidak valid.",show_alert=True)
+
+        until_ts=set_flash_sale_duration(product_id,minutes)
+
+        conn=db()
+        row=conn.execute(
+            "SELECT name FROM products WHERE id=?",
+            (product_id,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            return await call.answer("Produk tidak ditemukan.",show_alert=True)
+
+        end_text=datetime.fromtimestamp(
+            until_ts,tz=timezone.utc
+        ).astimezone(DISPLAY_TIMEZONE).strftime("%d/%m/%Y • %H:%M WIB")
+
+        await state.clear()
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>FLASH SALE AKTIF</b>\n\n"
+            f"📦 Produk: <b>{html.escape(str(row['name']))}</b>\n"
+            f"⏱ Durasi: <b>{minutes} menit</b>\n"
+            f"🏁 Berakhir: <b>{end_text}</b>\n\n"
+            "Setelah waktu habis, produk otomatis keluar dari menu Flash Sale.",
+            reply_markup=flash_duration_keyboard(product_id),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call,"Flash Sale diaktifkan.")
+    except Exception as exc:
+        await owner_product_error_view(call,"Aktifkan Flash Sale",exc)
+
+
+@router.callback_query(F.data.startswith("flashcustom:"))
+async def owner_flash_custom_begin(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        product_id=int(call.data.split(":")[-1])
+    except Exception:
+        return await call.answer("Produk tidak valid.",show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        "SELECT id,name FROM products WHERE id=? AND active=1",
+        (product_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return await call.answer("Produk tidak ditemukan.",show_alert=True)
+
+    await state.clear()
+    await state.update_data(flash_custom_product_id=product_id)
+    await state.set_state(OwnerState.flash_duration_custom)
+    await safe_edit_or_answer(
+        call,
+        "✏️ <b>DURASI FLASH SALE CUSTOM</b>\n\n"
+        f"📦 Produk: <b>{html.escape(str(row['name']))}</b>\n\n"
+        "Kirim durasi dalam <b>menit</b>.\n"
+        "Minimal 1 menit, maksimal 10080 menit (7 hari).\n\n"
+        "Contoh: <code>45</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="⬅️ Batal",
+                callback_data=f"flash:toggle:{product_id}"
+            )]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.flash_duration_custom)
+async def owner_flash_custom_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    raw=(message.text or "").strip()
+    if not raw.isdigit():
+        return await message.answer(
+            "❌ Masukkan angka durasi dalam menit. Contoh: <code>45</code>.",
+            parse_mode="HTML"
+        )
+
+    minutes=int(raw)
+    if not (1 <= minutes <= 10080):
+        return await message.answer(
+            "❌ Durasi harus antara <b>1–10080 menit</b>.",
+            parse_mode="HTML"
+        )
+
+    data=await state.get_data()
+    product_id=int(data.get("flash_custom_product_id",0) or 0)
+    if not product_id:
+        await state.clear()
+        return await message.answer("❌ Session Flash Sale tidak valid.")
+
+    try:
+        until_ts=set_flash_sale_duration(product_id,minutes)
+        conn=db()
+        row=conn.execute(
+            "SELECT name FROM products WHERE id=?",
+            (product_id,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            await state.clear()
+            return await message.answer("❌ Produk tidak ditemukan.")
+
+        end_text=datetime.fromtimestamp(
+            until_ts,tz=timezone.utc
+        ).astimezone(DISPLAY_TIMEZONE).strftime("%d/%m/%Y • %H:%M WIB")
+
+        await state.clear()
+        await message.answer(
+            "✅ <b>FLASH SALE AKTIF</b>\n\n"
+            f"📦 Produk: <b>{html.escape(str(row['name']))}</b>\n"
+            f"⏱ Durasi: <b>{minutes} menit</b>\n"
+            f"🏁 Berakhir: <b>{end_text}</b>",
+            reply_markup=owner_products_more_menu(),
             parse_mode="HTML"
         )
     except Exception as exc:
-        await owner_product_error_view(call, "Flash Sale", exc)
+        logging.exception("Custom flash duration failed: %s",exc)
+        await state.clear()
+        await message.answer(
+            "❌ Flash Sale gagal diaktifkan. Silakan coba kembali dari menu Produk.",
+            reply_markup=owner_products_more_menu()
+        )
+
+
+@router.callback_query(F.data.startswith("flashoff:"))
+async def owner_flash_off(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    try:
+        product_id=int(call.data.split(":")[-1])
+        disable_flash_sale(product_id)
+        await state.clear()
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>FLASH SALE DIMATIKAN</b>\n\n"
+            "Produk kembali ke status normal.",
+            reply_markup=flash_owner_products_keyboard(),
+            parse_mode="HTML"
+        )
+        await safe_callback_notice(call)
+    except Exception as exc:
+        await owner_product_error_view(call,"Matikan Flash Sale",exc)
+
 
 
 @router.callback_query(F.data == "owner:auto_recovery_now")
@@ -24967,7 +25460,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.30"
+EXPECTED_SOURCE_VERSION = "16.32"
 
 
 def source_integrity_self_test():
