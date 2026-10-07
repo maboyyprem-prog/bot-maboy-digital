@@ -132,6 +132,18 @@ try:
     )
 except Exception:
     TOOLS_PROVIDER_STATUS_CACHE_SECONDS = 60
+try:
+    TOOLS_PROVIDER_POLL_ATTEMPTS = max(1, min(8, int(os.getenv("TOOLS_PROVIDER_POLL_ATTEMPTS", "4"))))
+except Exception:
+    TOOLS_PROVIDER_POLL_ATTEMPTS = 4
+try:
+    TOOLS_PROVIDER_POLL_INTERVAL_SECONDS = max(1, min(30, int(os.getenv("TOOLS_PROVIDER_POLL_INTERVAL_SECONDS", "3"))))
+except Exception:
+    TOOLS_PROVIDER_POLL_INTERVAL_SECONDS = 3
+try:
+    TOOLS_PROVIDER_TEMP_RETRIES = max(0, min(3, int(os.getenv("TOOLS_PROVIDER_TEMP_RETRIES", "2"))))
+except Exception:
+    TOOLS_PROVIDER_TEMP_RETRIES = 2
 TOOLS_PROVIDER_AUTH_MODE = os.getenv("TOOLS_PROVIDER_AUTH_MODE", "bearer").strip().lower()
 if TOOLS_PROVIDER_AUTH_MODE not in {"bearer","x-api-key"}:
     TOOLS_PROVIDER_AUTH_MODE = "bearer"
@@ -157,8 +169,8 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.45"
-SCHEMA_VERSION = 176
+BOT_VERSION = "16.48"
+SCHEMA_VERSION = 177
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -913,6 +925,23 @@ def init_db():
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_tool_email_locks_until "
         "ON tool_email_locks(locked_until)"
+    )
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tool_provider_flows (
+            correlation_id TEXT PRIMARY KEY,
+            owner_id INTEGER NOT NULL,
+            target_email TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            provider_ref TEXT DEFAULT '',
+            http_status INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_provider_flows_owner_email "
+        "ON tool_provider_flows(owner_id,target_email,created_at)"
     )
 
     # migrations from previous versions
@@ -6499,6 +6528,27 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Compact Tools UI",False,str(exc)[:100]))
 
+    # Provider Auto Orchestration
+    try:
+        conn=db()
+        flow_table=bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_provider_flows'"
+        ).fetchone())
+        conn.close()
+        auto_provider_ok=(
+            flow_table
+            and callable(tools_provider_precheck)
+            and callable(tools_provider_request_resilient)
+            and callable(poll_provider_status)
+        )
+        checks.append((
+            "Provider Auto Orchestration",
+            auto_provider_ok,
+            "precheck + retry + polling + correlation"
+        ))
+    except Exception as exc:
+        checks.append(("Provider Auto Orchestration",False,str(exc)[:100]))
+
     # Schema version
     try:
         current_schema=schema_version_info()
@@ -9247,6 +9297,7 @@ def validate_system_schema():
         "tool_provision_logs": {"id","owner_id","tool_name","target_email","plan","status","created_at"},
         "tool_activity_logs": {"id","owner_id","action","target_email","status","http_status","created_at"},
         "tool_email_locks": {"email","owner_id","action","locked_until","created_at"},
+        "tool_provider_flows": {"correlation_id","owner_id","target_email","stage","status","http_status","created_at"},
         "settings": {"key","value"},
         "system_errors": {"id","error_text","created_at"},
         "payment_proof_sessions": {"user_id","entity_type","entity_id"},
@@ -11510,8 +11561,8 @@ def owner_tools_menu():
             InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify"),
         ],
         [
-            InlineKeyboardButton(text="⭐ Lisensi Pro",callback_data="tools:pro_license"),
-            InlineKeyboardButton(text="📋 Hasil Final",callback_data="tools:final_result"),
+            InlineKeyboardButton(text="⭐ Lisensi Provider",callback_data="tools:pro_license"),
+            InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result"),
         ],
         [
             InlineKeyboardButton(text="📊 Status",callback_data="tools:summary"),
@@ -11536,6 +11587,7 @@ def owner_tools_more_menu():
             InlineKeyboardButton(text="⚙️ Provider",callback_data="tools:provider"),
             InlineKeyboardButton(text="🔌 Config",callback_data="tools:status"),
         ],
+        [InlineKeyboardButton(text="🧹 Reset Session",callback_data="tools:reset_session")],
         [InlineKeyboardButton(text="⬅️ Kembali",callback_data="tools:home")],
     ])
 
@@ -11916,6 +11968,142 @@ async def render_tools_filtered_history(call: CallbackQuery, page: int=1, status
     await safe_callback_notice(call)
 
 
+def new_tools_correlation_id(owner_id: int, email: str) -> str:
+    seed=f"{int(owner_id)}|{str(email or '').lower()}|{time.time_ns()}"
+    return hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
+def create_tool_provider_flow(owner_id: int, email: str, stage: str) -> str:
+    correlation_id=new_tools_correlation_id(owner_id,email)
+    now=datetime.now().isoformat(timespec="seconds")
+    conn=db()
+    conn.execute(
+        """INSERT INTO tool_provider_flows(
+               correlation_id,owner_id,target_email,stage,status,provider_ref,http_status,created_at,updated_at
+           ) VALUES(?,?,?,?,?,'',0,?,?)""",
+        (correlation_id,int(owner_id),str(email or "").strip().lower(),str(stage),"pending",now,now)
+    )
+    conn.commit()
+    conn.close()
+    return correlation_id
+
+
+def update_tool_provider_flow(correlation_id: str, *, stage=None, status=None, provider_ref=None, http_status=None):
+    fields=[]
+    values=[]
+    if stage is not None:
+        fields.append("stage=?"); values.append(str(stage))
+    if status is not None:
+        fields.append("status=?"); values.append(str(status))
+    if provider_ref is not None:
+        fields.append("provider_ref=?"); values.append(str(provider_ref)[:300])
+    if http_status is not None:
+        fields.append("http_status=?"); values.append(int(http_status or 0))
+    fields.append("updated_at=?")
+    values.append(datetime.now().isoformat(timespec="seconds"))
+    values.append(str(correlation_id))
+    conn=db()
+    conn.execute(f"UPDATE tool_provider_flows SET {','.join(fields)} WHERE correlation_id=?",tuple(values))
+    conn.commit()
+    conn.close()
+
+
+def provider_result_reference(result) -> str:
+    if not isinstance(result,dict):
+        return ""
+    for key in ("request_id","requestId","reference","ref","id","transaction_id","transactionId"):
+        value=result.get(key)
+        if value:
+            return str(value)[:300]
+    for nested_key in ("data","result"):
+        nested=result.get(nested_key)
+        if isinstance(nested,dict):
+            value=provider_result_reference(nested)
+            if value:
+                return value
+    return ""
+
+
+def tools_provider_precheck(owner_id: int, email: str) -> tuple[bool,str]:
+    if not TOOLS_PROVIDER_ENABLED:
+        return False,"Provider disabled."
+    if not TOOLS_PROVIDER_API_KEY:
+        return False,"API key provider belum tersedia."
+    if not TOOLS_PROVIDER_VERIFY_URL:
+        return False,"Endpoint verifikasi belum tersedia."
+    if not valid_tools_email(email):
+        return False,"Email target tidak valid."
+
+    ok,reason=tools_quota_can_process(owner_id)
+    if not ok:
+        return False,str(reason)
+
+    cleanup_expired_tool_locks()
+    conn=db()
+    row=conn.execute(
+        "SELECT locked_until FROM tool_email_locks WHERE email=?",
+        (str(email).strip().lower(),)
+    ).fetchone()
+    conn.close()
+    if row:
+        return False,"Email target sedang diproses."
+    return True,"READY"
+
+
+async def tools_provider_request_resilient(method: str, url: str, *, payload=None):
+    last=(False,0,{"error":"not_started"})
+    for attempt in range(TOOLS_PROVIDER_TEMP_RETRIES+1):
+        ok,http_status,result=await tools_provider_request(method,url,payload=payload)
+        last=(ok,http_status,result)
+
+        if ok:
+            return last
+        if int(http_status or 0) in {400,401,403,404}:
+            return last
+
+        if int(http_status or 0)==429:
+            retry_after=0
+            if isinstance(result,dict):
+                try:
+                    retry_after=int(result.get("_retry_after") or 0)
+                except Exception:
+                    retry_after=0
+            if attempt < TOOLS_PROVIDER_TEMP_RETRIES:
+                await asyncio.sleep(max(1,min(30,retry_after or TOOLS_PROVIDER_POLL_INTERVAL_SECONDS)))
+                continue
+            return last
+
+        if int(http_status or 0)==0 or int(http_status or 0)>=500:
+            if attempt < TOOLS_PROVIDER_TEMP_RETRIES:
+                await asyncio.sleep(TOOLS_PROVIDER_POLL_INTERVAL_SECONDS)
+                continue
+        return last
+    return last
+
+
+async def poll_provider_status(email: str, correlation_id: str):
+    # Optional: only active when a provider status endpoint exists.
+    if not TOOLS_PROVIDER_STATUS_URL:
+        return None
+
+    for attempt in range(TOOLS_PROVIDER_POLL_ATTEMPTS):
+        ok,http_status,result=await tools_provider_request_resilient(
+            "POST",TOOLS_PROVIDER_STATUS_URL,payload={"email":email}
+        )
+        update_tool_provider_flow(
+            correlation_id,
+            stage="status_poll",
+            status="success" if ok else "pending",
+            provider_ref=provider_result_reference(result),
+            http_status=http_status
+        )
+        if ok and parse_provider_license_status(result).get("known"):
+            return (ok,http_status,result)
+        if attempt < TOOLS_PROVIDER_POLL_ATTEMPTS-1:
+            await asyncio.sleep(TOOLS_PROVIDER_POLL_INTERVAL_SECONDS)
+    return None
+
+
 def normalize_provider_bool(value):
     if isinstance(value,bool):
         return value
@@ -11988,7 +12176,7 @@ def tools_pro_license_text(data: dict) -> str:
     provider_status=dict(data.get("tools_provider_license_status") or {})
 
     lines=[
-        "⭐ <b>TAHAP LISENSI PRO</b>",
+        "⭐ <b>LISENSI PRO PROVIDER</b>",
         "",
         f"📧 Email Target: <b>{html.escape(email or '-')}</b>",
         f"✅ Verifikasi: <b>{'BERHASIL' if verify_status=='success' else 'BELUM BERHASIL'}</b>",
@@ -11998,12 +12186,12 @@ def tools_pro_license_text(data: dict) -> str:
 
     if provider_status.get("known"):
         lines.append(
-            "⭐ Status Lisensi: <b>✅ AKTIF</b>"
+            "⭐ Lisensi Pro Provider: <b>✅ BERHASIL</b>"
             if provider_status.get("active")
-            else "⭐ Status Lisensi: <b>❌ TIDAK AKTIF</b>"
+            else "⭐ Lisensi Pro Provider: <b>❌ GAGAL</b>"
         )
     else:
-        lines.append("⭐ Status Lisensi: <b>➖ BELUM DIKONFIRMASI PROVIDER</b>")
+        lines.append("⭐ Lisensi Pro Provider: <b>➖ BELUM ADA HASIL</b>")
 
     plan=str(provider_status.get("plan") or "").strip()
     expires=str(provider_status.get("expires_at") or "").strip()
@@ -12016,9 +12204,17 @@ def tools_pro_license_text(data: dict) -> str:
     if message:
         lines += ["",f"Provider: <code>{html.escape(message[:500])}</code>"]
 
+    if not email or verify_status!="success" or not token:
+        lines += [
+            "",
+            "⚠️ <b>Session verifikasi belum lengkap.</b>",
+            "Jalankan urutan: Kirim Link → Verifikasi → Lisensi Pro.",
+            "Navigasi ke Owner Tools tidak lagi menghapus session."
+        ]
+
     lines += [
         "",
-        "Status Premium/Pro hanya ditampilkan AKTIF jika provider mengembalikan status lisensi/subscription secara eksplisit."
+        "Status final hanya mengikuti hasil yang dikembalikan provider."
     ]
     return "\n".join(lines)
 
@@ -12030,45 +12226,51 @@ def tools_final_result_text(data: dict) -> str:
     final_at=str(data.get("tools_final_at") or "")
     preview=str(data.get("tools_final_preview") or "")
     token=str(data.get("tools_verify_id_token") or "")
+    correlation_id=str(data.get("tools_correlation_id") or "")
+    provider_ref=str(data.get("tools_provider_reference") or "")
     license_status=dict(data.get("tools_provider_license_status") or {})
 
-    status_text={"success":"✅ BERHASIL","failed":"❌ GAGAL"}.get(status,"➖ BELUM ADA HASIL")
+    verify_text={"success":"✅ BERHASIL","failed":"❌ GAGAL"}.get(status,"➖ BELUM ADA HASIL")
     lines=[
-        "📋 <b>HASIL FINAL TOOLS</b>",
+        "📋 <b>HASIL FINAL PROVIDER</b>",
         "",
         f"📧 Email Target: <b>{html.escape(email or '-')}</b>",
-        f"✅ Status Verify: <b>{status_text}</b>",
+        f"✅ Verifikasi Provider: <b>{verify_text}</b>",
         f"🔐 idToken: <b>{masked_id_token(token)}</b>",
         f"🌐 HTTP Provider: <b>{http_status or '-'}</b>",
+        f"🆔 Flow: <code>{html.escape(correlation_id or '-')}</code>",
     ]
 
     if license_status.get("known"):
         lines.append(
-            "⭐ Status Premium/Pro: <b>✅ AKTIF</b>"
+            "⭐ Lisensi Pro Provider: <b>✅ BERHASIL</b>"
             if license_status.get("active")
-            else "⭐ Status Premium/Pro: <b>❌ TIDAK AKTIF</b>"
+            else "⭐ Lisensi Pro Provider: <b>❌ GAGAL</b>"
         )
     else:
-        lines.append("⭐ Status Premium/Pro: <b>➖ BELUM DIKONFIRMASI</b>")
+        lines.append("⭐ Lisensi Pro Provider: <b>➖ BELUM ADA HASIL</b>")
 
     plan=str(license_status.get("plan") or "").strip()
     expires=str(license_status.get("expires_at") or "").strip()
     message=str(license_status.get("message") or "").strip()
 
+    if provider_ref:
+        lines.append(f"🔎 Provider Ref: <code>{html.escape(provider_ref)}</code>")
     if plan:
-        lines.append(f"📦 Paket: <b>{html.escape(plan)}</b>")
+        lines.append(f"📦 Paket Provider: <b>{html.escape(plan)}</b>")
     if expires:
         lines.append(f"📅 Berlaku sampai: <b>{html.escape(expires)}</b>")
     if final_at:
         lines.append(f"🕒 Waktu: <b>{html.escape(format_wib_datetime(final_at,compact=True))}</b>")
-    if preview:
-        lines += ["",f"Provider Verify: <code>{html.escape(preview[:500])}</code>"]
+
     if message:
-        lines += [f"Provider Lisensi: <code>{html.escape(message[:500])}</code>"]
+        lines += ["", f"Provider: <code>{html.escape(message[:500])}</code>"]
+    elif preview:
+        lines += ["", f"Provider: <code>{html.escape(preview[:500])}</code>"]
 
     lines += [
         "",
-        "Status Premium/Pro hanya dinyatakan AKTIF bila response provider mengonfirmasinya secara eksplisit."
+        "Hasil di atas adalah hasil dari provider, bukan pemeriksaan langsung status aplikasi Alight Motion."
     ]
     return "\n".join(lines)
 
@@ -12080,10 +12282,11 @@ def tools_compact_summary_text(owner_id: int) -> str:
     lines=[
         "📊 <b>STATUS TOOLS</b>",
         "",
-        f"Provider: <b>{tools_provider_status_text()}</b>",
+        f"Provider Config: <b>{tools_provider_status_text()}</b>",
         f"Kuota jam ini: <b>{stats['used_requests']}/{stats['hourly_limit']}</b>",
         f"Sisa akun: <b>{stats['remaining_accounts']}</b>",
         f"Hari ini: <b>{daily['success']} sukses / {daily['failed']} gagal</b>",
+        f"Auto Poll: <b>{TOOLS_PROVIDER_POLL_ATTEMPTS}× / {TOOLS_PROVIDER_POLL_INTERVAL_SECONDS}s</b>",
     ]
     if last:
         lines.append(
@@ -12465,7 +12668,8 @@ def update_tool_log(log_id: int, *, status: str,http_status: int=0,reference: st
 
 @router.message(Command("tools"))
 async def owner_tools_command(message: Message,state: FSMContext):
-    await state.clear()
+    # Preserve verified email/idToken/final metadata while reopening /tools.
+    await state.set_state(None)
     if not is_owner(message.from_user.id):
         return await message.answer(owner_access_denied_text(),parse_mode="HTML")
     await message.answer(
@@ -12484,7 +12688,8 @@ async def owner_tools_command(message: Message,state: FSMContext):
 @router.callback_query(F.data == "tools:home")
 async def owner_tools_home(call: CallbackQuery,state: FSMContext):
     if not is_owner(call.from_user.id): return await deny_owner_callback(call)
-    await state.clear()
+    # Preserve verified email/idToken/final metadata while navigating.
+    await state.set_state(None)
     await safe_edit_or_answer(
         call,
         "🧰 <b>OWNER TOOLS</b>\n\n"
@@ -12743,6 +12948,10 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         await state.clear()
         return await call.answer("Session tools kedaluwarsa. Ulangi dari /tools.",show_alert=True)
 
+    precheck_ok,precheck_reason=tools_provider_precheck(call.from_user.id,email)
+    if not precheck_ok:
+        return await call.answer(f"❌ {precheck_reason}",show_alert=True)
+
     if not valid_tools_email(email) or not raw_link.startswith(("https://","http://")):
         await state.clear()
         return await call.answer("Session verifikasi tidak valid.",show_alert=True)
@@ -12755,6 +12964,9 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
             "Email ini sedang diproses. Tunggu beberapa menit lalu coba lagi.",
             show_alert=True
         )
+
+    correlation_id=create_tool_provider_flow(call.from_user.id,email,"verify_account")
+    await state.update_data(tools_correlation_id=correlation_id)
 
     activity_id=create_tool_activity(
         call.from_user.id,
@@ -12770,7 +12982,7 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         parse_mode="HTML"
     )
 
-    ok,http_status,result=await tools_provider_request(
+    ok,http_status,result=await tools_provider_request_resilient(
         "POST",
         TOOLS_PROVIDER_VERIFY_URL,
         payload={
@@ -12786,6 +12998,14 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         )
 
     provider_license_status=parse_provider_license_status(result)
+    provider_ref=provider_result_reference(result)
+    update_tool_provider_flow(
+        correlation_id,
+        stage="verify_account",
+        status="success" if ok else "failed",
+        provider_ref=provider_ref,
+        http_status=http_status
+    )
     preview=tool_response_preview(result)
     final_at=datetime.now().isoformat(timespec="seconds")
     await state.update_data(
@@ -12795,6 +13015,8 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         tools_final_at=final_at,
         tools_final_preview=preview[:900],
         tools_provider_license_status=provider_license_status,
+        tools_provider_reference=provider_ref,
+        tools_correlation_id=correlation_id,
     )
     release_tool_email_lock(email)
     update_tool_activity(
@@ -12810,35 +13032,56 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
     await state.set_state(None)
 
     if ok:
-        safe_ref=""
-        if isinstance(result,dict):
-            safe_ref=str(
-                result.get("reference")
-                or result.get("id")
-                or result.get("request_id")
-                or ""
-            )[:200]
+        # Auto-continue: poll provider status when configured; no extra confirmation button.
+        polled=await poll_provider_status(email,correlation_id)
+        if polled:
+            p_ok,p_http,p_result=polled
+            provider_license_status=parse_provider_license_status(p_result)
+            provider_ref=provider_result_reference(p_result) or provider_ref
+            preview=tool_response_preview(p_result)
+            final_at=datetime.now().isoformat(timespec="seconds")
+            await state.update_data(
+                tools_provider_license_status=provider_license_status,
+                tools_provider_reference=provider_ref,
+                tools_final_http_status=int(p_http or http_status or 0),
+                tools_final_at=final_at,
+                tools_final_preview=preview[:900],
+            )
+            update_tool_provider_flow(
+                correlation_id,
+                stage="provider_final",
+                status="success" if p_ok else "failed",
+                provider_ref=provider_ref,
+                http_status=p_http
+            )
 
+        safe_ref=provider_ref
         await safe_edit_or_answer(
             call,
-            "✅ <b>HASIL FINAL VERIFIKASI</b>\n\n"
-            "Status Verify: <b>✅ BERHASIL</b>\n"
+            "✅ <b>HASIL VERIFIKASI PROVIDER</b>\n\n"
+            "Verifikasi Provider: <b>✅ BERHASIL</b>\n"
             f"📧 Email Target: <b>{html.escape(email)}</b>\n"
             f"🔐 idToken: <b>{masked_id_token(verify_id_token)}</b>\n"
             f"🌐 HTTP Provider: <b>{http_status}</b>\n"
+            f"🆔 Flow: <code>{html.escape(correlation_id)}</code>\n"
             + (
-                "⭐ Status Premium/Pro: <b>✅ AKTIF</b>\n"
+                "⭐ Lisensi Pro Provider: <b>✅ BERHASIL</b>\n"
                 if provider_license_status.get("known") and provider_license_status.get("active")
                 else (
-                    "⭐ Status Premium/Pro: <b>❌ TIDAK AKTIF</b>\n"
+                    "⭐ Lisensi Pro Provider: <b>❌ GAGAL</b>\n"
                     if provider_license_status.get("known")
-                    else "⭐ Status Premium/Pro: <b>➖ BELUM DIKONFIRMASI</b>\n"
+                    else "⭐ Lisensi Pro Provider: <b>➖ BELUM ADA HASIL</b>\n"
                 )
             )
             + f"🕒 Waktu: <b>{html.escape(format_wib_datetime(final_at,compact=True))}</b>\n"
             + (f"🔎 Ref: <code>{html.escape(safe_ref)}</code>\n" if safe_ref else "")
-            + "\nToken/link sensitif tidak ditampilkan atau disimpan permanen.",
-            reply_markup=alight_tools_menu(),
+            + "\nHasil final mengikuti response provider.\n"
+            + "Buka 📋 Hasil Final untuk ringkasan provider.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
+                [InlineKeyboardButton(text="⭐ Lisensi Provider",callback_data="tools:pro_license")],
+                [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+            ]),
             parse_mode="HTML"
         )
         return await safe_callback_notice(call,"Verifikasi berhasil.")
@@ -13161,6 +13404,22 @@ async def owner_tools_history_search_input(message: Message,state: FSMContext):
 
 
 
+@router.callback_query(F.data == "tools:reset_session")
+async def owner_tools_reset_session(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "🧹 <b>SESSION TOOLS DIRESET</b>\n\n"
+        "Email Target, hasil verifikasi, idToken sementara, dan hasil final telah dibersihkan.",
+        reply_markup=owner_tools_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
 @router.callback_query(F.data == "tools:summary")
 async def owner_tools_summary(call: CallbackQuery):
     if not is_owner(call.from_user.id):
@@ -13202,7 +13461,7 @@ async def owner_tools_pro_license(call: CallbackQuery,state: FSMContext):
         tools_pro_license_text(data),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Refresh Status",callback_data="tools:pro_license")],
-            [InlineKeyboardButton(text="📋 Hasil Final",callback_data="tools:final_result")],
+            [InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
             [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
         ]),
         parse_mode="HTML"
@@ -13250,6 +13509,7 @@ async def owner_tools_token_status(call: CallbackQuery,state: FSMContext):
         "",
         "Token penuh tidak ditampilkan atau dikirim ke Telegram.",
         "Token juga tidak disimpan ke database/activity log.",
+        "Navigasi menu tidak lagi menghapus session.",
         f"Session mengikuti batas {TOOLS_SESSION_EXPIRY_MINUTES} menit."
     ]
 
@@ -27567,7 +27827,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.45"
+EXPECTED_SOURCE_VERSION = "16.48"
 
 
 def source_integrity_self_test():
