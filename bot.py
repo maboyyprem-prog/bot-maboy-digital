@@ -79,6 +79,8 @@ TOOLS_PROVIDER_ENABLED = os.getenv("TOOLS_PROVIDER_ENABLED", "false").lower() ==
 TOOLS_PROVIDER_NAME = os.getenv("TOOLS_PROVIDER_NAME", "Authorized Provider").strip() or "Authorized Provider"
 TOOLS_PROVIDER_STATUS_URL = os.getenv("TOOLS_PROVIDER_STATUS_URL", "").strip()
 TOOLS_PROVIDER_PROVISION_URL = os.getenv("TOOLS_PROVIDER_PROVISION_URL", "").strip()
+TOOLS_PROVIDER_MAGICLINK_URL = os.getenv("TOOLS_PROVIDER_MAGICLINK_URL", "").strip()
+TOOLS_PROVIDER_VERIFY_URL = os.getenv("TOOLS_PROVIDER_VERIFY_URL", "").strip()
 TOOLS_PROVIDER_API_KEY = os.getenv("TOOLS_PROVIDER_API_KEY", "").strip()
 try:
     TOOLS_PROVIDER_TIMEOUT_SECONDS = max(3, min(30, int(os.getenv("TOOLS_PROVIDER_TIMEOUT_SECONDS", "12"))))
@@ -137,7 +139,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.35"
+BOT_VERSION = "16.36"
 SCHEMA_VERSION = 174
 
 CHECKOUT_TERMS_SHORT = (
@@ -8365,6 +8367,8 @@ class OwnerState(StatesGroup):
     mark_flash = State()
     flash_duration_custom = State()
     tools_alight_email = State()
+    tools_magiclink_email = State()
+    tools_verify_link = State()
     set_qris = State()
     set_payment_note = State()
     topup_amount = State()
@@ -11380,6 +11384,8 @@ def owner_tools_menu():
 
 def alight_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📧 Kirim Magic Link",callback_data="tools:magiclink")],
+        [InlineKeyboardButton(text="✅ Verifikasi Magic Link",callback_data="tools:verify")],
         [InlineKeyboardButton(text="🚀 Provision 1 Tahun",callback_data="tools:alight:1y")],
         [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
         [InlineKeyboardButton(text="📦 Riwayat Alight Motion",callback_data="tools:history")],
@@ -11706,24 +11712,273 @@ async def owner_tools_alight(call: CallbackQuery,state: FSMContext):
     await safe_callback_notice(call)
 
 
-@router.callback_query(F.data == "tools:alight:1y")
-async def owner_tools_alight_1y(call: CallbackQuery,state: FSMContext):
-    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
-    if not tools_provider_ready():
-        return await call.answer("Provider belum aktif/lengkap. Cek Status Provider.",show_alert=True)
+@router.callback_query(F.data == "tools:magiclink")
+async def owner_tools_magiclink_begin(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    if not TOOLS_PROVIDER_ENABLED:
+        return await call.answer("Provider belum diaktifkan.",show_alert=True)
+    if not TOOLS_PROVIDER_MAGICLINK_URL or not TOOLS_PROVIDER_API_KEY:
+        return await call.answer(
+            "Endpoint Magic Link/API key belum dikonfigurasi.",
+            show_alert=True
+        )
+
     await state.clear()
-    await state.set_state(OwnerState.tools_alight_email)
+    await state.set_state(OwnerState.tools_magiclink_email)
     await safe_edit_or_answer(
         call,
-        "📧 <b>ALIGHT MOTION • 1 TAHUN</b>\n\n"
-        "Kirim email tujuan yang akan diproses oleh provider resmi.\n\n"
-        "Bot akan meminta konfirmasi sebelum request dikirim.",
+        "📧 <b>KIRIM MAGIC LINK</b>\n\n"
+        "Kirim email akun yang ingin menerima Magic Link.\n\n"
+        "Bot hanya meneruskan request ke provider yang kamu konfigurasi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")]
-        ]),parse_mode="HTML"
+        ]),
+        parse_mode="HTML"
     )
     await safe_callback_notice(call)
 
+
+@router.message(OwnerState.tools_magiclink_email)
+async def owner_tools_magiclink_email_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    email=(message.text or "").strip().lower()
+    if not valid_tools_email(email):
+        return await message.answer("❌ Format email tidak valid. Silakan kirim ulang.")
+
+    await state.update_data(tools_magic_email=email)
+    await state.set_state(None)
+
+    await message.answer(
+        "⚠️ <b>KONFIRMASI KIRIM MAGIC LINK</b>\n\n"
+        f"📧 Email: <b>{html.escape(email)}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Kirim",callback_data="tools:magiclink:confirm")],
+            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")],
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "tools:magiclink:confirm")
+async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    data=await state.get_data()
+    email=str(data.get("tools_magic_email") or "").strip().lower()
+    if not valid_tools_email(email):
+        await state.clear()
+        return await call.answer("Session email tidak valid.",show_alert=True)
+
+    await safe_edit_or_answer(
+        call,
+        "⏳ <b>MENGIRIM MAGIC LINK...</b>\n\n"
+        f"📧 {html.escape(email)}",
+        parse_mode="HTML"
+    )
+
+    ok,http_status,result=await tools_provider_request(
+        "POST",
+        TOOLS_PROVIDER_MAGICLINK_URL,
+        payload={"email":email},
+    )
+    preview=tool_response_preview(result)
+
+    if ok:
+        await state.update_data(tools_verify_email=email)
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>MAGIC LINK REQUEST BERHASIL</b>\n\n"
+            f"📧 Email: <b>{html.escape(email)}</b>\n"
+            f"🌐 HTTP: <b>{http_status}</b>\n\n"
+            "Setelah menerima Magic Link, pilih tombol Verifikasi lalu tempel URL lengkap.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Verifikasi Magic Link",callback_data="tools:verify")],
+                [InlineKeyboardButton(text="⬅️ Alight Tools",callback_data="tools:alight")],
+            ]),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call,"Magic Link dikirim.")
+
+    await safe_edit_or_answer(
+        call,
+        "❌ <b>MAGIC LINK GAGAL</b>\n\n"
+        f"📧 Email: <b>{html.escape(email)}</b>\n"
+        f"🌐 HTTP: <b>{http_status or '-'}</b>\n"
+        f"Detail: <code>{html.escape(preview[:500])}</code>",
+        reply_markup=alight_tools_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:verify")
+async def owner_tools_verify_begin(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    if not TOOLS_PROVIDER_ENABLED:
+        return await call.answer("Provider belum diaktifkan.",show_alert=True)
+    if not TOOLS_PROVIDER_VERIFY_URL or not TOOLS_PROVIDER_API_KEY:
+        return await call.answer(
+            "Endpoint verifikasi/API key belum dikonfigurasi.",
+            show_alert=True
+        )
+
+    data=await state.get_data()
+    email=str(
+        data.get("tools_verify_email")
+        or data.get("tools_magic_email")
+        or ""
+    ).strip().lower()
+
+    if not valid_tools_email(email):
+        await state.clear()
+        await state.set_state(OwnerState.tools_magiclink_email)
+        return await safe_edit_or_answer(
+            call,
+            "📧 <b>VERIFIKASI MAGIC LINK</b>\n\n"
+            "Kirim email akun terlebih dahulu.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")]
+            ]),
+            parse_mode="HTML"
+        )
+
+    await state.update_data(tools_verify_email=email)
+    await state.set_state(OwnerState.tools_verify_link)
+    await safe_edit_or_answer(
+        call,
+        "🔗 <b>TEMPEL MAGIC LINK</b>\n\n"
+        f"📧 Email: <b>{html.escape(email)}</b>\n\n"
+        "Kirim URL Magic Link lengkap.\n"
+        "Link digunakan sekali untuk request verifikasi dan tidak disimpan permanen.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.tools_verify_link)
+async def owner_tools_verify_link_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+
+    raw_link=(message.text or "").strip()
+    if not raw_link.startswith(("https://","http://")) or len(raw_link) > 3000:
+        return await message.answer("❌ Magic Link tidak valid. Kirim URL lengkap.")
+
+    data=await state.get_data()
+    email=str(data.get("tools_verify_email") or "").strip().lower()
+    if not valid_tools_email(email):
+        await state.clear()
+        return await message.answer("❌ Session email tidak valid. Ulangi dari /tools.")
+
+    await state.update_data(tools_raw_link=raw_link)
+    await state.set_state(None)
+
+    await message.answer(
+        "⚠️ <b>KONFIRMASI VERIFIKASI</b>\n\n"
+        f"📧 Email: <b>{html.escape(email)}</b>\n"
+        "🔗 Magic Link: <b>TERSIMPAN SEMENTARA</b>\n\n"
+        "Link tidak akan ditampilkan kembali.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Verifikasi Sekarang",callback_data="tools:verify:confirm")],
+            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")],
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "tools:verify:confirm")
+async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    data=await state.get_data()
+    email=str(data.get("tools_verify_email") or "").strip().lower()
+    raw_link=str(data.get("tools_raw_link") or "").strip()
+
+    if not valid_tools_email(email) or not raw_link.startswith(("https://","http://")):
+        await state.clear()
+        return await call.answer("Session verifikasi tidak valid.",show_alert=True)
+
+    await safe_edit_or_answer(
+        call,
+        "⏳ <b>MEMVERIFIKASI AKUN...</b>\n\n"
+        f"📧 {html.escape(email)}",
+        parse_mode="HTML"
+    )
+
+    ok,http_status,result=await tools_provider_request(
+        "POST",
+        TOOLS_PROVIDER_VERIFY_URL,
+        payload={
+            "email":email,
+            "rawLink":raw_link,
+        },
+    )
+    preview=tool_response_preview(result)
+
+    # Never retain raw link after the request.
+    await state.clear()
+
+    if ok:
+        safe_ref=""
+        if isinstance(result,dict):
+            safe_ref=str(
+                result.get("reference")
+                or result.get("id")
+                or result.get("request_id")
+                or ""
+            )[:200]
+
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>AKUN BERHASIL DIVERIFIKASI</b>\n\n"
+            f"📧 Email: <b>{html.escape(email)}</b>\n"
+            f"🌐 HTTP: <b>{http_status}</b>\n"
+            + (f"🔎 Ref: <code>{html.escape(safe_ref)}</code>\n" if safe_ref else "")
+            + "\nToken/link sensitif tidak ditampilkan atau disimpan.",
+            reply_markup=alight_tools_menu(),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call,"Verifikasi berhasil.")
+
+    await safe_edit_or_answer(
+        call,
+        "❌ <b>VERIFIKASI GAGAL</b>\n\n"
+        f"📧 Email: <b>{html.escape(email)}</b>\n"
+        f"🌐 HTTP: <b>{http_status or '-'}</b>\n"
+        f"Detail: <code>{html.escape(preview[:500])}</code>",
+        reply_markup=alight_tools_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:alight:1y")
+async def owner_tools_alight_1y(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "ℹ️ <b>PROVISION 1 TAHUN</b>\n\n"
+        "Flow Magic Link dan verifikasi akun sudah tersedia.\n"
+        "Aktivasi Premium otomatis tidak disambungkan di bot ini.\n\n"
+        "Gunakan hanya endpoint provisioning resmi/berizin jika tersedia.",
+        reply_markup=alight_tools_menu(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
 @router.message(OwnerState.tools_alight_email)
 async def owner_tools_alight_email_input(message: Message,state: FSMContext):
@@ -11907,6 +12162,8 @@ async def owner_tools_provider_info(call: CallbackQuery):
         f"Nama: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
         f"Enabled: <b>{'YA' if TOOLS_PROVIDER_ENABLED else 'TIDAK'}</b>\n"
         f"Status endpoint: <b>{'SET' if TOOLS_PROVIDER_STATUS_URL else 'BELUM'}</b>\n"
+        f"Magic Link endpoint: <b>{'SET' if TOOLS_PROVIDER_MAGICLINK_URL else 'BELUM'}</b>\n"
+        f"Verify endpoint: <b>{'SET' if TOOLS_PROVIDER_VERIFY_URL else 'BELUM'}</b>\n"
         f"Provision endpoint: <b>{'SET' if TOOLS_PROVIDER_PROVISION_URL else 'BELUM'}</b>\n"
         f"API key: <b>{'SET' if TOOLS_PROVIDER_API_KEY else 'BELUM'}</b>\n"
         f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b>\n"
@@ -26161,7 +26418,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.35"
+EXPECTED_SOURCE_VERSION = "16.36"
 
 
 def source_integrity_self_test():
