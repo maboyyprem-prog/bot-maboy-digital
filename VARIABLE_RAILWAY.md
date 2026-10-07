@@ -1560,3 +1560,170 @@ SCHEMA_VERSION=176
 Tidak ada Railway Variable baru.
 Perubahan hanya pada UI dan pengelompokan menu `/tools`.
 Schema tetap `176`.
+
+
+## v16.46 — Session Persistence Fix
+
+Tidak ada Railway Variable baru.
+
+Fix:
+- `/tools` tidak lagi menghapus session;
+- `⬅️ Owner Tools` tidak lagi menghapus session;
+- Email Target, verify result, idToken sementara, dan final result dipertahankan;
+- reset manual tersedia melalui `🧹 Reset Session`.
+
+Schema tetap `176`.
+
+
+## v16.47 — Provider-Only Final Result
+
+Tidak ada Railway Variable baru.
+
+Hasil akhir `/tools` sekarang hanya memakai hasil dari provider:
+
+```text
+Email Target
+→ Kirim Link
+→ Verifikasi Provider
+→ baca status lisensi dari response provider
+→ Hasil Provider
+```
+
+Schema tetap `176`.
+
+
+## v16.48 — Auto Provider Orchestration
+
+Tambahkan:
+```text
+TOOLS_PROVIDER_POLL_ATTEMPTS=4
+TOOLS_PROVIDER_POLL_INTERVAL_SECONDS=3
+TOOLS_PROVIDER_TEMP_RETRIES=2
+```
+
+Jika provider memiliki `TOOLS_PROVIDER_STATUS_URL`, polling status berjalan otomatis.
+Jika tidak, flow tetap selesai memakai response verify/provider yang tersedia.
+
+Schema: `177`.
+
+
+## v16.49 — Apply Premium Provider Result
+
+Tidak ada Railway Variable baru.
+
+`/tools` sekarang dapat membaca dan menampilkan hasil Apply Premium bila response provider
+memuat status tersebut.
+
+Contoh:
+```text
+🚀 Apply Premium Provider: ✅ BERHASIL
+🔎 Apply Ref: ...
+🚀 Apply Result: ...
+```
+
+Schema tetap `177`.
+
+
+
+## v16.50 — Fokus Apply Premium Provider
+
+Tidak ada Railway Variable baru.
+
+Flow `/tools`:
+```text
+Kirim Link
+→ Verifikasi Provider
+→ Apply Premium
+→ Hasil Provider
+```
+
+Tampilan `Lisensi Pro Provider` dihapus.
+Schema tetap `177`.
+
+
+## v16.51 — Apply Premium Status URL
+
+Tambahkan Railway Variable:
+
+```text
+TOOLS_PROVIDER_APPLY_STATUS_URL=
+```
+
+Gunakan endpoint provider yang hanya membaca status/hasil Apply Premium, misalnya endpoint
+dengan path `status`, `result`, `history`, `lookup`, atau `check`.
+
+Endpoint action seperti `/api/v1/apply-premium` tidak digunakan sebagai status URL.
+
+Schema tetap `177`.
+
+
+## v16.52 — Aksi Apply Premium, Riwayat, dan Stabilitas Provider
+
+Revisi ini hanya mengembangkan `/tools`. Command lain serta pembacaan variable umum tetap
+menggunakan implementasi v16.51. Perubahan SQLite/FSM hanya menangani data provider tools.
+
+Variable baru wajib untuk flow apply:
+
+```text
+TOOLS_PROVIDER_APPLY_URL=https://alightfree.my.id/api/v1/apply-premium
+```
+
+Konfigurasi lengkap provider yang ditunjukkan pada contoh:
+
+```text
+TOOLS_PROVIDER_ENABLED=true
+TOOLS_PROVIDER_AUTH_MODE=x-api-key
+TOOLS_PROVIDER_MAGICLINK_URL=https://alightfree.my.id/api/v1/send-magiclink
+TOOLS_PROVIDER_VERIFY_URL=https://alightfree.my.id/api/v1/verify-account
+TOOLS_PROVIDER_APPLY_URL=https://alightfree.my.id/api/v1/apply-premium
+TOOLS_PROVIDER_APPLY_STATUS_URL=
+```
+
+`TOOLS_PROVIDER_API_KEY` tetap Railway Secret; tidak ditanam di source atau `.env.example`.
+Apply memakai POST JSON `email` + `idToken` dari respons Verify Account untuk email yang sama.
+Nama endpoint ini berasal dari konfigurasi/contoh provider yang diberikan; bot tidak melakukan login
+ke dashboard web untuk mengambil riwayat.
+
+`TOOLS_PROVIDER_APPLY_STATUS_URL` opsional. Isi hanya endpoint status/result/history yang benar-benar
+disediakan provider. Jangan mengisi endpoint action `/api/v1/apply-premium` sebagai status URL.
+Jika endpoint baca tidak tersedia, hasil tetap dibaca dari respons POST apply dan dicatat oleh bot.
+
+Pengaturan retry lama tetap tersedia, dengan perilaku baru:
+- `TOOLS_PROVIDER_MAX_RETRIES`: retry untuk request baca biasa;
+- `TOOLS_PROVIDER_TEMP_RETRIES`: satu lapisan retry untuk polling status yang ditandai read-only;
+- POST Kirim Link, Verify Account, Apply Premium, dan Provision tidak diulang otomatis;
+- HTTP 202/pending tetap diproses; timeout/5xx apply tetap belum diketahui;
+- Refresh Status tidak mengirim apply ulang dan tidak mengganti hasil sukses dengan kegagalan baca.
+- HTTP 429 menghentikan polling agar kuota tidak terbuang; ikuti waktu reset/Retry-After provider.
+
+`TOOLS_PROVIDER_HOURLY_LIMIT` sekarang ditegakkan terhadap request HTTP aktual pada SQLite.
+`TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT` tetap menjadi estimasi kapasitas akun; tiga request dasar
+adalah Kirim Link → Verify Account → Apply Premium. Polling status juga menggunakan kuota.
+Histori provision sebelum upgrade dipertahankan dan tetap diperhitungkan pada jam upgrade.
+
+Navigasi di `/tools` mempertahankan session. Link dan idToken hanya berada di memori hingga masa session
+habis; hasil, email, Flow ID, guard request, serta wizard harga/stok tetap berada di database.
+Setelah restart, bot bisa menampilkan hasil atau membaca status tanpa mengulang apply. Bila belum
+apply, verifikasi ulang diperlukan untuk memperoleh idToken baru.
+
+Schema `178`: tabel `tool_provider_requests`, serta kolom `apply_started_at` dan `apply_activity_id`
+pada `tool_provider_flows`, serta `request_metered` pada `tool_provision_logs`. Semua tabel lama dan fitur toko tetap tersedia. Backup database v16.51
+dapat dibuka oleh v16.52 dan dimigrasikan otomatis saat startup.
+
+## v16.53 — Perbaikan Command dan Runtime
+
+Tidak ada variable baru. Konfigurasi provider v16.52 tetap digunakan; flow `/tools` tidak diganti.
+Nama command serta fitur toko lama tetap tersedia. Perubahan command lain hanya memperbaiki bug
+Atur Harga, session Harga Custom, validasi callback produk, akses `/owner`, dan renderer Telegram.
+
+Variable angka umum yang kosong atau tidak valid kini memakai nilai default sebelumnya:
+`ADMIN_ID=0`, `PORT=8080`, `BACKUP_INTERVAL_HOURS=48`, `BACKUP_RETENTION=20`, dan
+`ORDER_RESERVATION_MINUTES=15`. Nilai minimum yang sudah berlaku tetap dipertahankan;
+port dibatasi ke 1–65535. `ADMIN_ID=0` menonaktifkan akses owner; isi ID owner yang benar.
+Nilai variable valid tetap digunakan. `DB_PATH`/`BACKUP_DIR` kosong memakai path default sebelumnya.
+
+Session Harga Custom aktif tetap persisten saat restart; session yang ditinggalkan melalui
+menu owner dibersihkan agar tidak menangkap input wizard lain. Metadata dan hasil tools tetap
+persisten; link/idToken tools tetap sementara di memori seperti v16.52.
+
+Schema tetap `178`; tidak ada tabel, fitur, atau file lama yang dihapus.

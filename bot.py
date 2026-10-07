@@ -12,6 +12,7 @@ import time
 import random
 import json
 import hashlib
+from urllib.parse import urlparse, unquote
 import hmac
 import base64
 import html
@@ -56,13 +57,23 @@ except ImportError:
 load_dotenv()
 
 
+def env_int(name: str, default: int, minimum: int=0, maximum=None) -> int:
+    """Blank/invalid optional Railway variables must not crash module import."""
+    try:
+        value=int(os.getenv(name,str(default)).strip())
+    except (TypeError,ValueError):
+        value=default
+    value=max(minimum,value)
+    return min(maximum,value) if maximum is not None else value
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_ID = env_int("ADMIN_ID",0)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").replace("@", "")
 DEFAULT_PAYMENT_NOTE = os.getenv("PAYMENT_NOTE", "QRIS Maboyy Digital").strip()
 
 # Payment Gateway API (optional until credentials are available)
-SHOPEEPAY_ENABLED = os.getenv("SHOPEEPAY_ENABLED", "false").lower() == "true"
+SHOPEEPAY_ENABLED = os.getenv("SHOPEEPAY_ENABLED", "false").strip().lower() == "true"
 SHOPEEPAY_BASE_URL = os.getenv("SHOPEEPAY_BASE_URL", "").rstrip("/")
 SHOPEEPAY_CLIENT_ID = os.getenv("SHOPEEPAY_CLIENT_ID", "").strip()
 SHOPEEPAY_CLIENT_SECRET = os.getenv("SHOPEEPAY_CLIENT_SECRET", "").strip()
@@ -75,10 +86,18 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 # Owner-only authorized provisioning tools. Disabled by default.
 # Use only with an official/authorized provider API.
-TOOLS_PROVIDER_ENABLED = os.getenv("TOOLS_PROVIDER_ENABLED", "false").lower() == "true"
+TOOLS_PROVIDER_ENABLED = os.getenv("TOOLS_PROVIDER_ENABLED", "false").strip().lower() == "true"
 TOOLS_PROVIDER_NAME = os.getenv("TOOLS_PROVIDER_NAME", "Authorized Provider").strip() or "Authorized Provider"
 TOOLS_PROVIDER_STATUS_URL = os.getenv("TOOLS_PROVIDER_STATUS_URL", "").strip()
+TOOLS_PROVIDER_APPLY_STATUS_URL = os.getenv("TOOLS_PROVIDER_APPLY_STATUS_URL", "").strip()
 TOOLS_PROVIDER_PROVISION_URL = os.getenv("TOOLS_PROVIDER_PROVISION_URL", "").strip()
+TOOLS_PROVIDER_APPLY_URL = os.getenv("TOOLS_PROVIDER_APPLY_URL", "").strip()
+# Compatibility for deployments that previously put the action in PROVISION_URL.
+if not TOOLS_PROVIDER_APPLY_URL:
+    try:legacy_apply_path=urlparse(TOOLS_PROVIDER_PROVISION_URL).path.rstrip("/").lower()
+    except ValueError:legacy_apply_path=""
+    if legacy_apply_path.endswith(("/apply-premium","/apply_premium")):
+        TOOLS_PROVIDER_APPLY_URL=TOOLS_PROVIDER_PROVISION_URL
 TOOLS_PROVIDER_MAGICLINK_URL = os.getenv("TOOLS_PROVIDER_MAGICLINK_URL", "").strip()
 TOOLS_PROVIDER_VERIFY_URL = os.getenv("TOOLS_PROVIDER_VERIFY_URL", "").strip()
 TOOLS_PROVIDER_API_KEY = os.getenv("TOOLS_PROVIDER_API_KEY", "").strip()
@@ -148,7 +167,7 @@ TOOLS_PROVIDER_AUTH_MODE = os.getenv("TOOLS_PROVIDER_AUTH_MODE", "bearer").strip
 if TOOLS_PROVIDER_AUTH_MODE not in {"bearer","x-api-key"}:
     TOOLS_PROVIDER_AUTH_MODE = "bearer"
 
-PORT = int(os.getenv("PORT", "8080"))
+PORT = env_int("PORT",8080,1,65535)
 
 REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
 REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "").strip()
@@ -163,14 +182,16 @@ BACKUP_DIR = os.getenv(
     "BACKUP_DIR",
     "/data/backups" if os.path.isdir("/data") else "backups"
 ).strip()
-BACKUP_INTERVAL_HOURS = max(1, int(os.getenv("BACKUP_INTERVAL_HOURS", "48")))
-BACKUP_RETENTION = max(3, int(os.getenv("BACKUP_RETENTION", "20")))
-ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "15")))
+if not DB_PATH:DB_PATH="/data/shop.db" if os.path.isdir("/data") else "shop.db"
+if not BACKUP_DIR:BACKUP_DIR="/data/backups" if os.path.isdir("/data") else "backups"
+BACKUP_INTERVAL_HOURS = env_int("BACKUP_INTERVAL_HOURS",48,1)
+BACKUP_RETENTION = env_int("BACKUP_RETENTION",20,3)
+ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.48"
-SCHEMA_VERSION = 177
+BOT_VERSION = "16.53"
+SCHEMA_VERSION = 178
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -291,6 +312,7 @@ class SQLiteFSMStorage(BaseStorage):
 
     def __init__(self, db_path: str):
         self.db_path=db_path
+        self._tools_secrets={}
 
     @staticmethod
     def _storage_key(key: StorageKey) -> str:
@@ -350,7 +372,12 @@ class SQLiteFSMStorage(BaseStorage):
             raise TypeError("FSM data must be mapping-like.")
 
         skey=self._storage_key(key)
-        payload=json.dumps(dict(data), ensure_ascii=False, default=str)
+        values=dict(data)
+        temporary={
+            name:values.pop(name) for name in ("tools_raw_link","tools_verify_id_token")
+            if name in values
+        }
+        payload=json.dumps(values, ensure_ascii=False, default=str)
         conn=self._connect()
         try:
             conn.execute(
@@ -367,6 +394,10 @@ class SQLiteFSMStorage(BaseStorage):
                 )
             )
             conn.commit()
+            if temporary:
+                self._tools_secrets[skey]=temporary
+            else:
+                self._tools_secrets.pop(skey,None)
         finally:
             conn.close()
 
@@ -382,7 +413,15 @@ class SQLiteFSMStorage(BaseStorage):
                 return {}
             try:
                 value=json.loads(row["data"])
-                return value if isinstance(value, dict) else {}
+                if not isinstance(value,dict):
+                    return {}
+                value.pop("tools_raw_link",None)
+                value.pop("tools_verify_id_token",None)
+                if tools_session_expired({**value,**self._tools_secrets.get(skey,{})}):
+                    self._tools_secrets.pop(skey,None)
+                else:
+                    value.update(self._tools_secrets.get(skey,{}))
+                return value
             except Exception:
                 return {}
         finally:
@@ -390,6 +429,7 @@ class SQLiteFSMStorage(BaseStorage):
 
     async def close(self) -> None:
         # Connections are short-lived per operation.
+        self._tools_secrets.clear()
         return None
 
 
@@ -943,6 +983,39 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_tool_provider_flows_owner_email "
         "ON tool_provider_flows(owner_id,target_email,created_at)"
     )
+    add_column_if_missing(conn,"tool_provider_flows","apply_started_at","TEXT DEFAULT ''")
+    add_column_if_missing(conn,"tool_provider_flows","apply_activity_id","INTEGER DEFAULT 0")
+    add_column_if_missing(conn,"tool_provision_logs","request_metered","INTEGER DEFAULT 0")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tool_provider_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            method TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            http_status INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_requests_owner_time "
+        "ON tool_provider_requests(owner_id,created_at)"
+    )
+    # Legacy FSM rows could contain temporary credentials despite the UI promise.
+    for row in cur.execute(
+        "SELECT storage_key,data FROM fsm_storage "
+        "WHERE data LIKE '%tools_raw_link%' OR data LIKE '%tools_verify_id_token%'"
+    ).fetchall():
+        try:
+            values=json.loads(row["data"])
+            if isinstance(values,dict):
+                values.pop("tools_raw_link",None)
+                values.pop("tools_verify_id_token",None)
+                cur.execute(
+                    "UPDATE fsm_storage SET data=? WHERE storage_key=?",
+                    (json.dumps(values,ensure_ascii=False),row["storage_key"])
+                )
+        except (TypeError,ValueError):
+            pass
 
     # migrations from previous versions
     add_column_if_missing(conn, "products", "created_at", "TEXT DEFAULT ''")
@@ -1261,7 +1334,7 @@ def rupiah(value: int) -> str:
 
 
 def is_owner(user_id: int) -> bool:
-    return user_id == ADMIN_ID
+    return bool(ADMIN_ID and user_id == ADMIN_ID)
 
 
 
@@ -6549,6 +6622,56 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Provider Auto Orchestration",False,str(exc)[:100]))
 
+    # Provider Apply Result Parser
+    try:
+        sample_apply=parse_provider_apply_premium_result({
+            "applyPremium": True,
+            "message": "apply premium success",
+            "request_id": "test-ref"
+        })
+        apply_parser_ok=(
+            sample_apply.get("known") is True
+            and sample_apply.get("success") is True
+        )
+        checks.append((
+            "Provider Apply Result Parser",
+            apply_parser_ok,
+            "reads apply-premium result from provider response"
+        ))
+    except Exception as exc:
+        checks.append(("Provider Apply Result Parser",False,str(exc)[:100]))
+
+    # Apply Premium Focus UI
+    try:
+        apply_focus_ok=(
+            callable(parse_provider_apply_premium_result)
+            and callable(tools_pro_license_text)
+            and callable(tools_final_result_text)
+        )
+        checks.append((
+            "Apply Premium Focus UI",
+            apply_focus_ok,
+            "verify + apply-premium provider result + final"
+        ))
+    except Exception as exc:
+        checks.append(("Apply Premium Focus UI",False,str(exc)[:100]))
+
+    # Apply Status URL
+    try:
+        apply_status_ok=(
+            callable(tools_apply_status_url_allowed)
+            and callable(poll_provider_apply_result)
+            and tools_apply_status_url_allowed("https://provider.example/api/apply/status")
+            and not tools_apply_status_url_allowed("https://provider.example/api/v1/apply-premium")
+        )
+        checks.append((
+            "Apply Status URL",
+            apply_status_ok,
+            "read-only apply result/status endpoint"
+        ))
+    except Exception as exc:
+        checks.append(("Apply Status URL",False,str(exc)[:100]))
+
     # Schema version
     try:
         current_schema=schema_version_info()
@@ -7107,6 +7230,8 @@ def get_owner_input_session(user_id: int):
     try:
         payload=json.loads(row["payload"] or "{}")
     except Exception:
+        payload={}
+    if not isinstance(payload, dict):
         payload={}
 
     return {
@@ -8673,8 +8798,27 @@ async def safe_edit_or_answer(call: CallbackQuery, text: str, reply_markup=None,
         if "message is not modified" in str(exc).lower():
             return True
 
+    answer=getattr(getattr(call, "message", None), "answer", None)
+    if callable(answer):
+        try:
+            await answer(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+            return True
+        except Exception:
+            # A timeout may already have sent the message; do not replay it.
+            return False
+
+    # Older/deleted messages may be InaccessibleMessage and have no answer method.
     try:
-        await call.message.answer(
+        chat = getattr(getattr(call, "message", None), "chat", None)
+        chat_id = getattr(chat, "id", None) or getattr(getattr(call, "from_user", None), "id", None)
+        if not chat_id:
+            return False
+        await call.bot.send_message(
+            chat_id,
             text,
             reply_markup=reply_markup,
             parse_mode=parse_mode
@@ -9271,11 +9415,29 @@ async def owner_system_error_view(call: CallbackQuery, feature: str, exc: Except
     )
 
 
-async def safe_callback_notice(call: CallbackQuery, text: str = ""):
+async def safe_callback_notice(call: CallbackQuery, text: str = "", *, show_alert: bool = False):
     try:
-        await call.answer(text)
+        await call.answer(text, show_alert=show_alert)
     except Exception:
         pass
+
+
+def callback_positive_numbers(data: str, prefix: str, count: int = 1):
+    """Reject malformed/oversized IDs before they reach SQLite or mutate state."""
+    if not isinstance(data, str):
+        return None
+    parts=data.split(":")
+    if len(parts)!=count+1 or parts[0]!=prefix:
+        return None
+    values=[]
+    for part in parts[1:]:
+        if not re.fullmatch(r"[0-9]{1,19}", part):
+            return None
+        value=int(part)
+        if not 0 < value <= 9223372036854775807:
+            return None
+        values.append(value)
+    return tuple(values)
 
 
 
@@ -10718,9 +10880,9 @@ def compact_variant_price_stock_text(variants) -> str:
 def product_card(product):
     return (
         "┌────────────────────\n"
-        f"• Produk : <b>{product['name']}</b>\n"
+        f"• Produk : <b>{html.escape(str(product['name']))}</b>\n"
         f"• Stok Terjual : <b>{product['sold']}</b>\n"
-        f"• Desk : {product['description'] or '-'}\n"
+        f"• Desk : {html.escape(str(product['description'] or '-'))}\n"
         "└────────────────────\n\n"
         f"<i>{STORE_FOOTER}</i>"
     )
@@ -10798,13 +10960,13 @@ def variant_card(product, variant, qty=1):
 
     return (
         "┌────────────────────\n"
-        f"• Produk : <b>{product['name']}</b>\n"
-        f"• Variasi : <b>{variant['name']}</b>\n"
+        f"• Produk : <b>{html.escape(str(product['name']))}</b>\n"
+        f"• Variasi : <b>{html.escape(str(variant['name']))}</b>\n"
         f"• Jenis Akun : <b>{account_type}</b>\n"
         f"• Batas Beli : <b>{buy_limit}</b>\n"
-        f"• Kode : <code>{variant['code'] or '-'}</code>\n"
+        f"• Kode : <code>{html.escape(str(variant['code'] or '-'))}</code>\n"
         f"• Sisa Produk : <b>{available_stock(variant)}</b>\n"
-        f"• Desk : {product['description'] or '-'}\n"
+        f"• Desk : {html.escape(str(product['description'] or '-'))}\n"
         + (
             f"• Estimasi PO : <b>{html.escape(str(product['preorder_estimate'] or '-'))}</b>\n"
             f"• Arahan PO : {html.escape(str(product['preorder_instructions'] or '-'))}\n"
@@ -10854,6 +11016,15 @@ class OwnerAuditMiddleware(BaseMiddleware):
         callback_data=str(getattr(event,"data","") or "")
 
         if user_id and is_owner(user_id):
+            # A navigation callback ends the previous custom-price input flow.
+            if callback_data not in {"", "noop", "newprodprice:custom", "addvariantprice:custom"}:
+                try:
+                    session=get_owner_input_session(user_id)
+                    if session and session.get("flow") in {"product_custom_price", "variant_custom_price"}:
+                        clear_owner_input_session(user_id)
+                except (sqlite3.Error, OSError):
+                    logging.exception("Custom-price session cleanup failed during owner navigation.")
+
             # Any navigation away from QRIS upload clears the old image-upload flag.
             if callback_data != "owner:qris_set":
                 try:
@@ -10988,7 +11159,10 @@ async def shop_cart(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cartremove:"))
 async def cart_remove(call: CallbackQuery):
-    variant_id=int(call.data.split(":")[1])
+    numbers=callback_positive_numbers(call.data, "cartremove")
+    if not numbers:
+        return await call.answer("Variasi tidak valid.", show_alert=True)
+    variant_id=numbers[0]
     conn=db()
     conn.execute("DELETE FROM cart_items WHERE user_id=? AND variant_id=?",(call.from_user.id,variant_id))
     conn.commit(); conn.close()
@@ -10998,7 +11172,10 @@ async def cart_remove(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("favadd:"))
 async def favorite_add(call: CallbackQuery):
-    variant_id=int(call.data.split(":")[1])
+    numbers=callback_positive_numbers(call.data, "favadd")
+    if not numbers:
+        return await call.answer("Variasi tidak valid.", show_alert=True)
+    variant_id=numbers[0]
     conn=db()
     variant=conn.execute("SELECT product_id FROM product_variants WHERE id=?",(variant_id,)).fetchone()
     if not variant:
@@ -11238,7 +11415,10 @@ async def shop_bundles(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("bundleadd:"))
 async def bundle_add_cart(call: CallbackQuery):
-    bundle_id=int(call.data.split(":")[1])
+    numbers=callback_positive_numbers(call.data, "bundleadd")
+    if not numbers:
+        return await call.answer("Paket tidak valid.", show_alert=True)
+    bundle_id=numbers[0]
     conn=db()
     bundle=conn.execute("SELECT * FROM bundle_offers WHERE id=? AND active=1",(bundle_id,)).fetchone()
     if not bundle:
@@ -11528,12 +11708,72 @@ async def payment_proof_invalid(message: Message):
 # OWNER TOOLS / AUTHORIZED PROVIDER
 # =========================
 
+
+def provider_response_state(result, *, http_status=200, require_evidence=False) -> str:
+    """Request acceptance is separate from an explicit final operation result."""
+    status=int(http_status or 0)
+    if status>=500 or 300<=status<400 or status==0:return "unknown"
+    if not 200<=status<300:return "failed"
+    if not isinstance(result,(dict,list)) or not result:return "unknown"
+    if isinstance(result,list):return "success"
+    flags=[]; states=[]; errors=[]
+    for obj in (result,result.get("data"),result.get("result")):
+        if not isinstance(obj,dict):continue
+        for key in ("success","ok"):
+            if key in obj:
+                flag=normalize_provider_bool(obj[key])
+                if flag is not None:flags.append(flag)
+        for key in ("status","state"):
+            if isinstance(obj.get(key),str):states.append(obj[key].strip().lower())
+            elif isinstance(obj.get(key),bool):flags.append(obj[key])
+        if obj.get("error"):errors.append(True)
+    failed=False in flags or bool(errors) or bool(set(states)&{"failed","error","rejected","cancelled","gagal"})
+    pending=status==202 or bool(set(states)&{"pending","processing","queued","accepted","in_progress","diproses"})
+    if failed:return "failed"
+    if pending:return "pending"
+    if True in flags or any(normalize_provider_bool(state) is True for state in states):return "success"
+    return "unknown" if require_evidence else "success"
+
+
+def _tools_request_totals(conn, owner_id, start_utc, next_utc):
+    bounds=(int(owner_id),start_utc.isoformat(timespec="seconds"),next_utc.isoformat(timespec="seconds"))
+    rows=conn.execute("""SELECT status,COUNT(*) AS n FROM tool_provider_requests
+                         WHERE owner_id=? AND created_at>=? AND created_at<? GROUP BY status""",bounds).fetchall()
+    totals={str(row["status"]):int(row["n"] or 0) for row in rows}
+    legacy=int(conn.execute("""SELECT COUNT(*) AS n FROM tool_provision_logs
+                              WHERE owner_id=? AND created_at>=? AND created_at<? AND request_metered=0""",
+                            bounds).fetchone()["n"] or 0)
+    return totals,legacy
+
+
+def _reserve_tool_provider_request(owner_id: int, method: str) -> int:
+    _,_,_,start_utc,next_utc=tools_hour_window()
+    conn=db(); begin_immediate_retry(conn)
+    try:
+        totals,legacy=_tools_request_totals(conn,owner_id,start_utc,next_utc)
+        if sum(totals.values())+legacy*TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT>=TOOLS_PROVIDER_HOURLY_LIMIT:
+            conn.rollback();return 0
+        cur=conn.execute("INSERT INTO tool_provider_requests(owner_id,method,created_at) VALUES(?,?,?)",
+                         (int(owner_id),method,datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")))
+        conn.commit();return int(cur.lastrowid)
+    except Exception:conn.rollback();raise
+    finally:conn.close()
+
+
+def _finish_tool_provider_request(request_id: int, status: str, http_status: int):
+    conn=db()
+    try:
+        conn.execute("UPDATE tool_provider_requests SET status=?,http_status=? WHERE id=?",
+                     (status,int(http_status or 0),request_id))
+        conn.commit()
+    finally:conn.close()
+
+
 def tools_provider_ready() -> bool:
     return bool(
-        TOOLS_PROVIDER_ENABLED
-        and TOOLS_PROVIDER_API_KEY
-        and TOOLS_PROVIDER_MAGICLINK_URL
-        and TOOLS_PROVIDER_VERIFY_URL
+        TOOLS_PROVIDER_ENABLED and TOOLS_PROVIDER_API_KEY
+        and TOOLS_PROVIDER_MAGICLINK_URL and TOOLS_PROVIDER_VERIFY_URL
+        and TOOLS_PROVIDER_APPLY_URL
     )
 
 
@@ -11548,6 +11788,8 @@ def tools_provider_status_text() -> str:
         missing.append("LINK_VERIFIKASI_URL")
     if not TOOLS_PROVIDER_VERIFY_URL:
         missing.append("VERIFY_URL")
+    if not TOOLS_PROVIDER_APPLY_URL:
+        missing.append("APPLY_URL")
 
     if missing:
         return "🟠 KONFIGURASI BELUM LENGKAP"
@@ -11561,7 +11803,7 @@ def owner_tools_menu():
             InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify"),
         ],
         [
-            InlineKeyboardButton(text="⭐ Lisensi Provider",callback_data="tools:pro_license"),
+            InlineKeyboardButton(text="🚀 Apply Premium",callback_data="tools:pro_license"),
             InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result"),
         ],
         [
@@ -11618,71 +11860,36 @@ def tools_hour_window():
 def tools_stats_snapshot(owner_id: int) -> dict:
     now_wib,start_wib,next_wib,start_utc,next_utc=tools_hour_window()
     conn=db()
-    rows=conn.execute(
-        """SELECT status,COUNT(*) AS n
-           FROM tool_provision_logs
-           WHERE owner_id=?
-             AND created_at>=?
-             AND created_at<?
-           GROUP BY status""",
-        (
-            int(owner_id),
-            start_utc.isoformat(timespec="seconds"),
-            next_utc.isoformat(timespec="seconds"),
-        )
-    ).fetchall()
-    totals={str(row["status"] or ""):int(row["n"] or 0) for row in rows}
-
-    lifetime=conn.execute(
-        """SELECT
-             COUNT(*) AS total,
-             SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
-             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
-           FROM tool_provision_logs
-           WHERE owner_id=?""",
-        (int(owner_id),)
-    ).fetchone()
-    conn.close()
-
-    hour_success=int(totals.get("success",0))
-    hour_failed=int(totals.get("failed",0))
-    hour_pending=int(totals.get("pending",0))
-    hour_attempts=hour_success+hour_failed+hour_pending
-
-    request_cost=max(1,int(TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT))
-    used_requests=min(
-        int(TOOLS_PROVIDER_HOURLY_LIMIT),
-        hour_attempts*request_cost
-    )
-    remaining_requests=max(0,int(TOOLS_PROVIDER_HOURLY_LIMIT)-used_requests)
-    remaining_accounts=remaining_requests//request_cost
-
-    total=int(lifetime["total"] or 0)
-    success=int(lifetime["success"] or 0)
-    failed=int(lifetime["failed"] or 0)
-    decided=max(0,success+failed)
-    success_rate=(success/decided*100.0) if decided else 0.0
-
-    reset_seconds=max(0,int((next_wib-now_wib).total_seconds()))
-    reset_minutes=reset_seconds//60
-    reset_secs=reset_seconds%60
-
+    try:
+        totals,legacy=_tools_request_totals(conn,owner_id,start_utc,next_utc)
+        lifetime_rows=conn.execute(
+            """SELECT status,COUNT(*) AS n FROM (
+                SELECT status FROM tool_provider_requests WHERE owner_id=?
+                UNION ALL SELECT status FROM tool_provision_logs
+                WHERE owner_id=? AND request_metered=0
+            ) GROUP BY status""",(int(owner_id),int(owner_id))
+        ).fetchall()
+    finally:
+        conn.close()
+    lifetime={str(row["status"]):int(row["n"] or 0) for row in lifetime_rows}
+    success=int(lifetime.get("success",0)); failed=int(lifetime.get("failed",0))
+    cost=max(1,int(TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT))
+    used=sum(totals.values())+legacy*cost
+    remaining=max(0,TOOLS_PROVIDER_HOURLY_LIMIT-used)
+    reset=max(0,int((next_wib-now_wib).total_seconds()))
     return {
-        "hour_success":hour_success,
-        "hour_failed":hour_failed,
-        "hour_pending":hour_pending,
-        "hour_attempts":hour_attempts,
-        "used_requests":used_requests,
-        "remaining_requests":remaining_requests,
-        "remaining_accounts":remaining_accounts,
-        "hourly_limit":int(TOOLS_PROVIDER_HOURLY_LIMIT),
-        "request_cost":request_cost,
-        "lifetime_total":total,
-        "lifetime_success":success,
+        "hour_success":totals.get("success",0),
+        "hour_failed":totals.get("failed",0),
+        "hour_pending":totals.get("pending",0)+totals.get("unknown",0),
+        "hour_attempts":sum(totals.values())+legacy,
+        "used_requests":used,"remaining_requests":remaining,
+        "remaining_accounts":remaining//cost,
+        "hourly_limit":int(TOOLS_PROVIDER_HOURLY_LIMIT),"request_cost":cost,
+        "lifetime_total":sum(lifetime.values()),"lifetime_success":success,
         "lifetime_failed":failed,
-        "success_rate":success_rate,
+        "success_rate":success/(success+failed)*100.0 if success+failed else 0.0,
         "reset_at":next_wib.strftime("%H:00 WIB"),
-        "reset_countdown":f"{reset_minutes:02d}m {reset_secs:02d}d",
+        "reset_countdown":f"{reset//60:02d}m {reset%60:02d}d",
     }
 
 
@@ -11719,12 +11926,20 @@ def tools_stats_text(owner_id: int) -> str:
     )
 
 
-def tools_quota_can_process(owner_id: int) -> tuple[bool,dict]:
-    s=tools_stats_snapshot(owner_id)
-    return s["remaining_requests"] >= s["request_cost"],s
+def tools_quota_can_process(owner_id: int, *, requests_needed=None) -> tuple[bool,dict]:
+    stats=tools_stats_snapshot(owner_id)
+    needed=stats["request_cost"] if requests_needed is None else max(1,int(requests_needed))
+    return stats["remaining_requests"]>=needed,stats
 
 
 TOOLS_HISTORY_PAGE_SIZE = 5
+TOOLS_HISTORY_RECORDS_SQL = """(
+    SELECT id,owner_id,action,target_email,status,http_status,created_at,'activity' AS record_kind
+    FROM tool_activity_logs
+    UNION ALL
+    SELECT id,owner_id,'provision_1_year' AS action,target_email,status,http_status,created_at,'provision' AS record_kind
+    FROM tool_provision_logs
+)"""
 
 
 TOOLS_STATUS_CACHE = {
@@ -11736,13 +11951,16 @@ TOOLS_STATUS_CACHE = {
 
 
 def tools_session_expired(data: dict) -> bool:
-    raw=str(data.get("tools_session_started_at") or "")
-    if not raw:
-        return False
+    timestamps=[str(data.get(key) or "") for key in ("tools_session_started_at","tools_verify_id_token_at")]
+    timestamps=[value for value in timestamps if value]
+    if not timestamps:return bool(data.get("tools_verify_id_token") or data.get("tools_raw_link"))
     try:
-        started=datetime.fromisoformat(raw)
-        now=datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
-        return (now-started).total_seconds() > TOOLS_SESSION_EXPIRY_MINUTES*60
+        for raw in timestamps:
+            started=datetime.fromisoformat(raw)
+            now=datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
+            age=(now-started).total_seconds()
+            if age>TOOLS_SESSION_EXPIRY_MINUTES*60 or age < -60:return True
+        return False
     except Exception:
         return True
 
@@ -11825,19 +12043,16 @@ def classify_tools_error(http_status: int, data) -> tuple[str,str]:
 
 def tools_retry_hint(http_status: int, result) -> str:
     category,message=classify_tools_error(http_status,result)
+    if isinstance(result,dict) and result.get("_outcome_unknown"):
+        return message+" Status request belum diketahui. Periksa Hasil Provider/riwayat sebelum mengulang."
     if category in {"timeout","provider_server","network"}:
-        return message + " Aman mencoba lagi."
+        return message+" Periksa status request sebelum mencoba lagi."
     if category=="rate_limit":
-        retry_after=""
-        if isinstance(result,dict):
-            retry_after=str(result.get("_retry_after") or "")
-        return message + (f" Coba lagi setelah {retry_after} detik." if retry_after else " Tunggu hingga limit provider reset.")
-    if category=="auth":
-        return message + " Periksa Railway Secret API key."
-    if category=="endpoint":
-        return message + " Periksa URL endpoint di Railway."
-    if category=="bad_request":
-        return message + " Periksa email/link yang dikirim."
+        retry_after=str(result.get("_retry_after") or "") if isinstance(result,dict) else ""
+        return message+(f" Tunggu {retry_after} detik." if retry_after else " Tunggu hingga limit reset.")
+    if category=="auth":return message+" Periksa Railway Secret API key."
+    if category=="endpoint":return message+" Periksa URL endpoint di Railway."
+    if category=="bad_request":return message+" Periksa email/link yang dikirim."
     return message
 
 
@@ -11854,7 +12069,7 @@ def tools_daily_stats(owner_id: int) -> dict:
              COUNT(*) AS total,
              SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
              SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
-             SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending
+             SUM(CASE WHEN status IN ('pending','unknown') THEN 1 ELSE 0 END) AS pending
            FROM tool_activity_logs
            WHERE owner_id=? AND created_at>=? AND created_at<?""",
         (
@@ -11879,7 +12094,7 @@ def tools_daily_stats(owner_id: int) -> dict:
 def tools_history_filter_keyboard(page: int, total_pages: int, status_filter: str="all"):
     page=max(1,int(page or 1))
     total_pages=max(1,int(total_pages or 1))
-    status_filter=status_filter if status_filter in {"all","success","failed","pending"} else "all"
+    status_filter=status_filter if status_filter in {"all","success","failed","pending","unknown"} else "all"
     rows=[
         [
             InlineKeyboardButton(text=("✅ Semua" if status_filter=="all" else "Semua"),callback_data=f"toolsfilter:all:1"),
@@ -11889,6 +12104,7 @@ def tools_history_filter_keyboard(page: int, total_pages: int, status_filter: st
             InlineKeyboardButton(text=("✅ Gagal" if status_filter=="failed" else "Gagal"),callback_data=f"toolsfilter:failed:1"),
             InlineKeyboardButton(text=("✅ Pending" if status_filter=="pending" else "Pending"),callback_data=f"toolsfilter:pending:1"),
         ],
+        [InlineKeyboardButton(text="❔ Belum diketahui",callback_data="toolsfilter:unknown:1")],
         [InlineKeyboardButton(text="🔎 Cari Email",callback_data="tools:history_search")],
     ]
     nav=[]
@@ -11903,7 +12119,7 @@ def tools_history_filter_keyboard(page: int, total_pages: int, status_filter: st
 
 
 async def render_tools_filtered_history(call: CallbackQuery, page: int=1, status_filter: str="all", email_query: str=""):
-    status_filter=status_filter if status_filter in {"all","success","failed","pending"} else "all"
+    status_filter=status_filter if status_filter in {"all","success","failed","pending","unknown"} else "all"
     clauses=["owner_id=?"]
     params=[int(call.from_user.id)]
     if status_filter!="all":
@@ -11916,16 +12132,16 @@ async def render_tools_filtered_history(call: CallbackQuery, page: int=1, status
 
     conn=db()
     total=int(conn.execute(
-        f"SELECT COUNT(*) AS n FROM tool_activity_logs WHERE {where}",
+        f"SELECT COUNT(*) AS n FROM {TOOLS_HISTORY_RECORDS_SQL} WHERE {where}",
         tuple(params)
     ).fetchone()["n"] or 0)
     total_pages=max(1,(total+TOOLS_HISTORY_PAGE_SIZE-1)//TOOLS_HISTORY_PAGE_SIZE)
     page=max(1,min(int(page or 1),total_pages))
     offset=(page-1)*TOOLS_HISTORY_PAGE_SIZE
     rows=conn.execute(
-        f"""SELECT * FROM tool_activity_logs
+        f"""SELECT * FROM {TOOLS_HISTORY_RECORDS_SQL}
             WHERE {where}
-            ORDER BY id DESC
+            ORDER BY created_at DESC,id DESC
             LIMIT ? OFFSET ?""",
         tuple(params+[TOOLS_HISTORY_PAGE_SIZE,offset])
     ).fetchall()
@@ -11941,8 +12157,10 @@ async def render_tools_filtered_history(call: CallbackQuery, page: int=1, status
     lines.append("")
 
     action_map={
-        "send_verification_link":"Kirim Link Verifikasi",
-        "verify_account":"Verifikasi Akun",
+        "send_verification_link":"Send Magic Link",
+        "verify_account":"Verify Account",
+        "apply_premium":"Apply Premium",
+        "provision_1_year":"Provision 1 Tahun",
     }
 
     if not rows:
@@ -11950,10 +12168,11 @@ async def render_tools_filtered_history(call: CallbackQuery, page: int=1, status
     else:
         for row in rows:
             status=str(row["status"] or "")
-            icon="✅" if status=="success" else ("⏳" if status=="pending" else "❌")
+            icon="✅" if status=="success" else ("⏳" if status=="pending" else ("❔" if status=="unknown" else "❌"))
             action=action_map.get(str(row["action"] or ""),str(row["action"] or "-"))
+            record_id=("P" if row["record_kind"]=="provision" else "")+str(row["id"])
             lines.append(
-                f"{icon} <b>#{row['id']}</b> • {html.escape(action)}\n"
+                f"{icon} <b>#{record_id}</b> • {html.escape(action)}\n"
                 f"📧 {html.escape(str(row['target_email'] or '-'))}\n"
                 f"🌐 HTTP: {int(row['http_status'] or 0) or '-'}\n"
                 f"🕒 {html.escape(format_wib_datetime(row['created_at'],compact=True))}"
@@ -12014,7 +12233,11 @@ def provider_result_reference(result) -> str:
     for key in ("request_id","requestId","reference","ref","id","transaction_id","transactionId"):
         value=result.get(key)
         if value:
-            return str(value)[:300]
+            try:
+                safe=json.loads(tool_response_preview({"reference":str(value)[:300],"idToken":extract_verify_id_token(result)}))
+                reference=str(safe.get("reference") or "")[:300]
+                return "" if reference=="***" else reference
+            except (TypeError,ValueError):return ""
     for nested_key in ("data","result"):
         nested=result.get(nested_key)
         if isinstance(nested,dict):
@@ -12025,95 +12248,57 @@ def provider_result_reference(result) -> str:
 
 
 def tools_provider_precheck(owner_id: int, email: str) -> tuple[bool,str]:
-    if not TOOLS_PROVIDER_ENABLED:
-        return False,"Provider disabled."
-    if not TOOLS_PROVIDER_API_KEY:
-        return False,"API key provider belum tersedia."
-    if not TOOLS_PROVIDER_VERIFY_URL:
-        return False,"Endpoint verifikasi belum tersedia."
-    if not valid_tools_email(email):
-        return False,"Email target tidak valid."
-
-    ok,reason=tools_quota_can_process(owner_id)
-    if not ok:
-        return False,str(reason)
-
+    if not TOOLS_PROVIDER_ENABLED:return False,"Provider disabled."
+    if not TOOLS_PROVIDER_API_KEY:return False,"API key provider belum tersedia."
+    if not TOOLS_PROVIDER_VERIFY_URL:return False,"Endpoint verifikasi belum tersedia."
+    if not valid_tools_email(email):return False,"Email target tidak valid."
+    needed=2 if TOOLS_PROVIDER_APPLY_URL else 1
+    ok,quota=tools_quota_can_process(owner_id,requests_needed=needed)
+    if not ok:return False,f"Kuota tidak cukup untuk verifikasi/apply. Reset {quota['reset_at']}."
     cleanup_expired_tool_locks()
     conn=db()
-    row=conn.execute(
-        "SELECT locked_until FROM tool_email_locks WHERE email=?",
-        (str(email).strip().lower(),)
-    ).fetchone()
-    conn.close()
-    if row:
-        return False,"Email target sedang diproses."
-    return True,"READY"
+    try:
+        row=conn.execute("SELECT locked_until FROM tool_email_locks WHERE email=?",
+                         (str(email).strip().lower(),)).fetchone()
+    finally:conn.close()
+    return (False,"Email target sedang diproses.") if row else (True,"READY")
 
 
-async def tools_provider_request_resilient(method: str, url: str, *, payload=None):
-    last=(False,0,{"error":"not_started"})
-    for attempt in range(TOOLS_PROVIDER_TEMP_RETRIES+1):
-        ok,http_status,result=await tools_provider_request(method,url,payload=payload)
-        last=(ok,http_status,result)
-
-        if ok:
-            return last
-        if int(http_status or 0) in {400,401,403,404}:
-            return last
-
-        if int(http_status or 0)==429:
-            retry_after=0
-            if isinstance(result,dict):
-                try:
-                    retry_after=int(result.get("_retry_after") or 0)
-                except Exception:
-                    retry_after=0
-            if attempt < TOOLS_PROVIDER_TEMP_RETRIES:
-                await asyncio.sleep(max(1,min(30,retry_after or TOOLS_PROVIDER_POLL_INTERVAL_SECONDS)))
-                continue
-            return last
-
-        if int(http_status or 0)==0 or int(http_status or 0)>=500:
-            if attempt < TOOLS_PROVIDER_TEMP_RETRIES:
-                await asyncio.sleep(TOOLS_PROVIDER_POLL_INTERVAL_SECONDS)
-                continue
-        return last
-    return last
+async def tools_provider_request_resilient(method: str, url: str, *, payload=None,
+                                            read_only=False, owner_id=0):
+    # One retry layer. Action POSTs are always sent once, including verify/apply.
+    return await tools_provider_request(
+        method,url,payload=payload,read_only=read_only,owner_id=owner_id,
+        max_retries=TOOLS_PROVIDER_TEMP_RETRIES,
+    )
 
 
 async def poll_provider_status(email: str, correlation_id: str):
-    # Optional: only active when a provider status endpoint exists.
-    if not TOOLS_PROVIDER_STATUS_URL:
-        return None
-
+    if not tools_apply_status_url_allowed(TOOLS_PROVIDER_STATUS_URL):return None
+    owner_id=_tools_flow_owner(correlation_id)
+    last=None
     for attempt in range(TOOLS_PROVIDER_POLL_ATTEMPTS):
-        ok,http_status,result=await tools_provider_request_resilient(
-            "POST",TOOLS_PROVIDER_STATUS_URL,payload={"email":email}
+        last=await tools_provider_request_resilient(
+            "POST",TOOLS_PROVIDER_STATUS_URL,payload={"email":email},
+            read_only=True,owner_id=owner_id,
         )
-        update_tool_provider_flow(
-            correlation_id,
-            stage="status_poll",
-            status="success" if ok else "pending",
-            provider_ref=provider_result_reference(result),
-            http_status=http_status
-        )
-        if ok and parse_provider_license_status(result).get("known"):
-            return (ok,http_status,result)
-        if attempt < TOOLS_PROVIDER_POLL_ATTEMPTS-1:
-            await asyncio.sleep(TOOLS_PROVIDER_POLL_INTERVAL_SECONDS)
-    return None
+        ok,http_status,result=last
+        if not ok:return last
+        if ok and parse_provider_license_status(result).get("known"):return last
+        if http_status in {400,401,403,404,429}:return last
+        if attempt+1<TOOLS_PROVIDER_POLL_ATTEMPTS:await asyncio.sleep(TOOLS_PROVIDER_POLL_INTERVAL_SECONDS)
+    return last
 
 
 def normalize_provider_bool(value):
-    if isinstance(value,bool):
-        return value
+    if isinstance(value,bool):return value
     if isinstance(value,(int,float)):
-        return bool(value)
-    text=str(value or "").strip().lower()
-    if text in {"1","true","yes","y","active","activated","premium","pro","success","berhasil","aktif"}:
-        return True
-    if text in {"0","false","no","n","inactive","failed","gagal","tidak aktif","expired"}:
-        return False
+        return bool(value) if value in (0,1) else None
+    text=str(value if value is not None else "").strip().lower()
+    if text in {"1","true","yes","y","active","activated","premium","pro",
+                "success","succeeded","completed","ok","sukses","berhasil","aktif"}:return True
+    if text in {"0","false","no","n","inactive","failed","error","rejected",
+                "cancelled","gagal","tidak aktif","expired"}:return False
     return None
 
 
@@ -12141,10 +12326,16 @@ def parse_provider_license_status(result) -> dict:
         result,
         (
             "premium","isPremium","is_premium","pro","isPro","is_pro",
-            "active","isActive","is_active","status","subscriptionStatus",
+            "active","isActive","is_active","subscriptionStatus",
             "licenseStatus","premiumStatus"
         )
     )
+    if isinstance(raw_status,dict):
+        raw_status=raw_status.get("active",raw_status.get("status"))
+    if raw_status is None:
+        candidate=find_provider_value(result,("status",))
+        if str(candidate or "").strip().lower() in {"active","activated","inactive","expired","premium","pro","aktif","tidak aktif"}:
+            raw_status=candidate
     active=normalize_provider_bool(raw_status)
 
     plan=find_provider_value(
@@ -12169,110 +12360,341 @@ def parse_provider_license_status(result) -> dict:
     }
 
 
+def tools_apply_status_url_allowed(url: str) -> bool:
+    try:
+        parsed=urlparse(str(url or "").strip())
+        if parsed.scheme not in {"https","http"} or not parsed.hostname or parsed.username or parsed.password:
+            return False
+        parts=[unquote(part).lower().replace("_","-") for part in parsed.path.split("/") if part]
+        if not parts:return False
+        # A terminal action can never be made read-only by a query or parent path.
+        if parts[-1] in {"apply-premium","activate-premium","grant-premium","apply","activate","grant",
+                         "send-magiclink","verify-account","provision"}:return False
+        return any(part in {"status","result","results","history","lookup","check"}
+                   or part.startswith(("check-","get-status","get-result")) for part in parts)
+    except (TypeError,ValueError):return False
+
+
+async def poll_provider_apply_result(email: str, correlation_id: str):
+    if not TOOLS_PROVIDER_APPLY_STATUS_URL:return None
+    if not tools_apply_status_url_allowed(TOOLS_PROVIDER_APPLY_STATUS_URL):
+        return False,0,{"error":"unsafe_apply_status_url","message":"URL status harus endpoint baca status/result/history."}
+    owner_id=_tools_flow_owner(correlation_id)
+    last=None
+    for attempt in range(TOOLS_PROVIDER_POLL_ATTEMPTS):
+        last=await tools_provider_request_resilient(
+            "POST",TOOLS_PROVIDER_APPLY_STATUS_URL,
+            payload={"email":email,"correlation_id":correlation_id},
+            read_only=True,owner_id=owner_id,
+        )
+        ok,http_status,result=last
+        if not ok:return last
+        parsed=parse_provider_apply_premium_result(result,from_apply=True,target_email=email)
+        if http_status==202:parsed.update(known=False,success=False,status="pending")
+        if ok and parsed["known"]:return last
+        if http_status in {400,401,403,404,429}:return last
+        if attempt+1<TOOLS_PROVIDER_POLL_ATTEMPTS:await asyncio.sleep(TOOLS_PROVIDER_POLL_INTERVAL_SECONDS)
+    return last
+
+
+def parse_provider_apply_premium_result(result, *, from_apply=False, target_email="") -> dict:
+    """Read explicit apply results; verify success alone is never apply success.
+
+    from_apply is used only for the actual apply response or its read-only status
+    endpoint. History records must name Apply Premium and match the target email.
+    """
+    empty={"known":False,"success":False,"status":"unknown","message":"","reference":""}
+    queue=[(result,from_apply,0)]; seen=set(); matches=[]
+    while queue and len(seen)<500:
+        obj,context,depth=queue.pop(0)
+        if not isinstance(obj,(dict,list)) or id(obj) in seen or depth>10:continue
+        seen.add(id(obj))
+        if isinstance(obj,list):
+            queue.extend((item,False,depth+1) for item in obj)
+            continue
+        lowered={str(key).lower():value for key,value in obj.items()}
+        email=str(lowered.get("email") or lowered.get("target_email") or "").strip().lower()
+        if target_email and email and email!=target_email.strip().lower():continue
+        action=str(lowered.get("action") or lowered.get("operation") or lowered.get("type") or "")
+        action=action.lower().replace("_"," ").replace("-"," ")
+        has_history=any(isinstance(obj.get(key),list) for key in ("data","result","history","items","records","logs"))
+        context=(context and not has_history) or "apply premium" in action or action.replace(" ","") in {"applypremium","premiumapplied"}
+        raw=None
+        for key in ("applypremium","apply_premium","premiumapplied","premium_applied",
+                    "applypremiumstatus","apply_premium_status"):
+            if key in lowered:
+                value=lowered[key]
+                if isinstance(value,dict):queue.insert(0,(value,True,depth+1))
+                else:raw=value; context=True
+        if context:
+            state=provider_response_state(obj,require_evidence=True)
+            explicit=normalize_provider_bool(raw)
+            pending=str(raw or "").strip().lower() in {"pending","processing","queued","accepted","diproses"}
+            if pending:state="pending"
+            elif explicit is not None:
+                if explicit and state=="failed":state="unknown"
+                else:state="success" if explicit else "failed"
+            try:
+                safe_obj=json.loads(tool_response_preview(obj))
+                safe_lower={str(key).lower():value for key,value in safe_obj.items()}
+                message=str(safe_lower.get("message") or safe_lower.get("detail") or safe_lower.get("description") or "")
+            except (TypeError,ValueError):message="Detail provider disembunyikan."
+            matches.append({
+                "known":state in {"success","failed"},"success":state=="success",
+                "status":state,"message":tool_response_preview(message)[:500] if message else "",
+                "reference":tool_response_preview(provider_result_reference(obj))[:300],
+            })
+        for key in ("data","result","premium","applyPremium","apply_premium","operation",
+                    "history","items","records","logs"):
+            value=obj.get(key)
+            if isinstance(value,(dict,list)):
+                child_context=context if isinstance(value,dict) else False
+                if key in {"applyPremium","apply_premium"}:child_context=True
+                queue.append((value,child_context,depth+1))
+    history=isinstance(result,list) or (isinstance(result,dict) and any(
+        isinstance(result.get(key),list) for key in ("history","items","records","logs","data","result")
+    ))
+    if history and matches:return matches[0]
+    # A pending or explicit final nested result takes priority over envelope success.
+    if any(item["status"]=="pending" for item in matches):
+        return next(item for item in reversed(matches) if item["status"]=="pending")
+    finals=[item for item in matches if item["known"]]
+    if finals:
+        # For history lists, the provider's first matching (newest) record is used.
+        if isinstance(result,list) or (isinstance(result,dict) and any(
+            isinstance(result.get(key),list) for key in ("history","items","records","logs","data","result")
+        )):return finals[0]
+        return finals[-1]
+    return matches[-1] if matches else empty
+
+
+
+def tools_result_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Apply Premium",callback_data="tools:pro_license"),
+         InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
+        [InlineKeyboardButton(text="🔄 Refresh Status",callback_data="tools:apply:refresh"),
+         InlineKeyboardButton(text="📦 Riwayat",callback_data="tools:history")],
+        [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
+        [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+    ])
+
+
+def _tools_flow_owner(correlation_id: str) -> int:
+    conn=db()
+    try:
+        row=conn.execute("SELECT owner_id FROM tool_provider_flows WHERE correlation_id=?",(correlation_id,)).fetchone()
+        return int(row["owner_id"] if row else 0)
+    finally:conn.close()
+
+
+def _tools_claim_apply(owner_id: int, email: str, correlation_id: str):
+    """Persist the claim before dispatch, so callback replay/restarts cannot reapply."""
+    conn=db();begin_immediate_retry(conn)
+    try:
+        flow=conn.execute("SELECT * FROM tool_provider_flows WHERE correlation_id=? AND owner_id=? AND target_email=?",
+                          (correlation_id,int(owner_id),email)).fetchone()
+        if not flow:raise ValueError("Flow verifikasi tidak ditemukan.")
+        if flow["apply_started_at"]:
+            conn.rollback();return False,dict(flow)
+        previous=conn.execute("""SELECT * FROM tool_provider_flows
+                                 WHERE owner_id=? AND target_email=? AND apply_started_at!=''
+                                 AND status IN ('pending','unknown','success') ORDER BY apply_started_at DESC LIMIT 1""",
+                              (int(owner_id),email)).fetchone()
+        if previous:
+            try:age=(datetime.now()-datetime.fromisoformat(previous["apply_started_at"])).total_seconds()
+            except (TypeError,ValueError):age=0
+            if previous["status"] in {"pending","unknown"} or age<TOOLS_PROVIDER_REQUEST_COOLDOWN_SECONDS:
+                conn.rollback();return False,dict(previous)
+        now=datetime.now().isoformat(timespec="seconds")
+        activity=conn.execute("""INSERT INTO tool_activity_logs(owner_id,action,target_email,status,http_status,detail,created_at,updated_at)
+                                 VALUES(?,'apply_premium',?,'pending',0,'',?,?)""",(int(owner_id),email,now,now))
+        conn.execute("""UPDATE tool_provider_flows SET apply_started_at=?,apply_activity_id=?,
+                         stage='apply_premium',status='pending',updated_at=? WHERE correlation_id=?""",
+                      (now,int(activity.lastrowid),now,correlation_id))
+        conn.commit()
+        return True,{"correlation_id":correlation_id,"apply_activity_id":int(activity.lastrowid),"status":"pending"}
+    except Exception:conn.rollback();raise
+    finally:conn.close()
+
+
+async def _save_tools_apply_result(state, email, correlation_id, parsed, http_status, preview=""):
+    now=datetime.now().isoformat(timespec="seconds")
+    await state.update_data(
+        tools_correlation_id=correlation_id,tools_apply_requested=True,
+        tools_provider_apply_premium_result=parsed,tools_apply_http_status=int(http_status or 0),
+        tools_apply_at=now,tools_apply_preview=preview[:900],tools_apply_notice="",
+    )
+    update_tool_provider_flow(correlation_id,stage="apply_premium",status=parsed["status"],
+                              http_status=http_status,provider_ref=parsed.get("reference") or None)
+    conn=db()
+    try:flow=conn.execute("SELECT apply_activity_id FROM tool_provider_flows WHERE correlation_id=?",(correlation_id,)).fetchone()
+    finally:conn.close()
+    if flow and flow["apply_activity_id"]:
+        update_tool_activity(int(flow["apply_activity_id"]),status=parsed["status"],http_status=http_status,
+                             detail=tool_response_preview(parsed))
+
+
+async def run_tools_apply_once(call, state):
+    data=await state.get_data()
+    email=str(data.get("tools_target_email") or data.get("tools_verify_email") or "").strip().lower()
+    existing=dict(data.get("tools_provider_apply_premium_result") or {})
+    if existing.get("known") or existing.get("status")=="pending" or data.get("tools_apply_requested"):return existing
+    if data.get("tools_final_status")!="success" or not valid_tools_email(email):return existing
+    if str(data.get("tools_verify_email") or email).strip().lower()!=email:
+        await state.update_data(tools_apply_notice="Email target berubah. Verifikasi kembali sebelum apply.")
+        return existing
+    if tools_session_expired(data):
+        await state.update_data(tools_verify_id_token=None,tools_raw_link=None)
+        return existing
+    token=str(data.get("tools_verify_id_token") or "").strip()
+    if not token or not TOOLS_PROVIDER_ENABLED or not TOOLS_PROVIDER_API_KEY or not TOOLS_PROVIDER_APPLY_URL:
+        return existing
+    quota_ok,_=tools_quota_can_process(call.from_user.id,requests_needed=1)
+    if not quota_ok:
+        await state.update_data(tools_apply_notice="Kuota request habis. Tunggu reset, lalu pilih Apply Premium.")
+        return existing
+    correlation_id=str(data.get("tools_correlation_id") or "")
+    if not correlation_id:
+        correlation_id=create_tool_provider_flow(call.from_user.id,email,"verify_account")
+        await state.update_data(tools_correlation_id=correlation_id)
+    locked,_=acquire_tool_email_lock(call.from_user.id,email,"apply_premium")
+    if not locked:
+        await state.update_data(tools_apply_notice="Email target sedang diproses.")
+        return existing
+    claimed=None
+    try:
+        started,claimed=_tools_claim_apply(call.from_user.id,email,correlation_id)
+        if not started:
+            status=str(claimed["status"])
+            parsed={"known":status in {"success","failed"},"success":status=="success", "status":status,
+                    "message":"Hasil apply sebelumnya dipertahankan. Request apply tidak diulang.",
+                    "reference":str(claimed.get("provider_ref") or "")}
+            await state.update_data(tools_correlation_id=claimed["correlation_id"],tools_apply_requested=True,
+                                    tools_provider_apply_premium_result=parsed,tools_apply_http_status=claimed.get("http_status",0))
+            return parsed
+        await state.update_data(tools_apply_requested=True,tools_apply_notice="")
+        await safe_callback_notice(call,"Menerapkan premium...")
+        await safe_edit_or_answer(call,"⏳ <b>APPLY PREMIUM...</b>\n\n📧 "+html.escape(email),parse_mode="HTML")
+        ok,http_status,result=await tools_provider_request(
+            "POST",TOOLS_PROVIDER_APPLY_URL,payload={"email":email,"idToken":token},owner_id=call.from_user.id,
+        )
+        parsed=parse_provider_apply_premium_result(result,from_apply=True,target_email=email)
+        if http_status==202:parsed.update(known=False,success=False,status="pending")
+        if not ok:
+            unknown=bool(isinstance(result,dict) and result.get("_outcome_unknown"))
+            parsed.update(known=not unknown,success=False,status="unknown" if unknown else "failed",
+                          message=parsed.get("message") if not unknown and parsed.get("known") and parsed.get("message")
+                          else tools_retry_hint(http_status,result))
+        await _save_tools_apply_result(state,email,correlation_id,parsed,http_status,tool_response_preview(result))
+        if parsed["status"] in {"pending","unknown"} and TOOLS_PROVIDER_APPLY_STATUS_URL:
+            await refresh_tools_apply_result(state,call.from_user.id)
+            parsed=dict((await state.get_data()).get("tools_provider_apply_premium_result") or parsed)
+        return parsed
+    except BaseException:
+        if claimed and claimed.get("apply_activity_id"):
+            parsed={"known":False,"success":False,"status":"unknown",
+                    "message":"Proses apply terputus. Periksa status provider sebelum mengulang.","reference":""}
+            await _save_tools_apply_result(state,email,correlation_id,parsed,0)
+        raise
+    finally:release_tool_email_lock(email)
+
+
+async def refresh_tools_apply_result(state, owner_id):
+    data=await state.get_data()
+    correlation_id=str(data.get("tools_correlation_id") or "")
+    email=str(data.get("tools_target_email") or data.get("tools_verify_email") or "").strip().lower()
+    if not correlation_id or not valid_tools_email(email) or _tools_flow_owner(correlation_id)!=owner_id:return
+    if not TOOLS_PROVIDER_APPLY_STATUS_URL:
+        await state.update_data(tools_apply_notice="Endpoint status/riwayat belum dikonfigurasi. Periksa riwayat provider; apply tidak diulang.")
+        return
+    polled=await poll_provider_apply_result(email,correlation_id)
+    if not polled:return
+    ok,http_status,result=polled
+    parsed=parse_provider_apply_premium_result(result,from_apply=True,target_email=email)
+    if http_status==202:parsed.update(known=False,success=False,status="pending")
+    # Failure to read status must never overwrite an existing confirmed apply result.
+    if ok and (parsed["known"] or parsed["status"]=="pending"):
+        await _save_tools_apply_result(state,email,correlation_id,parsed,http_status,tool_response_preview(result))
+        await state.update_data(tools_apply_notice="")
+    elif not ok:
+        await state.update_data(tools_apply_notice="Status belum dapat dibaca. "+tools_retry_hint(http_status,result))
+
+
+@router.callback_query(F.data == "tools:apply:refresh")
+async def owner_tools_apply_refresh(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    await safe_callback_notice(call,"Memeriksa status...")
+    await refresh_tools_apply_result(state,call.from_user.id)
+    await safe_edit_or_answer(call,tools_final_result_text(await state.get_data()),
+                              reply_markup=tools_result_keyboard(),parse_mode="HTML")
+
+
+
+def _tools_status_label(status: str) -> str:
+    return {"success":"✅ SUKSES","failed":"❌ GAGAL","pending":"⏳ DIPROSES",
+            "unknown":"❔ BELUM DIKETAHUI"}.get(status,"➖ BELUM ADA HASIL")
+
+
+def _tools_apply_label(parsed: dict, requested=False) -> str:
+    if parsed.get("known"):return "✅ SUKSES" if parsed.get("success") else "❌ GAGAL"
+    if parsed.get("status")=="pending":return "⏳ DIPROSES"
+    return "❔ BELUM DIKETAHUI" if requested else "➖ BELUM DIJALANKAN"
+
+
 def tools_pro_license_text(data: dict) -> str:
     email=str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "")
-    verify_status=str(data.get("tools_final_status") or "")
     token=str(data.get("tools_verify_id_token") or "")
-    provider_status=dict(data.get("tools_provider_license_status") or {})
-
-    lines=[
-        "⭐ <b>LISENSI PRO PROVIDER</b>",
-        "",
-        f"📧 Email Target: <b>{html.escape(email or '-')}</b>",
-        f"✅ Verifikasi: <b>{'BERHASIL' if verify_status=='success' else 'BELUM BERHASIL'}</b>",
-        f"🔐 idToken: <b>{masked_id_token(token)}</b>",
-        "",
-    ]
-
-    if provider_status.get("known"):
-        lines.append(
-            "⭐ Lisensi Pro Provider: <b>✅ BERHASIL</b>"
-            if provider_status.get("active")
-            else "⭐ Lisensi Pro Provider: <b>❌ GAGAL</b>"
-        )
-    else:
-        lines.append("⭐ Lisensi Pro Provider: <b>➖ BELUM ADA HASIL</b>")
-
-    plan=str(provider_status.get("plan") or "").strip()
-    expires=str(provider_status.get("expires_at") or "").strip()
-    message=str(provider_status.get("message") or "").strip()
-
-    if plan:
-        lines.append(f"📦 Paket: <b>{html.escape(plan)}</b>")
-    if expires:
-        lines.append(f"📅 Berlaku sampai: <b>{html.escape(expires)}</b>")
-    if message:
-        lines += ["",f"Provider: <code>{html.escape(message[:500])}</code>"]
-
-    if not email or verify_status!="success" or not token:
-        lines += [
-            "",
-            "⚠️ <b>Session verifikasi belum lengkap.</b>",
-            "Jalankan urutan: Kirim Link → Verifikasi → Lisensi Pro.",
-            "Navigasi ke Owner Tools tidak lagi menghapus session."
-        ]
-
-    lines += [
-        "",
-        "Status final hanya mengikuti hasil yang dikembalikan provider."
-    ]
+    parsed=dict(data.get("tools_provider_apply_premium_result") or {})
+    lines=["🚀 <b>APPLY PREMIUM PROVIDER</b>","",
+           f"📧 Email Target: <b>{html.escape(email or '-')}</b>",
+           "✅ Verifikasi Provider: <b>"+_tools_status_label(str(data.get("tools_final_status") or ""))+"</b>",
+           f"🔐 idToken: <b>{masked_id_token(token)}</b>","",
+           "🚀 Apply Premium: <b>"+_tools_apply_label(parsed,bool(data.get("tools_apply_requested")))+"</b>"]
+    for title,key in (("Status Apply","status"),("Apply Ref","reference")):
+        value=str(parsed.get(key) or "")
+        if value:lines.append(f"{title}: <code>{html.escape(value)}</code>")
+    message=str(parsed.get("message") or "")
+    if message:lines.extend(["",html.escape(message[:500])])
+    notice=str(data.get("tools_apply_notice") or "")
+    if notice:lines.extend(["",html.escape(notice)])
+    if not parsed.get("known") and not data.get("tools_apply_requested"):
+        if not TOOLS_PROVIDER_APPLY_URL:lines.extend(["","Konfigurasi TOOLS_PROVIDER_APPLY_URL untuk menjalankan apply."])
+        elif data.get("tools_final_status")!="success" or not token:
+            lines.extend(["","Jalankan Kirim Link → Verifikasi untuk memperoleh idToken baru."])
+        elif tools_session_expired(data):lines.extend(["","Session kedaluwarsa. Jalankan verifikasi kembali."])
     return "\n".join(lines)
 
 
 def tools_final_result_text(data: dict) -> str:
     email=str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "")
-    status=str(data.get("tools_final_status") or "")
-    http_status=int(data.get("tools_final_http_status") or 0)
-    final_at=str(data.get("tools_final_at") or "")
-    preview=str(data.get("tools_final_preview") or "")
-    token=str(data.get("tools_verify_id_token") or "")
-    correlation_id=str(data.get("tools_correlation_id") or "")
+    parsed=dict(data.get("tools_provider_apply_premium_result") or {})
+    lines=["📋 <b>HASIL PROVIDER</b>","",
+           f"📧 Email Target: <b>{html.escape(email or '-')}</b>",
+           "✅ Verifikasi Provider: <b>"+_tools_status_label(str(data.get("tools_final_status") or ""))+"</b>",
+           "🚀 Apply Premium: <b>"+_tools_apply_label(parsed,bool(data.get("tools_apply_requested")))+"</b>",
+           f"🔐 idToken: <b>{masked_id_token(str(data.get('tools_verify_id_token') or ''))}</b>",
+           f"🌐 HTTP Verifikasi: <b>{int(data.get('tools_final_http_status') or 0) or '-'}</b>",
+           f"🌐 HTTP Apply: <b>{int(data.get('tools_apply_http_status') or 0) or '-'}</b>",
+           f"🆔 Flow: <code>{html.escape(str(data.get('tools_correlation_id') or '-'))}</code>"]
     provider_ref=str(data.get("tools_provider_reference") or "")
-    license_status=dict(data.get("tools_provider_license_status") or {})
-
-    verify_text={"success":"✅ BERHASIL","failed":"❌ GAGAL"}.get(status,"➖ BELUM ADA HASIL")
-    lines=[
-        "📋 <b>HASIL FINAL PROVIDER</b>",
-        "",
-        f"📧 Email Target: <b>{html.escape(email or '-')}</b>",
-        f"✅ Verifikasi Provider: <b>{verify_text}</b>",
-        f"🔐 idToken: <b>{masked_id_token(token)}</b>",
-        f"🌐 HTTP Provider: <b>{http_status or '-'}</b>",
-        f"🆔 Flow: <code>{html.escape(correlation_id or '-')}</code>",
-    ]
-
-    if license_status.get("known"):
-        lines.append(
-            "⭐ Lisensi Pro Provider: <b>✅ BERHASIL</b>"
-            if license_status.get("active")
-            else "⭐ Lisensi Pro Provider: <b>❌ GAGAL</b>"
-        )
-    else:
-        lines.append("⭐ Lisensi Pro Provider: <b>➖ BELUM ADA HASIL</b>")
-
-    plan=str(license_status.get("plan") or "").strip()
-    expires=str(license_status.get("expires_at") or "").strip()
-    message=str(license_status.get("message") or "").strip()
-
-    if provider_ref:
-        lines.append(f"🔎 Provider Ref: <code>{html.escape(provider_ref)}</code>")
-    if plan:
-        lines.append(f"📦 Paket Provider: <b>{html.escape(plan)}</b>")
-    if expires:
-        lines.append(f"📅 Berlaku sampai: <b>{html.escape(expires)}</b>")
-    if final_at:
-        lines.append(f"🕒 Waktu: <b>{html.escape(format_wib_datetime(final_at,compact=True))}</b>")
-
-    if message:
-        lines += ["", f"Provider: <code>{html.escape(message[:500])}</code>"]
-    elif preview:
-        lines += ["", f"Provider: <code>{html.escape(preview[:500])}</code>"]
-
-    lines += [
-        "",
-        "Hasil di atas adalah hasil dari provider, bukan pemeriksaan langsung status aplikasi Alight Motion."
-    ]
+    apply_ref=str(parsed.get("reference") or "")
+    if provider_ref:lines.append(f"🔎 Provider Ref: <code>{html.escape(provider_ref)}</code>")
+    if apply_ref and apply_ref!=provider_ref:lines.append(f"🔎 Apply Ref: <code>{html.escape(apply_ref)}</code>")
+    when=str(data.get("tools_apply_at") or data.get("tools_final_at") or "")
+    if when:lines.append(f"🕒 Waktu: <b>{html.escape(format_wib_datetime(when,compact=True))}</b>")
+    message=str(parsed.get("message") or "")
+    if message:lines.extend(["",html.escape(message[:500])])
+    notice=str(data.get("tools_apply_notice") or "")
+    if notice:lines.extend(["",html.escape(notice)])
+    if data.get("tools_final_status")=="success" and not data.get("tools_apply_requested") and not parsed.get("known"):
+        if not TOOLS_PROVIDER_APPLY_URL:lines.extend(["","Endpoint Apply Premium belum dikonfigurasi."])
+        elif not data.get("tools_verify_id_token"):lines.extend(["","Provider belum memberikan idToken yang bisa dipakai. Verifikasi kembali."])
+        else:lines.extend(["","Pilih 🚀 Apply Premium untuk melanjutkan."])
+    if data.get("tools_apply_requested") and parsed.get("status") in {"unknown","pending"}:
+        lines.extend(["","Status akhir belum diketahui. Refresh membaca status; request apply tidak diulang."])
     return "\n".join(lines)
+
 
 def tools_compact_summary_text(owner_id: int) -> str:
     stats=tools_stats_snapshot(owner_id)
@@ -12283,6 +12705,8 @@ def tools_compact_summary_text(owner_id: int) -> str:
         "📊 <b>STATUS TOOLS</b>",
         "",
         f"Provider Config: <b>{tools_provider_status_text()}</b>",
+        f"Apply URL: <b>{'READY' if TOOLS_PROVIDER_APPLY_URL else 'BELUM SIAP'}</b>",
+        f"Apply Status URL: <b>{'READY' if tools_apply_status_url_allowed(TOOLS_PROVIDER_APPLY_STATUS_URL) else ('URL TIDAK VALID' if TOOLS_PROVIDER_APPLY_STATUS_URL else 'OPSIONAL')}</b>",
         f"Kuota jam ini: <b>{stats['used_requests']}/{stats['hourly_limit']}</b>",
         f"Sisa akun: <b>{stats['remaining_accounts']}</b>",
         f"Hari ini: <b>{daily['success']} sukses / {daily['failed']} gagal</b>",
@@ -12382,16 +12806,16 @@ def tools_history_keyboard(page: int, total_pages: int):
 async def render_tools_history(call: CallbackQuery, page: int=1):
     conn=db()
     total=int(conn.execute(
-        "SELECT COUNT(*) AS n FROM tool_activity_logs WHERE owner_id=?",
+        f"SELECT COUNT(*) AS n FROM {TOOLS_HISTORY_RECORDS_SQL} WHERE owner_id=?",
         (int(call.from_user.id),)
     ).fetchone()["n"] or 0)
     total_pages=max(1,(total+TOOLS_HISTORY_PAGE_SIZE-1)//TOOLS_HISTORY_PAGE_SIZE)
     page=max(1,min(int(page or 1),total_pages))
     offset=(page-1)*TOOLS_HISTORY_PAGE_SIZE
     rows=conn.execute(
-        """SELECT * FROM tool_activity_logs
+        f"""SELECT * FROM {TOOLS_HISTORY_RECORDS_SQL}
            WHERE owner_id=?
-           ORDER BY id DESC
+           ORDER BY created_at DESC,id DESC
            LIMIT ? OFFSET ?""",
         (int(call.from_user.id),TOOLS_HISTORY_PAGE_SIZE,offset)
     ).fetchall()
@@ -12406,15 +12830,18 @@ async def render_tools_history(call: CallbackQuery, page: int=1):
         lines.append("Belum ada aktivitas.")
     else:
         action_map={
-            "send_verification_link":"Kirim Link Verifikasi",
-            "verify_account":"Verifikasi Akun",
+            "send_verification_link":"Send Magic Link",
+            "verify_account":"Verify Account",
+            "apply_premium":"Apply Premium",
+            "provision_1_year":"Provision 1 Tahun",
         }
         for row in rows:
             status=str(row["status"] or "")
-            icon="✅" if status=="success" else ("⏳" if status=="pending" else "❌")
+            icon="✅" if status=="success" else ("⏳" if status=="pending" else ("❔" if status=="unknown" else "❌"))
             action=action_map.get(str(row["action"] or ""),str(row["action"] or "-"))
+            record_id=("P" if row["record_kind"]=="provision" else "")+str(row["id"])
             lines.append(
-                f"{icon} <b>#{row['id']}</b> • {html.escape(action)}\n"
+                f"{icon} <b>#{record_id}</b> • {html.escape(action)}\n"
                 f"📧 {html.escape(str(row['target_email'] or '-'))}\n"
                 f"🌐 HTTP: {int(row['http_status'] or 0) or '-'}\n"
                 f"🕒 {html.escape(format_wib_datetime(row['created_at'],compact=True))}"
@@ -12439,6 +12866,8 @@ def tools_diagnostics_text(owner_id: int) -> str:
         missing.append("URL kirim link belum tersedia")
     if not TOOLS_PROVIDER_VERIFY_URL:
         missing.append("URL verifikasi belum tersedia")
+    if not TOOLS_PROVIDER_APPLY_URL:
+        missing.append("URL Apply Premium belum tersedia")
 
     stats=tools_stats_snapshot(owner_id)
     last=tools_last_activity(owner_id)
@@ -12479,23 +12908,37 @@ def valid_tools_email(value: str) -> bool:
 
 
 def tool_response_preview(data) -> str:
-    """Redact likely secrets/tokens before showing or persisting provider output."""
+    """Redact credentials structurally, including nested tokens and magic links."""
+    secrets=[]; seen=set()
+    def redact(value,depth=0):
+        if depth>12:return "<truncated>"
+        if isinstance(value,(dict,list)):
+            if id(value) in seen:return "<cycle>"
+            seen.add(id(value))
+        if isinstance(value,dict):
+            out={}
+            for key,item in value.items():
+                label=re.sub(r"[^a-z]","",str(key).lower())
+                if any(word in label for word in ("token","apikey","secret","password","authorization",
+                                                   "rawlink","magiclink","verificationlink","oobcode")):
+                    if isinstance(item,str) and len(item)>=6:secrets.append(item)
+                    out[str(key)]="***"
+                else:out[str(key)]=redact(item,depth+1)
+            return out
+        if isinstance(value,list):return [redact(item,depth+1) for item in value]
+        if isinstance(value,str):
+            value=re.sub(r"(?i)(?:id[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|"
+                         r"api[_-]?key|x-api-key|secret|password|rawlink|oobcode)[\"']?\s*[:=]\s*[\"']?[^,}\s\"']+",
+                         "credential=***",value)
+        return value
     try:
-        if isinstance(data,(dict,list)):
-            raw=json.dumps(data,ensure_ascii=False,separators=(",",":"))
-        else:
-            raw=str(data)
-    except Exception:
-        raw="<unreadable>"
-
-    patterns=[
-        r'(?i)(api[_-]?key|x-api-key|secret|authorization|bearer)["\']?\s*[:=]\s*["\']?[^,}\s"\']+',
-        r'(?i)(idtoken|access[_-]?token|refresh[_-]?token|session[_-]?token)["\']?\s*[:=]\s*["\']?[^,}\s"\']+',
-    ]
-    for pattern in patterns:
-        raw=re.sub(pattern,r'\1=***',raw)
-
-    raw=raw.replace("<","&lt;").replace(">","&gt;")
+        clean=redact(data)
+        raw=json.dumps(clean,ensure_ascii=False,separators=(",",":")) if isinstance(clean,(dict,list)) else str(clean)
+    except Exception:raw="<unreadable>"
+    if TOOLS_PROVIDER_API_KEY:secrets.append(TOOLS_PROVIDER_API_KEY)
+    for secret in secrets:raw=raw.replace(secret,"***")
+    raw=re.sub(r"(?i)Bearer\s+[A-Za-z0-9._~+/-]+=*","Bearer ***",raw)
+    raw=re.sub(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+","***",raw)
     return raw[:TOOLS_PROVIDER_MAX_RESPONSE_CHARS]
 
 
@@ -12521,7 +12964,7 @@ def extract_verify_id_token(result) -> str:
             ])
 
     for value in candidates:
-        if isinstance(value, str) and len(value.strip()) >= 20:
+        if isinstance(value, str) and len(value.strip()) >= 20 and not any(char.isspace() for char in value.strip()) and value.strip() != "idToken_dari_verifyaccount":
             return value.strip()
     return ""
 
@@ -12551,69 +12994,68 @@ def tools_provider_headers(payload_present: bool=False) -> dict:
     return headers
 
 
-async def tools_provider_request(method: str, url: str, *, payload=None):
-    """
-    Generic authorized-provider request helper.
-    Keeps provider failures isolated from the main shop flow.
-    """
-    if not TOOLS_PROVIDER_ENABLED:
-        return False,0,{"error":"provider_disabled"}
-    if not url:
-        return False,0,{"error":"endpoint_not_configured"}
-    if not str(url).startswith(("https://","http://")):
-        return False,0,{"error":"invalid_provider_url"}
-
+async def tools_provider_request(method: str, url: str, *, payload=None,
+                                 read_only=False, owner_id=0, max_retries=None):
+    if not TOOLS_PROVIDER_ENABLED:return False,0,{"error":"provider_disabled"}
+    if not TOOLS_PROVIDER_API_KEY:return False,0,{"error":"api_key_missing"}
+    if not url:return False,0,{"error":"endpoint_not_configured"}
+    try:
+        parsed=urlparse(str(url))
+        if parsed.scheme not in {"https","http"} or not parsed.hostname or parsed.username or parsed.password:
+            return False,0,{"error":"invalid_provider_url"}
+    except ValueError:return False,0,{"error":"invalid_provider_url"}
+    method=method.upper(); safe_read=method in {"GET","HEAD"} or read_only
+    if read_only and not tools_apply_status_url_allowed(url):
+        return False,0,{"error":"unsafe_status_url"}
+    retries=TOOLS_PROVIDER_MAX_RETRIES if max_retries is None else max(0,int(max_retries))
+    attempts=1+retries if safe_read else 1
     timeout=aiohttp.ClientTimeout(total=float(TOOLS_PROVIDER_TIMEOUT_SECONDS))
     headers=tools_provider_headers(payload is not None)
-    attempts=1+int(TOOLS_PROVIDER_MAX_RETRIES)
-    last=(False,0,{"error":"unknown"})
-
-    for attempt in range(1,attempts+1):
+    owner_id=int(owner_id or ADMIN_ID)
+    last=(False,0,{"error":"not_started"})
+    for attempt in range(attempts):
+        request_id=_reserve_tool_provider_request(owner_id,method)
+        if not request_id:
+            return False,429,{"error":"local_quota_exhausted","_local_quota":True}
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Retain the managed environment/Railway proxy and CA configuration.
+            async with aiohttp.ClientSession(timeout=timeout,trust_env=True) as session:
                 async with session.request(
-                    method.upper(),
-                    url,
-                    headers=headers,
-                    json=payload if payload is not None else None,
+                    method,url,headers=headers,json=payload if payload is not None else None,
                     allow_redirects=False,
                 ) as response:
                     status=int(response.status)
-                    try:
-                        data=await response.json(content_type=None)
-                    except Exception:
-                        data={"text":(await response.text())[:TOOLS_PROVIDER_MAX_RESPONSE_CHARS]}
-
+                    try:data=await response.json(content_type=None)
+                    except (ValueError,aiohttp.ContentTypeError):
+                        data={"error":"invalid_json_response","_outcome_unknown":not safe_read}
+                    if not isinstance(data,(dict,list)):
+                        data={"error":"invalid_response","_outcome_unknown":not safe_read}
                     if isinstance(data,dict):
                         retry_after=response.headers.get("Retry-After")
-                        if retry_after:
-                            data["_retry_after"]=retry_after
-
-                    last=(200 <= status < 300,status,data)
-
-                    # Do not retry client/auth errors.
-                    if status < 500:
-                        return last
-
+                        if retry_after:data["_retry_after"]=retry_after
+                        if not safe_read and (status>=500 or 300<=status<400):data["_outcome_unknown"]=True
+                    state=provider_response_state(data,http_status=status)
+                    last=(200<=status<300 and state not in {"failed","unknown"},status,data)
+        except aiohttp.ClientConnectorError:
+            last=(False,0,{"error":"connect_error","_outcome_unknown":False})
+        except aiohttp.ConnectionTimeoutError:
+            last=(False,0,{"error":"connect_timeout","_outcome_unknown":False})
         except asyncio.TimeoutError:
-            last=(False,0,{"error":"timeout"})
+            last=(False,0,{"error":"timeout","_outcome_unknown":not safe_read})
         except Exception as exc:
-            logging.warning(
-                "Owner tools provider request failed (%s/%s): %s",
-                attempt,attempts,type(exc).__name__
-            )
-            last=(
-                False,
-                0,
-                {
-                    "error":type(exc).__name__,
-                    "detail":tool_response_preview(str(exc))[:300],
-                }
-            )
-
-        if attempt < attempts:
-            await asyncio.sleep(min(1.0*attempt,2.0))
-
+            logging.warning("Provider request failed: %s",type(exc).__name__)
+            last=(False,0,{"error":type(exc).__name__,"_outcome_unknown":not safe_read})
+        ok,status,data=last
+        state=provider_response_state(data,http_status=status)
+        if isinstance(data,dict) and data.get("_outcome_unknown"):state="unknown"
+        _finish_tool_provider_request(request_id,state,status)
+        if ok or status in {400,401,403,404,429} or (status and status<500):return last
+        if attempt+1<attempts:
+            delay=TOOLS_PROVIDER_POLL_INTERVAL_SECONDS
+            if isinstance(data,dict):
+                try:delay=max(delay,int(data.get("_retry_after") or 0))
+                except (TypeError,ValueError):pass
+            await asyncio.sleep(min(30,max(1,delay)))
     return last
 
 
@@ -12647,6 +13089,7 @@ def create_tool_log(owner_id: int,email: str,plan: str="1_year") -> int:
             (int(owner_id),"alight_motion",email.lower(),plan,now,now)
         )
         log_id=int(cur.lastrowid)
+        conn.execute("UPDATE tool_provision_logs SET request_metered=1 WHERE id=?",(log_id,))
         conn.commit()
         return log_id
     except Exception:
@@ -12704,7 +13147,7 @@ async def owner_tools_home(call: CallbackQuery,state: FSMContext):
 @router.callback_query(F.data == "tools:alight")
 async def owner_tools_alight(call: CallbackQuery,state: FSMContext):
     if not is_owner(call.from_user.id): return await deny_owner_callback(call)
-    await state.clear()
+    await state.set_state(None)
     await safe_edit_or_answer(
         call,
         "🎬 <b>ALIGHT MOTION TOOLS</b>\n\n"
@@ -12776,82 +13219,48 @@ async def owner_tools_magiclink_email_input(message: Message,state: FSMContext):
 
 @router.callback_query(F.data == "tools:magiclink:confirm")
 async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await deny_owner_callback(call)
-
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
     data=await state.get_data()
     email=str(data.get("tools_magic_email") or "").strip().lower()
-    if tools_session_expired(data):
-        await state.clear()
-        return await call.answer("Session tools kedaluwarsa. Ulangi dari /tools.",show_alert=True)
-    if not valid_tools_email(email):
-        await state.clear()
-        return await call.answer("Session email tidak valid.",show_alert=True)
-
-    locked,locked_until=acquire_tool_email_lock(
-        call.from_user.id,email,"send_verification_link"
-    )
-    if not locked:
-        return await call.answer(
-            "Email ini sedang diproses. Tunggu beberapa menit lalu coba lagi.",
-            show_alert=True
+    if tools_session_expired(data):return await call.answer("Session tools kedaluwarsa. Kirim Link kembali.",show_alert=True)
+    if not valid_tools_email(email):return await call.answer("Session email tidak valid.",show_alert=True)
+    if data.get("tools_magiclink_sent"):
+        return await safe_callback_notice(call,"Link sudah dikirim. Lanjutkan Verifikasi.")
+    quota_ok,quota=tools_quota_can_process(call.from_user.id,requests_needed=1)
+    if not quota_ok:return await call.answer(f"Kuota habis. Reset {quota['reset_at']}.",show_alert=True)
+    locked,_=acquire_tool_email_lock(call.from_user.id,email,"send_verification_link")
+    if not locked:return await call.answer("Email ini sedang diproses.",show_alert=True)
+    await safe_callback_notice(call,"Mengirim link...")
+    activity_id=0
+    try:
+        activity_id=create_tool_activity(call.from_user.id,"send_verification_link",email)
+        await state.update_data(tools_magiclink_sent=True)
+        await safe_edit_or_answer(call,"⏳ <b>MENGIRIM LINK VERIFIKASI...</b>\n\n"+html.escape(email),parse_mode="HTML")
+        ok,http_status,result=await tools_provider_request(
+            "POST",TOOLS_PROVIDER_MAGICLINK_URL,payload={"email":email},owner_id=call.from_user.id,
         )
-
-    activity_id=create_tool_activity(
-        call.from_user.id,
-        "send_verification_link",
-        email,
-        "pending"
+        status=provider_response_state(result,http_status=http_status)
+        if not ok and isinstance(result,dict) and result.get("_outcome_unknown"):status="unknown"
+        update_tool_activity(activity_id,status=status,http_status=http_status,detail=tool_response_preview(result))
+        await state.update_data(tools_verify_email=email,tools_magiclink_status=status)
+        if status=="failed":await state.update_data(tools_magiclink_sent=False)
+    except BaseException:
+        if activity_id:update_tool_activity(activity_id,status="unknown",detail="Request terputus; periksa inbox sebelum mengulang.")
+        raise
+    finally:release_tool_email_lock(email)
+    text=(
+        "✅ <b>LINK VERIFIKASI REQUEST BERHASIL</b>" if status=="success" else
+        "⏳ <b>LINK VERIFIKASI BELUM TERKONFIRMASI</b>" if status in {"pending","unknown"} else
+        "❌ <b>LINK VERIFIKASI GAGAL</b>"
     )
-
     await safe_edit_or_answer(
-        call,
-        "⏳ <b>MENGIRIM LINK VERIFIKASI...</b>\n\n"
-        f"📧 {html.escape(email)}",
-        parse_mode="HTML"
+        call,text+f"\n\n📧 Email Target: <b>{html.escape(email)}</b>\n🌐 HTTP: <b>{http_status or '-'}</b>\n\n"
+        +("Buka inbox, lalu pilih Verifikasi dan kirim link lengkap." if status=="success" else tools_retry_hint(http_status,result)),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
+            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+        ]),parse_mode="HTML",
     )
-
-    ok,http_status,result=await tools_provider_request(
-        "POST",
-        TOOLS_PROVIDER_MAGICLINK_URL,
-        payload={"email":email},
-    )
-    preview=tool_response_preview(result)
-    release_tool_email_lock(email)
-    update_tool_activity(
-        activity_id,
-        status="success" if ok else "failed",
-        http_status=http_status,
-        detail=preview,
-    )
-
-    if ok:
-        await state.update_data(tools_verify_email=email)
-        await safe_edit_or_answer(
-            call,
-            "✅ <b>LINK VERIFIKASI REQUEST BERHASIL</b>\n\n"
-            f"📧 Email Target: <b>{html.escape(email)}</b>\n"
-            f"🌐 HTTP: <b>{http_status}</b>\n\n"
-            "Setelah link masuk ke email, pilih tombol Verifikasi Akun lalu kirim URL verifikasi lengkap.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
-                [InlineKeyboardButton(text="⬅️ Alight Tools",callback_data="tools:alight")],
-            ]),
-            parse_mode="HTML"
-        )
-        return await safe_callback_notice(call,"Link Verifikasi dikirim.")
-
-    await safe_edit_or_answer(
-        call,
-        "❌ <b>LINK VERIFIKASI GAGAL</b>\n\n"
-        f"📧 Email Target: <b>{html.escape(email)}</b>\n"
-        f"🌐 HTTP: <b>{http_status or '-'}</b>\n"
-        f"Detail: <code>{html.escape(preview[:500])}</code>\n"
-        f"💡 {html.escape(tools_retry_hint(http_status,result))}",
-        reply_markup=alight_tools_menu(),
-        parse_mode="HTML"
-    )
-    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data == "tools:verify")
@@ -12887,7 +13296,8 @@ async def owner_tools_verify_begin(call: CallbackQuery,state: FSMContext):
             parse_mode="HTML"
         )
 
-    await state.update_data(tools_verify_email=email)
+    await state.update_data(tools_verify_email=email,tools_verify_id_token=None,
+                            tools_verify_id_token_at="",tools_raw_link=None)
     await state.update_data(tools_session_started_at=datetime.now().isoformat(timespec="seconds"))
     await state.set_state(OwnerState.tools_verify_link)
     await safe_edit_or_answer(
@@ -12937,166 +13347,69 @@ async def owner_tools_verify_link_input(message: Message,state: FSMContext):
 
 @router.callback_query(F.data == "tools:verify:confirm")
 async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await deny_owner_callback(call)
-
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
     data=await state.get_data()
     email=str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "").strip().lower()
     raw_link=str(data.get("tools_raw_link") or "").strip()
-
-    if tools_session_expired(data):
-        await state.clear()
-        return await call.answer("Session tools kedaluwarsa. Ulangi dari /tools.",show_alert=True)
-
-    precheck_ok,precheck_reason=tools_provider_precheck(call.from_user.id,email)
-    if not precheck_ok:
-        return await call.answer(f"❌ {precheck_reason}",show_alert=True)
-
+    if tools_session_expired(data):return await call.answer("Session kedaluwarsa. Kirim link verifikasi baru.",show_alert=True)
     if not valid_tools_email(email) or not raw_link.startswith(("https://","http://")):
-        await state.clear()
-        return await call.answer("Session verifikasi tidak valid.",show_alert=True)
-
-    locked,locked_until=acquire_tool_email_lock(
-        call.from_user.id,email,"verify_account"
-    )
-    if not locked:
-        return await call.answer(
-            "Email ini sedang diproses. Tunggu beberapa menit lalu coba lagi.",
-            show_alert=True
-        )
-
-    correlation_id=create_tool_provider_flow(call.from_user.id,email,"verify_account")
-    await state.update_data(tools_correlation_id=correlation_id)
-
-    activity_id=create_tool_activity(
-        call.from_user.id,
-        "verify_account",
-        email,
-        "pending"
-    )
-
-    await safe_edit_or_answer(
-        call,
-        "⏳ <b>MEMVERIFIKASI AKUN...</b>\n\n"
-        f"📧 {html.escape(email)}",
-        parse_mode="HTML"
-    )
-
-    ok,http_status,result=await tools_provider_request_resilient(
-        "POST",
-        TOOLS_PROVIDER_VERIFY_URL,
-        payload={
-            "email":email,
-            "rawLink":raw_link,
-        },
-    )
-    verify_id_token=extract_verify_id_token(result) if ok else ""
-    if verify_id_token:
+        return await call.answer("Link sudah dipakai/session tidak lengkap. Periksa Hasil Provider.",show_alert=True)
+    precheck_ok,reason=tools_provider_precheck(call.from_user.id,email)
+    if not precheck_ok:return await call.answer(reason[:190],show_alert=True)
+    locked,_=acquire_tool_email_lock(call.from_user.id,email,"verify_account")
+    if not locked:return await call.answer("Email ini sedang diproses.",show_alert=True)
+    await safe_callback_notice(call,"Memverifikasi akun...")
+    activity_id=0; correlation_id=""
+    try:
+        correlation_id=create_tool_provider_flow(call.from_user.id,email,"verify_account")
+        activity_id=create_tool_activity(call.from_user.id,"verify_account",email)
         await state.update_data(
-            tools_verify_id_token=verify_id_token,
-            tools_verify_id_token_at=datetime.now().isoformat(timespec="seconds"),
+            tools_correlation_id=correlation_id,tools_verify_id_token=None,
+            tools_provider_apply_premium_result={},tools_apply_requested=False,
+            tools_apply_http_status=0,tools_apply_at="",tools_apply_preview="",
         )
-
-    provider_license_status=parse_provider_license_status(result)
-    provider_ref=provider_result_reference(result)
-    update_tool_provider_flow(
-        correlation_id,
-        stage="verify_account",
-        status="success" if ok else "failed",
-        provider_ref=provider_ref,
-        http_status=http_status
-    )
-    preview=tool_response_preview(result)
-    final_at=datetime.now().isoformat(timespec="seconds")
-    await state.update_data(
-        tools_target_email=email,
-        tools_final_status="success" if ok else "failed",
-        tools_final_http_status=int(http_status or 0),
-        tools_final_at=final_at,
-        tools_final_preview=preview[:900],
-        tools_provider_license_status=provider_license_status,
-        tools_provider_reference=provider_ref,
-        tools_correlation_id=correlation_id,
-    )
-    release_tool_email_lock(email)
-    update_tool_activity(
-        activity_id,
-        status="success" if ok else "failed",
-        http_status=http_status,
-        detail=preview,
-    )
-
-    # Never retain raw link after the request.
-    # Preserve safe final metadata and temporary idToken in the owner session.
-    await state.update_data(tools_raw_link=None)
-    await state.set_state(None)
-
-    if ok:
-        # Auto-continue: poll provider status when configured; no extra confirmation button.
-        polled=await poll_provider_status(email,correlation_id)
-        if polled:
-            p_ok,p_http,p_result=polled
-            provider_license_status=parse_provider_license_status(p_result)
-            provider_ref=provider_result_reference(p_result) or provider_ref
-            preview=tool_response_preview(p_result)
-            final_at=datetime.now().isoformat(timespec="seconds")
-            await state.update_data(
-                tools_provider_license_status=provider_license_status,
-                tools_provider_reference=provider_ref,
-                tools_final_http_status=int(p_http or http_status or 0),
-                tools_final_at=final_at,
-                tools_final_preview=preview[:900],
-            )
-            update_tool_provider_flow(
-                correlation_id,
-                stage="provider_final",
-                status="success" if p_ok else "failed",
-                provider_ref=provider_ref,
-                http_status=p_http
-            )
-
-        safe_ref=provider_ref
-        await safe_edit_or_answer(
-            call,
-            "✅ <b>HASIL VERIFIKASI PROVIDER</b>\n\n"
-            "Verifikasi Provider: <b>✅ BERHASIL</b>\n"
-            f"📧 Email Target: <b>{html.escape(email)}</b>\n"
-            f"🔐 idToken: <b>{masked_id_token(verify_id_token)}</b>\n"
-            f"🌐 HTTP Provider: <b>{http_status}</b>\n"
-            f"🆔 Flow: <code>{html.escape(correlation_id)}</code>\n"
-            + (
-                "⭐ Lisensi Pro Provider: <b>✅ BERHASIL</b>\n"
-                if provider_license_status.get("known") and provider_license_status.get("active")
-                else (
-                    "⭐ Lisensi Pro Provider: <b>❌ GAGAL</b>\n"
-                    if provider_license_status.get("known")
-                    else "⭐ Lisensi Pro Provider: <b>➖ BELUM ADA HASIL</b>\n"
-                )
-            )
-            + f"🕒 Waktu: <b>{html.escape(format_wib_datetime(final_at,compact=True))}</b>\n"
-            + (f"🔎 Ref: <code>{html.escape(safe_ref)}</code>\n" if safe_ref else "")
-            + "\nHasil final mengikuti response provider.\n"
-            + "Buka 📋 Hasil Final untuk ringkasan provider.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
-                [InlineKeyboardButton(text="⭐ Lisensi Provider",callback_data="tools:pro_license")],
-                [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
-            ]),
-            parse_mode="HTML"
+        await safe_edit_or_answer(call,"⏳ <b>MEMVERIFIKASI AKUN...</b>\n\n"+html.escape(email),parse_mode="HTML")
+        ok,http_status,result=await tools_provider_request_resilient(
+            "POST",TOOLS_PROVIDER_VERIFY_URL,payload={"email":email,"rawLink":raw_link},owner_id=call.from_user.id,
         )
-        return await safe_callback_notice(call,"Verifikasi berhasil.")
-
+        status=provider_response_state(result,http_status=http_status)
+        token=extract_verify_id_token(result) if ok and status=="success" else ""
+        returned_email=find_provider_value(result,("email",))
+        if token and returned_email and str(returned_email).strip().lower()!=email:
+            ok=False;status="failed";token="";result={"error":"verified_email_mismatch"}
+        preview=tool_response_preview(result)
+        parsed=parse_provider_apply_premium_result(result,target_email=email) if ok and status=="success" else parse_provider_apply_premium_result({})
+        await state.update_data(
+            tools_target_email=email,tools_verify_email=email,
+            tools_verify_id_token=token or None,
+            tools_verify_id_token_at=datetime.now().isoformat(timespec="seconds") if token else "",
+            tools_final_status=status,tools_final_http_status=int(http_status or 0),
+            tools_final_at=datetime.now().isoformat(timespec="seconds"),tools_final_preview=preview[:900],
+            tools_provider_license_status=parse_provider_license_status(result),
+            tools_provider_apply_premium_result=parsed,
+            tools_provider_reference=provider_result_reference(result),
+        )
+        update_tool_provider_flow(correlation_id,stage="verify_account",status=status,
+                                  provider_ref=provider_result_reference(result),http_status=http_status)
+        update_tool_activity(activity_id,status=status,http_status=http_status,detail=preview)
+    except BaseException:
+        if activity_id:update_tool_activity(activity_id,status="unknown",detail="Verifikasi terputus. Periksa provider sebelum mengulang.")
+        if correlation_id:update_tool_provider_flow(correlation_id,status="unknown")
+        raise
+    finally:
+        release_tool_email_lock(email)
+        await state.update_data(tools_raw_link=None)
+        await state.set_state(None)
+    if status=="success":
+        if token or parsed.get("known"):
+            await run_tools_apply_once(call,state)
+        elif TOOLS_PROVIDER_STATUS_URL:
+            # Preserve optional legacy status lookup; it cannot grant premium.
+            await poll_provider_status(email,correlation_id)
     await safe_edit_or_answer(
-        call,
-        "❌ <b>VERIFIKASI GAGAL</b>\n\n"
-        f"📧 Email Target: <b>{html.escape(email)}</b>\n"
-        f"🌐 HTTP: <b>{http_status or '-'}</b>\n"
-        f"Detail: <code>{html.escape(preview[:500])}</code>\n"
-        f"💡 {html.escape(tools_retry_hint(http_status,result))}",
-        reply_markup=alight_tools_menu(),
-        parse_mode="HTML"
+        call,tools_final_result_text(await state.get_data()),
+        reply_markup=tools_result_keyboard(),parse_mode="HTML",
     )
-    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data == "tools:alight:1y")
@@ -13140,8 +13453,10 @@ async def owner_tools_alight_email_input(message: Message,state: FSMContext):
 @router.callback_query(F.data == "tools:alight:confirm")
 async def owner_tools_alight_confirm(call: CallbackQuery,state: FSMContext):
     if not is_owner(call.from_user.id): return await deny_owner_callback(call)
-    if not tools_provider_ready():
-        return await call.answer("Provider belum aktif/lengkap.",show_alert=True)
+    if TOOLS_PROVIDER_APPLY_URL and TOOLS_PROVIDER_PROVISION_URL==TOOLS_PROVIDER_APPLY_URL:
+        return await owner_tools_pro_license(call,state)
+    if not (TOOLS_PROVIDER_ENABLED and TOOLS_PROVIDER_API_KEY and TOOLS_PROVIDER_PROVISION_URL):
+        return await call.answer("Endpoint Provision/API key belum dikonfigurasi.",show_alert=True)
     data=await state.get_data()
     email=str(data.get("tools_target_email") or "").strip().lower()
     plan=str(data.get("tools_plan") or "1_year")
@@ -13192,7 +13507,7 @@ async def owner_tools_alight_confirm(call: CallbackQuery,state: FSMContext):
         "request_id":f"MBY-TOOLS-{log_id}",
     }
     ok,http_status,result=await tools_provider_request(
-        "POST",TOOLS_PROVIDER_PROVISION_URL,payload=payload
+        "POST",TOOLS_PROVIDER_PROVISION_URL,payload=payload,owner_id=call.from_user.id
     )
     preview=tool_response_preview(result)
     reference=""
@@ -13271,6 +13586,8 @@ async def owner_tools_status(call: CallbackQuery):
         missing.append("TOOLS_PROVIDER_MAGICLINK_URL (URL kirim link verifikasi)")
     if not TOOLS_PROVIDER_VERIFY_URL:
         missing.append("TOOLS_PROVIDER_VERIFY_URL (URL verifikasi akun)")
+    if not TOOLS_PROVIDER_APPLY_URL:
+        missing.append("TOOLS_PROVIDER_APPLY_URL (URL apply premium)")
 
     if missing:
         text=(
@@ -13288,6 +13605,7 @@ async def owner_tools_status(call: CallbackQuery):
             "API key: <b>✅ SET</b>\n"
             "Link Verifikasi endpoint: <b>✅ SET</b>\n"
             "Verify endpoint: <b>✅ SET</b>\n"
+            "Apply endpoint: <b>✅ SET</b>\n"
             f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b>\n"
             f"Retry: <b>{TOOLS_PROVIDER_MAX_RETRIES}</b>"
         )
@@ -13311,6 +13629,8 @@ async def owner_tools_provider_info(call: CallbackQuery):
         f"Status endpoint: <b>{'SET' if TOOLS_PROVIDER_STATUS_URL else 'BELUM'}</b>\n"
         f"Link Verifikasi endpoint: <b>{'SET' if TOOLS_PROVIDER_MAGICLINK_URL else 'BELUM'}</b>\n"
         f"Verify endpoint: <b>{'SET' if TOOLS_PROVIDER_VERIFY_URL else 'BELUM'}</b>\n"
+        f"Apply Premium endpoint: <b>{'SET' if TOOLS_PROVIDER_APPLY_URL else 'BELUM'}</b>\n"
+        f"Apply Status endpoint: <b>{'SET' if tools_apply_status_url_allowed(TOOLS_PROVIDER_APPLY_STATUS_URL) else 'OPSIONAL'}</b>\n"
         f"Provision endpoint: <b>{'SET' if TOOLS_PROVIDER_PROVISION_URL else 'BELUM'}</b>\n"
         f"API key: <b>{'SET' if TOOLS_PROVIDER_API_KEY else 'BELUM'}</b>\n"
         f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b>\n"
@@ -13327,6 +13647,14 @@ async def owner_tools_history(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
     await render_tools_filtered_history(call,1,"all")
+
+
+@router.callback_query(F.data.startswith("toolshistory:"))
+async def owner_tools_history_page(call: CallbackQuery):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    try:page=max(1,int(call.data.split(":",1)[1]))
+    except (TypeError,ValueError,IndexError):page=1
+    await render_tools_history(call,page)
 
 
 @router.callback_query(F.data.startswith("toolsfilter:"))
@@ -13367,13 +13695,13 @@ async def owner_tools_history_search_input(message: Message,state: FSMContext):
     query=(message.text or "").strip().lower()
     if len(query)<2 or len(query)>120:
         return await message.answer("❌ Kata pencarian harus 2–120 karakter.")
-    await state.clear()
+    await state.set_state(None)
 
     conn=db()
     rows=conn.execute(
-        """SELECT * FROM tool_activity_logs
+        f"""SELECT * FROM {TOOLS_HISTORY_RECORDS_SQL}
            WHERE owner_id=? AND LOWER(target_email) LIKE ?
-           ORDER BY id DESC LIMIT 10""",
+           ORDER BY created_at DESC,id DESC LIMIT 10""",
         (int(message.from_user.id),f"%{query}%")
     ).fetchall()
     conn.close()
@@ -13388,7 +13716,7 @@ async def owner_tools_history_search_input(message: Message,state: FSMContext):
     else:
         for row in rows:
             status=str(row["status"] or "")
-            icon="✅" if status=="success" else ("⏳" if status=="pending" else "❌")
+            icon="✅" if status=="success" else ("⏳" if status=="pending" else ("❔" if status=="unknown" else "❌"))
             lines.append(
                 f"{icon} <b>#{row['id']}</b> • {html.escape(str(row['action']))}\n"
                 f"📧 {html.escape(str(row['target_email'] or '-'))}\n"
@@ -13413,7 +13741,7 @@ async def owner_tools_reset_session(call: CallbackQuery,state: FSMContext):
     await safe_edit_or_answer(
         call,
         "🧹 <b>SESSION TOOLS DIRESET</b>\n\n"
-        "Email Target, hasil verifikasi, idToken sementara, dan hasil final telah dibersihkan.",
+        "Email Target, hasil verifikasi, idToken sementara, hasil Apply Premium provider, dan hasil provider telah dibersihkan.",
         reply_markup=owner_tools_menu(),
         parse_mode="HTML"
     )
@@ -13452,38 +13780,19 @@ async def owner_tools_more(call: CallbackQuery):
 
 @router.callback_query(F.data == "tools:pro_license")
 async def owner_tools_pro_license(call: CallbackQuery,state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await deny_owner_callback(call)
-
-    data=await state.get_data()
-    await safe_edit_or_answer(
-        call,
-        tools_pro_license_text(data),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Refresh Status",callback_data="tools:pro_license")],
-            [InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
-            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
-        ]),
-        parse_mode="HTML"
-    )
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
     await safe_callback_notice(call)
+    await state.set_state(None)
+    await run_tools_apply_once(call,state)
+    await safe_edit_or_answer(call,tools_pro_license_text(await state.get_data()),
+                              reply_markup=tools_result_keyboard(),parse_mode="HTML")
 
 
 @router.callback_query(F.data == "tools:final_result")
 async def owner_tools_final_result(call: CallbackQuery,state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await deny_owner_callback(call)
-    data=await state.get_data()
-    await safe_edit_or_answer(
-        call,
-        tools_final_result_text(data),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Refresh",callback_data="tools:final_result")],
-            [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
-            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
-        ]),
-        parse_mode="HTML"
-    )
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    await safe_edit_or_answer(call,tools_final_result_text(await state.get_data()),
+                              reply_markup=tools_result_keyboard(),parse_mode="HTML")
     await safe_callback_notice(call)
 
 
@@ -13561,65 +13870,57 @@ async def owner_tools_diagnostics(call: CallbackQuery):
 
 @router.callback_query(F.data == "tools:resume")
 async def owner_tools_resume(call: CallbackQuery,state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await deny_owner_callback(call)
-
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    data=await state.get_data()
     last=tools_last_activity(call.from_user.id)
-    if not last:
-        return await call.answer("Belum ada aktivitas yang bisa dilanjutkan.",show_alert=True)
-
-    action=str(last["action"] or "")
+    if not last:return await call.answer("Belum ada aktivitas yang bisa dilanjutkan.",show_alert=True)
     email=str(last["target_email"] or "").strip().lower()
-    status=str(last["status"] or "")
-
-    if action=="send_verification_link":
-        await state.clear()
-        if valid_tools_email(email):
-            await state.update_data(tools_magic_email=email,tools_verify_email=email)
-        await safe_edit_or_answer(
-            call,
-            "♻️ <b>LANJUTKAN PROSES TERAKHIR</b>\n\n"
-            f"📧 Email Target: <b>{html.escape(email or '-')}</b>\n"
-            f"Status terakhir: <b>{html.escape(status.upper())}</b>\n\n"
-            "Jika link sudah masuk ke email, lanjutkan ke Verifikasi Akun.\n"
-            "Jika belum, kirim ulang Link Verifikasi.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
-                [InlineKeyboardButton(text="📧 Kirim Ulang Link",callback_data="tools:magiclink")],
-                [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
-            ]),
-            parse_mode="HTML"
+    action=str(last["action"] or "")
+    await state.set_state(None)
+    if data.get("tools_target_email")==email and (data.get("tools_final_status")=="success" or data.get("tools_apply_requested")):
+        return await owner_tools_final_result(call,state)
+    if action=="apply_premium":
+        conn=db()
+        try:
+            flow=conn.execute("SELECT * FROM tool_provider_flows WHERE owner_id=? AND apply_activity_id=?",
+                              (int(call.from_user.id),int(last["id"]))).fetchone()
+        finally:conn.close()
+        status=str(last["status"] or "unknown")
+        await state.update_data(
+            tools_target_email=email,tools_verify_email=email,tools_apply_requested=True,
+            tools_final_status="success",tools_final_http_status=0,
+            tools_apply_http_status=int(last["http_status"] or 0),tools_apply_at=str(last["updated_at"] or ""),
+            tools_correlation_id=str(flow["correlation_id"] if flow else ""),
+            tools_provider_apply_premium_result={"known":status in {"success","failed"},"success":status=="success",
+                                                 "status":status,"message":"Hasil dipulihkan dari Riwayat Tools.",
+                                                 "reference":str(flow["provider_ref"] if flow else "")},
         )
-        return await safe_callback_notice(call)
-
-    if action=="verify_account":
-        await state.clear()
-        if valid_tools_email(email):
-            await state.update_data(tools_verify_email=email)
-        await safe_edit_or_answer(
-            call,
-            "♻️ <b>LANJUTKAN VERIFIKASI</b>\n\n"
-            f"📧 Email Target: <b>{html.escape(email or '-')}</b>\n"
-            f"Status terakhir: <b>{html.escape(status.upper())}</b>\n\n"
-            "Link verifikasi tidak disimpan permanen, jadi kirim kembali link dari inbox untuk mencoba lagi.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Masukkan Link Verifikasi",callback_data="tools:verify")],
-                [InlineKeyboardButton(text="📧 Kirim Ulang Link",callback_data="tools:magiclink")],
-                [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
-            ]),
-            parse_mode="HTML"
-        )
-        return await safe_callback_notice(call)
-
-    await call.answer("Aktivitas terakhir tidak memiliki recovery otomatis.",show_alert=True)
+        return await owner_tools_final_result(call,state)
+    if valid_tools_email(email):
+        await state.update_data(tools_target_email=email,tools_magic_email=email,tools_verify_email=email,
+                                tools_session_started_at=datetime.now().isoformat(timespec="seconds"))
+    await safe_edit_or_answer(
+        call,"♻️ <b>LANJUTKAN PROSES TERAKHIR</b>\n\n"
+        f"📧 Email Target: <b>{html.escape(email or '-')}</b>\n"
+        f"Status terakhir: <b>{html.escape(str(last['status'] or 'unknown'))}</b>\n\n"
+        "Gunakan link dari inbox untuk melanjutkan verifikasi. Link dan idToken perlu diperoleh kembali setelah restart.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
+            [InlineKeyboardButton(text="📧 Kirim Link",callback_data="tools:magiclink")],
+            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+        ]),parse_mode="HTML",
+    )
+    await safe_callback_notice(call)
 
 
 @router.message(Command("owner"))
 async def owner(message: Message, state: FSMContext):
-    set_setting("qris_upload_pending","0")
-    await state.clear()
     if not is_owner(message.from_user.id):
         return await message.answer(owner_access_denied_text(), parse_mode="HTML")
+
+    set_setting("qris_upload_pending","0")
+    clear_owner_input_session(message.from_user.id)
+    await state.clear()
 
     await message.answer(
         f"🛠️ <b>PANEL OWNER • {STORE_NAME}</b>\n\n"
@@ -14815,10 +15116,13 @@ async def product_detail(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("back_product:"))
 async def back_product(call: CallbackQuery):
-    variant_id = int(call.data.split(":")[1])
+    numbers = callback_positive_numbers(call.data, "back_product")
+    if not numbers:
+        return await call.answer("Variasi tidak valid.", show_alert=True)
+    variant_id = numbers[0]
     conn = db()
-    variant = conn.execute("SELECT * FROM product_variants WHERE id=?", (variant_id,)).fetchone()
-    product = conn.execute("SELECT * FROM products WHERE id=?", (variant["product_id"],)).fetchone() if variant else None
+    variant = conn.execute("SELECT * FROM product_variants WHERE id=? AND active=1", (variant_id,)).fetchone()
+    product = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (variant["product_id"],)).fetchone() if variant else None
     conn.close()
     if not product:
         return await call.answer("Produk tidak ditemukan.", show_alert=True)
@@ -14834,10 +15138,13 @@ async def back_product(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("variant:"))
 async def variant_detail(call: CallbackQuery):
-    variant_id = int(call.data.split(":")[1])
+    numbers = callback_positive_numbers(call.data, "variant")
+    if not numbers:
+        return await call.answer("Variasi tidak valid.", show_alert=True)
+    variant_id = numbers[0]
     conn = db()
-    variant = conn.execute("SELECT * FROM product_variants WHERE id=?", (variant_id,)).fetchone()
-    product = conn.execute("SELECT * FROM products WHERE id=?", (variant["product_id"],)).fetchone() if variant else None
+    variant = conn.execute("SELECT * FROM product_variants WHERE id=? AND active=1", (variant_id,)).fetchone()
+    product = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (variant["product_id"],)).fetchone() if variant else None
     conn.close()
 
     if not variant or not product:
@@ -14854,12 +15161,14 @@ async def variant_detail(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("qty:"))
 async def change_qty(call: CallbackQuery):
-    _, variant_id, qty = call.data.split(":")
-    variant_id, qty = int(variant_id), max(1, int(qty))
+    numbers = callback_positive_numbers(call.data, "qty", 2)
+    if not numbers:
+        return await call.answer("Variasi atau jumlah tidak valid.", show_alert=True)
+    variant_id, qty = numbers
 
     conn = db()
-    variant = conn.execute("SELECT * FROM product_variants WHERE id=?", (variant_id,)).fetchone()
-    product = conn.execute("SELECT * FROM products WHERE id=?", (variant["product_id"],)).fetchone() if variant else None
+    variant = conn.execute("SELECT * FROM product_variants WHERE id=? AND active=1", (variant_id,)).fetchone()
+    product = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (variant["product_id"],)).fetchone() if variant else None
     conn.close()
 
     if not variant or not product:
@@ -14887,14 +15196,17 @@ async def change_qty(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("restock:"))
 async def restock(call: CallbackQuery, bot: Bot):
-    variant_id = int(call.data.split(":")[1])
+    numbers = callback_positive_numbers(call.data, "restock")
+    if not numbers:
+        return await call.answer("Variasi tidak valid.", show_alert=True)
+    variant_id = numbers[0]
 
     conn = db()
     variant = conn.execute(
         """SELECT v.*, p.name AS product_name
            FROM product_variants v
            JOIN products p ON p.id=v.product_id
-           WHERE v.id=?""",
+           WHERE v.id=? AND v.active=1 AND p.active=1""",
         (variant_id,)
     ).fetchone()
 
@@ -14958,8 +15270,10 @@ async def restock(call: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("confirm:"))
 async def confirm_order(call: CallbackQuery, state: FSMContext):
-    _, variant_id, qty = call.data.split(":")
-    variant_id, qty = int(variant_id), max(1, int(qty))
+    numbers = callback_positive_numbers(call.data, "confirm", 2)
+    if not numbers:
+        return await call.answer("Variasi atau jumlah tidak valid.", show_alert=True)
+    variant_id, qty = numbers
 
     conn = db()
     variant = conn.execute(
@@ -20784,6 +21098,7 @@ async def owner_set_price(call: CallbackQuery, state: FSMContext):
         return await deny_owner_callback(call)
 
     try:
+        clear_owner_input_session(call.from_user.id)
         await state.clear()
 
         conn=db()
@@ -20829,6 +21144,60 @@ async def owner_set_price(call: CallbackQuery, state: FSMContext):
 
 
 
+@router.callback_query(F.data.startswith("setpriceprod:"))
+async def owner_set_price_product(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    numbers=callback_positive_numbers(call.data,"setpriceprod")
+    if not numbers:return await call.answer("Pilihan produk tidak valid.",show_alert=True)
+    product_id=numbers[0];conn=db()
+    try:
+        product=conn.execute("SELECT id,name FROM products WHERE id=? AND active=1",(product_id,)).fetchone()
+        variants=conn.execute("SELECT id,name,price FROM product_variants WHERE product_id=? AND active=1 ORDER BY id",(product_id,)).fetchall()
+    finally:conn.close()
+    if not product:return await call.answer("Produk sudah tidak tersedia.",show_alert=True)
+    clear_owner_input_session(call.from_user.id)
+    await state.set_state(None)
+    await state.update_data(set_price_product_id=product_id,set_price_variant_id=0)
+    rows=[[InlineKeyboardButton(text=f"{variant['name']} • {rupiah(variant['price'])}",
+                                callback_data=f"setpricevar:{variant['id']}")] for variant in variants]
+    rows.append([InlineKeyboardButton(text="⬅️ Produk",callback_data="owner:set_price")])
+    await safe_edit_or_answer(
+        call,"💰 <b>ATUR HARGA VARIAN</b>\n\n📦 "+html.escape(product["name"])
+        +("\nPilih variasi:" if variants else "\nBelum ada variasi aktif."),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),parse_mode="HTML",
+    )
+    await safe_callback_notice(call)
+
+
+
+@router.callback_query(F.data.startswith("setpricevar:"))
+async def owner_set_price_variant(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    numbers=callback_positive_numbers(call.data,"setpricevar")
+    if not numbers:return await call.answer("Pilihan variasi tidak valid.",show_alert=True)
+    variant_id=numbers[0];conn=db()
+    try:
+        variant=conn.execute("""SELECT v.id,v.product_id,v.name,v.price,p.name AS product_name
+                                FROM product_variants v JOIN products p ON p.id=v.product_id
+                                WHERE v.id=? AND v.active=1 AND p.active=1""",(variant_id,)).fetchone()
+    finally:conn.close()
+    if not variant:return await call.answer("Variasi sudah tidak tersedia.",show_alert=True)
+    clear_owner_input_session(call.from_user.id)
+    await state.update_data(set_price_product_id=int(variant["product_id"]),set_price_variant_id=variant_id)
+    await state.set_state(OwnerState.set_price)
+    await safe_edit_or_answer(
+        call,"💰 <b>ATUR HARGA VARIAN</b>\n\n"
+        f"📦 {html.escape(variant['product_name'])}\n🧩 {html.escape(variant['name'])}\n"
+        f"Harga saat ini: <b>{rupiah(variant['price'])}</b>\n\nKirim harga baru, contoh <code>Rp2.750</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Variasi",callback_data=f"setpriceprod:{variant['product_id']}")],
+            [InlineKeyboardButton(text="❌ Batal",callback_data="owner:back_products")],
+        ]),parse_mode="HTML",
+    )
+    await safe_callback_notice(call)
+
+
+
 @router.message(OwnerState.set_price)
 async def owner_set_price_input(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
@@ -20852,7 +21221,12 @@ async def owner_set_price_input(message: Message, state: FSMContext):
         )
 
     data=await state.get_data()
-    variant_id=int(data.get("set_price_variant_id") or 0)
+    try:
+        variant_id=int(data.get("set_price_variant_id") or 0)
+        if not 0 < variant_id <= 9223372036854775807:
+            variant_id=0
+    except (TypeError, ValueError, OverflowError):
+        variant_id=0
 
     if not variant_id:
         await state.clear()
@@ -23281,7 +23655,7 @@ async def global_error_handler(event: ErrorEvent):
         event_type="message"
         user_id=int(message.from_user.id or 0)
         msg_text=str(message.text or "")
-        reference=f"message:{msg_text[:80]}" if msg_text else "message"
+        reference=f"message:{tool_response_preview(msg_text)[:80]}" if msg_text else "message"
 
     logging.exception(
         "Unhandled bot error update_id=%s event=%s user=%s callback=%r: %s",
@@ -27621,7 +27995,8 @@ async def stale_callback_recovery(call: CallbackQuery, state: FSMContext):
         )
         return await safe_callback_notice(call)
 
-    await call.answer(
+    await safe_callback_notice(
+        call,
         "Tombol ini sudah kedaluwarsa. Buka menu terbaru.",
         show_alert=True
     )
@@ -27827,7 +28202,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.48"
+EXPECTED_SOURCE_VERSION = "16.53"
 
 
 def source_integrity_self_test():
