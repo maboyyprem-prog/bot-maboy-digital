@@ -93,7 +93,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.10"
+BOT_VERSION = "16.11"
 SCHEMA_VERSION = 169
 
 CHECKOUT_TERMS_SHORT = (
@@ -9100,6 +9100,22 @@ def qty_keyboard(variant_id, qty):
 # =========================
 # RENDER HELPERS
 # =========================
+def compact_variant_price_stock_text(variants) -> str:
+    """Compact one-line variant list: name — price — (stock)."""
+    if not variants:
+        return "<i>Belum ada variasi aktif.</i>"
+
+    lines=[]
+    for variant in variants:
+        stock=max(0,int(available_stock(variant)))
+        lines.append(
+            f"• {html.escape(str(variant['name'] or 'Standard'))}: "
+            f"<b>{rupiah(int(variant['price'] or 0))}</b> - "
+            f"(<b>{stock}</b>)"
+        )
+    return "\n".join(lines)
+
+
 def product_card(product):
     return (
         "┌────────────────────\n"
@@ -10887,23 +10903,9 @@ async def product_detail(call: CallbackQuery):
         f"• <b>Deskripsi:</b> {html.escape(product['description'] or '-')}\n"
         "╰────────────────────╯\n\n"
         "╭────────────────────╮\n"
-        "📦 <b>VARIASI • HARGA • STOK</b>\n"
-    )
-
-    if variants:
-        for index, variant in enumerate(variants, start=1):
-            stock = available_stock(variant)
-            stock_icon = "✅" if stock > 0 else "❌"
-            text += (
-                f"\n{index}. <b>{html.escape(variant['name'])}</b>\n"
-                f"   💰 Harga: <b>{rupiah(variant['price'])}</b>\n"
-                f"   {stock_icon} Stok: <b>{stock}</b>\n"
-            )
-    else:
-        text += "\n<i>Belum ada variasi aktif.</i>\n"
-
-    text += (
-        "\n╰────────────────────╯\n\n"
+        "📦 <b>Varian | Harga - (Stok)</b>\n"
+        f"{compact_variant_price_stock_text(variants)}\n"
+        "╰────────────────────╯\n\n"
         f"<i>{STORE_FOOTER}</i>\n\n"
         "Pilih variasi:"
     )
@@ -17780,33 +17782,22 @@ async def reply_menu_product_number(message: Message, bot: Bot):
         f"• <b>Deskripsi:</b> {html.escape(product['description'] or '-')}\n"
         "╰────────────────────╯\n\n"
         "╭────────────────────╮\n"
-        "📦 <b>VARIASI • HARGA • STOK</b>\n"
+        "📦 <b>Varian | Harga - (Stok)</b>\n"
+        f"{compact_variant_price_stock_text(variants)}\n"
+        "╰────────────────────╯\n\n"
+        f"<i>{STORE_FOOTER}</i>\n\n"
+        "Pilih variasi:"
     )
 
     kb = InlineKeyboardBuilder()
 
     if variants:
-        for idx, variant in enumerate(variants, start=1):
+        for variant in variants:
             stock = available_stock(variant)
-            icon = "✅" if stock > 0 else "❌"
-            text += (
-                f"\n{idx}. <b>{html.escape(variant['name'])}</b>\n"
-                f"   💰 Harga: <b>{rupiah(variant['price'])}</b>\n"
-                f"   {icon} Stok: <b>{stock}</b>\n"
-            )
-
             kb.button(
                 text=f"{variant_button_label(variant)} ({stock})",
                 callback_data=f"variant:{variant['id']}"
             )
-    else:
-        text += "\n<i>Belum ada variasi aktif.</i>\n"
-
-    text += (
-        "\n╰────────────────────╯\n\n"
-        f"<i>{STORE_FOOTER}</i>\n\n"
-        "Pilih variasi:"
-    )
 
     kb.adjust(1)
 
@@ -22327,7 +22318,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.10"
+EXPECTED_SOURCE_VERSION = "16.11"
 
 
 def source_integrity_self_test():
