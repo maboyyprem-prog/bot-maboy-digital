@@ -93,7 +93,8 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.6"
+BOT_VERSION = "16.10"
+SCHEMA_VERSION = 169
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -468,6 +469,25 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            app_version TEXT NOT NULL DEFAULT '',
+            applied_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            window_start INTEGER NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, action)
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS inventory_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             variant_id INTEGER NOT NULL,
@@ -816,6 +836,12 @@ def init_db():
     add_column_if_missing(conn, "topups", "expires_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "updated_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "payment_review_status", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "topups", "payment_proof_file_id", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "topups", "payment_proof_type", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "topups", "payment_proof_submitted_at", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "topups", "payment_reject_reason", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "orders", "trace_id", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "topups", "trace_id", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "cashback_applied", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "orders", "payment_verified_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "orders", "payment_verified_by", "INTEGER NOT NULL DEFAULT 0")
@@ -965,6 +991,63 @@ def init_db():
                GROUP BY variant_id, content
                HAVING COUNT(*) > 1
            )"""
+    )
+
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_trace_id "
+        "ON orders(trace_id) WHERE trace_id!=''"
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_topups_trace_id "
+        "ON topups(trace_id) WHERE trace_id!=''"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rate_limit_updated "
+        "ON rate_limit_buckets(updated_at)"
+    )
+
+    # Backfill existing rows with stable trace IDs.
+    cur.execute(
+        """UPDATE orders
+           SET trace_id='ORD-' || printf('%08d',id)
+           WHERE COALESCE(trace_id,'')=''"""
+    )
+    cur.execute(
+        """UPDATE topups
+           SET trace_id='TOP-' || printf('%08d',id)
+           WHERE COALESCE(trace_id,'')=''"""
+    )
+
+    # New rows receive a trace automatically, regardless of which flow created them.
+    cur.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_orders_trace_id
+        AFTER INSERT ON orders
+        WHEN COALESCE(NEW.trace_id,'')=''
+        BEGIN
+            UPDATE orders
+            SET trace_id='ORD-' || printf('%08d',NEW.id)
+            WHERE id=NEW.id;
+        END
+    """)
+    cur.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_topups_trace_id
+        AFTER INSERT ON topups
+        WHEN COALESCE(NEW.trace_id,'')=''
+        BEGIN
+            UPDATE topups
+            SET trace_id='TOP-' || printf('%08d',NEW.id)
+            WHERE id=NEW.id;
+        END
+    """)
+
+    cur.execute(
+        """INSERT OR IGNORE INTO schema_migrations(version,app_version,applied_at)
+           VALUES(?,?,?)""",
+        (
+            SCHEMA_VERSION,
+            BOT_VERSION,
+            datetime.now().isoformat(timespec="seconds")
+        )
     )
 
     reconcile_all_inventory_stock(conn)
@@ -2155,7 +2238,7 @@ def rating_keyboard(order_id: int):
             InlineKeyboardButton(text="⭐⭐⭐⭐⭐ 5", callback_data=f"rate:{order_id}:5"),
         ],
         [
-            InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")
+            InlineKeyboardButton(text="🧾 Riwayat", callback_data="my_orders")
         ]
     ])
 
@@ -2175,14 +2258,14 @@ def review_after_rating_keyboard(order_id: int):
             )
         ],
         [
-            InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")
+            InlineKeyboardButton(text="🧾 Riwayat", callback_data="my_orders")
         ]
     ])
 
 
 def review_done_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
+        [InlineKeyboardButton(text="🧾 Riwayat", callback_data="my_orders")],
         [InlineKeyboardButton(text="🏠 Menu Utama", callback_data="home")]
     ])
 
@@ -2490,7 +2573,7 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
                     "⚠️ <b>PENGIRIMAN AKUN GAGAL</b>\n\n"
                     f"🧾 {invoice(order_id)}\n"
                     "Akun sudah dialokasikan dan <b>tidak akan diberikan ke user lain</b>.\n"
-                    "Gunakan Pesanan Saya / kirim ulang setelah koneksi Telegram normal.",
+                    "Gunakan Riwayat / kirim ulang setelah koneksi Telegram normal.",
                     parse_mode="HTML"
                 )
             except Exception as owner_alert_exc:
@@ -3194,7 +3277,7 @@ def transaction_pending_keyboard(order_id: int, include_proof: bool = True):
     ])
 
     rows.append([
-        InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders"),
+        InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders"),
         InlineKeyboardButton(text="🏠 Menu",callback_data="home")
     ])
 
@@ -3204,7 +3287,7 @@ def transaction_pending_keyboard(order_id: int, include_proof: bool = True):
 def transaction_done_keyboard(order_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders"),
+            InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders"),
             InlineKeyboardButton(text="🏠 Menu",callback_data="home")
         ]
     ])
@@ -4574,14 +4657,18 @@ def bank_transfer_ready() -> bool:
 
 def bank_transfer_text() -> str:
     bank = html.escape(get_setting("bank_name", "-"))
-    account = html.escape(get_setting("bank_account", "-"))
+    account_raw = str(get_setting("bank_account", "-") or "-").strip()
+    account_raw = account_raw.replace("\r", "").replace("\n", "").strip()
+    account = html.escape(account_raw)
     holder = html.escape(get_setting("bank_holder", "-"))
+
     return (
         f"🏦 Bank: <b>{bank}</b>\n"
-        f"💳 No. Rekening: <code>{account}</code>\n"
-        f"👤 Atas Nama: <b>{holder}</b>"
+        f"👤 Atas Nama: <b>{holder}</b>\n\n"
+        "💳 <b>Nomor Rekening</b>\n"
+        f"<pre>{account}</pre>\n"
+        "📋 <i>Tekan lama blok nomor rekening di atas untuk menyalin.</i>"
     )
-
 
 def topup_payment_method_keyboard(amount: int):
     rows = [
@@ -4635,6 +4722,138 @@ def owner_alert_allowed(key: str, seconds: int = 120) -> bool:
 
 
 _recent_actions = {}
+
+
+def persistent_rate_limit(
+    user_id: int,
+    action: str,
+    *,
+    limit: int,
+    window_seconds: int,
+) -> tuple[bool, int]:
+    """
+    SQLite-backed rate limiter.
+    Survives process restart and works across multiple workers sharing the same DB.
+    Returns (allowed, retry_after_seconds).
+    """
+    now_ts=int(time.time())
+    limit=max(1,int(limit))
+    window_seconds=max(1,int(window_seconds))
+    conn=None
+    try:
+        conn=db()
+        begin_immediate_retry(conn)
+
+        row=conn.execute(
+            """SELECT window_start,hit_count
+               FROM rate_limit_buckets
+               WHERE user_id=? AND action=?""",
+            (int(user_id),str(action))
+        ).fetchone()
+
+        if not row or now_ts-int(row["window_start"] or 0) >= window_seconds:
+            conn.execute(
+                """INSERT INTO rate_limit_buckets(
+                       user_id,action,window_start,hit_count,updated_at
+                   ) VALUES(?,?,?,?,?)
+                   ON CONFLICT(user_id,action) DO UPDATE SET
+                       window_start=excluded.window_start,
+                       hit_count=1,
+                       updated_at=excluded.updated_at""",
+                (
+                    int(user_id),str(action),now_ts,1,
+                    datetime.now().isoformat(timespec="seconds")
+                )
+            )
+            conn.commit()
+            conn.close()
+            return True,0
+
+        count=int(row["hit_count"] or 0)
+        elapsed=max(0,now_ts-int(row["window_start"] or 0))
+        retry=max(1,window_seconds-elapsed)
+
+        if count >= limit:
+            conn.rollback()
+            conn.close()
+            return False,retry
+
+        conn.execute(
+            """UPDATE rate_limit_buckets
+               SET hit_count=hit_count+1, updated_at=?
+               WHERE user_id=? AND action=?""",
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                int(user_id),str(action)
+            )
+        )
+        conn.commit()
+        conn.close()
+        return True,0
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+        logging.warning(
+            "Persistent rate limiter degraded action=%s user=%s: %s",
+            action,user_id,exc
+        )
+        # Fail open so a temporary limiter issue cannot block legitimate payments.
+        return True,0
+
+
+def schema_version_info():
+    conn=db()
+    try:
+        row=conn.execute(
+            "SELECT MAX(version) AS version FROM schema_migrations"
+        ).fetchone()
+        return int(row["version"] or 0)
+    finally:
+        conn.close()
+
+
+def payment_safety_snapshot():
+    conn=db()
+    try:
+        return {
+            "cancelled_reserved": int(conn.execute(
+                """SELECT COUNT(*) AS n FROM orders
+                   WHERE status='cancelled' AND stock_reserved!=0"""
+            ).fetchone()["n"] or 0),
+            "expired_reserved": int(conn.execute(
+                """SELECT COUNT(*) AS n FROM orders
+                   WHERE status='expired' AND stock_reserved!=0"""
+            ).fetchone()["n"] or 0),
+            "completed_not_delivered": int(conn.execute(
+                """SELECT COUNT(*) AS n FROM orders
+                   WHERE status='completed'
+                     AND fulfillment_status!='delivered'"""
+            ).fetchone()["n"] or 0),
+            "paid_without_event": int(conn.execute(
+                """SELECT COUNT(*) AS n
+                   FROM orders o
+                   LEFT JOIN payment_events e
+                     ON e.entity_type='order'
+                    AND e.entity_id=o.id
+                    AND e.event_type='paid'
+                   WHERE o.payment_status='paid'
+                     AND COALESCE(o.payment_method,'')!='OWNER_FREE'
+                     AND e.id IS NULL"""
+            ).fetchone()["n"] or 0),
+            "rejected_with_session": int(conn.execute(
+                """SELECT COUNT(*) AS n
+                   FROM payment_proof_sessions s
+                   JOIN orders o
+                     ON s.entity_type='order' AND s.entity_id=o.id
+                   WHERE COALESCE(o.payment_review_status,'')='rejected'"""
+            ).fetchone()["n"] or 0),
+        }
+    finally:
+        conn.close()
 
 
 def recent_action_allowed(key: str, seconds: int = 3) -> bool:
@@ -5238,6 +5457,105 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Inventory", False, str(exc)[:100]))
 
+    # Owner proof action UX
+    try:
+        proof_ui_ok=(
+            callable(owner_proof_result_screen)
+            and callable(owner_proof_home_keyboard)
+        )
+        checks.append((
+            "Owner Proof UX",
+            proof_ui_ok,
+            "responsive result + menu"
+        ))
+    except Exception as exc:
+        checks.append(("Owner Proof UX",False,str(exc)[:100]))
+
+    # Schema version
+    try:
+        current_schema=schema_version_info()
+        checks.append((
+            "Schema Version",
+            current_schema>=SCHEMA_VERSION,
+            f"{current_schema}/{SCHEMA_VERSION}"
+        ))
+    except Exception as exc:
+        checks.append(("Schema Version",False,str(exc)[:100]))
+
+    # Topup proof schema
+    try:
+        conn=db()
+        topup_proof_cols=all(
+            has_column(conn,"topups",name)
+            for name in (
+                "payment_proof_file_id",
+                "payment_proof_type",
+                "payment_proof_submitted_at",
+                "payment_reject_reason",
+            )
+        )
+        conn.close()
+        checks.append((
+            "Topup Proof Schema",
+            topup_proof_cols,
+            "OK" if topup_proof_cols else "missing column"
+        ))
+    except Exception as exc:
+        checks.append(("Topup Proof Schema",False,str(exc)[:100]))
+
+    # Trace IDs
+    try:
+        conn=db()
+        missing_order_trace=int(conn.execute(
+            "SELECT COUNT(*) AS n FROM orders WHERE COALESCE(trace_id,'')=''"
+        ).fetchone()["n"] or 0)
+        missing_topup_trace=int(conn.execute(
+            "SELECT COUNT(*) AS n FROM topups WHERE COALESCE(trace_id,'')=''"
+        ).fetchone()["n"] or 0)
+        conn.close()
+        missing_trace=missing_order_trace+missing_topup_trace
+        checks.append((
+            "Transaction Trace",
+            missing_trace==0,
+            f"{missing_trace} missing"
+        ))
+    except Exception as exc:
+        checks.append(("Transaction Trace",False,str(exc)[:100]))
+
+    # Persistent rate limiter schema
+    try:
+        conn=db()
+        rate_table=conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='rate_limit_buckets'"""
+        ).fetchone()
+        conn.close()
+        checks.append((
+            "Persistent Rate Limit",
+            bool(rate_table),
+            "ready" if rate_table else "missing"
+        ))
+    except Exception as exc:
+        checks.append(("Persistent Rate Limit",False,str(exc)[:100]))
+
+    # Payment scenario invariants
+    try:
+        safety=payment_safety_snapshot()
+        issues=sum(int(v or 0) for v in safety.values())
+        checks.append((
+            "Payment Scenario Safety",
+            issues==0,
+            (
+                f"cancel_reserved={safety['cancelled_reserved']}, "
+                f"expired_reserved={safety['expired_reserved']}, "
+                f"completed_not_delivered={safety['completed_not_delivered']}, "
+                f"paid_without_event={safety['paid_without_event']}, "
+                f"rejected_session={safety['rejected_with_session']}"
+            )
+        ))
+    except Exception as exc:
+        checks.append(("Payment Scenario Safety",False,str(exc)[:100]))
+
     # Smart Alert default/persistence
     try:
         smart_alert_value=get_setting("smart_alert_enabled","0")
@@ -5704,7 +6022,7 @@ def clear_owner_input_session(user_id: int):
 
 PRICE_SESSION_EXCLUDED_TEXTS = {
     "🏷️ List Produk","🔥 Produk Populer","⚡ Flash Sale","🎁 Voucher",
-    "📁 Laporan Stok","🧾 Pesanan Saya","💰 Isi Saldo","❓ Cara Order",
+    "📁 Laporan Stok","🧾 Riwayat","🧾 Riwayat","💰 Isi Saldo","❓ Cara Order",
     "💬 Hubungi Owner","🔄 Perbarui Keyboard",
 }
 
@@ -6052,6 +6370,7 @@ def order_detail_text(order) -> str:
         "🧾 <b>DETAIL PESANAN</b>",
         "",
         f"Invoice: <b>{invoice(int(order['id']))}</b>",
+        f"🔎 Ref: <code>{html.escape(str(order['trace_id'] or invoice(int(order['id']))))}</code>",
         f"📦 Produk: <b>{html.escape(str(product_name))}</b>",
         f"🧩 Varian: <b>{html.escape(str(variant_name))}</b>",
         f"🔢 Qty: <b>{int(order['qty'] or 0)}</b>",
@@ -6104,7 +6423,7 @@ def proof_rejected_keyboard(entity: str, entity_id: int):
             )
         ])
         rows.append([
-            InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders"),
+            InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders"),
             InlineKeyboardButton(text="🏠 Menu",callback_data="home")
         ])
     else:
@@ -6157,7 +6476,7 @@ def order_detail_keyboard(order):
         ])
 
     rows.append([
-        InlineKeyboardButton(text="⬅️ Pesanan Saya", callback_data="my_orders"),
+        InlineKeyboardButton(text="⬅️ Riwayat", callback_data="my_orders"),
         InlineKeyboardButton(text="🏠 Menu", callback_data="home")
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -6187,7 +6506,7 @@ def payment_proof_keyboard(entity: str, entity_id: int):
             )
         ])
         rows.append([
-            InlineKeyboardButton(text="🧾 Pesanan Saya",callback_data="my_orders"),
+            InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders"),
             InlineKeyboardButton(text="🏠 Menu",callback_data="home")
         ])
     else:
@@ -6196,6 +6515,63 @@ def payment_proof_keyboard(entity: str, entity_id: int):
         ])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def owner_proof_home_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🏠 Menu Awal",
+                callback_data="owner:panel"
+            )
+        ]
+    ])
+
+
+async def owner_proof_result_screen(
+    call: CallbackQuery,
+    text: str,
+    *,
+    alert_text: str = "",
+):
+    """
+    Always leave a visible owner result after a proof action.
+    Handles both media/caption messages and normal text messages.
+    """
+    try:
+        await call.answer(alert_text or "Selesai.", show_alert=bool(alert_text))
+    except Exception:
+        pass
+
+    try:
+        if getattr(call.message, "caption", None) is not None:
+            await call.message.edit_caption(
+                caption=text,
+                reply_markup=owner_proof_home_keyboard(),
+                parse_mode="HTML"
+            )
+            return
+    except Exception:
+        pass
+
+    try:
+        await call.message.edit_text(
+            text,
+            reply_markup=owner_proof_home_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+    except Exception:
+        pass
+
+    try:
+        await call.message.answer(
+            text,
+            reply_markup=owner_proof_home_keyboard(),
+            parse_mode="HTML"
+        )
+    except Exception:
+        logging.exception("Failed to render owner proof result screen")
 
 
 def owner_payment_proof_keyboard(entity: str, entity_id: int):
@@ -6214,6 +6590,12 @@ def owner_payment_proof_keyboard(entity: str, entity_id: int):
             InlineKeyboardButton(
                 text="⏳ Tandai Pending",
                 callback_data=f"proofpending:{entity}:{entity_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🏠 Menu Awal",
+                callback_data="owner:panel"
             )
         ]
     ])
@@ -7102,7 +7484,7 @@ def user_reply_menu():
     ])
 
     keyboard.append([
-        KeyboardButton(text="🧾 Pesanan Saya"),
+        KeyboardButton(text="🧾 Riwayat"),
         KeyboardButton(text="💬 Hubungi Owner"),
     ])
 
@@ -7125,7 +7507,7 @@ def main_menu():
     kb.button(text="⚡ Flash Sale", callback_data="flash")
     kb.button(text="🎁 Voucher", callback_data="voucher_info")
     kb.button(text="💰 Isi Saldo", callback_data="wallet")
-    kb.button(text="🧾 Pesanan Saya", callback_data="my_orders")
+    kb.button(text="🧾 Riwayat", callback_data="my_orders")
     kb.button(text="⭐ Rating Toko", callback_data="store:rating")
 
     if ADMIN_USERNAME:
@@ -9268,6 +9650,18 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
     if entity not in {"order", "topup"}:
         return await call.answer("Jenis transaksi tidak valid.", show_alert=True)
 
+    rate_ok,retry_after=persistent_rate_limit(
+        call.from_user.id,
+        "payment_proof",
+        limit=3,
+        window_seconds=60
+    )
+    if not rate_ok:
+        return await call.answer(
+            f"Terlalu banyak percobaan. Coba lagi dalam {retry_after} detik.",
+            show_alert=True
+        )
+
     conn = db()
     if entity == "order":
         row = conn.execute(
@@ -9358,7 +9752,7 @@ async def payment_proof_photo(message: Message, state: FSMContext, bot: Bot):
         return await message.answer(
             "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
             f"{html.escape(error)}\n\n"
-            "Silakan cek status transaksi melalui Pesanan Saya.",
+            "Silakan cek status transaksi melalui Riwayat.",
             parse_mode="HTML"
         )
 
@@ -9366,9 +9760,9 @@ async def payment_proof_photo(message: Message, state: FSMContext, bot: Bot):
         "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
         "Bukti sudah benar-benar diteruskan ke PM owner.\n"
         "Owner akan memeriksa dan mengonfirmasi pembayaran.\n"
-        "Kamu bisa cek status dari Pesanan Saya.",
+        "Kamu bisa cek status dari Riwayat.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
+            [InlineKeyboardButton(text="🧾 Riwayat", callback_data="my_orders")],
             [InlineKeyboardButton(text="🏠 Menu", callback_data="home")]
         ]),
         parse_mode="HTML"
@@ -9407,16 +9801,16 @@ async def payment_proof_document(message: Message, state: FSMContext, bot: Bot):
         return await message.answer(
             "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
             f"{html.escape(error)}\n\n"
-            "Silakan cek status transaksi melalui Pesanan Saya.",
+            "Silakan cek status transaksi melalui Riwayat.",
             parse_mode="HTML"
         )
 
     await message.answer(
         "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
         "Bukti sudah benar-benar diteruskan ke PM owner.\n"
-        "Kamu bisa cek status dari Pesanan Saya.",
+        "Kamu bisa cek status dari Riwayat.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🧾 Pesanan Saya", callback_data="my_orders")],
+            [InlineKeyboardButton(text="🧾 Riwayat", callback_data="my_orders")],
             [InlineKeyboardButton(text="🏠 Menu", callback_data="home")]
         ]),
         parse_mode="HTML"
@@ -9432,7 +9826,9 @@ async def payment_proof_document(message: Message, state: FSMContext, bot: Bot):
         "📁 Laporan Stok",
         "💰 Isi Saldo",
         "❓ Cara Order",
+        "🧾 Riwayat",
         "🧾 Pesanan Saya",
+        "🧾 Riwayat",
         "💬 Hubungi Owner",
         "🏠 Menu Utama",
     })
@@ -9454,7 +9850,7 @@ async def payment_proof_exit_to_menu(message: Message, state: FSMContext, bot: B
         return await reply_menu_wallet(message, bot)
     if text=="❓ Cara Order":
         return await reply_menu_howto(message)
-    if text=="🧾 Pesanan Saya":
+    if text in {"🧾 Riwayat","🧾 Riwayat"}:
         return await reply_menu_orders(message, bot)
     if text=="💬 Hubungi Owner":
         return await reply_menu_owner_contact(message)
@@ -10977,6 +11373,19 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
         _, variant_id, qty = call.data.split(":")
         variant_id, qty = int(variant_id), max(1, int(qty))
 
+
+        rate_ok,retry_after=persistent_rate_limit(
+            call.from_user.id,
+            "checkout_payment",
+            limit=5,
+            window_seconds=30
+        )
+        if not rate_ok:
+            return await call.answer(
+                f"Terlalu banyak percobaan pembayaran. Coba lagi dalam {retry_after} detik.",
+                show_alert=True
+            )
+
         allowed, reason = anti_abuse_checkout(call.from_user.id, "WALLET")
         if not allowed:
             return await call.answer(reason, show_alert=True)
@@ -10994,7 +11403,7 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
             conn.rollback()
             conn.close()
             return await call.answer(
-                "Pesanan yang sama baru saja diproses. Cek Pesanan Saya.",
+                "Pesanan yang sama baru saja diproses. Cek Riwayat.",
                 show_alert=True
             )
 
@@ -11093,7 +11502,7 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
             conn.rollback()
             conn.close()
             return await call.answer(
-                "Transaksi yang sama sedang diproses. Cek Pesanan Saya.",
+                "Transaksi yang sama sedang diproses. Cek Riwayat.",
                 show_alert=True
             )
 
@@ -11255,6 +11664,19 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         _, variant_id, qty = call.data.split(":")
         variant_id, qty = int(variant_id), max(1, int(qty))
 
+
+        rate_ok,retry_after=persistent_rate_limit(
+            call.from_user.id,
+            "checkout_payment",
+            limit=5,
+            window_seconds=30
+        )
+        if not rate_ok:
+            return await call.answer(
+                f"Terlalu banyak percobaan pembayaran. Coba lagi dalam {retry_after} detik.",
+                show_alert=True
+            )
+
         allowed, reason = anti_abuse_checkout(call.from_user.id, "BANK_TRANSFER")
         if not allowed:
             return await call.answer(reason, show_alert=True)
@@ -11272,7 +11694,7 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             conn.rollback()
             conn.close()
             return await call.answer(
-                "Pesanan transfer yang sama baru saja dibuat. Cek Pesanan Saya.",
+                "Pesanan transfer yang sama baru saja dibuat. Cek Riwayat.",
                 show_alert=True
             )
 
@@ -11441,6 +11863,19 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         _, variant_id, qty = call.data.split(":")
         variant_id, qty = int(variant_id), max(1, int(qty))
 
+
+        rate_ok,retry_after=persistent_rate_limit(
+            call.from_user.id,
+            "checkout_payment",
+            limit=5,
+            window_seconds=30
+        )
+        if not rate_ok:
+            return await call.answer(
+                f"Terlalu banyak percobaan pembayaran. Coba lagi dalam {retry_after} detik.",
+                show_alert=True
+            )
+
         allowed, reason = anti_abuse_checkout(call.from_user.id, "QRIS")
         if not allowed:
             return await call.answer(reason, show_alert=True)
@@ -11458,7 +11893,7 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             conn.rollback()
             conn.close()
             return await call.answer(
-                "Pesanan QRIS yang sama baru saja dibuat. Cek Pesanan Saya.",
+                "Pesanan QRIS yang sama baru saja dibuat. Cek Riwayat.",
                 show_alert=True
             )
         variant = conn.execute(
@@ -11650,6 +12085,19 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         _, variant_id, qty = call.data.split(":")
         variant_id, qty = int(variant_id), max(1, int(qty))
 
+
+        rate_ok,retry_after=persistent_rate_limit(
+            call.from_user.id,
+            "checkout_payment",
+            limit=5,
+            window_seconds=30
+        )
+        if not rate_ok:
+            return await call.answer(
+                f"Terlalu banyak percobaan pembayaran. Coba lagi dalam {retry_after} detik.",
+                show_alert=True
+            )
+
         allowed, reason = anti_abuse_checkout(call.from_user.id, "AUTO_QRIS")
         if not allowed:
             return await call.answer(reason, show_alert=True)
@@ -11667,7 +12115,7 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             conn.rollback()
             conn.close()
             return await call.answer(
-                "QR pembayaran yang sama baru saja dibuat. Cek Pesanan Saya.",
+                "QR pembayaran yang sama baru saja dibuat. Cek Riwayat.",
                 show_alert=True
             )
         variant = conn.execute(
@@ -11851,9 +12299,9 @@ async def my_orders(call: CallbackQuery):
     conn.close()
 
     if not rows:
-        text = f"🧾 <b>PESANAN SAYA</b>\n\nBelum ada pesanan.\n\n<i>{STORE_FOOTER}</i>"
+        text = f"🧾 <b>RIWAYAT TRANSAKSI</b>\n\nBelum ada transaksi.\n\n<i>{STORE_FOOTER}</i>"
     else:
-        lines = ["🧾 <b>PESANAN SAYA</b>\n"]
+        lines = ["🧾 <b>RIWAYAT TRANSAKSI</b>\n"]
         for row in rows:
             status_icons = {
                 "completed": "✅",
@@ -11867,11 +12315,10 @@ async def my_orders(call: CallbackQuery):
             display_status=order_user_status_label(row)
 
             lines.append(
-                f"{icon} <b>{invoice(row['id'])}</b>\n"
-                f"   {html.escape(row['product_name'] or 'Produk lama')} — "
-                f"{html.escape(row['variant_name'] or 'Standard')}\n"
-                f"   Qty {row['qty']} • {rupiah(row['payment_total'] or row['total'])}\n"
-                f"   Status: {html.escape(display_status)}\n"
+                f"{icon} <b>{invoice(row['id'])}</b> • "
+                f"{html.escape(row['product_name'] or 'Produk')} • "
+                f"{rupiah(row['payment_total'] or row['total'])}\n"
+                f"   {html.escape(display_status)}"
             )
         lines.append(
             f"<i>Pesanan selesai/ditolak otomatis hilang dari daftar setelah "
@@ -11882,37 +12329,60 @@ async def my_orders(call: CallbackQuery):
 
     kb = InlineKeyboardBuilder()
 
-    # Direct detail access for recent invoices.
-    for row in rows[:5] if rows else []:
+    if rows:
         kb.button(
-            text=f"📄 {invoice(row['id'])}",
-            callback_data=f"orderdetail:{row['id']}"
+            text="📄 Detail Terbaru",
+            callback_data="history:latest"
         )
 
-    # Fallback review entry in case the automatic post-delivery prompt was missed.
-    pending_reviews=[
-        row for row in rows
-        if row["status"]=="completed"
+    has_delivery = any(
+        row["status"]=="completed"
         and row["fulfillment_status"]=="delivered"
-        and int(row["reviewed"] or 0)==0
-    ] if rows else []
+        and (row["delivery_text"] or "").strip()
+        for row in rows
+    ) if rows else False
 
-    for row in pending_reviews[:3]:
+    if has_delivery:
         kb.button(
-            text=f"⭐ Nilai {invoice(row['id'])}",
-            callback_data=f"reviewopen:{row['id']}"
+            text="📩 Kirim Ulang Akun Terakhir",
+            callback_data="resend:last"
         )
 
-    has_delivery = any((row["delivery_text"] or "").strip() for row in rows) if rows else False
-    if has_delivery:
-        kb.button(text="📩 Kirim Ulang Akun Terakhir", callback_data="resend:last")
-
-    kb.button(text="⬅️ Menu Utama", callback_data="home")
+    kb.button(text="🏠 Menu Utama", callback_data="home")
     kb.adjust(1)
 
     await safe_edit_or_answer(call, text, reply_markup=kb.as_markup(), parse_mode="HTML")
     await call.answer()
 
+
+
+@router.callback_query(F.data == "history:latest")
+async def history_latest(call: CallbackQuery):
+    conn=db()
+    cutoff=user_final_order_cutoff_iso()
+    order=conn.execute(
+        f"""SELECT o.*,p.name AS product_name,v.name AS variant_name
+            FROM orders o
+            LEFT JOIN products p ON p.id=o.product_id
+            LEFT JOIN product_variants v ON v.id=o.variant_id
+            WHERE o.user_id=?
+              AND ({user_order_visible_sql('o')})
+            ORDER BY o.id DESC
+            LIMIT 1""",
+        (call.from_user.id,cutoff)
+    ).fetchone()
+    conn.close()
+
+    if not order:
+        return await call.answer("Belum ada riwayat transaksi.",show_alert=True)
+
+    await safe_edit_or_answer(
+        call,
+        order_detail_text(order),
+        reply_markup=order_detail_keyboard(order),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data.startswith("orderdetail:"))
@@ -11978,6 +12448,18 @@ async def user_check_transaction_status(call: CallbackQuery):
 
     if not recent_action_allowed(f"statuscheck:{entity}:{entity_id}:{call.from_user.id}",2):
         return await call.answer("Status baru saja dicek.",show_alert=True)
+
+    rate_ok,retry_after=persistent_rate_limit(
+        call.from_user.id,
+        "status_check",
+        limit=8,
+        window_seconds=30
+    )
+    if not rate_ok:
+        return await call.answer(
+            f"Terlalu sering cek status. Coba lagi dalam {retry_after} detik.",
+            show_alert=True
+        )
 
     conn=db()
     if entity=="order":
@@ -12395,6 +12877,18 @@ async def wallet_topup_method_qris(call: CallbackQuery):
             show_alert=True
         )
     amount = int(call.data.split(":")[2])
+    rate_ok,retry_after=persistent_rate_limit(
+        call.from_user.id,
+        "topup_payment",
+        limit=4,
+        window_seconds=60
+    )
+    if not rate_ok:
+        return await call.answer(
+            f"Terlalu banyak percobaan top up. Coba lagi dalam {retry_after} detik.",
+            show_alert=True
+        )
+
     minimum = get_min_topup()
     if amount < minimum:
         return await call.answer(
@@ -12524,6 +13018,18 @@ async def wallet_topup_method_bank(call: CallbackQuery):
             show_alert=True
         )
     amount = int(call.data.split(":")[2])
+    rate_ok,retry_after=persistent_rate_limit(
+        call.from_user.id,
+        "topup_payment",
+        limit=4,
+        window_seconds=60
+    )
+    if not rate_ok:
+        return await call.answer(
+            f"Terlalu banyak percobaan top up. Coba lagi dalam {retry_after} detik.",
+            show_alert=True
+        )
+
     minimum = get_min_topup()
 
     if amount < minimum:
@@ -12969,7 +13475,8 @@ async def owner_bank_preview(call: CallbackQuery):
         call,
         "🏦 <b>PREVIEW TRANSFER REKENING</b>\n\n"
         + bank_transfer_text()
-        + f"\n\nStatus: <b>{'AKTIF' if bank_transfer_ready() else 'BELUM LENGKAP'}</b>",
+        + f"\n\nStatus: <b>{'AKTIF' if bank_transfer_ready() else 'BELUM LENGKAP'}</b>\n"
+          "<i>Nomor rekening ditampilkan dalam blok agar mudah disalin user.</i>",
         reply_markup=bank_settings_menu(),
         parse_mode="HTML"
     )
@@ -17108,7 +17615,7 @@ async def reply_menu_stock(message: Message, bot: Bot):
     )
 
 
-@router.message(F.text == "🧾 Pesanan Saya")
+@router.message(F.text.in_({"🧾 Riwayat","🧾 Pesanan Saya"}))
 async def reply_menu_orders(message: Message, bot: Bot):
     if not await is_channel_member(bot, message.from_user.id):
         return await send_join_required(message)
@@ -17127,12 +17634,12 @@ async def reply_menu_orders(message: Message, bot: Bot):
 
     if not rows:
         return await message.answer(
-            "🧾 <b>PESANAN SAYA</b>\n\nBelum ada pesanan.",
+            "🧾 <b>RIWAYAT TRANSAKSI</b>\n\nBelum ada transaksi.",
             reply_markup=user_reply_menu(),
             parse_mode="HTML"
         )
 
-    lines = ["🧾 <b>PESANAN SAYA</b>", ""]
+    lines = ["🧾 <b>RIWAYAT TRANSAKSI</b>", ""]
     for row in rows:
         display_status=order_user_status_label(row)
 
@@ -17150,13 +17657,22 @@ async def reply_menu_orders(message: Message, bot: Bot):
             expiry_line = f"\n   ⏳ {format_expiry_time(row['reserved_until'])}"
 
         lines.append(
-            f"{icon} <b>{invoice(row['id'])}</b>\n"
-            f"   Status: {html.escape(display_status)}\n"
-            f"   Total: {rupiah(row['payment_total'] or row['total'])}"
+            f"{icon} <b>{invoice(row['id'])}</b> • "
+            f"{rupiah(row['payment_total'] or row['total'])} • "
+            f"{html.escape(display_status)}"
             f"{expiry_line}"
         )
 
     kb_rows=[]
+
+    if rows:
+        kb_rows.append([
+            InlineKeyboardButton(
+                text="📄 Detail Terbaru",
+                callback_data="history:latest"
+            )
+        ])
+
     if any(
         row["status"]=="completed"
         and row["fulfillment_status"]=="delivered"
@@ -18663,34 +19179,14 @@ async def owner_proof_reject(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
-    _, entity, raw_id = call.data.split(":")
-    entity_id = int(raw_id)
+    try:
+        _, entity, raw_id = call.data.split(":")
+        entity_id = int(raw_id)
+    except Exception:
+        return await call.answer("Data transaksi tidak valid.", show_alert=True)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Bukti Tidak Valid", callback_data=f"proofrejectreason:{entity}:{entity_id}:invalid")],
-        [InlineKeyboardButton(text="💰 Nominal Tidak Sesuai", callback_data=f"proofrejectreason:{entity}:{entity_id}:amount")],
-        [InlineKeyboardButton(text="🔎 Pembayaran Tidak Ditemukan", callback_data=f"proofrejectreason:{entity}:{entity_id}:notfound")],
-        [InlineKeyboardButton(text="↩️ Kembali", callback_data=f"proofback:{entity}:{entity_id}")]
-    ])
-
-    await safe_edit_or_answer(
-        call,
-        "❌ <b>TOLAK BUKTI PEMBAYARAN</b>\n\nPilih alasan:",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-    await call.answer()
-
-
-
-@router.callback_query(F.data.startswith("proofback:"))
-async def owner_proof_back(call: CallbackQuery):
-    """Return from reject-reason menu without changing payment state."""
-    if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
-
-    _, entity, raw_id = call.data.split(":")
-    entity_id = int(raw_id)
+    if entity not in {"order","topup"}:
+        return await call.answer("Jenis transaksi tidak valid.", show_alert=True)
 
     conn=db()
     row=conn.execute(
@@ -18701,32 +19197,127 @@ async def owner_proof_back(call: CallbackQuery):
     conn.close()
 
     if not row:
-        return await call.answer("Transaksi tidak ditemukan.", show_alert=True)
+        return await owner_proof_result_screen(
+            call,
+            "⚠️ <b>TRANSAKSI TIDAK DITEMUKAN</b>\n\n"
+            "Data transaksi sudah tidak tersedia.",
+            alert_text="Transaksi tidak ditemukan."
+        )
 
-    caption = payment_proof_caption(entity, row)
+    if entity=="order":
+        final=(
+            row["payment_status"]=="paid"
+            or row["status"] in {"cancelled","expired","completed"}
+            or str(row["payment_review_status"] or "")=="rejected"
+        )
+    else:
+        final=(
+            topup_payment_terminal(row)
+            or str(row["payment_review_status"] or "")=="rejected"
+        )
+
+    if final:
+        inv=invoice(entity_id) if entity=="order" else topup_invoice(entity_id)
+        return await owner_proof_result_screen(
+            call,
+            "✅ <b>TRANSAKSI SUDAH SELESAI</b>\n\n"
+            f"🧾 {inv}\n"
+            "Bukti pembayaran sudah memiliki status final dan tidak dapat diproses ulang.",
+            alert_text="Transaksi sudah selesai."
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Bukti Tidak Valid", callback_data=f"proofrejectreason:{entity}:{entity_id}:invalid")],
+        [InlineKeyboardButton(text="💰 Nominal Tidak Sesuai", callback_data=f"proofrejectreason:{entity}:{entity_id}:amount")],
+        [InlineKeyboardButton(text="🔎 Pembayaran Tidak Ditemukan", callback_data=f"proofrejectreason:{entity}:{entity_id}:notfound")],
+        [InlineKeyboardButton(text="↩️ Kembali", callback_data=f"proofback:{entity}:{entity_id}")],
+        [InlineKeyboardButton(text="🏠 Menu Awal", callback_data="owner:panel")]
+    ])
+
+    await safe_edit_or_answer(
+        call,
+        "❌ <b>TOLAK BUKTI PEMBAYARAN</b>\n\nPilih alasan:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+
+@router.callback_query(F.data.startswith("proofback:"))
+async def owner_proof_back(call: CallbackQuery):
+    """Return from reject menu without mutating payment state."""
+    if not is_owner(call.from_user.id):
+        return await call.answer("Akses ditolak.", show_alert=True)
 
     try:
-        await call.message.edit_caption(
-            caption=caption,
-            reply_markup=owner_payment_proof_keyboard(entity, entity_id),
-            parse_mode="HTML"
-        )
+        _, entity, raw_id = call.data.split(":")
+        entity_id = int(raw_id)
     except Exception:
-        try:
+        return await call.answer("Data transaksi tidak valid.", show_alert=True)
+
+    conn=db()
+    row=conn.execute(
+        "SELECT * FROM orders WHERE id=?" if entity=="order"
+        else "SELECT * FROM topups WHERE id=?",
+        (entity_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return await owner_proof_result_screen(
+            call,
+            "⚠️ <b>TRANSAKSI TIDAK DITEMUKAN</b>",
+            alert_text="Transaksi tidak ditemukan."
+        )
+
+    if entity=="order":
+        final=(
+            row["payment_status"]=="paid"
+            or row["status"] in {"cancelled","expired","completed"}
+            or str(row["payment_review_status"] or "")=="rejected"
+        )
+    else:
+        final=(
+            topup_payment_terminal(row)
+            or str(row["payment_review_status"] or "")=="rejected"
+        )
+
+    if final:
+        inv=invoice(entity_id) if entity=="order" else topup_invoice(entity_id)
+        return await owner_proof_result_screen(
+            call,
+            "✅ <b>TRANSAKSI SUDAH SELESAI</b>\n\n"
+            f"🧾 {inv}\n"
+            "Tidak ada tindakan pembayaran yang perlu dilakukan.",
+            alert_text="Transaksi sudah selesai."
+        )
+
+    caption=payment_proof_caption(entity,row)
+
+    try:
+        if getattr(call.message,"caption",None) is not None:
+            await call.message.edit_caption(
+                caption=caption,
+                reply_markup=owner_payment_proof_keyboard(entity,entity_id),
+                parse_mode="HTML"
+            )
+        else:
             await safe_edit_or_answer(
                 call,
                 caption,
-                reply_markup=owner_payment_proof_keyboard(entity, entity_id),
+                reply_markup=owner_payment_proof_keyboard(entity,entity_id),
                 parse_mode="HTML"
             )
-        except Exception:
-            await call.message.answer(
-                caption,
-                reply_markup=owner_payment_proof_keyboard(entity, entity_id),
-                parse_mode="HTML"
-            )
+    except Exception:
+        await call.message.answer(
+            caption,
+            reply_markup=owner_payment_proof_keyboard(entity,entity_id),
+            parse_mode="HTML"
+        )
 
-    await call.answer()
+    await safe_callback_notice(call)
+
 
 
 @router.callback_query(F.data.startswith("proofrejectreason:"))
@@ -18734,8 +19325,14 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
-    _, entity, raw_id, reason_code = call.data.split(":")
-    entity_id = int(raw_id)
+    try:
+        _, entity, raw_id, reason_code = call.data.split(":")
+        entity_id = int(raw_id)
+    except Exception:
+        return await call.answer("Data transaksi tidak valid.", show_alert=True)
+
+    if entity not in {"order","topup"}:
+        return await call.answer("Jenis transaksi tidak valid.", show_alert=True)
 
     reasons = {
         "invalid": "Bukti pembayaran tidak valid.",
@@ -18744,53 +19341,105 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
     }
     reason = reasons.get(reason_code, "Bukti pembayaran ditolak.")
 
-    conn = db()
-    if entity == "order":
-        row = conn.execute("SELECT * FROM orders WHERE id=?", (entity_id,)).fetchone()
-        if row and (
+    conn=db()
+    begin_immediate_retry(conn)
+
+    row=conn.execute(
+        "SELECT * FROM orders WHERE id=?" if entity=="order"
+        else "SELECT * FROM topups WHERE id=?",
+        (entity_id,)
+    ).fetchone()
+
+    if not row:
+        conn.rollback()
+        conn.close()
+        return await owner_proof_result_screen(
+            call,
+            "⚠️ <b>TRANSAKSI TIDAK DITEMUKAN</b>\n\n"
+            "Tidak ada perubahan yang dilakukan.",
+            alert_text="Transaksi tidak ditemukan."
+        )
+
+    if entity=="order":
+        is_final=(
             row["payment_status"]=="paid"
             or row["status"] in {"cancelled","expired","completed"}
-        ):
-            conn.close()
-            return await call.answer(
-                "Order sudah final dan bukti tidak bisa diubah.",
-                show_alert=True
-            )
-        if row and str(row["payment_review_status"] or "")=="rejected":
-            conn.close()
-            return await call.answer("Bukti sudah ditolak sebelumnya.", show_alert=True)
-        if row:
-            conn.execute(
-                "UPDATE orders SET payment_reject_reason=?, payment_review_status='rejected' WHERE id=?",
-                (reason, entity_id)
-            )
+        )
     else:
-        row = conn.execute("SELECT * FROM topups WHERE id=?", (entity_id,)).fetchone()
-        if row and topup_payment_terminal(row):
-            conn.close()
-            return await call.answer(
-                "Top up sudah final dan bukti tidak bisa diubah.",
-                show_alert=True
+        is_final=topup_payment_terminal(row)
+
+    if is_final:
+        conn.rollback()
+        conn.close()
+        inv=invoice(entity_id) if entity=="order" else topup_invoice(entity_id)
+        return await owner_proof_result_screen(
+            call,
+            "✅ <b>TRANSAKSI SUDAH SELESAI</b>\n\n"
+            f"🧾 {inv}\n"
+            "Status transaksi sudah final. Tombol lama tidak dapat mengubah transaksi.",
+            alert_text="Transaksi sudah selesai."
+        )
+
+    if str(row["payment_review_status"] or "")=="rejected":
+        conn.rollback()
+        conn.close()
+        inv=invoice(entity_id) if entity=="order" else topup_invoice(entity_id)
+        return await owner_proof_result_screen(
+            call,
+            "❌ <b>BUKTI SUDAH DITOLAK</b>\n\n"
+            f"🧾 {inv}\n"
+            f"Alasan: <b>{html.escape(row['payment_reject_reason'] or row['reject_reason'] or reason)}</b>\n\n"
+            "Tidak ada proses ulang untuk bukti yang sama.",
+            alert_text="Bukti sudah ditolak."
+        )
+
+    if entity=="order":
+        conn.execute(
+            """UPDATE orders
+               SET payment_reject_reason=?,
+                   payment_review_status='rejected'
+               WHERE id=?
+                 AND payment_status!='paid'
+                 AND status NOT IN ('cancelled','expired','completed')
+                 AND COALESCE(payment_review_status,'')!='rejected'""",
+            (reason,entity_id)
+        )
+    else:
+        conn.execute(
+            """UPDATE topups
+               SET payment_reject_reason=?,
+                   reject_reason=?,
+                   payment_review_status='rejected',
+                   updated_at=?
+               WHERE id=?
+                 AND status NOT IN ('completed','expired','cancelled','rejected')
+                 AND COALESCE(payment_review_status,'')!='rejected'""",
+            (
+                reason,
+                reason,
+                datetime.now().isoformat(timespec="seconds"),
+                entity_id
             )
-        if row:
-            conn.execute(
-                """UPDATE topups
-                   SET payment_reject_reason=?,
-                       payment_review_status='rejected',
-                       updated_at=?
-                   WHERE id=?""",
-                (reason, datetime.now().isoformat(timespec="seconds"), entity_id)
-            )
+        )
+
+    changed=conn.total_changes
     conn.commit()
     conn.close()
 
-    if not row:
-        return await call.answer("Transaksi tidak ditemukan.", show_alert=True)
+    if not changed:
+        return await owner_proof_result_screen(
+            call,
+            "⚠️ <b>STATUS TIDAK BERUBAH</b>\n\n"
+            "Transaksi sudah diproses oleh aksi lain.",
+            alert_text="Transaksi sudah diproses."
+        )
+
+    clear_payment_proof_session(int(row["user_id"]))
 
     try:
         inv = invoice(entity_id) if entity == "order" else topup_invoice(entity_id)
         await bot.send_message(
-            row["user_id"],
+            int(row["user_id"]),
             "❌ <b>BUKTI PEMBAYARAN DITOLAK</b>\n\n"
             f"🧾 {inv}\n"
             f"Alasan: <b>{html.escape(reason)}</b>\n\n"
@@ -18799,16 +19448,22 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
             parse_mode="HTML"
         )
     except Exception:
-        pass
-
-    await call.answer("Bukti ditolak.", show_alert=True)
-    try:
-        await call.message.edit_caption(
-            caption=payment_proof_caption(entity, row) + f"\n\n❌ <b>DITOLAK</b>\n{html.escape(reason)}",
-            parse_mode="HTML"
+        logging.exception(
+            "Failed to notify user about rejected proof entity=%s id=%s",
+            entity,entity_id
         )
-    except Exception:
-        pass
+
+    inv=invoice(entity_id) if entity=="order" else topup_invoice(entity_id)
+    return await owner_proof_result_screen(
+        call,
+        "❌ <b>BUKTI PEMBAYARAN DITOLAK</b>\n\n"
+        f"🧾 {inv}\n"
+        f"Alasan: <b>{html.escape(reason)}</b>\n\n"
+        "✅ Status berhasil diperbarui.\n"
+        "🔒 Bukti yang sama tidak dapat dikirim ulang.",
+        alert_text="Bukti berhasil ditolak."
+    )
+
 
 
 @router.callback_query(F.data.startswith("proofpending:"))
@@ -21672,7 +22327,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.6"
+EXPECTED_SOURCE_VERSION = "16.10"
 
 
 def source_integrity_self_test():
@@ -21729,6 +22384,11 @@ def runtime_dependency_self_test():
     checks.append(("begin_immediate_retry", callable(begin_immediate_retry)))
     checks.append(("reservation_integrity_snapshot", callable(reservation_integrity_snapshot)))
     checks.append(("repair_reservation_integrity", callable(repair_reservation_integrity)))
+    checks.append(("persistent_rate_limit", callable(persistent_rate_limit)))
+    checks.append(("schema_version_info", callable(schema_version_info)))
+    checks.append(("payment_safety_snapshot", callable(payment_safety_snapshot)))
+    checks.append(("owner_proof_result_screen", callable(owner_proof_result_screen)))
+    checks.append(("owner_proof_home_keyboard", callable(owner_proof_home_keyboard)))
 
     failed=[name for name,ok in checks if not ok]
     if failed:
