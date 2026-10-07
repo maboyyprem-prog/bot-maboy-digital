@@ -93,7 +93,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.28"
+BOT_VERSION = "16.30"
 SCHEMA_VERSION = 172
 
 CHECKOUT_TERMS_SHORT = (
@@ -1597,13 +1597,46 @@ async def force_refresh_user_keyboard(message: Message):
             pass
 
 
-async def show_main_menu_message(message: Message):
-    await message.answer(
+def start_view_keyboard():
+    rows=[
+        [
+            InlineKeyboardButton(
+                text="⭐ Rating Toko",
+                callback_data="store:rating"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🛍️ Buka Menu Utama",
+                callback_data="home"
+            )
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def start_view_text() -> str:
+    return (
         f"🛍️ <b>{STORE_NAME}</b>\n\n"
         "Selamat datang di Maboyy Digital.\n"
         f"{store_rating_text()}\n\n"
-        "Pilih menu atau nomor produk di bawah untuk mulai belanja.\n\n"
-        f"<i>{STORE_FOOTER}</i>",
+        "Lihat rating dan ulasan pembeli melalui tombol di bawah.\n"
+        "Untuk belanja, gunakan keyboard menu yang tersedia.\n\n"
+        f"<i>{STORE_FOOTER}</i>"
+    )
+
+
+async def show_main_menu_message(message: Message):
+    # Start card contains only start-specific inline actions.
+    await message.answer(
+        start_view_text(),
+        reply_markup=start_view_keyboard(),
+        parse_mode="HTML"
+    )
+    # Persistent Telegram reply keyboard must be sent separately because
+    # one message cannot carry inline + reply keyboards at the same time.
+    await message.answer(
+        "⌨️ <b>Menu belanja aktif.</b>",
         reply_markup=user_reply_menu(),
         parse_mode="HTML"
     )
@@ -6185,6 +6218,33 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("WIB Display",False,str(exc)[:100]))
 
+    # User history pagination + start review placement
+    try:
+        conn=db()
+        review_unique=bool(conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type='index' AND name LIKE '%reviews%'"""
+        ).fetchone()) or bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reviews'"
+        ).fetchone())
+        conn.close()
+        start_rating_ok=(
+            "store:rating" in str(start_view_keyboard())
+            if False else callable(start_view_keyboard)
+        )
+        checks.append((
+            "User History Pagination",
+            USER_HISTORY_PAGE_SIZE==4 and callable(render_user_history_page),
+            f"{USER_HISTORY_PAGE_SIZE}/page + rating status"
+        ))
+        checks.append((
+            "Start Rating Entry",
+            start_rating_ok and review_unique,
+            "/start -> rating & ulasan"
+        ))
+    except Exception as exc:
+        checks.append(("User History Pagination",False,str(exc)[:100]))
+
     # Schema version
     try:
         current_schema=schema_version_info()
@@ -7130,6 +7190,14 @@ def order_detail_text(order) -> str:
     method=payment_method_label(order["payment_method"])
     total=int(order["payment_total"] or order["total"] or 0)
     reject_reason=(order["payment_reject_reason"] or "").strip()
+    reviewed=order_has_review(int(order["id"]))
+    rating_line=""
+    if order["status"]=="completed" and order["fulfillment_status"]=="delivered":
+        rating_line=(
+            "⭐ Rating: <b>Sudah diberi rating</b>"
+            if reviewed
+            else "⭐ Rating: <b>Belum diberi rating</b>"
+        )
 
     lines=[
         "🧾 <b>DETAIL PESANAN</b>",
@@ -7145,6 +7213,8 @@ def order_detail_text(order) -> str:
         f"📝 Catatan: <b>{html.escape(str(note))}</b>",
         f"🕒 Dibuat: <code>{html.escape(str(created))}</code>",
     ]
+    if rating_line:
+        lines.append(rating_line)
     if completed and completed!="-":
         lines.append(f"✅ Selesai: <code>{html.escape(str(completed))}</code>")
     if reject_reason:
@@ -7198,17 +7268,36 @@ def proof_rejected_keyboard(entity: str, entity_id: int):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def order_has_review(order_id: int) -> bool:
+    conn=db()
+    try:
+        return bool(conn.execute(
+            "SELECT 1 FROM reviews WHERE order_id=? LIMIT 1",
+            (int(order_id),)
+        ).fetchone())
+    finally:
+        conn.close()
+
+
 def order_detail_keyboard(order):
     rows=[]
     status=str(order["status"] or "")
     payment_status=str(order["payment_status"] or "")
     proof_used=proof_locked_status(order)
+    reviewed=order_has_review(int(order["id"]))
 
     if status=="completed" and order["fulfillment_status"]=="delivered":
+        if not reviewed and str(order["payment_method"] or "")!="OWNER_FREE":
+            rows.append([
+                InlineKeyboardButton(
+                    text="⭐ Beri Rating",
+                    callback_data=f"reviewopen:{order['id']}"
+                )
+            ])
         rows.append([
             InlineKeyboardButton(
-                text="⭐ Nilai Toko",
-                callback_data=f"reviewopen:{order['id']}"
+                text="📸 Kirim Bukti Login",
+                callback_data=f"loginproof:{order['id']}"
             )
         ])
     elif payment_status!="paid" and status not in {"expired","cancelled","completed"}:
@@ -7241,8 +7330,8 @@ def order_detail_keyboard(order):
         ])
 
     rows.append([
-        InlineKeyboardButton(text="⬅️ Riwayat", callback_data="my_orders"),
-        InlineKeyboardButton(text="🏠 Menu", callback_data="home")
+        InlineKeyboardButton(text="⬅️ Riwayat",callback_data="my_orders"),
+        InlineKeyboardButton(text="🏠 Menu",callback_data="home")
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -8291,7 +8380,6 @@ def main_menu():
     kb.button(text="🎁 Voucher", callback_data="voucher_info")
     kb.button(text="💰 Isi Saldo", callback_data="wallet")
     kb.button(text="🧾 Riwayat", callback_data="my_orders")
-    kb.button(text="⭐ Rating Toko", callback_data="store:rating")
 
     if ADMIN_USERNAME:
         kb.button(
@@ -8299,7 +8387,7 @@ def main_menu():
             url=f"https://t.me/{ADMIN_USERNAME}"
         )
 
-    kb.adjust(2,2,2,1)
+    kb.adjust(2,2,2)
     return kb.as_markup()
 
 
@@ -11684,6 +11772,29 @@ async def verify_join(call: CallbackQuery, bot: Bot, state: FSMContext):
 
 
 
+@router.callback_query(F.data == "start:view")
+async def cb_start_view(call: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+    if not await is_channel_member(bot,call.from_user.id):
+        await safe_edit_or_answer(
+            call,
+            "🔐 <b>VERIFIKASI CHANNEL</b>\n\n"
+            f"Silakan join <b>{REQUIRED_CHANNEL_NAME}</b> terlebih dahulu.",
+            reply_markup=join_required_keyboard(),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+
+    mark_user_verified(call.from_user.id,call.from_user.username or "")
+    await safe_edit_or_answer(
+        call,
+        start_view_text(),
+        reply_markup=start_view_keyboard(),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
 @router.callback_query(F.data == "home")
 async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
     await state.clear()
@@ -11857,7 +11968,9 @@ async def public_store_rating(call: CallbackQuery):
     await safe_edit_or_answer(
         call,
         "\n\n".join(lines),
-        reply_markup=back_home(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Kembali ke /start",callback_data="start:view")]
+        ]),
         parse_mode="HTML"
     )
     await safe_callback_notice(call)
@@ -13476,84 +13589,161 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         await call.answer("QR otomatis berhasil dibuat.")
 
 
-@router.callback_query(F.data == "my_orders")
-async def my_orders(call: CallbackQuery):
-    conn = db()
+USER_HISTORY_PAGE_SIZE = 4
+
+
+def user_history_keyboard(rows, page: int, total_pages: int):
+    rows_kb=[]
+    page=max(1,int(page))
+    total_pages=max(1,int(total_pages))
+
+    # One compact detail/rating row for each visible order.
+    for row in rows:
+        actions=[
+            InlineKeyboardButton(
+                text=f"🧾 {invoice(row['id'])}",
+                callback_data=f"orderdetail:{row['id']}"
+            )
+        ]
+        if (
+            row["status"]=="completed"
+            and row["fulfillment_status"]=="delivered"
+            and int(row["reviewed"] or 0)==0
+            and str(row["payment_method"] or "")!="OWNER_FREE"
+        ):
+            actions.append(
+                InlineKeyboardButton(
+                    text="⭐ Beri Rating",
+                    callback_data=f"reviewopen:{row['id']}"
+                )
+            )
+        rows_kb.append(actions)
+
+    nav=[]
+    if page>1:
+        nav.append(InlineKeyboardButton(text="⬅️",callback_data=f"myorderspage:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page}/{total_pages}",callback_data=f"myorderspage:{page}"))
+    if page<total_pages:
+        nav.append(InlineKeyboardButton(text="➡️",callback_data=f"myorderspage:{page+1}"))
+    rows_kb.append(nav)
+
+    rows_kb.append([
+        InlineKeyboardButton(text="🔄 Refresh",callback_data=f"myorderspage:{page}")
+    ])
+    rows_kb.append([
+        InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows_kb)
+
+
+async def render_user_history_page(call: CallbackQuery, page: int = 1):
+    page=max(1,int(page))
     cutoff=user_final_order_cutoff_iso()
-    rows = conn.execute(
-        f"""
-        SELECT o.*, p.name AS product_name, v.name AS variant_name,
-               EXISTS(
-                   SELECT 1 FROM reviews r WHERE r.order_id=o.id
-               ) AS reviewed
-        FROM orders o
-        LEFT JOIN products p ON p.id=o.product_id
-        LEFT JOIN product_variants v ON v.id=o.variant_id
-        WHERE o.user_id=?
-          AND ({user_order_visible_sql('o')})
-        ORDER BY o.id DESC
-        LIMIT 10
-        """,
-        (call.from_user.id, cutoff)
+    conn=db()
+
+    total=int(conn.execute(
+        f"""SELECT COUNT(*) AS n
+            FROM orders o
+            WHERE o.user_id=?
+              AND ({user_order_visible_sql('o')})""",
+        (call.from_user.id,cutoff)
+    ).fetchone()["n"] or 0)
+
+    total_pages=max(1,(total + USER_HISTORY_PAGE_SIZE - 1)//USER_HISTORY_PAGE_SIZE)
+    page=min(page,total_pages)
+    offset=(page-1)*USER_HISTORY_PAGE_SIZE
+
+    rows=conn.execute(
+        f"""SELECT o.*,p.name AS product_name,v.name AS variant_name,
+                   EXISTS(
+                       SELECT 1 FROM reviews r WHERE r.order_id=o.id
+                   ) AS reviewed
+            FROM orders o
+            LEFT JOIN products p ON p.id=o.product_id
+            LEFT JOIN product_variants v ON v.id=o.variant_id
+            WHERE o.user_id=?
+              AND ({user_order_visible_sql('o')})
+            ORDER BY o.id DESC
+            LIMIT ? OFFSET ?""",
+        (call.from_user.id,cutoff,USER_HISTORY_PAGE_SIZE,offset)
     ).fetchall()
     conn.close()
 
     if not rows:
-        text = f"🧾 <b>RIWAYAT TRANSAKSI</b>\n\nBelum ada transaksi.\n\n<i>{STORE_FOOTER}</i>"
+        text=(
+            "🧾 <b>RIWAYAT TRANSAKSI</b>\n\n"
+            "Belum ada transaksi.\n\n"
+            f"<i>{STORE_FOOTER}</i>"
+        )
     else:
-        lines = ["🧾 <b>RIWAYAT TRANSAKSI</b>\n"]
+        lines=[
+            "🧾 <b>RIWAYAT TRANSAKSI</b>",
+            f"📄 Halaman <b>{page}/{total_pages}</b> • Total <b>{total}</b>",
+            ""
+        ]
+        status_icons={
+            "completed":"✅",
+            "pending":"🟡",
+            "expired":"⌛",
+            "cancelled":"❌",
+            "payment_error":"⚠️",
+            "paid_pending_delivery":"💰",
+        }
+
         for row in rows:
-            status_icons = {
-                "completed": "✅",
-                "pending": "🟡",
-                "expired": "⌛",
-                "cancelled": "❌",
-                "payment_error": "⚠️",
-                "paid_pending_delivery": "💰",
-            }
-            icon = status_icons.get(row["status"], "🔵")
+            icon=status_icons.get(str(row["status"] or ""), "🔵")
             display_status=order_user_status_label(row)
+            raw_time=(
+                row["completed_at"]
+                or row["payment_verified_at"]
+                or row["created_at"]
+                or "-"
+            )
+            rating_text=""
+            if row["status"]=="completed" and row["fulfillment_status"]=="delivered":
+                rating_text=(
+                    " • ⭐ Sudah dinilai"
+                    if int(row["reviewed"] or 0)==1
+                    else " • ⭐ Belum dinilai"
+                )
 
             lines.append(
-                f"{icon} <b>{invoice(row['id'])}</b> • "
-                f"{html.escape(row['product_name'] or 'Produk')} • "
-                f"{rupiah(row['payment_total'] or row['total'])}\n"
-                f"   💳 {html.escape(payment_method_label(row['payment_method']))} • "
-                f"{html.escape(display_status)}"
+                f"{icon} <b>{invoice(row['id'])}</b> • {html.escape(display_status)}\n"
+                f"📦 {html.escape(str(row['product_name'] or 'Produk'))} — "
+                f"{html.escape(str(row['variant_name'] or 'Standard'))}\n"
+                f"💰 {rupiah(row['payment_total'] or row['total'])}{rating_text}\n"
+                f"🕒 {html.escape(format_wib_datetime(raw_time,compact=True))}"
             )
-        lines.append(
-            f"<i>Pesanan selesai/ditolak otomatis hilang dari daftar setelah "
-            f"{USER_FINAL_ORDER_VISIBLE_HOURS} jam.</i>"
-        )
-        lines.append(f"<i>{STORE_FOOTER}</i>")
-        text = "\n".join(lines)
 
-    kb = InlineKeyboardBuilder()
+        lines.extend([
+            "",
+            f"<i>Pesanan final ditampilkan selama {USER_FINAL_ORDER_VISIBLE_HOURS} jam.</i>",
+            f"<i>{STORE_FOOTER}</i>"
+        ])
+        text="\n\n".join(lines)
 
-    if rows:
-        kb.button(
-            text="📄 Detail Terbaru",
-            callback_data="history:latest"
-        )
+    await safe_edit_or_answer(
+        call,
+        text,
+        reply_markup=user_history_keyboard(rows,page,total_pages),
+        parse_mode="HTML"
+    )
 
-    has_delivery = any(
-        row["status"]=="completed"
-        and row["fulfillment_status"]=="delivered"
-        and (row["delivery_text"] or "").strip()
-        for row in rows
-    ) if rows else False
 
-    if has_delivery:
-        kb.button(
-            text="📩 Kirim Ulang Akun Terakhir",
-            callback_data="resend:last"
-        )
+@router.callback_query(F.data == "my_orders")
+async def my_orders(call: CallbackQuery):
+    await render_user_history_page(call,1)
+    await safe_callback_notice(call)
 
-    kb.button(text="🏠 Menu Utama", callback_data="home")
-    kb.adjust(1)
 
-    await safe_edit_or_answer(call, text, reply_markup=kb.as_markup(), parse_mode="HTML")
-    await call.answer()
+@router.callback_query(F.data.startswith("myorderspage:"))
+async def my_orders_page(call: CallbackQuery):
+    try:
+        page=max(1,int(call.data.split(":")[-1]))
+    except Exception:
+        page=1
+    await render_user_history_page(call,page)
+    await safe_callback_notice(call)
 
 
 
@@ -24777,7 +24967,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.28"
+EXPECTED_SOURCE_VERSION = "16.30"
 
 
 def source_integrity_self_test():
