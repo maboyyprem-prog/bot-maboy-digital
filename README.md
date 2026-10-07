@@ -1,37 +1,31 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v16.32
+**Versi aktif:** v16.35
 
-## v16.32 — Flash Sale Berjangka
+## v16.35 — Statistik & Kuota `/tools`
 
-Flash Sale sekarang memakai timer persisten di database.
+Fitur baru owner-only:
 
-### Owner
-Pilih `Produk & Stok > Lainnya > Flash Sale`, lalu pilih produk dan durasi:
-- 15 menit
-- 30 menit
-- 1 jam
-- 3 jam
-- 6 jam
-- 12 jam
-- 24 jam
-- Custom 1–10080 menit (maks. 7 hari)
-- Matikan Flash Sale
+- tombol `📊 Statistik & Kuota`;
+- statistik sukses, gagal, pending;
+- total request akun;
+- tingkat keberhasilan dihitung dari request yang sudah selesai;
+- kuota lokal per jam;
+- estimasi sisa request;
+- estimasi sisa kapasitas akun;
+- reset otomatis setiap awal jam WIB;
+- countdown ke reset berikutnya;
+- request baru diblokir secara lokal jika sisa kuota kurang dari biaya per akun;
+- statistik dan riwayat disimpan dari `tool_provision_logs`.
 
-Memilih durasi baru mengganti timer lama.
+Variable tambahan:
+```text
+TOOLS_PROVIDER_HOURLY_LIMIT=15
+TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT=3
+```
 
-### Auto Expiry
-- Waktu akhir disimpan sebagai Unix timestamp di SQLite.
-- Restart/redeploy Railway tidak mereset timer.
-- Produk expired otomatis tidak ditampilkan di menu Flash Sale.
-- Saat menu Flash Sale dibuka, flag expired juga dibersihkan dari database.
-- Legacy Flash Sale ON tanpa timer dinonaktifkan saat migrasi agar tidak aktif tanpa batas.
+Nilai di atas cocok dengan panel provider yang menunjukkan 15 request API/jam dan estimasi 3 request untuk satu proses akun penuh.
 
-### User
-- Menu Flash Sale hanya menampilkan produk yang timer-nya masih aktif.
-- Halaman Flash Sale menampilkan waktu berakhir terdekat dalam WIB.
-- Detail produk menampilkan waktu berakhir jika produk sedang Flash Sale.
+Catatan: counter ini adalah pengaman lokal bot berdasarkan request yang dilakukan melalui bot. Provider tetap menjadi sumber kebenaran akhir jika memiliki counter sendiri.
 
-Semua fitur v16.31 tetap dipertahankan.
-Schema naik ke 173.
-Tidak ada Railway Variable baru.
+Schema tetap 174.

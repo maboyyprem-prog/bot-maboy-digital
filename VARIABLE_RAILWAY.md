@@ -1344,3 +1344,49 @@ Indikator warna stok dihapus. List Produk tetap menampilkan jumlah stok per prod
 - Tidak ada Railway Variable baru.
 - Schema naik ke 173.
 - Timer Flash Sale disimpan di SQLite dan aman terhadap restart/redeploy.
+
+
+## v16.33 — Owner Tools Provider (OPSIONAL)
+```text
+TOOLS_PROVIDER_ENABLED=false
+TOOLS_PROVIDER_NAME=Authorized Provider
+TOOLS_PROVIDER_STATUS_URL=
+TOOLS_PROVIDER_PROVISION_URL=
+TOOLS_PROVIDER_API_KEY=
+TOOLS_PROVIDER_TIMEOUT_SECONDS=12
+```
+Gunakan hanya endpoint/API provider resmi atau yang memang mengizinkan provisioning.
+
+
+## v16.34 — `/tools` hardening
+
+Tambahan variable opsional:
+
+```text
+TOOLS_PROVIDER_AUTH_MODE=bearer
+TOOLS_PROVIDER_MAX_RETRIES=1
+TOOLS_PROVIDER_REQUEST_COOLDOWN_SECONDS=600
+TOOLS_PROVIDER_MAX_RESPONSE_CHARS=2000
+```
+
+`TOOLS_PROVIDER_AUTH_MODE` mendukung `bearer` atau `x-api-key`.
+
+API key yang pernah dibagikan di chat harus dianggap terekspos dan di-rotate.
+Jangan menaruh API key langsung di `bot.py`.
+
+Schema tetap 174.
+
+
+## v16.35 — Statistik & Kuota Tools
+
+Tambahkan:
+
+```text
+TOOLS_PROVIDER_HOURLY_LIMIT=15
+TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT=3
+```
+
+- `HOURLY_LIMIT`: batas request API per jam.
+- `REQUESTS_PER_ACCOUNT`: estimasi konsumsi request untuk satu proses akun.
+- Reset counter lokal mengikuti awal jam WIB.
+- Schema tetap 174.

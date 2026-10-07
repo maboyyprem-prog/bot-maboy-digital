@@ -72,6 +72,50 @@ SHOPEEPAY_TERMINAL_ID = os.getenv("SHOPEEPAY_TERMINAL_ID", "").strip()
 SHOPEEPAY_PRIVATE_KEY = os.getenv("SHOPEEPAY_PRIVATE_KEY", "").replace("\\n", "\n").strip()
 SHOPEEPAY_PUBLIC_KEY = os.getenv("SHOPEEPAY_PUBLIC_KEY", "").replace("\\n", "\n").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+# Owner-only authorized provisioning tools. Disabled by default.
+# Use only with an official/authorized provider API.
+TOOLS_PROVIDER_ENABLED = os.getenv("TOOLS_PROVIDER_ENABLED", "false").lower() == "true"
+TOOLS_PROVIDER_NAME = os.getenv("TOOLS_PROVIDER_NAME", "Authorized Provider").strip() or "Authorized Provider"
+TOOLS_PROVIDER_STATUS_URL = os.getenv("TOOLS_PROVIDER_STATUS_URL", "").strip()
+TOOLS_PROVIDER_PROVISION_URL = os.getenv("TOOLS_PROVIDER_PROVISION_URL", "").strip()
+TOOLS_PROVIDER_API_KEY = os.getenv("TOOLS_PROVIDER_API_KEY", "").strip()
+try:
+    TOOLS_PROVIDER_TIMEOUT_SECONDS = max(3, min(30, int(os.getenv("TOOLS_PROVIDER_TIMEOUT_SECONDS", "12"))))
+except Exception:
+    TOOLS_PROVIDER_TIMEOUT_SECONDS = 12
+try:
+    TOOLS_PROVIDER_MAX_RETRIES = max(0, min(2, int(os.getenv("TOOLS_PROVIDER_MAX_RETRIES", "1"))))
+except Exception:
+    TOOLS_PROVIDER_MAX_RETRIES = 1
+try:
+    TOOLS_PROVIDER_REQUEST_COOLDOWN_SECONDS = max(
+        30, min(3600, int(os.getenv("TOOLS_PROVIDER_REQUEST_COOLDOWN_SECONDS", "600")))
+    )
+except Exception:
+    TOOLS_PROVIDER_REQUEST_COOLDOWN_SECONDS = 600
+try:
+    TOOLS_PROVIDER_MAX_RESPONSE_CHARS = max(
+        500, min(5000, int(os.getenv("TOOLS_PROVIDER_MAX_RESPONSE_CHARS", "2000")))
+    )
+except Exception:
+    TOOLS_PROVIDER_MAX_RESPONSE_CHARS = 2000
+try:
+    TOOLS_PROVIDER_HOURLY_LIMIT = max(
+        1, min(100000, int(os.getenv("TOOLS_PROVIDER_HOURLY_LIMIT", "15")))
+    )
+except Exception:
+    TOOLS_PROVIDER_HOURLY_LIMIT = 15
+try:
+    TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT = max(
+        1, min(100, int(os.getenv("TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT", "3")))
+    )
+except Exception:
+    TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT = 3
+TOOLS_PROVIDER_AUTH_MODE = os.getenv("TOOLS_PROVIDER_AUTH_MODE", "bearer").strip().lower()
+if TOOLS_PROVIDER_AUTH_MODE not in {"bearer","x-api-key"}:
+    TOOLS_PROVIDER_AUTH_MODE = "bearer"
+
 PORT = int(os.getenv("PORT", "8080"))
 
 REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
@@ -93,8 +137,8 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.32"
-SCHEMA_VERSION = 173
+BOT_VERSION = "16.35"
+SCHEMA_VERSION = 174
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -702,6 +746,23 @@ def init_db():
         )
     """)
 
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tool_provision_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            tool_name TEXT NOT NULL DEFAULT 'alight_motion',
+            target_email TEXT NOT NULL,
+            plan TEXT NOT NULL DEFAULT '1_year',
+            status TEXT NOT NULL DEFAULT 'pending',
+            http_status INTEGER NOT NULL DEFAULT 0,
+            provider_reference TEXT DEFAULT '',
+            response_preview TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS system_errors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -792,6 +853,11 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_provision_email "
+        "ON tool_provision_logs(target_email, created_at)"
+    )
 
     # migrations from previous versions
     add_column_if_missing(conn, "products", "created_at", "TEXT DEFAULT ''")
@@ -6281,6 +6347,37 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Timed Flash Sale",False,str(exc)[:100]))
 
+    # Owner-only authorized tools
+    try:
+        conn=db()
+        tools_table=bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_provision_logs'"
+        ).fetchone())
+        conn.close()
+        checks.append((
+            "Owner Tools",
+            tools_table and callable(tools_provider_request) and callable(owner_tools_menu),
+            "owner-only + provider disabled by default"
+        ))
+    except Exception as exc:
+        checks.append(("Owner Tools",False,str(exc)[:100]))
+
+    # Owner tools statistics / quota
+    try:
+        tools_stats_ok=(
+            callable(tools_stats_snapshot)
+            and callable(tools_quota_can_process)
+            and TOOLS_PROVIDER_HOURLY_LIMIT>=1
+            and TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT>=1
+        )
+        checks.append((
+            "Tools Stats & Quota",
+            tools_stats_ok,
+            f"{TOOLS_PROVIDER_HOURLY_LIMIT}/hour • cost {TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT}"
+        ))
+    except Exception as exc:
+        checks.append(("Tools Stats & Quota",False,str(exc)[:100]))
+
     # Schema version
     try:
         current_schema=schema_version_info()
@@ -8267,6 +8364,7 @@ class OwnerState(StatesGroup):
     mark_popular = State()
     mark_flash = State()
     flash_duration_custom = State()
+    tools_alight_email = State()
     set_qris = State()
     set_payment_note = State()
     topup_amount = State()
@@ -9022,6 +9120,7 @@ def validate_system_schema():
             "content_fingerprint","inventory_mode"
         },
         "order_login_proofs": {"id","order_id","user_id","file_id","created_at"},
+        "tool_provision_logs": {"id","owner_id","tool_name","target_email","plan","status","created_at"},
         "settings": {"key","value"},
         "system_errors": {"id","error_text","created_at"},
         "payment_proof_sessions": {"user_id","entity_type","entity_id"},
@@ -11245,6 +11344,608 @@ async def payment_proof_invalid(message: Message):
         "Jika ingin keluar dari pengiriman bukti, tekan 🏠 Menu Utama.",
         reply_markup=user_reply_menu()
     )
+
+
+
+# =========================
+# OWNER TOOLS / AUTHORIZED PROVIDER
+# =========================
+
+def tools_provider_ready() -> bool:
+    return bool(
+        TOOLS_PROVIDER_ENABLED
+        and TOOLS_PROVIDER_PROVISION_URL
+        and TOOLS_PROVIDER_API_KEY
+    )
+
+
+def tools_provider_status_text() -> str:
+    if not TOOLS_PROVIDER_ENABLED:
+        return "🔴 DISABLED"
+    if not TOOLS_PROVIDER_PROVISION_URL or not TOOLS_PROVIDER_API_KEY:
+        return "🟠 KONFIGURASI BELUM LENGKAP"
+    return "🟢 READY"
+
+
+def owner_tools_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Alight Motion Tools",callback_data="tools:alight")],
+        [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
+        [InlineKeyboardButton(text="🔌 Cek API",callback_data="tools:status")],
+        [InlineKeyboardButton(text="📦 Riwayat Provision",callback_data="tools:history")],
+        [InlineKeyboardButton(text="⚙️ Status Provider",callback_data="tools:provider")],
+        [InlineKeyboardButton(text="⬅️ Owner Panel",callback_data="owner:panel")],
+    ])
+
+
+def alight_tools_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Provision 1 Tahun",callback_data="tools:alight:1y")],
+        [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
+        [InlineKeyboardButton(text="📦 Riwayat Alight Motion",callback_data="tools:history")],
+        [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+    ])
+
+
+def tools_hour_window():
+    """Current provider quota window; reset at the start of each WIB hour."""
+    now_wib=datetime.now(DISPLAY_TIMEZONE)
+    start_wib=now_wib.replace(minute=0,second=0,microsecond=0)
+    next_wib=start_wib + timedelta(hours=1)
+    # tool_provision_logs uses historical naive server timestamps; query in UTC-naive
+    # so the bucket remains stable on Railway while displayed in WIB.
+    start_utc=start_wib.astimezone(timezone.utc).replace(tzinfo=None)
+    next_utc=next_wib.astimezone(timezone.utc).replace(tzinfo=None)
+    return now_wib,start_wib,next_wib,start_utc,next_utc
+
+
+def tools_stats_snapshot(owner_id: int) -> dict:
+    now_wib,start_wib,next_wib,start_utc,next_utc=tools_hour_window()
+    conn=db()
+    rows=conn.execute(
+        """SELECT status,COUNT(*) AS n
+           FROM tool_provision_logs
+           WHERE owner_id=?
+             AND created_at>=?
+             AND created_at<?
+           GROUP BY status""",
+        (
+            int(owner_id),
+            start_utc.isoformat(timespec="seconds"),
+            next_utc.isoformat(timespec="seconds"),
+        )
+    ).fetchall()
+    totals={str(row["status"] or ""):int(row["n"] or 0) for row in rows}
+
+    lifetime=conn.execute(
+        """SELECT
+             COUNT(*) AS total,
+             SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success,
+             SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
+           FROM tool_provision_logs
+           WHERE owner_id=?""",
+        (int(owner_id),)
+    ).fetchone()
+    conn.close()
+
+    hour_success=int(totals.get("success",0))
+    hour_failed=int(totals.get("failed",0))
+    hour_pending=int(totals.get("pending",0))
+    hour_attempts=hour_success+hour_failed+hour_pending
+
+    request_cost=max(1,int(TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT))
+    used_requests=min(
+        int(TOOLS_PROVIDER_HOURLY_LIMIT),
+        hour_attempts*request_cost
+    )
+    remaining_requests=max(0,int(TOOLS_PROVIDER_HOURLY_LIMIT)-used_requests)
+    remaining_accounts=remaining_requests//request_cost
+
+    total=int(lifetime["total"] or 0)
+    success=int(lifetime["success"] or 0)
+    failed=int(lifetime["failed"] or 0)
+    decided=max(0,success+failed)
+    success_rate=(success/decided*100.0) if decided else 0.0
+
+    reset_seconds=max(0,int((next_wib-now_wib).total_seconds()))
+    reset_minutes=reset_seconds//60
+    reset_secs=reset_seconds%60
+
+    return {
+        "hour_success":hour_success,
+        "hour_failed":hour_failed,
+        "hour_pending":hour_pending,
+        "hour_attempts":hour_attempts,
+        "used_requests":used_requests,
+        "remaining_requests":remaining_requests,
+        "remaining_accounts":remaining_accounts,
+        "hourly_limit":int(TOOLS_PROVIDER_HOURLY_LIMIT),
+        "request_cost":request_cost,
+        "lifetime_total":total,
+        "lifetime_success":success,
+        "lifetime_failed":failed,
+        "success_rate":success_rate,
+        "reset_at":next_wib.strftime("%H:00 WIB"),
+        "reset_countdown":f"{reset_minutes:02d}m {reset_secs:02d}d",
+    }
+
+
+def tools_stats_text(owner_id: int) -> str:
+    s=tools_stats_snapshot(owner_id)
+    return (
+        "📊 <b>STATISTIK & KUOTA TOOLS</b>\n\n"
+        f"🔌 Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
+        f"📡 Status: <b>{tools_provider_status_text()}</b>\n\n"
+        "⚡ <b>KUOTA JAM INI</b>\n"
+        f"Request terpakai: <b>{s['used_requests']}/{s['hourly_limit']}</b>\n"
+        f"Sisa request: <b>{s['remaining_requests']}</b>\n"
+        f"Biaya per akun: <b>{s['request_cost']} request</b>\n"
+        f"Estimasi sisa kapasitas: <b>{s['remaining_accounts']} akun</b>\n"
+        f"Reset berikutnya: <b>{s['reset_at']}</b>\n"
+        f"Hitung mundur: <b>{s['reset_countdown']}</b>\n\n"
+        "📦 <b>PROSES JAM INI</b>\n"
+        f"✅ Sukses: <b>{s['hour_success']}</b>\n"
+        f"❌ Gagal: <b>{s['hour_failed']}</b>\n"
+        f"⏳ Pending: <b>{s['hour_pending']}</b>\n\n"
+        "📈 <b>TOTAL STATISTIK BOT</b>\n"
+        f"Total request akun: <b>{s['lifetime_total']}</b>\n"
+        f"✅ Sukses: <b>{s['lifetime_success']}</b>\n"
+        f"❌ Gagal: <b>{s['lifetime_failed']}</b>\n"
+        f"🎯 Tingkat keberhasilan: <b>{s['success_rate']:.1f}%</b>"
+    )
+
+
+def tools_quota_can_process(owner_id: int) -> tuple[bool,dict]:
+    s=tools_stats_snapshot(owner_id)
+    return s["remaining_requests"] >= s["request_cost"],s
+
+
+def valid_tools_email(value: str) -> bool:
+    value=str(value or "").strip()
+    if not value or len(value) > 254 or " " in value or "@" not in value:
+        return False
+    return bool(re.fullmatch(
+        r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        value
+    ))
+
+
+def tool_response_preview(data) -> str:
+    """Redact likely secrets/tokens before showing or persisting provider output."""
+    try:
+        if isinstance(data,(dict,list)):
+            raw=json.dumps(data,ensure_ascii=False,separators=(",",":"))
+        else:
+            raw=str(data)
+    except Exception:
+        raw="<unreadable>"
+
+    patterns=[
+        r'(?i)(api[_-]?key|x-api-key|secret|authorization|bearer)["\']?\s*[:=]\s*["\']?[^,}\s"\']+',
+        r'(?i)(idtoken|access[_-]?token|refresh[_-]?token|session[_-]?token)["\']?\s*[:=]\s*["\']?[^,}\s"\']+',
+    ]
+    for pattern in patterns:
+        raw=re.sub(pattern,r'\1=***',raw)
+
+    raw=raw.replace("<","&lt;").replace(">","&gt;")
+    return raw[:TOOLS_PROVIDER_MAX_RESPONSE_CHARS]
+
+
+def tools_provider_headers(payload_present: bool=False) -> dict:
+    headers={
+        "Accept":"application/json",
+        "User-Agent":f"MaboyyDigital/{BOT_VERSION}",
+    }
+    if TOOLS_PROVIDER_API_KEY:
+        if TOOLS_PROVIDER_AUTH_MODE=="x-api-key":
+            headers["x-api-key"]=TOOLS_PROVIDER_API_KEY
+        else:
+            headers["Authorization"]=f"Bearer {TOOLS_PROVIDER_API_KEY}"
+    if payload_present:
+        headers["Content-Type"]="application/json"
+    return headers
+
+
+async def tools_provider_request(method: str, url: str, *, payload=None):
+    """
+    Generic authorized-provider request helper.
+    Keeps provider failures isolated from the main shop flow.
+    """
+    if not TOOLS_PROVIDER_ENABLED:
+        return False,0,{"error":"provider_disabled"}
+    if not url:
+        return False,0,{"error":"endpoint_not_configured"}
+    if not str(url).startswith(("https://","http://")):
+        return False,0,{"error":"invalid_provider_url"}
+
+    timeout=aiohttp.ClientTimeout(total=float(TOOLS_PROVIDER_TIMEOUT_SECONDS))
+    headers=tools_provider_headers(payload is not None)
+    attempts=1+int(TOOLS_PROVIDER_MAX_RETRIES)
+    last=(False,0,{"error":"unknown"})
+
+    for attempt in range(1,attempts+1):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.request(
+                    method.upper(),
+                    url,
+                    headers=headers,
+                    json=payload if payload is not None else None,
+                    allow_redirects=False,
+                ) as response:
+                    status=int(response.status)
+                    try:
+                        data=await response.json(content_type=None)
+                    except Exception:
+                        data={"text":(await response.text())[:TOOLS_PROVIDER_MAX_RESPONSE_CHARS]}
+
+                    last=(200 <= status < 300,status,data)
+
+                    # Do not retry client/auth errors.
+                    if status < 500:
+                        return last
+
+        except asyncio.TimeoutError:
+            last=(False,0,{"error":"timeout"})
+        except Exception as exc:
+            logging.warning(
+                "Owner tools provider request failed (%s/%s): %s",
+                attempt,attempts,type(exc).__name__
+            )
+            last=(
+                False,
+                0,
+                {
+                    "error":type(exc).__name__,
+                    "detail":tool_response_preview(str(exc))[:300],
+                }
+            )
+
+        if attempt < attempts:
+            await asyncio.sleep(min(1.0*attempt,2.0))
+
+    return last
+
+
+def create_tool_log(owner_id: int,email: str,plan: str="1_year") -> int:
+    now=datetime.now().isoformat(timespec="seconds")
+    conn=db(); begin_immediate_retry(conn)
+    try:
+        # Double-click / replay guard for same email and plan.
+        recent=conn.execute(
+            """SELECT id,status,created_at FROM tool_provision_logs
+               WHERE owner_id=? AND target_email=? AND plan=?
+               ORDER BY id DESC LIMIT 1""",
+            (int(owner_id),email.lower(),plan)
+        ).fetchone()
+        if recent and str(recent["status"] or "") in {"pending","success"}:
+            try:
+                dt=datetime.fromisoformat(str(recent["created_at"]))
+                now_dt=datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+                if (now_dt-dt).total_seconds() < TOOLS_PROVIDER_REQUEST_COOLDOWN_SECONDS:
+                    conn.rollback()
+                    raise ValueError(f"Request email/plan yang sama masih dalam cooldown {TOOLS_PROVIDER_REQUEST_COOLDOWN_SECONDS//60} menit.")
+            except ValueError:
+                raise
+            except Exception:
+                pass
+        cur=conn.execute(
+            """INSERT INTO tool_provision_logs(
+                   owner_id,tool_name,target_email,plan,status,http_status,
+                   provider_reference,response_preview,created_at,updated_at
+               ) VALUES(?,?,?,?, 'pending',0,'','',?,?)""",
+            (int(owner_id),"alight_motion",email.lower(),plan,now,now)
+        )
+        log_id=int(cur.lastrowid)
+        conn.commit()
+        return log_id
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+def update_tool_log(log_id: int, *, status: str,http_status: int=0,reference: str="",preview: str=""):
+    conn=db()
+    conn.execute(
+        """UPDATE tool_provision_logs
+           SET status=?,http_status=?,provider_reference=?,response_preview=?,updated_at=?
+           WHERE id=?""",
+        (str(status),int(http_status or 0),str(reference or "")[:200],str(preview or "")[:900],datetime.now().isoformat(timespec="seconds"),int(log_id))
+    )
+    conn.commit(); conn.close()
+
+
+@router.message(Command("tools"))
+async def owner_tools_command(message: Message,state: FSMContext):
+    await state.clear()
+    if not is_owner(message.from_user.id):
+        return await message.answer(owner_access_denied_text(),parse_mode="HTML")
+    await message.answer(
+        "🧰 <b>OWNER TOOLS</b>\n\n"
+        "Modul ini terpisah dari checkout utama.\n"
+        "Gunakan hanya dengan API provider resmi/berizin.\n\n"
+        f"Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
+        f"Status: <b>{tools_provider_status_text()}</b>\n"
+        f"Auth: <b>{html.escape(TOOLS_PROVIDER_AUTH_MODE)}</b>\n"
+        f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b> • Retry: <b>{TOOLS_PROVIDER_MAX_RETRIES}</b>\n"
+        f"Kuota lokal: <b>{tools_stats_snapshot(message.from_user.id)['used_requests']}/{TOOLS_PROVIDER_HOURLY_LIMIT}</b>",
+        reply_markup=owner_tools_menu(),parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "tools:home")
+async def owner_tools_home(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "🧰 <b>OWNER TOOLS</b>\n\n"
+        f"Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
+        f"Status: <b>{tools_provider_status_text()}</b>\n"
+        f"Kuota lokal: <b>{tools_stats_snapshot(call.from_user.id)['used_requests']}/{TOOLS_PROVIDER_HOURLY_LIMIT}</b>",
+        reply_markup=owner_tools_menu(),parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:alight")
+async def owner_tools_alight(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
+    await state.clear()
+    await safe_edit_or_answer(
+        call,
+        "🎬 <b>ALIGHT MOTION TOOLS</b>\n\n"
+        "Provision hanya akan dikirim ke endpoint provider yang kamu konfigurasi sendiri.\n"
+        "Bot tidak memiliki generator/bypass premium bawaan.\n\n"
+        f"API: <b>{tools_provider_status_text()}</b>\n"
+        f"Kuota: <b>{tools_stats_snapshot(call.from_user.id)['used_requests']}/{TOOLS_PROVIDER_HOURLY_LIMIT} request</b>\n"
+        f"Sisa kapasitas: <b>{tools_stats_snapshot(call.from_user.id)['remaining_accounts']} akun</b>",
+        reply_markup=alight_tools_menu(),parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:alight:1y")
+async def owner_tools_alight_1y(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
+    if not tools_provider_ready():
+        return await call.answer("Provider belum aktif/lengkap. Cek Status Provider.",show_alert=True)
+    await state.clear()
+    await state.set_state(OwnerState.tools_alight_email)
+    await safe_edit_or_answer(
+        call,
+        "📧 <b>ALIGHT MOTION • 1 TAHUN</b>\n\n"
+        "Kirim email tujuan yang akan diproses oleh provider resmi.\n\n"
+        "Bot akan meminta konfirmasi sebelum request dikirim.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")]
+        ]),parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.tools_alight_email)
+async def owner_tools_alight_email_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id): return
+    email=(message.text or "").strip().lower()
+    if not valid_tools_email(email):
+        return await message.answer("❌ Format email tidak valid. Silakan kirim ulang.")
+    await state.update_data(tools_target_email=email,tools_plan="1_year")
+    await state.set_state(None)
+    await message.answer(
+        "⚠️ <b>KONFIRMASI PROVISION</b>\n\n"
+        "🎬 Produk: <b>Alight Motion</b>\n"
+        "⏳ Paket: <b>1 Tahun</b>\n"
+        f"📧 Email: <b>{html.escape(email)}</b>\n\n"
+        "Pastikan endpoint yang digunakan adalah provider resmi/berizin.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Kirim ke Provider",callback_data="tools:alight:confirm")],
+            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")],
+        ]),parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "tools:alight:confirm")
+async def owner_tools_alight_confirm(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
+    if not tools_provider_ready():
+        return await call.answer("Provider belum aktif/lengkap.",show_alert=True)
+    data=await state.get_data()
+    email=str(data.get("tools_target_email") or "").strip().lower()
+    plan=str(data.get("tools_plan") or "1_year")
+    if not valid_tools_email(email):
+        await state.clear()
+        return await call.answer("Session email tidak valid. Ulangi dari /tools.",show_alert=True)
+
+    quota_ok,quota=tools_quota_can_process(call.from_user.id)
+    if not quota_ok:
+        await state.clear()
+        await safe_edit_or_answer(
+            call,
+            "⏳ <b>KUOTA API JAM INI HABIS</b>\n\n"
+            f"Request: <b>{quota['used_requests']}/{quota['hourly_limit']}</b>\n"
+            f"Sisa: <b>{quota['remaining_requests']}</b>\n"
+            f"Kebutuhan per akun: <b>{quota['request_cost']} request</b>\n"
+            f"Reset: <b>{quota['reset_at']}</b>\n"
+            f"Hitung mundur: <b>{quota['reset_countdown']}</b>\n\n"
+            "Bot tidak mengirim request baru agar provider tidak terkena limit.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📊 Statistik & Kuota",callback_data="tools:stats")],
+                [InlineKeyboardButton(text="⬅️ Alight Tools",callback_data="tools:alight")],
+            ]),
+            parse_mode="HTML"
+        )
+        return await safe_callback_notice(call,"Kuota provider habis.")
+
+    try:
+        log_id=create_tool_log(call.from_user.id,email,plan)
+    except ValueError as exc:
+        return await call.answer(str(exc),show_alert=True)
+    except Exception as exc:
+        logging.exception("Create tool provision log failed: %s",exc)
+        return await call.answer("Gagal menyiapkan request.",show_alert=True)
+
+    await safe_edit_or_answer(
+        call,
+        "⏳ <b>MENGHUBUNGI PROVIDER...</b>\n\n"
+        f"📧 {html.escape(email)}\n"
+        f"🧾 Request #{log_id}",
+        parse_mode="HTML"
+    )
+
+    payload={
+        "product":"alight_motion",
+        "plan":"1_year",
+        "email":email,
+        "request_id":f"MBY-TOOLS-{log_id}",
+    }
+    ok,http_status,result=await tools_provider_request(
+        "POST",TOOLS_PROVIDER_PROVISION_URL,payload=payload
+    )
+    preview=tool_response_preview(result)
+    reference=""
+    if isinstance(result,dict):
+        reference=str(
+            result.get("reference") or result.get("id") or result.get("request_id") or ""
+        )[:200]
+        provider_status=str(result.get("status") or "").lower()
+        if provider_status in {"error","failed","rejected"}:
+            ok=False
+
+    update_tool_log(
+        log_id,
+        status="success" if ok else "failed",
+        http_status=http_status,
+        reference=reference,
+        preview=preview,
+    )
+    await state.clear()
+
+    if ok:
+        await safe_edit_or_answer(
+            call,
+            "✅ <b>REQUEST BERHASIL DIKIRIM</b>\n\n"
+            f"🧾 Request: <b>#{log_id}</b>\n"
+            f"📧 Email: <b>{html.escape(email)}</b>\n"
+            f"🌐 HTTP: <b>{http_status}</b>\n"
+            + (f"🔎 Ref Provider: <code>{html.escape(reference)}</code>\n" if reference else "")
+            + "\nHasil lengkap tersimpan di Riwayat Provision.",
+            reply_markup=alight_tools_menu(),parse_mode="HTML"
+        )
+        return await safe_callback_notice(call,"Provision terkirim")
+
+    await safe_edit_or_answer(
+        call,
+        "❌ <b>PROVISION GAGAL</b>\n\n"
+        f"🧾 Request: <b>#{log_id}</b>\n"
+        f"📧 Email: <b>{html.escape(email)}</b>\n"
+        f"🌐 HTTP: <b>{http_status or '-'}</b>\n"
+        f"Detail: <code>{html.escape(preview[:500])}</code>\n\n"
+        "Checkout toko tetap berjalan normal.",
+        reply_markup=alight_tools_menu(),parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:stats")
+async def owner_tools_stats(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    await safe_edit_or_answer(
+        call,
+        tools_stats_text(call.from_user.id),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Refresh Statistik",callback_data="tools:stats")],
+            [InlineKeyboardButton(text="📦 Riwayat Provision",callback_data="tools:history")],
+            [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:status")
+async def owner_tools_status(call: CallbackQuery):
+    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
+    if not TOOLS_PROVIDER_ENABLED:
+        await safe_edit_or_answer(
+            call,
+            "🔌 <b>CEK API</b>\n\nStatus: <b>DISABLED</b>\nAktifkan provider resmi terlebih dahulu.",
+            reply_markup=owner_tools_menu(),parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+    if not TOOLS_PROVIDER_STATUS_URL:
+        await safe_edit_or_answer(
+            call,
+            "🔌 <b>CEK API</b>\n\nEndpoint status belum dikonfigurasi.\n"
+            "Provision endpoint dapat tetap digunakan jika sudah lengkap.",
+            reply_markup=owner_tools_menu(),parse_mode="HTML"
+        )
+        return await safe_callback_notice(call)
+    ok,status,data=await tools_provider_request("GET",TOOLS_PROVIDER_STATUS_URL)
+    preview=tool_response_preview(data)
+    await safe_edit_or_answer(
+        call,
+        "🔌 <b>STATUS API PROVIDER</b>\n\n"
+        f"Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
+        f"Status: <b>{'ONLINE' if ok else 'ERROR'}</b>\n"
+        f"HTTP: <b>{status or '-'}</b>\n"
+        f"Response: <code>{html.escape(preview[:600])}</code>",
+        reply_markup=owner_tools_menu(),parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:provider")
+async def owner_tools_provider_info(call: CallbackQuery):
+    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
+    await safe_edit_or_answer(
+        call,
+        "⚙️ <b>STATUS PROVIDER TOOLS</b>\n\n"
+        f"Nama: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
+        f"Enabled: <b>{'YA' if TOOLS_PROVIDER_ENABLED else 'TIDAK'}</b>\n"
+        f"Status endpoint: <b>{'SET' if TOOLS_PROVIDER_STATUS_URL else 'BELUM'}</b>\n"
+        f"Provision endpoint: <b>{'SET' if TOOLS_PROVIDER_PROVISION_URL else 'BELUM'}</b>\n"
+        f"API key: <b>{'SET' if TOOLS_PROVIDER_API_KEY else 'BELUM'}</b>\n"
+        f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b>\n"
+        f"Limit lokal: <b>{TOOLS_PROVIDER_HOURLY_LIMIT} request/jam</b>\n"
+        f"Biaya estimasi: <b>{TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT} request/akun</b>\n\n"
+        "Secret/API key tidak pernah ditampilkan di Telegram.",
+        reply_markup=owner_tools_menu(),parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:history")
+async def owner_tools_history(call: CallbackQuery):
+    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
+    conn=db()
+    rows=conn.execute(
+        """SELECT * FROM tool_provision_logs
+           WHERE owner_id=?
+           ORDER BY id DESC LIMIT 10""",
+        (int(call.from_user.id),)
+    ).fetchall()
+    conn.close()
+    lines=["📦 <b>RIWAYAT PROVISION</b>",""]
+    if not rows:
+        lines.append("Belum ada request provisioning.")
+    else:
+        for row in rows:
+            icon="✅" if row["status"]=="success" else ("⏳" if row["status"]=="pending" else "❌")
+            lines.append(
+                f"{icon} <b>#{row['id']}</b> • {html.escape(str(row['status']).upper())}\n"
+                f"🎬 Alight Motion • 1 Tahun\n"
+                f"📧 {html.escape(str(row['target_email']))}\n"
+                f"🌐 HTTP: {int(row['http_status'] or 0) or '-'}\n"
+                f"🕒 {html.escape(format_wib_datetime(row['created_at'],compact=True))}"
+            )
+    await safe_edit_or_answer(
+        call,"\n\n".join(lines),reply_markup=owner_tools_menu(),parse_mode="HTML"
+    )
+    await safe_callback_notice(call)
 
 
 @router.message(Command("owner"))
@@ -25460,7 +26161,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.32"
+EXPECTED_SOURCE_VERSION = "16.35"
 
 
 def source_integrity_self_test():
