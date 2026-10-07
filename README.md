@@ -1,31 +1,22 @@
 # Maboyy Digital Bot
 
-**Versi aktif:** v16.35
+**Versi aktif:** v16.38
 
-## v16.35 — Statistik & Kuota `/tools`
+## v16.38 — Fix `/tools` Konfigurasi Belum Lengkap
 
-Fitur baru owner-only:
+Bug diperbaiki:
+- status READY sebelumnya masih bergantung pada `TOOLS_PROVIDER_PROVISION_URL`;
+- padahal flow aktif sekarang hanya Magic Link + Verify.
 
-- tombol `📊 Statistik & Kuota`;
-- statistik sukses, gagal, pending;
-- total request akun;
-- tingkat keberhasilan dihitung dari request yang sudah selesai;
-- kuota lokal per jam;
-- estimasi sisa request;
-- estimasi sisa kapasitas akun;
-- reset otomatis setiap awal jam WIB;
-- countdown ke reset berikutnya;
-- request baru diblokir secara lokal jika sisa kuota kurang dari biaya per akun;
-- statistik dan riwayat disimpan dari `tool_provision_logs`.
+Sekarang `/tools` dianggap READY jika:
+- `TOOLS_PROVIDER_ENABLED=true`
+- `TOOLS_PROVIDER_API_KEY` tersedia di Railway Secret
+- `TOOLS_PROVIDER_MAGICLINK_URL` terisi
+- `TOOLS_PROVIDER_VERIFY_URL` terisi
 
-Variable tambahan:
-```text
-TOOLS_PROVIDER_HOURLY_LIMIT=15
-TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT=3
-```
+`TOOLS_PROVIDER_STATUS_URL` dan `TOOLS_PROVIDER_PROVISION_URL` tidak lagi diwajibkan.
 
-Nilai di atas cocok dengan panel provider yang menunjukkan 15 request API/jam dan estimasi 3 request untuk satu proses akun penuh.
-
-Catatan: counter ini adalah pengaman lokal bot berdasarkan request yang dilakukan melalui bot. Provider tetap menjadi sumber kebenaran akhir jika memiliki counter sendiri.
+Menu `Cek API` sekarang memeriksa konfigurasi aktif tersebut dan menampilkan
+variable mana yang benar-benar belum tersedia jika ada.
 
 Schema tetap 174.

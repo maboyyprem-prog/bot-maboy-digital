@@ -1390,3 +1390,58 @@ TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT=3
 - `REQUESTS_PER_ACCOUNT`: estimasi konsumsi request untuk satu proses akun.
 - Reset counter lokal mengikuti awal jam WIB.
 - Schema tetap 174.
+
+
+## v16.36 — Magic Link & Verify
+
+Tambahkan:
+
+```text
+TOOLS_PROVIDER_MAGICLINK_URL=
+TOOLS_PROVIDER_VERIFY_URL=
+```
+
+Isi dengan endpoint provider yang memang kamu berhak gunakan.
+
+Flow Premium otomatis tidak disambungkan.
+Schema tetap 174.
+
+
+## v16.37 — Railway Variables untuk `/tools`
+
+Gunakan nilai berikut di Railway:
+
+```text
+TOOLS_PROVIDER_ENABLED=true
+TOOLS_PROVIDER_NAME=Alight Tools
+TOOLS_PROVIDER_AUTH_MODE=x-api-key
+TOOLS_PROVIDER_MAGICLINK_URL=https://alightfree.my.id/api/v1/send-magiclink
+TOOLS_PROVIDER_VERIFY_URL=https://alightfree.my.id/api/v1/verify-account
+TOOLS_PROVIDER_TIMEOUT_SECONDS=12
+TOOLS_PROVIDER_MAX_RETRIES=1
+TOOLS_PROVIDER_REQUEST_COOLDOWN_SECONDS=240
+TOOLS_PROVIDER_MAX_RESPONSE_CHARS=2000
+TOOLS_PROVIDER_HOURLY_LIMIT=15
+TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT=3
+```
+
+Catatan:
+- `TOOLS_PROVIDER_API_KEY` tidak ditulis ulang di file ini karena sudah disimpan sebagai Railway Secret.
+- `TOOLS_PROVIDER_STATUS_URL` tidak digunakan.
+- `TOOLS_PROVIDER_PROVISION_URL` tidak digunakan.
+- Jangan hapus variable lama bot yang sudah ada di Railway.
+
+
+## v16.38 — Fix readiness `/tools`
+
+Status READY sekarang hanya membutuhkan:
+
+```text
+TOOLS_PROVIDER_ENABLED=true
+TOOLS_PROVIDER_API_KEY=<tersimpan sebagai Railway Secret>
+TOOLS_PROVIDER_MAGICLINK_URL=https://alightfree.my.id/api/v1/send-magiclink
+TOOLS_PROVIDER_VERIFY_URL=https://alightfree.my.id/api/v1/verify-account
+```
+
+`TOOLS_PROVIDER_STATUS_URL` dan `TOOLS_PROVIDER_PROVISION_URL` tidak lagi digunakan
+untuk menentukan kesiapan `/tools`.

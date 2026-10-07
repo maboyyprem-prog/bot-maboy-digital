@@ -139,7 +139,7 @@ ORDER_RESERVATION_MINUTES = max(5, int(os.getenv("ORDER_RESERVATION_MINUTES", "1
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.36"
+BOT_VERSION = "16.38"
 SCHEMA_VERSION = 174
 
 CHECKOUT_TERMS_SHORT = (
@@ -11358,15 +11358,25 @@ async def payment_proof_invalid(message: Message):
 def tools_provider_ready() -> bool:
     return bool(
         TOOLS_PROVIDER_ENABLED
-        and TOOLS_PROVIDER_PROVISION_URL
         and TOOLS_PROVIDER_API_KEY
+        and TOOLS_PROVIDER_MAGICLINK_URL
+        and TOOLS_PROVIDER_VERIFY_URL
     )
 
 
 def tools_provider_status_text() -> str:
     if not TOOLS_PROVIDER_ENABLED:
         return "🔴 DISABLED"
-    if not TOOLS_PROVIDER_PROVISION_URL or not TOOLS_PROVIDER_API_KEY:
+
+    missing=[]
+    if not TOOLS_PROVIDER_API_KEY:
+        missing.append("API_KEY")
+    if not TOOLS_PROVIDER_MAGICLINK_URL:
+        missing.append("MAGICLINK_URL")
+    if not TOOLS_PROVIDER_VERIFY_URL:
+        missing.append("VERIFY_URL")
+
+    if missing:
         return "🟠 KONFIGURASI BELUM LENGKAP"
     return "🟢 READY"
 
@@ -12123,35 +12133,46 @@ async def owner_tools_stats(call: CallbackQuery):
 
 @router.callback_query(F.data == "tools:status")
 async def owner_tools_status(call: CallbackQuery):
-    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+
+    missing=[]
     if not TOOLS_PROVIDER_ENABLED:
-        await safe_edit_or_answer(
-            call,
-            "🔌 <b>CEK API</b>\n\nStatus: <b>DISABLED</b>\nAktifkan provider resmi terlebih dahulu.",
-            reply_markup=owner_tools_menu(),parse_mode="HTML"
+        missing.append("TOOLS_PROVIDER_ENABLED=true")
+    if not TOOLS_PROVIDER_API_KEY:
+        missing.append("TOOLS_PROVIDER_API_KEY")
+    if not TOOLS_PROVIDER_MAGICLINK_URL:
+        missing.append("TOOLS_PROVIDER_MAGICLINK_URL")
+    if not TOOLS_PROVIDER_VERIFY_URL:
+        missing.append("TOOLS_PROVIDER_VERIFY_URL")
+
+    if missing:
+        text=(
+            "🔌 <b>STATUS KONFIGURASI TOOLS</b>\n\n"
+            "Status: <b>🟠 BELUM LENGKAP</b>\n\n"
+            "Yang belum tersedia:\n"
+            + "\n".join(f"• <code>{html.escape(item)}</code>" for item in missing)
         )
-        return await safe_callback_notice(call)
-    if not TOOLS_PROVIDER_STATUS_URL:
-        await safe_edit_or_answer(
-            call,
-            "🔌 <b>CEK API</b>\n\nEndpoint status belum dikonfigurasi.\n"
-            "Provision endpoint dapat tetap digunakan jika sudah lengkap.",
-            reply_markup=owner_tools_menu(),parse_mode="HTML"
+    else:
+        text=(
+            "🔌 <b>STATUS KONFIGURASI TOOLS</b>\n\n"
+            "Status: <b>🟢 READY</b>\n"
+            f"Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
+            f"Auth: <b>{html.escape(TOOLS_PROVIDER_AUTH_MODE)}</b>\n"
+            "API key: <b>✅ SET</b>\n"
+            "Magic Link endpoint: <b>✅ SET</b>\n"
+            "Verify endpoint: <b>✅ SET</b>\n"
+            f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b>\n"
+            f"Retry: <b>{TOOLS_PROVIDER_MAX_RETRIES}</b>"
         )
-        return await safe_callback_notice(call)
-    ok,status,data=await tools_provider_request("GET",TOOLS_PROVIDER_STATUS_URL)
-    preview=tool_response_preview(data)
+
     await safe_edit_or_answer(
         call,
-        "🔌 <b>STATUS API PROVIDER</b>\n\n"
-        f"Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
-        f"Status: <b>{'ONLINE' if ok else 'ERROR'}</b>\n"
-        f"HTTP: <b>{status or '-'}</b>\n"
-        f"Response: <code>{html.escape(preview[:600])}</code>",
-        reply_markup=owner_tools_menu(),parse_mode="HTML"
+        text,
+        reply_markup=owner_tools_menu(),
+        parse_mode="HTML"
     )
     await safe_callback_notice(call)
-
 
 @router.callback_query(F.data == "tools:provider")
 async def owner_tools_provider_info(call: CallbackQuery):
@@ -26418,7 +26439,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.36"
+EXPECTED_SOURCE_VERSION = "16.38"
 
 
 def source_integrity_self_test():
