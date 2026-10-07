@@ -34,7 +34,7 @@ from Crypto.Hash import SHA256
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramBadRequest, TelegramConflictError
 from aiogram.utils.backoff import BackoffConfig
-from aiogram.filters import Command, Filter
+from aiogram.filters import Command, Filter, StateFilter
 from aiogram.types import (
     ErrorEvent,
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton, FSInputFile,
@@ -190,8 +190,8 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.55"
-SCHEMA_VERSION = 178
+BOT_VERSION = "16.56"
+SCHEMA_VERSION = 179
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -985,6 +985,25 @@ def init_db():
     )
     add_column_if_missing(conn,"tool_provider_flows","apply_started_at","TEXT DEFAULT ''")
     add_column_if_missing(conn,"tool_provider_flows","apply_activity_id","INTEGER DEFAULT 0")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tools_user_access (
+            user_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            granted_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tools_user_reviews (
+            correlation_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(correlation_id) REFERENCES tool_provider_flows(correlation_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_tools_user_reviews_user ON tools_user_reviews(user_id,created_at)")
     add_column_if_missing(conn,"tool_provision_logs","request_metered","INTEGER DEFAULT 0")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tool_provider_requests (
@@ -2641,7 +2660,11 @@ def store_rating_summary(conn=None):
                       COALESCE(AVG(rating),0) AS avg_rating,
                       SUM(CASE WHEN rating=5 THEN 1 ELSE 0 END) AS five_star,
                       SUM(CASE WHEN COALESCE(comment,'')!='' THEN 1 ELSE 0 END) AS with_comment
-               FROM reviews"""
+               FROM (
+                   SELECT rating,comment FROM reviews
+                   UNION ALL
+                   SELECT rating,'' AS comment FROM tools_user_reviews
+               )"""
         ).fetchone()
         return {
             "count": int(row["n"] or 0),
@@ -2662,6 +2685,20 @@ def store_rating_text() -> str:
         f"⭐ Rating Toko: <b>{summary['average']:.1f}/5</b> "
         f"({summary['count']} penilaian)"
     )
+
+
+def store_recent_ratings(conn, limit: int=30):
+    return conn.execute(
+        """SELECT r.user_id,r.order_id,r.rating,r.comment,r.product_name_snapshot,
+                  r.variant_name_snapshot,r.created_at,o.username
+           FROM reviews r LEFT JOIN orders o ON o.id=r.order_id
+           UNION ALL
+           SELECT r.user_id,NULL AS order_id,r.rating,'' AS comment,
+                  'Magic Link' AS product_name_snapshot,'Apply Premium' AS variant_name_snapshot,
+                  r.created_at,v.username
+           FROM tools_user_reviews r LEFT JOIN verified_users v ON v.user_id=r.user_id
+           ORDER BY created_at DESC LIMIT ?""",(limit,)
+    ).fetchall()
 
 
 def review_order_snapshot(order_id: int, user_id: int | None = None):
@@ -8639,6 +8676,11 @@ class BundleState(StatesGroup):
     choose_second = State()
 
 
+class ToolsUserState(StatesGroup):
+    email = State()
+    magic_link = State()
+
+
 
 class OwnerState(StatesGroup):
     add_product = State()
@@ -8664,6 +8706,7 @@ class OwnerState(StatesGroup):
     tools_magiclink_email = State()
     tools_verify_link = State()
     tools_history_search = State()
+    tools_access_user_id = State()
     set_qris = State()
     set_payment_note = State()
     topup_amount = State()
@@ -11811,6 +11854,7 @@ def owner_tools_menu():
             InlineKeyboardButton(text="📦 Riwayat",callback_data="tools:history"),
         ],
         [InlineKeyboardButton(text="⚙️ Lainnya",callback_data="tools:more")],
+        [InlineKeyboardButton(text="👑 VIP /tools",callback_data="tools:access")],
         [InlineKeyboardButton(text="⬅️ Owner Panel",callback_data="owner:panel")],
     ])
 
@@ -12535,8 +12579,10 @@ async def _save_tools_apply_result(state, email, correlation_id, parsed, http_st
                              detail=tool_response_preview(parsed))
 
 
-async def run_tools_apply_once(call, state):
+async def run_tools_apply_once(call, state, *, user_mode=False):
     data=await state.get_data()
+    if user_mode and not tools_user_allowed(call.from_user.id):
+        return {}
     email=str(data.get("tools_target_email") or data.get("tools_verify_email") or "").strip().lower()
     existing=dict(data.get("tools_provider_apply_premium_result") or {})
     if existing.get("known") or existing.get("status")=="pending" or data.get("tools_apply_requested"):return existing
@@ -12574,8 +12620,13 @@ async def run_tools_apply_once(call, state):
                                     tools_provider_apply_premium_result=parsed,tools_apply_http_status=claimed.get("http_status",0))
             return parsed
         await state.update_data(tools_apply_requested=True,tools_apply_notice="")
-        await safe_callback_notice(call,"Menerapkan premium...")
-        await safe_edit_or_answer(call,"⏳ <b>APPLY PREMIUM...</b>\n\n📧 "+html.escape(email),parse_mode="HTML")
+        await safe_callback_notice(call,"Memproses Magic Link..." if user_mode else "Menerapkan premium...")
+        await safe_edit_or_answer(call,("⏳ <b>MENYELESAIKAN MAGIC LINK...</b>\n\n📧 " if user_mode else
+                                       "⏳ <b>APPLY PREMIUM...</b>\n\n📧 ")+html.escape(email),parse_mode="HTML")
+        if user_mode and not tools_user_allowed(call.from_user.id):
+            parsed={"known":True,"success":False,"status":"failed","message":"Akses telah dicabut owner.","reference":""}
+            await _save_tools_apply_result(state,email,correlation_id,parsed,0)
+            return parsed
         ok,http_status,result=await tools_provider_request(
             "POST",TOOLS_PROVIDER_APPLY_URL,payload={"email":email,"idToken":token},owner_id=call.from_user.id,
         )
@@ -13109,12 +13160,566 @@ def update_tool_log(log_id: int, *, status: str,http_status: int=0,reference: st
     conn.commit(); conn.close()
 
 
+def tools_user_allowed(user_id: int) -> bool:
+    conn=db()
+    try:
+        return bool(conn.execute(
+            """SELECT 1 FROM tools_user_access a
+               LEFT JOIN user_security s ON s.user_id=a.user_id
+               WHERE a.user_id=? AND a.enabled=1 AND COALESCE(s.blocked,0)=0""",
+            (int(user_id),)
+        ).fetchone())
+    finally:
+        conn.close()
+
+
+def set_tools_user_access(user_id: int, enabled: bool, actor_id: int):
+    if not is_owner(actor_id):
+        raise PermissionError("Hanya owner yang dapat mengatur VIP /tools.")
+    if not (0 < user_id <= 9223372036854775807) or is_owner(user_id):
+        raise ValueError("ID user tidak valid atau merupakan ID owner.")
+    now=datetime.now().isoformat(timespec="seconds")
+    conn=db()
+    try:
+        conn.execute(
+            """INSERT INTO tools_user_access(user_id,enabled,granted_by,created_at,updated_at)
+               VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+               enabled=excluded.enabled,granted_by=excluded.granted_by,updated_at=excluded.updated_at""",
+            (user_id,int(enabled),actor_id,now,now)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def render_tools_access_user(call: CallbackQuery, user_id: int):
+    conn=db()
+    try:
+        row=conn.execute(
+            """SELECT a.enabled,v.username,COALESCE(s.blocked,0) AS blocked
+               FROM (SELECT ? AS user_id) u
+               LEFT JOIN tools_user_access a ON a.user_id=u.user_id
+               LEFT JOIN verified_users v ON v.user_id=u.user_id
+               LEFT JOIN user_security s ON s.user_id=u.user_id""",(user_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    enabled=bool(row and row["enabled"])
+    label=("@"+str(row["username"])) if row and row["username"] else str(user_id)
+    status="👑 VIP /tools AKTIF" if enabled else "🚫 VIP /tools TIDAK AKTIF"
+    text=("👤 <b>VIP KHUSUS /TOOLS</b>\n\n"
+          f"User: <b>{html.escape(label)}</b>\nID: <code>{user_id}</code>\n"
+          f"Akses: <b>{status}</b>\n\n"
+          "VIP ini khusus untuk /tools. User mendapat menu Magic Link dan Rating Toko "
+          "setelah Apply Premium sukses. Akses command lain tetap mengikuti aturan toko.")
+    if row and row["blocked"]:
+        text+="\n\n🚫 User sedang diblokir. Buka blokir user sebelum akses dapat digunakan."
+    await safe_edit_or_answer(call,text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 Cabut VIP /tools" if enabled else "✅ Jadikan VIP /tools",
+                              callback_data=f"toolsaccessrevoke:{user_id}" if enabled else f"toolsaccessgrant:{user_id}")],
+        [InlineKeyboardButton(text="⬅️ Daftar VIP /tools",callback_data="tools:access")],
+    ]))
+
+
+async def render_tools_access_list(call: CallbackQuery, page: int=1, *, candidates=False):
+    conn=db()
+    try:
+        source=("verified_users v LEFT JOIN tools_user_access a ON a.user_id=v.user_id" if candidates else
+                "tools_user_access a LEFT JOIN verified_users v ON v.user_id=a.user_id")
+        where="v.active=1 AND v.user_id!=?" if candidates else "a.enabled=1 AND a.user_id!=?"
+        total=int(conn.execute(f"SELECT COUNT(*) FROM {source} WHERE {where}",(ADMIN_ID,)).fetchone()[0])
+        pages=max(1,(total+9)//10)
+        page=max(1,min(page,pages))
+        id_column="v.user_id" if candidates else "a.user_id"
+        rows=conn.execute(
+            f"SELECT {id_column} AS user_id,v.username,COALESCE(a.enabled,0) AS enabled "
+            f"FROM {source} WHERE {where} ORDER BY {id_column} LIMIT 10 OFFSET ?",
+            (ADMIN_ID,(page-1)*10)
+        ).fetchall()
+    finally:
+        conn.close()
+    keyboard=[]
+    for row in rows:
+        label=("@"+str(row["username"])) if row["username"] else str(row["user_id"])
+        keyboard.append([InlineKeyboardButton(text=("✅ " if row["enabled"] else "▫️ ")+label[:40],
+                                              callback_data=f"toolsaccessuser:{row['user_id']}")])
+    navigation=[]
+    if candidates:
+        if page>1:navigation.append(InlineKeyboardButton(text="⬅️",callback_data=f"toolsaccesscandidates:{page-1}"))
+        if page<pages:navigation.append(InlineKeyboardButton(text="➡️",callback_data=f"toolsaccesscandidates:{page+1}"))
+    else:
+        if page>1:navigation.append(InlineKeyboardButton(text="⬅️",callback_data=f"toolsaccesspage:{page-1}"))
+        if page<pages:navigation.append(InlineKeyboardButton(text="➡️",callback_data=f"toolsaccesspage:{page+1}"))
+    if navigation:keyboard.append(navigation)
+    keyboard.extend([
+        [InlineKeyboardButton(text="➕ Tambah User dengan ID",callback_data="tools:access:add")],
+        [InlineKeyboardButton(text="👤 Pilih User Bot",callback_data="toolsaccesscandidates:1")],
+        [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+    ])
+    text=("👥 <b>"+("PILIH USER BOT" if candidates else "VIP KHUSUS /TOOLS")+"</b>\n\n"
+          f"Jumlah user: <b>{total}</b> • Halaman <b>{page}/{pages}</b>\n\n"
+          "Pilih user untuk mengaktifkan atau mencabut VIP /tools.\n"
+          "VIP hanya berlaku pada /tools: Magic Link dan Rating Toko setelah apply sukses.")
+    if not rows:text+="\n\nBelum ada user. Gunakan Tambah User dengan ID."
+    await safe_edit_or_answer(call,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
+
+
+@router.callback_query((F.data == "tools:access") | F.data.startswith("toolsaccesspage:"))
+async def owner_tools_access_list(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    values=(1,) if call.data=="tools:access" else callback_positive_numbers(call.data,"toolsaccesspage")
+    if not values:return await safe_callback_notice(call,"Halaman tidak valid.",show_alert=True)
+    await state.set_state(None)
+    await render_tools_access_list(call,values[0])
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("toolsaccesscandidates:"))
+async def owner_tools_access_candidates(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    values=callback_positive_numbers(call.data,"toolsaccesscandidates")
+    if not values:return await safe_callback_notice(call,"Halaman tidak valid.",show_alert=True)
+    await state.set_state(None)
+    await render_tools_access_list(call,values[0],candidates=True)
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:access:add")
+async def owner_tools_access_add(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    await state.set_state(OwnerState.tools_access_user_id)
+    await safe_edit_or_answer(call,"➕ <b>TAMBAH VIP /TOOLS</b>\n\n"
+        "Kirim ID Telegram user atau teruskan pesan dari user.\n"
+        "Anda akan diminta menekan Jadikan VIP /tools sebelum izin diaktifkan.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:access")]
+        ]),parse_mode="HTML")
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.tools_access_user_id)
+async def owner_tools_access_id_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id):return
+    forwarded=getattr(getattr(message,"forward_origin",None),"sender_user",None)
+    raw=str(forwarded.id) if forwarded else str(message.text or "").strip()
+    values=callback_positive_numbers("toolsaccessuser:"+raw,"toolsaccessuser")
+    if not values or is_owner(values[0]):
+        return await message.answer("❌ Kirim ID Telegram user yang valid. Owner sudah memiliki akses penuh.")
+    await state.set_state(None)
+    await message.answer("👤 <b>KONFIRMASI VIP /TOOLS</b>\n\n"
+        f"ID user: <code>{values[0]}</code>\n\nPilih untuk mengaktifkan VIP khusus /tools.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Jadikan VIP /tools",callback_data=f"toolsaccessgrant:{values[0]}")],
+            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:access")],
+        ]),parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("toolsaccessuser:"))
+async def owner_tools_access_user(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    values=callback_positive_numbers(call.data,"toolsaccessuser")
+    if not values or is_owner(values[0]):return await safe_callback_notice(call,"User tidak valid.",show_alert=True)
+    await state.set_state(None)
+    await render_tools_access_user(call,values[0])
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("toolsaccessgrant:") | F.data.startswith("toolsaccessrevoke:"))
+async def owner_tools_access_set(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    prefix=str(call.data or "").split(":",1)[0]
+    values=callback_positive_numbers(call.data,prefix)
+    if not values or is_owner(values[0]):return await safe_callback_notice(call,"User tidak valid.",show_alert=True)
+    enabled=prefix=="toolsaccessgrant"
+    set_tools_user_access(values[0],enabled,call.from_user.id)
+    await state.set_state(None)
+    await render_tools_access_user(call,values[0])
+    await safe_callback_notice(call,"VIP /tools diaktifkan." if enabled else "VIP /tools dicabut.")
+
+
+def tools_user_success_flow(user_id: int, correlation_id: str=""):
+    conn=db()
+    try:
+        extra=" AND f.correlation_id=?" if correlation_id else ""
+        params=(user_id,correlation_id) if correlation_id else (user_id,)
+        return conn.execute(
+            """SELECT f.correlation_id,f.target_email,r.rating FROM tool_provider_flows f
+               JOIN tool_activity_logs a ON a.id=f.apply_activity_id AND a.owner_id=f.owner_id
+                 AND a.target_email=f.target_email AND a.action='apply_premium' AND a.status='success'
+               LEFT JOIN tools_user_reviews r ON r.correlation_id=f.correlation_id
+               WHERE f.owner_id=? AND f.stage='apply_premium' AND f.status='success'
+                 AND COALESCE(f.apply_started_at,'')!=''"""+extra+
+            " ORDER BY f.updated_at DESC,f.correlation_id DESC LIMIT 1",params
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def tools_user_menu(user_id: int):
+    rows=[[InlineKeyboardButton(text="📧 Magic Link",callback_data="utools:magic")]]
+    success=tools_user_success_flow(user_id)
+    if success:
+        rows.append([InlineKeyboardButton(text="⭐ Rating Toko",callback_data=f"utools:rating:{success['correlation_id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def tools_user_welcome_text() -> str:
+    return ("👑 <b>VIP KHUSUS /TOOLS</b>\n\n"
+            "Gunakan fitur dengan bijak. Pastikan email dan link yang Anda kirim sudah benar.\n\n"
+            "📧 Pilih Magic Link untuk mengirim link ke email, melakukan verifikasi, "
+            "dan menerapkan premium.\n\n"
+            "⭐ Rating Toko tersedia setelah premium berhasil diterapkan.")
+
+
+def tools_user_flow_key(data: str, action: str):
+    prefix=f"utools:{action}:"
+    if not isinstance(data,str) or not data.startswith(prefix):return ""
+    key=data[len(prefix):]
+    return key if re.fullmatch(r"[0-9a-f]{16}",key) else ""
+
+
+async def require_tools_user(event, state: FSMContext) -> bool:
+    chat=getattr(event,"chat",None) or getattr(getattr(event,"message",None),"chat",None)
+    private=bool(chat and str(chat.type)=="private")
+    allowed=private and tools_user_allowed(event.from_user.id)
+    if allowed:return True
+    text=("Gunakan /tools di chat pribadi dengan bot." if not private else
+          "🔒 /tools hanya tersedia untuk owner dan user VIP yang dipilih owner. "
+          "Akses VIP Anda belum aktif atau sudah dicabut. Hubungi owner.")
+    if private:
+        data=await state.get_data()
+        current=await state.get_state()
+        if data.get("tools_user_mode") or str(current or "").startswith("ToolsUserState:"):
+            await state.clear()
+    if isinstance(event,CallbackQuery):await safe_callback_notice(event,text,show_alert=True)
+    else:await event.answer(text)
+    return False
+
+
+async def user_tools_command(message: Message,state: FSMContext):
+    if not await require_tools_user(message,state):return
+    await state.set_state(None)
+    await message.answer("🧰 <b>TOOLS • MAGIC LINK</b>",reply_markup=ReplyKeyboardRemove(),parse_mode="HTML")
+    await message.answer(tools_user_welcome_text(),
+                         reply_markup=tools_user_menu(message.from_user.id),parse_mode="HTML")
+
+
+async def render_tools_user_result(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
+    data=await state.get_data()
+    key=str(data.get("tools_correlation_id") or "")
+    success=tools_user_success_flow(call.from_user.id,key) if key else None
+    email=str(data.get("tools_target_email") or "")
+    parsed=dict(data.get("tools_provider_apply_premium_result") or {})
+    if success:
+        text="✅ <b>MAGIC LINK SUKSES</b>\n\nPremium berhasil diterapkan.\nAnda dapat memberikan Rating Toko."
+    elif data.get("tools_apply_requested"):
+        text=("❌ <b>MAGIC LINK BELUM BERHASIL</b>\n\nSilakan hubungi owner." if parsed.get("status")=="failed" else
+              "⏳ <b>MAGIC LINK BELUM TERKONFIRMASI</b>\n\nHasil premium belum dapat dipastikan. "
+              "Pilih Magic Link untuk mengecek kembali atau hubungi owner. Proses tidak dikirim ulang.")
+    elif data.get("tools_final_status")=="failed" or data.get("tools_magiclink_status")=="failed":
+        text="❌ <b>MAGIC LINK BELUM BERHASIL</b>\n\nPeriksa email/link, lalu coba dari Magic Link atau hubungi owner."
+    else:
+        text="⏳ <b>MAGIC LINK BELUM SELESAI</b>\n\nPremium belum berhasil diterapkan. Silakan hubungi owner."
+    if email:text+="\n\n📧 "+html.escape(email)
+    await safe_edit_or_answer(call,text,reply_markup=tools_user_menu(call.from_user.id),parse_mode="HTML")
+
+
+async def render_tools_user_link_prompt(call: CallbackQuery,state: FSMContext):
+    data=await state.get_data()
+    await state.set_state(ToolsUserState.magic_link)
+    confirmed=data.get("tools_magiclink_status")=="success"
+    text=("📧 <b>MAGIC LINK TERKIRIM</b>" if confirmed else "📧 <b>PERIKSA INBOX EMAIL</b>")
+    await safe_edit_or_answer(call,text+"\n\nBuka email, lalu salin dan kirim URL Magic Link lengkap ke bot.\n"
+        "Setelah verifikasi berhasil, bot akan menerapkan premium secara otomatis.",parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Magic Link",callback_data="utools:home")]
+        ]))
+
+
+async def tools_user_bound_flow(call: CallbackQuery,state: FSMContext,action: str):
+    key=tools_user_flow_key(call.data,action)
+    data=await state.get_data()
+    if not key or key!=data.get("tools_correlation_id") or not data.get("tools_user_mode"):
+        await safe_callback_notice(call,"Tombol dari proses lama. Buka Magic Link kembali.",show_alert=True)
+        return None
+    conn=db()
+    try:
+        flow=conn.execute("SELECT owner_id,target_email FROM tool_provider_flows WHERE correlation_id=?",(key,)).fetchone()
+    finally:
+        conn.close()
+    if not flow or flow["owner_id"]!=call.from_user.id or flow["target_email"]!=data.get("tools_target_email"):
+        await safe_callback_notice(call,"Proses Magic Link tidak ditemukan.",show_alert=True)
+        return None
+    if tools_session_expired(data):
+        await state.update_data(tools_raw_link=None,tools_verify_id_token=None)
+        await safe_callback_notice(call,"Session kedaluwarsa. Buka Magic Link kembali.",show_alert=True)
+        return None
+    return data
+
+
+@router.callback_query(F.data == "utools:home")
+async def user_tools_home(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
+    await state.set_state(None)
+    await safe_edit_or_answer(call,tools_user_welcome_text(),
+        reply_markup=tools_user_menu(call.from_user.id),parse_mode="HTML")
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "utools:magic")
+async def user_tools_magic_begin(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
+    data=await state.get_data()
+    if data.get("tools_user_mode"):
+        parsed=dict(data.get("tools_provider_apply_premium_result") or {})
+        if data.get("tools_apply_requested") and parsed.get("status") in {"pending","unknown",""}:
+            if TOOLS_PROVIDER_APPLY_STATUS_URL:await refresh_tools_apply_result(state,call.from_user.id)
+            await render_tools_user_result(call,state)
+            return await safe_callback_notice(call)
+        if data.get("tools_user_verify_started") and data.get("tools_final_status","") in {"pending","unknown",""}:
+            await render_tools_user_result(call,state)
+            return await safe_callback_notice(call)
+        if data.get("tools_magiclink_sent") and not data.get("tools_user_verify_started") and not tools_session_expired(data):
+            await render_tools_user_link_prompt(call,state)
+            return await safe_callback_notice(call)
+    if not tools_provider_ready():
+        return await safe_callback_notice(call,"Magic Link belum tersedia. Hubungi owner.",show_alert=True)
+    await state.clear()
+    await state.update_data(tools_user_mode=True,tools_session_started_at=datetime.now().isoformat(timespec="seconds"))
+    await state.set_state(ToolsUserState.email)
+    await safe_edit_or_answer(call,"📧 <b>MAGIC LINK</b>\n\nKirim email akun yang akan menerima Magic Link.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Batal",callback_data="utools:home")]
+        ]),parse_mode="HTML")
+    await safe_callback_notice(call)
+
+
+@router.message(ToolsUserState.email)
+async def user_tools_email_input(message: Message,state: FSMContext):
+    if not await require_tools_user(message,state):return
+    email=str(message.text or "").strip().lower()
+    if not valid_tools_email(email):return await message.answer("❌ Format email tidak valid. Silakan kirim ulang.")
+    key=create_tool_provider_flow(message.from_user.id,email,"email_confirmed")
+    await state.update_data(tools_user_mode=True,tools_target_email=email,tools_magic_email=email,
+                            tools_verify_email=email,tools_correlation_id=key,tools_magiclink_sent=False,
+                            tools_user_verify_started=False)
+    await state.set_state(None)
+    await message.answer("📧 <b>KONFIRMASI MAGIC LINK</b>\n\nEmail: <b>"+html.escape(email)+"</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📧 Kirim Magic Link",callback_data=f"utools:send:{key}")],
+            [InlineKeyboardButton(text="❌ Batal",callback_data="utools:home")],
+        ]),parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("utools:send:"))
+async def user_tools_send(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
+    data=await tools_user_bound_flow(call,state,"send")
+    if data is None:return
+    if data.get("tools_user_verify_started"):
+        return await render_tools_user_result(call,state)
+    if data.get("tools_magiclink_sent"):
+        await render_tools_user_link_prompt(call,state)
+        return await safe_callback_notice(call)
+    if not tools_provider_ready():return await safe_callback_notice(call,"Magic Link belum tersedia. Hubungi owner.",show_alert=True)
+    quota_ok,quota=tools_quota_can_process(call.from_user.id,requests_needed=3)
+    if not quota_ok:return await safe_callback_notice(call,f"Kuota belum tersedia. Coba setelah {quota['reset_at']}.",show_alert=True)
+    email=data["tools_target_email"]; key=data["tools_correlation_id"]
+    locked,_=acquire_tool_email_lock(call.from_user.id,email,"send_verification_link")
+    if not locked:return await safe_callback_notice(call,"Email sedang diproses. Tunggu sebentar.",show_alert=True)
+    activity_id=0
+    try:
+        await state.update_data(tools_magiclink_sent=True)
+        activity_id=create_tool_activity(call.from_user.id,"send_verification_link",email)
+        await safe_callback_notice(call,"Mengirim Magic Link...")
+        await safe_edit_or_answer(call,"⏳ <b>MENGIRIM MAGIC LINK...</b>",parse_mode="HTML")
+        if not await require_tools_user(call,state):
+            update_tool_activity(activity_id,status="failed",detail="Akses dicabut sebelum request dikirim.")
+            update_tool_provider_flow(key,status="failed")
+            return
+        ok,http_status,result=await tools_provider_request(
+            "POST",TOOLS_PROVIDER_MAGICLINK_URL,payload={"email":email},owner_id=call.from_user.id)
+        status=provider_response_state(result,http_status=http_status)
+        if not ok and isinstance(result,dict) and result.get("_outcome_unknown"):status="unknown"
+        update_tool_activity(activity_id,status=status,http_status=http_status,detail=tool_response_preview(result))
+        update_tool_provider_flow(key,stage="send_verification_link",status=status,http_status=http_status)
+        await state.update_data(tools_magiclink_status=status,tools_magiclink_sent=status!="failed")
+    except BaseException:
+        if activity_id:update_tool_activity(activity_id,status="unknown",detail="Pengiriman terputus; periksa inbox sebelum mengulang.")
+        update_tool_provider_flow(key,status="unknown")
+        await state.update_data(tools_magiclink_status="unknown")
+        raise
+    finally:
+        release_tool_email_lock(email)
+    if not await require_tools_user(call,state):return
+    if status=="failed":
+        await state.set_state(None)
+        return await render_tools_user_result(call,state)
+    await render_tools_user_link_prompt(call,state)
+
+
+@router.message(ToolsUserState.magic_link)
+async def user_tools_link_input(message: Message,state: FSMContext):
+    if not await require_tools_user(message,state):return
+    raw=str(message.text or "").strip()
+    if not raw.startswith(("https://","http://")) or len(raw)>3000:
+        return await message.answer("❌ Kirim URL Magic Link lengkap dari email.")
+    data=await state.get_data()
+    if not data.get("tools_user_mode") or not data.get("tools_magiclink_sent") or tools_session_expired(data):
+        await state.update_data(tools_raw_link=None,tools_verify_id_token=None)
+        await state.set_state(None)
+        return await message.answer("Session kedaluwarsa. Buka /tools dan pilih Magic Link kembali.",
+                                    reply_markup=tools_user_menu(message.from_user.id))
+    key=str(data.get("tools_correlation_id") or "")
+    await state.update_data(tools_raw_link=raw)
+    await state.set_state(None)
+    await message.answer("📧 <b>PROSES MAGIC LINK</b>\n\nLink siap diproses untuk email <b>"+
+        html.escape(str(data.get("tools_target_email") or ""))+"</b>.\nVerifikasi dan Apply Premium akan dijalankan otomatis.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Proses Magic Link",callback_data=f"utools:verify:{key}")],
+            [InlineKeyboardButton(text="❌ Batal",callback_data="utools:home")],
+        ]),parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("utools:verify:"))
+async def user_tools_verify(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
+    data=await tools_user_bound_flow(call,state,"verify")
+    if data is None:return
+    if data.get("tools_user_verify_started"):return await render_tools_user_result(call,state)
+    raw=str(data.get("tools_raw_link") or "")
+    if not data.get("tools_magiclink_sent") or not raw.startswith(("https://","http://")):
+        return await safe_callback_notice(call,"Kirim URL Magic Link dari email terlebih dahulu.",show_alert=True)
+    if not tools_provider_ready():return await safe_callback_notice(call,"Magic Link belum tersedia. Hubungi owner.",show_alert=True)
+    quota_ok,quota=tools_quota_can_process(call.from_user.id,requests_needed=2)
+    if not quota_ok:return await safe_callback_notice(call,f"Kuota belum tersedia. Coba setelah {quota['reset_at']}.",show_alert=True)
+    email=data["tools_target_email"]; key=data["tools_correlation_id"]
+    locked,_=acquire_tool_email_lock(call.from_user.id,email,"verify_account")
+    if not locked:return await safe_callback_notice(call,"Email sedang diproses. Tunggu sebentar.",show_alert=True)
+    activity_id=0; token=""; status="unknown"
+    try:
+        await state.update_data(tools_user_verify_started=True,tools_verify_id_token=None,
+                                tools_provider_apply_premium_result={},tools_apply_requested=False)
+        activity_id=create_tool_activity(call.from_user.id,"verify_account",email)
+        await safe_callback_notice(call,"Memproses Magic Link...")
+        await safe_edit_or_answer(call,"⏳ <b>MEMPROSES MAGIC LINK...</b>",parse_mode="HTML")
+        if not await require_tools_user(call,state):
+            update_tool_activity(activity_id,status="failed",detail="Akses dicabut sebelum verifikasi.")
+            update_tool_provider_flow(key,status="failed")
+            return
+        ok,http_status,result=await tools_provider_request_resilient(
+            "POST",TOOLS_PROVIDER_VERIFY_URL,payload={"email":email,"rawLink":raw},owner_id=call.from_user.id)
+        status=provider_response_state(result,http_status=http_status)
+        if not ok and isinstance(result,dict) and result.get("_outcome_unknown"):status="unknown"
+        token=extract_verify_id_token(result) if ok and status=="success" else ""
+        returned_email=find_provider_value(result,("email",))
+        if token and returned_email and str(returned_email).strip().lower()!=email:
+            status="failed";token="";result={"error":"verified_email_mismatch"}
+        await state.update_data(tools_final_status=status,tools_final_http_status=http_status,
+            tools_verify_id_token=token or None,tools_verify_id_token_at=datetime.now().isoformat(timespec="seconds") if token else "")
+        update_tool_activity(activity_id,status=status,http_status=http_status,detail=tool_response_preview(result))
+        update_tool_provider_flow(key,stage="verify_account",status=status,http_status=http_status)
+    except BaseException:
+        if activity_id:update_tool_activity(activity_id,status="unknown",detail="Verifikasi terputus; request tidak diulang.")
+        update_tool_provider_flow(key,stage="verify_account",status="unknown")
+        await state.update_data(tools_final_status="unknown")
+        raise
+    finally:
+        release_tool_email_lock(email)
+        await state.update_data(tools_raw_link=None)
+        await state.set_state(None)
+    if not await require_tools_user(call,state):return
+    if status=="success" and token:
+        await run_tools_apply_once(call,state,user_mode=True)
+    await render_tools_user_result(call,state)
+
+
+def save_tools_user_rating(user_id: int, correlation_id: str, stars: int):
+    if not re.fullmatch(r"[0-9a-f]{16}",str(correlation_id)) or not (1 <= stars <= 5):
+        raise ValueError("Rating tidak valid.")
+    conn=db()
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            eligible=conn.execute(
+                """SELECT 1 FROM tool_provider_flows f
+                   JOIN tool_activity_logs a ON a.id=f.apply_activity_id AND a.owner_id=f.owner_id
+                     AND a.target_email=f.target_email AND a.action='apply_premium' AND a.status='success'
+                   JOIN tools_user_access u ON u.user_id=f.owner_id AND u.enabled=1
+                   LEFT JOIN user_security s ON s.user_id=f.owner_id
+                   WHERE f.correlation_id=? AND f.owner_id=? AND f.stage='apply_premium'
+                     AND f.status='success' AND COALESCE(f.apply_started_at,'')!=''
+                     AND COALESCE(s.blocked,0)=0""",(correlation_id,user_id)
+            ).fetchone()
+            if not eligible:raise ValueError("Rating tersedia setelah Magic Link Anda sukses.")
+            existing=conn.execute("SELECT rating FROM tools_user_reviews WHERE correlation_id=?",(correlation_id,)).fetchone()
+            if existing:return int(existing["rating"]),False
+            conn.execute("INSERT INTO tools_user_reviews(correlation_id,user_id,rating,created_at) VALUES(?,?,?,?)",
+                         (correlation_id,user_id,stars,datetime.now().isoformat(timespec="seconds")))
+        return stars,True
+    finally:
+        conn.close()
+
+
+@router.callback_query(F.data.startswith("utools:rating:"))
+async def user_tools_rating(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
+    key=tools_user_flow_key(call.data,"rating")
+    success=tools_user_success_flow(call.from_user.id,key) if key else None
+    if not success:return await safe_callback_notice(call,"Rating tersedia setelah Magic Link Anda sukses.",show_alert=True)
+    await state.set_state(None)
+    text="⭐ <b>RATING TOKO</b>\n\n"+store_rating_text()
+    if success["rating"]:
+        text+=f"\n\nTerima kasih! Rating Anda: <b>{'⭐'*int(success['rating'])} ({success['rating']}/5)</b>."
+        keyboard=tools_user_menu(call.from_user.id)
+    else:
+        text+="\n\nMagic Link berhasil. Pilih penilaian untuk layanan toko:"
+        keyboard=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐ {stars}",callback_data=f"utools:rate:{key}:{stars}") for stars in range(1,6)],
+            [InlineKeyboardButton(text="⬅️ Magic Link",callback_data="utools:home")],
+        ])
+    await safe_edit_or_answer(call,text,reply_markup=keyboard,parse_mode="HTML")
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data.startswith("utools:rate:"))
+async def user_tools_rate_submit(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
+    parts=str(call.data or "").split(":")
+    if len(parts)!=4 or not re.fullmatch(r"[1-5]",parts[-1]):
+        return await safe_callback_notice(call,"Rating tidak valid.",show_alert=True)
+    try:
+        stars,created=save_tools_user_rating(call.from_user.id,parts[2],int(parts[3]))
+    except ValueError as exc:
+        return await safe_callback_notice(call,str(exc),show_alert=True)
+    await state.set_state(None)
+    await safe_edit_or_answer(call,"✅ <b>RATING TOKO TERSIMPAN</b>\n\n"
+        f"{'⭐'*stars} <b>{stars}/5</b>\n\nTerima kasih atas penilaian Anda.",
+        reply_markup=tools_user_menu(call.from_user.id),parse_mode="HTML")
+    await safe_callback_notice(call,"Rating tersimpan." if created else "Rating sebelumnya sudah tersimpan.")
+
+
+@router.callback_query(F.data.startswith("utools:"))
+async def user_tools_stale_callback(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
+    await user_tools_home(call,state)
+
+
+@router.callback_query(F.data.startswith("toolsaccess"))
+async def owner_tools_access_stale_callback(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    await state.set_state(None)
+    await render_tools_access_list(call)
+    await safe_callback_notice(call,"Buka pengaturan akses terbaru.")
+
+
 @router.message(Command("tools"))
 async def owner_tools_command(message: Message,state: FSMContext):
     # Preserve verified email/idToken/final metadata while reopening /tools.
-    await state.set_state(None)
     if not is_owner(message.from_user.id):
-        return await message.answer(owner_access_denied_text(),parse_mode="HTML")
+        return await user_tools_command(message,state)
+    await state.set_state(None)
     await message.answer(
         "🧰 <b>OWNER TOOLS</b>\n\n"
         "Modul ini terpisah dari checkout utama.\n"
@@ -17161,6 +17766,11 @@ async def wallet_topup(call: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await call.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def callback_noop(call: CallbackQuery):
+    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data.startswith("topup:set:"))
@@ -22402,7 +23012,7 @@ async def reply_menu_wallet(message: Message, bot: Bot):
     )
 
 
-@router.message(F.text.regexp(r"^\d{1,2}$"))
+@router.message(StateFilter(None), F.text.regexp(r"^\d{1,2}$"))
 async def reply_menu_product_number(message: Message, bot: Bot):
     if not await is_channel_member(bot, message.from_user.id):
         return await send_join_required(message)
@@ -23046,13 +23656,7 @@ async def owner_reviews(call: CallbackQuery):
     conn=db()
     summary=store_rating_summary(conn)
 
-    rows=conn.execute(
-        """SELECT r.*,o.username
-           FROM reviews r
-           LEFT JOIN orders o ON o.id=r.order_id
-           ORDER BY r.id DESC
-           LIMIT 30"""
-    ).fetchall()
+    rows=store_recent_ratings(conn,30)
     conn.close()
 
     lines=[
@@ -23091,7 +23695,7 @@ async def owner_reviews(call: CallbackQuery):
 
             lines.append(
                 f"{'⭐' * stars} <b>{stars}/5</b> • Maboyy Digital\n"
-                f"🧾 {invoice(row['order_id'])} • "
+                f"🧾 {invoice(row['order_id']) if row['order_id'] else 'Magic Link'} • "
                 f"👤 {html.escape(user_label)}\n"
                 f"📦 Transaksi: {html.escape(product_snapshot)} — "
                 f"{html.escape(variant_snapshot)}"
@@ -28268,7 +28872,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.55"
+EXPECTED_SOURCE_VERSION = "16.56"
 
 
 def source_integrity_self_test():

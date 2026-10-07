@@ -1727,3 +1727,53 @@ menu owner dibersihkan agar tidak menangkap input wizard lain. Metadata dan hasi
 persisten; link/idToken tools tetap sementara di memori seperti v16.52.
 
 Schema tetap `178`; tidak ada tabel, fitur, atau file lama yang dihapus.
+
+## v16.54 — Penomoran Rilis dan Panduan Upload
+
+Tidak ada variable baru atau perubahan schema. Versi pada launcher/source kini v16.54;
+nama paket `MaboyyDigital_v16.54.zip`. Fitur dan perbaikan runtime v16.53 tetap dipertahankan.
+Setiap peningkatan berikutnya menaikkan nomor rilis serta menyelaraskan versi source,
+launcher, panduan, dan nama ZIP. Enam nama file di dalam ZIP tetap sama tanpa folder tambahan.
+Panduan file yang di-upload ke GitHub serta status integrasi pembayaran ada di README.
+
+## v16.55 — Perbaikan Stok/Slot Famhead
+
+Tidak ada variable, dependensi, atau migrasi schema baru. Schema tetap `178`.
+Gunakan `main.py` dan `bot.py` dari paket v16.55 yang sama, lalu redeploy Railway.
+Start Command tetap `python main.py`; database pada Volume tetap dipakai.
+
+Tombol +1/+5/+10 kini memperbarui tampilan slot setelah commit tanpa mengubah callback
+Telegram. Tambah Custom, tombol Kembali, dan tombol stok lama diperbaiki tanpa mengganti
+command. Flow pembayaran dan provider `/tools` tetap seperti versi sebelumnya.
+
+Pada versi sebelumnya, `ValidationError` tambah slot terjadi setelah stok sudah tersimpan.
+Periksa jumlah aktual sebelum menambahkan ulang. Rilis ini tidak mengoreksi stok historis
+secara otomatis karena jumlah yang sebenarnya diinginkan owner tidak dapat disimpulkan.
+
+## v16.56 — VIP /tools, Magic Link, Rating, dan Input Slot
+
+Tidak ada variable atau dependensi baru. Owner mengatur VIP khusus tools dari `/tools` →
+**👑 VIP /tools** → pilih user → **✅ Jadikan VIP /tools**; tidak perlu menambahkan ID user
+melalui Railway Variables. VIP ini tidak mengubah level member belanja atau akses command lain.
+Izin disimpan dalam database di Volume dan tetap berlaku setelah restart.
+
+Schema `179` menambahkan tabel `tools_user_access` dan `tools_user_reviews` tanpa menghapus
+tabel/data lama. Migrasi otomatis saat startup. Enam file flat dan Start Command
+`python main.py` tetap digunakan; upload `main.py`/`bot.py` dari paket v16.56 yang sama.
+
+Flow user membutuhkan provider aktif, API key, serta URL Send Magic Link, Verify Account,
+dan Apply Premium yang sudah dikonfigurasi. `TOOLS_PROVIDER_APPLY_STATUS_URL` tetap opsional
+untuk membaca hasil pending/unknown; tombol Magic Link tidak mengulang request apply tersebut.
+Limit request lokal yang sudah ada juga menghitung request user sesuai ID Telegram pelaku.
+
+Panel owner tetap lengkap. User VIP melihat pesan “Gunakan fitur dengan bijak” dan hanya
+menu Magic Link, lalu Rating Toko setelah apply sukses. User non-VIP tidak mendapat akses
+fitur /tools. User yang diblokir atau izinnya dicabut tidak dapat melanjutkan request baru.
+Link/idToken user tetap sementara di memori; credential provider tidak ditampilkan ke user.
+
+Input angka Tambah Slot Pre-Order/Famhead diperbaiki agar tidak ditangkap shortcut produk.
+Shortcut tetap tersedia saat tidak ada input aktif. Perbaikan ini tidak memerlukan perubahan
+variable Railway atau koreksi stok otomatis; redeploy menggunakan paket v16.56 yang sama.
+
+Tombol nominal saldo terpilih juga diperbaiki agar tidak menampilkan peringatan kedaluwarsa.
+Nominal, session, dan alur pembayaran tetap dipertahankan.
