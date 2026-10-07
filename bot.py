@@ -190,7 +190,7 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.53"
+BOT_VERSION = "16.55"
 SCHEMA_VERSION = 178
 
 CHECKOUT_TERMS_SHORT = (
@@ -20573,18 +20573,29 @@ async def owner_stock_product(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
-    product_id = int(call.data.split(":")[2])
-    product, markup = owner_stock_variants_keyboard(product_id)
+    values=callback_positive_numbers(str(call.data or "").removeprefix("ownerstock:"),"product")
+    if not values:
+        return await safe_callback_notice(call,"Produk tidak valid.",show_alert=True)
+    product_id=values[0]
+    conn=db()
+    try:
+        product=conn.execute(
+            "SELECT id,name FROM products WHERE id=? AND active=1",(product_id,)
+        ).fetchone()
+    finally:
+        conn.close()
 
     if not product:
-        return await call.answer("Produk tidak ditemukan.", show_alert=True)
+        return await safe_callback_notice(call,"Produk tidak ditemukan.",show_alert=True)
+
+    markup=owner_stock_variants_keyboard(product_id)
 
     await safe_edit_or_answer(call, 
-        f"📦 <b>{product['name']}</b>\n\nPilih variasi:",
+        f"📦 <b>{html.escape(product['name'])}</b>\n\nPilih variasi:",
         reply_markup=markup,
         parse_mode="HTML"
     )
-    await call.answer()
+    await safe_callback_notice(call)
 
 
 @router.callback_query(F.data.startswith("ownerstock:variant:"))
@@ -20626,14 +20637,23 @@ async def owner_stock_back_variant(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    variant_id = int(call.data.split(":")[2])
+    values=callback_positive_numbers(str(call.data or "").removeprefix("ownerstock:"),"backvariant")
+    if not values:
+        return await safe_callback_notice(call,"Varian tidak valid.",show_alert=True)
+    variant_id=values[0]
     conn = db()
-    row = conn.execute("SELECT product_id FROM product_variants WHERE id=?", (variant_id,)).fetchone()
-    conn.close()
+    try:
+        row=conn.execute(
+            """SELECT v.product_id FROM product_variants v
+               JOIN products p ON p.id=v.product_id
+               WHERE v.id=? AND v.active=1 AND p.active=1""",(variant_id,)
+        ).fetchone()
+    finally:
+        conn.close()
     if not row:
-        return await call.answer("Variasi tidak ditemukan.", show_alert=True)
-    call.data = f"ownerstock:product:{row['product_id']}"
-    await owner_stock_product(call)
+        return await safe_callback_notice(call,"Variasi tidak ditemukan.",show_alert=True)
+    forwarded=call.model_copy(update={"data":f"ownerstock:product:{row['product_id']}"})
+    await owner_stock_product(forwarded)
 
 
 @router.callback_query(F.data.startswith("ownerstock:add:"))
@@ -24939,32 +24959,29 @@ async def owner_stock_product_pick(call: CallbackQuery):
     await safe_callback_notice(call)
 
 
-@router.callback_query(F.data.startswith("ownerstockvar:"))
-async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await deny_owner_callback(call)
-
-    try:
-        variant_id=int(call.data.split(":")[-1])
-    except Exception:
-        return await call.answer("Varian tidak valid.", show_alert=True)
-
+async def render_owner_stock_variant(call: CallbackQuery, state: FSMContext, variant_id: int):
+    """Render stock by variant ID without modifying the incoming callback payload."""
     conn=db()
-    row=conn.execute(
-        """SELECT v.id,v.name,v.stock,v.reserved_stock,v.sharing_mode,
-                  p.name AS product_name,p.fulfillment_mode
-           FROM product_variants v
-           JOIN products p ON p.id=v.product_id
-           WHERE v.id=? AND v.active=1 AND p.active=1""",
-        (variant_id,)
-    ).fetchone()
-    conn.close()
+    try:
+        row=conn.execute(
+            """SELECT v.id,v.name,v.stock,v.reserved_stock,v.sharing_mode,
+                      p.name AS product_name,p.fulfillment_mode
+               FROM product_variants v
+               JOIN products p ON p.id=v.product_id
+               WHERE v.id=? AND v.active=1 AND p.active=1""",
+            (variant_id,)
+        ).fetchone()
+    finally:
+        conn.close()
 
     if not row:
-        return await call.answer("Varian tidak ditemukan.", show_alert=True)
+        await safe_callback_notice(call,"Varian tidak ditemukan.",show_alert=True)
+        return False
 
     available=max(0,int(row["stock"] or 0)-int(row["reserved_stock"] or 0))
 
+    # Returning from custom slot input must cancel that input session.
+    await state.clear()
     await state.update_data(stock_variant_id=variant_id)
 
     if str(row["fulfillment_mode"] or "ready")=="preorder":
@@ -24985,7 +25002,7 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
             ]),
             parse_mode="HTML"
         )
-        return await safe_callback_notice(call)
+        return True
 
     await safe_edit_or_answer(
         call,
@@ -25010,47 +25027,93 @@ async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
         ]),
         parse_mode="HTML"
     )
-    await safe_callback_notice(call)
+    return True
+
+
+@router.callback_query(F.data.startswith("ownerstockvar:"))
+async def owner_stock_variant_pick(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    values=callback_positive_numbers(call.data,"ownerstockvar")
+    if not values:
+        return await safe_callback_notice(call,"Varian tidak valid.",show_alert=True)
+    if await render_owner_stock_variant(call,state,values[0]):
+        await safe_callback_notice(call)
+
+
+def add_preorder_slots(variant_id: int, qty: int):
+    """Add slots atomically; preserve reservations and reject stale stock buttons."""
+    if not (0 < variant_id <= 9223372036854775807 and 1 <= qty <= 10000):
+        raise ValueError("Jumlah slot tidak valid.")
+    conn=db()
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row=conn.execute(
+                """SELECT v.* FROM product_variants v
+                   JOIN products p ON p.id=v.product_id
+                   WHERE v.id=? AND v.active=1 AND p.active=1
+                     AND COALESCE(p.fulfillment_mode,'ready')='preorder'""",
+                (variant_id,)
+            ).fetchone()
+            if not row:
+                return None
+            if int(row["stock"] or 0) > 9223372036854775807-qty:
+                raise ValueError("Jumlah slot melebihi batas penyimpanan.")
+            conn.execute(
+                "UPDATE product_variants SET stock=COALESCE(stock,0)+? WHERE id=?",
+                (qty,variant_id)
+            )
+            variant=conn.execute(
+                "SELECT * FROM product_variants WHERE id=?",(variant_id,)
+            ).fetchone()
+        return variant
+    finally:
+        conn.close()
 
 
 
 
 @router.callback_query(F.data.startswith("ownerposlotadd:"))
-async def owner_preorder_slot_add(call: CallbackQuery):
+async def owner_preorder_slot_add(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
-    try:
-        _,variant_raw,qty_raw=call.data.split(":")
-        variant_id=int(variant_raw); qty=int(qty_raw)
-    except Exception:
-        return await call.answer("Data slot tidak valid.",show_alert=True)
+    values=callback_positive_numbers(call.data,"ownerposlotadd",2)
+    if not values:
+        return await safe_callback_notice(call,"Data slot tidak valid.",show_alert=True)
+    variant_id,qty=values
     if qty < 1 or qty > 10000:
-        return await call.answer("Jumlah slot tidak valid.",show_alert=True)
+        return await safe_callback_notice(call,"Jumlah slot tidak valid.",show_alert=True)
 
-    conn=db()
-    row=conn.execute(
-        """SELECT v.id,p.fulfillment_mode
-           FROM product_variants v JOIN products p ON p.id=v.product_id
-           WHERE v.id=?""",(variant_id,)
-    ).fetchone()
-    if not row or str(row["fulfillment_mode"] or "ready")!="preorder":
-        conn.close()
-        return await call.answer("Varian bukan Pre-Order.",show_alert=True)
-    conn.execute("UPDATE product_variants SET stock=stock+? WHERE id=?",(qty,variant_id))
-    conn.commit(); conn.close()
-    call.data=f"ownerstockvar:{variant_id}"
-    await owner_stock_variant_pick(call,FSMContext) if False else None
-    return await call.answer(f"✅ Slot Pre-Order +{qty}.",show_alert=True)
+    try:
+        variant=add_preorder_slots(variant_id,qty)
+    except ValueError as exc:
+        return await safe_callback_notice(call,str(exc),show_alert=True)
+    if not variant:
+        return await safe_callback_notice(call,"Varian bukan Pre-Order.",show_alert=True)
+    await safe_callback_notice(call,f"✅ Slot Pre-Order +{qty}.",show_alert=True)
+    await render_owner_stock_variant(call,state,variant_id)
 
 
 @router.callback_query(F.data.startswith("ownerposlotcustom:"))
 async def owner_preorder_slot_custom(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
+    values=callback_positive_numbers(call.data,"ownerposlotcustom")
+    if not values:
+        return await safe_callback_notice(call,"Varian tidak valid.",show_alert=True)
+    variant_id=values[0]
+    conn=db()
     try:
-        variant_id=int(call.data.split(":")[-1])
-    except Exception:
-        return await call.answer("Varian tidak valid.",show_alert=True)
+        row=conn.execute(
+            """SELECT v.id FROM product_variants v JOIN products p ON p.id=v.product_id
+               WHERE v.id=? AND v.active=1 AND p.active=1
+                 AND COALESCE(p.fulfillment_mode,'ready')='preorder'""",(variant_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return await safe_callback_notice(call,"Varian bukan Pre-Order.",show_alert=True)
     await state.clear()
     await state.update_data(preorder_slot_variant_id=variant_id)
     await state.set_state(OwnerState.preorder_slot_adjust)
@@ -25070,26 +25133,27 @@ async def owner_preorder_slot_adjust_input(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
     raw=(message.text or "").strip()
-    if not raw.isdigit() or not (1 <= int(raw) <= 10000):
+    if not re.fullmatch(r"[0-9]{1,5}",raw) or not (1 <= int(raw) <= 10000):
         return await message.answer("❌ Jumlah slot harus 1–10000.")
     data=await state.get_data()
-    variant_id=int(data.get("preorder_slot_variant_id",0) or 0)
-    if not variant_id:
+    values=callback_positive_numbers(
+        f"ownerposlotcustom:{data.get('preorder_slot_variant_id','')}","ownerposlotcustom"
+    )
+    if not values:
         await state.clear()
         return await message.answer("❌ Varian tidak valid.")
-    conn=db()
-    row=conn.execute(
-        """SELECT p.fulfillment_mode FROM product_variants v
-           JOIN products p ON p.id=v.product_id WHERE v.id=?""",(variant_id,)
-    ).fetchone()
-    if not row or str(row["fulfillment_mode"] or "ready")!="preorder":
-        conn.close(); await state.clear()
+    variant_id=values[0]
+    qty=int(raw)
+    try:
+        variant=add_preorder_slots(variant_id,qty)
+    except ValueError as exc:
+        return await message.answer(f"❌ {exc}")
+    if not variant:
+        await state.clear()
         return await message.answer("❌ Varian bukan Pre-Order.")
-    conn.execute("UPDATE product_variants SET stock=stock+? WHERE id=?",(int(raw),variant_id))
-    variant=conn.execute("SELECT * FROM product_variants WHERE id=?",(variant_id,)).fetchone()
-    conn.commit(); conn.close(); await state.clear()
+    await state.clear()
     await message.answer(
-        f"✅ Slot Pre-Order ditambah <b>{int(raw)}</b>.\n"
+        f"✅ Slot Pre-Order ditambah <b>{qty}</b>.\n"
         f"📦 Slot tersedia sekarang: <b>{available_stock(variant)}</b>",
         reply_markup=owner_products_menu(),
         parse_mode="HTML"
@@ -25655,14 +25719,14 @@ async def owner_stock_unified_begin(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
 
-    try:
-        variant_id=int(call.data.split(":")[-1])
-    except Exception:
-        return await call.answer("Varian tidak valid.",show_alert=True)
+    values=callback_positive_numbers(call.data,"ownerstockunified")
+    if not values:
+        return await safe_callback_notice(call,"Varian tidak valid.",show_alert=True)
+    variant_id=values[0]
 
     conn=db()
     row=conn.execute(
-        """SELECT v.id,v.name,p.name AS product_name
+        """SELECT v.id,v.name,p.name AS product_name,p.fulfillment_mode
            FROM product_variants v
            JOIN products p ON p.id=v.product_id
            WHERE v.id=? AND v.active=1 AND p.active=1""",
@@ -25672,6 +25736,12 @@ async def owner_stock_unified_begin(call: CallbackQuery, state: FSMContext):
 
     if not row:
         return await call.answer("Varian tidak ditemukan.",show_alert=True)
+
+    # Old stock buttons for Famhead/pre-order must still open slot management.
+    if str(row["fulfillment_mode"] or "ready")=="preorder":
+        if await render_owner_stock_variant(call,state,variant_id):
+            await safe_callback_notice(call)
+        return
 
     await state.clear()
     await state.update_data(stock_variant_id=variant_id)
@@ -25846,18 +25916,14 @@ async def owner_stock_target_cancel(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("ownerstockadd:"))
-async def owner_stock_add_legacy(call: CallbackQuery):
+async def owner_stock_add_legacy(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await deny_owner_callback(call)
-    try:
-        variant_id=int(call.data.split(":")[-1])
-    except Exception:
-        return await call.answer("Varian tidak valid.",show_alert=True)
-    await call.answer(
-        "Tambah akun dan stok sekarang digabung menjadi satu menu.",
-        show_alert=True
-    )
-    call.data=f"ownerstockunified:{variant_id}"
+    values=callback_positive_numbers(call.data,"ownerstockadd")
+    if not values:
+        return await safe_callback_notice(call,"Varian tidak valid.",show_alert=True)
+    forwarded=call.model_copy(update={"data":f"ownerstockunified:{values[0]}"})
+    await owner_stock_unified_begin(forwarded,state)
 
 
 
@@ -28202,7 +28268,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.53"
+EXPECTED_SOURCE_VERSION = "16.55"
 
 
 def source_integrity_self_test():
