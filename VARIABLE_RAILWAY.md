@@ -1777,3 +1777,28 @@ variable Railway atau koreksi stok otomatis; redeploy menggunakan paket v16.56 y
 
 Tombol nominal saldo terpilih juga diperbaiki agar tidak menampilkan peringatan kedaluwarsa.
 Nominal, session, dan alur pembayaran tetap dipertahankan.
+
+## v16.57 — README Ringkas
+
+README diringkas untuk upload, menjalankan bot, dan VIP /tools. Versi launcher/source/paket
+diselaraskan ke v16.57; fitur, variable, dependensi, dan schema `179` tetap seperti v16.56.
+
+## v16.58 — Pengaturan Famhead dan Stok
+
+Owner membuka Produk & Stok → Atur Produk untuk mengubah nama/deskripsi, estimasi/arahan,
+nama/harga varian, menambah varian, atau membuka slot. Pengaturan teks/harga tidak mengubah
+stok/reservasi. Setup slot awal hanya mengisi varian kosong; stok yang sudah ada dipertahankan.
+Session setup lama/nonaktif ditolak. Flow Famhead diperiksa sebelum pembayaran dan konfirmasi.
+Perbaikan inventory saat restart/recovery tidak lagi menyamakan slot Famhead/Pre-Order dengan
+jumlah akun inventory; slot yang ditambahkan tetap tersimpan. Stock ready tetap disinkronkan.
+Tidak ada variable/dependensi baru. Schema `180` menambahkan penanda notifikasi undangan
+Famhead agar klik ulang tidak mengirim berulang. Migrasi otomatis mempertahankan data lama.
+Gunakan enam file dari paket v16.58.
+
+## v16.59 — Rating Toko
+
+Rating checkout dan VIP /tools memakai kartu serta tombol bintang yang seragam.
+Owner dapat membaca seluruh ulasan lewat halaman 5 penilaian; ringkasan toko memuat
+sebaran bintang dan ulasan terbaru. Validasi callback, duplikasi, status pesanan,
+sesi ulasan, serta error database diperbaiki tanpa mengubah alur pembayaran/provider.
+Tidak ada variable/dependensi baru; schema tetap `180`. Upload enam file v16.59 bersama.
