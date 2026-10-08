@@ -196,7 +196,7 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.63"
+BOT_VERSION = "16.64"
 SCHEMA_VERSION = 182
 
 CHECKOUT_TERMS_SHORT = (
@@ -10621,7 +10621,7 @@ def qris_settings_menu():
     return kb.as_markup()
 
 
-PRODUCTS_PAGE_SIZE = 5
+PRODUCTS_PAGE_SIZE = 10
 
 
 FLASH_DURATION_PRESETS = (
@@ -10854,41 +10854,40 @@ def product_view_filter(view: str) -> str:
     return ""
 
 
-def products_keyboard(page: int = 1, total_pages: int = 1, view: str = "all"):
-    page=max(1,int(page or 1))
+def products_keyboard(page: int = 1, total_pages: int = 1, view: str = "all",
+                      *, products=None, stock_map=None, global_number_map=None):
     total_pages=max(1,int(total_pages or 1))
+    page=max(1,min(int(page or 1),total_pages))
     view=view if view in {"all","popular","flash"} else "all"
-
+    stock_map=stock_map or {}
+    number_map=global_number_map or {}
     kb=InlineKeyboardBuilder()
+
+    # Each visible product remains reachable on pages beyond the reply shortcuts.
+    for product in products or ():
+        product_id=int(product["id"])
+        number=int(number_map.get(product_id,0) or 0)
+        name=re.sub(r"\s+"," ",str(product["name"] or "Produk")).strip()[:44]
+        label=product_stock_button_label(name,max(0,int(stock_map.get(product_id,0))))
+        kb.row(InlineKeyboardButton(
+            text=(f"[{number}] " if number else "")+label,
+            callback_data=f"product:{product_id}"
+        ))
 
     nav=[]
     if page>1:
-        nav.append(
-            InlineKeyboardButton(
-                text="⬅️ Halaman Sebelumnya",
-                callback_data=f"productspage:{view}:{page-1}"
-            )
-        )
+        nav.append(InlineKeyboardButton(text="⬅️ Halaman Sebelumnya",
+            callback_data=f"productspage:{view}:{page-1}"))
     if page<total_pages:
-        nav.append(
-            InlineKeyboardButton(
-                text="Halaman Berikutnya ➡️",
-                callback_data=f"productspage:{view}:{page+1}"
-            )
-        )
-    if nav:
-        kb.row(*nav)
-
+        nav.append(InlineKeyboardButton(text="Halaman Berikutnya ➡️",
+            callback_data=f"productspage:{view}:{page+1}"))
+    if nav:kb.row(*nav)
     kb.row(
         InlineKeyboardButton(text="🛒 Keranjang",callback_data="shop:cart"),
         InlineKeyboardButton(text="⭐ Favorit",callback_data="shop:favorites")
     )
-    kb.row(
-        InlineKeyboardButton(text="🎁 Paket Hemat",callback_data="shop:bundles")
-    )
-    kb.row(
-        InlineKeyboardButton(text="⬅️ Menu Utama",callback_data="home")
-    )
+    kb.row(InlineKeyboardButton(text="🎁 Paket Hemat",callback_data="shop:bundles"))
+    kb.row(InlineKeyboardButton(text="⬅️ Menu Utama",callback_data="home"))
     return kb.as_markup()
 
 
@@ -11990,7 +11989,7 @@ async def payment_proof_exit_to_menu(message: Message, state: FSMContext, bot: B
 
 @router.message(
     CheckoutState.waiting_payment_proof,
-    F.text.regexp(r"^\d{1,2}$")
+    F.text.regexp(r"^[0-9]{1,6}$")
 )
 async def payment_proof_exit_to_product_number(message: Message, state: FSMContext, bot: Bot):
     """Product shortcut numbers also exit proof-upload mode safely."""
@@ -12647,8 +12646,75 @@ async def temp_mail_fetch_inbox(owner_id: int, mailbox_id: int, page: int = 1) -
             total = max(0, min(1000000, int(result.get("hydra:totalItems", result.get("totalItems", len(messages))))))
         except (TypeError, ValueError):
             raise TempMailError("Jumlah pesan provider tidak valid.", status=502) from None
-        public = [temp_mail_public_message(item) for item in messages[:30] if isinstance(item, dict)]
+        public = []
+        for item in messages[:30]:
+            if not isinstance(item, dict) or not temp_mail_provider_id(item.get("id")):
+                continue
+            public.append(temp_mail_public_message(item))
         return {"messages": public, "total": total, "page": page, "total_pages": max(1, min(1000, (total + 29) // 30)), "mailbox": temp_mail_public_mailbox(row), "address": row["address"]}
+
+
+def temp_mail_account_identity(value) -> str:
+    """Normalize a Mail.tm account reference without accepting another origin."""
+    if isinstance(value, dict):
+        identities = []
+        for key in ("id", "@id"):
+            if key in value and value[key] not in (None, ""):
+                # Only one object level is part of the provider resource format.
+                if not isinstance(value[key], str):
+                    return ""
+                identity = temp_mail_account_identity(value[key])
+                if not identity:
+                    return ""
+                identities.append(identity)
+        return identities[0] if identities and len(set(identities)) == 1 else ""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if temp_mail_provider_id(value):
+        return value
+    if not value or len(value) > 256 or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value):
+        return ""
+    if value.startswith("/accounts/"):
+        account_id = value[len("/accounts/"):]
+        return account_id if temp_mail_provider_id(account_id) else ""
+    try:
+        reference = urlparse(value)
+        if (reference.scheme.lower() != "https" or reference.hostname != "api.mail.tm"
+                or reference.username is not None or reference.password is not None
+                or reference.port not in (None, 443) or reference.query or reference.fragment
+                or not reference.path.startswith("/accounts/")):
+            return ""
+    except ValueError:
+        return ""
+    account_id = reference.path[len("/accounts/"):]
+    return account_id if temp_mail_provider_id(account_id) else ""
+
+
+def temp_mail_recipient_addresses(message: dict) -> set:
+    """Read the provider's To/CC/BCC forms; headers are never ownership alone."""
+    addresses = set()
+    for key in ("to", "cc", "bcc"):
+        recipients = message.get(key)
+        if recipients in (None, ""):
+            continue
+        if not isinstance(recipients, list) or len(recipients) > 500:
+            raise TempMailError("Data penerima pesan provider tidak valid.", status=502)
+        for recipient in recipients:
+            value = recipient.get("address") if isinstance(recipient, dict) else recipient
+            if value in (None, ""):
+                continue
+            if not isinstance(value, str) or len(value) > 512:
+                raise TempMailError("Data penerima pesan provider tidak valid.", status=502)
+            value = value.strip()
+            # Some CC/BCC entries are a single RFC-style display-name address.
+            display_address = re.fullmatch(r'[^<>]*<([^<>]+)>', value)
+            if display_address:
+                value = display_address.group(1).strip()
+            if not valid_tools_email(value):
+                raise TempMailError("Data penerima pesan provider tidak valid.", status=502)
+            addresses.add(value.lower())
+    return addresses
 
 
 async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str) -> dict:
@@ -12659,14 +12725,20 @@ async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str
         row, result = await temp_mail_authenticated_read_locked(temp_mail_owned_row(owner_id, mailbox_id), "/messages/" + message_id)
         if result.get("id") != message_id:
             raise TempMailError("Identitas pesan provider tidak cocok.", status=409)
-        account_id = result.get("accountId")
-        if account_id and account_id != row.get("provider_account_id"):
+        account_value = result.get("accountId")
+        has_account_identity = account_value is not None and account_value != ""
+        account_id = temp_mail_account_identity(account_value) if has_account_identity else ""
+        expected_id = temp_mail_account_identity(row.get("provider_account_id"))
+        if has_account_identity and (not account_id or not expected_id or account_id != expected_id):
             raise TempMailError("Pesan bukan milik alamat email ini.", status=409)
-        recipients = result.get("to")
-        recipients = recipients if isinstance(recipients, list) else []
-        addresses = {str(item.get("address") or "").strip().lower() for item in recipients if isinstance(item, dict)}
-        addresses.discard("")
-        if addresses and str(row["address"]).lower() not in addresses and not account_id:
+        if isinstance(account_value, dict) and account_value.get("address") is not None:
+            address = account_value.get("address")
+            if not isinstance(address, str) or address.strip().lower() != str(row["address"]).strip().lower():
+                raise TempMailError("Pesan bukan milik alamat email ini.", status=409)
+        addresses = temp_mail_recipient_addresses(result)
+        # A matching account resource, validated by /me under the same token,
+        # also permits legitimate BCC deliveries whose hidden header is omitted.
+        if addresses and str(row["address"]).strip().lower() not in addresses and not account_id:
             raise TempMailError("Penerima pesan tidak cocok dengan alamat email ini.", status=409)
         message = temp_mail_public_message(result, body=True)
         message["mailbox"] = temp_mail_public_mailbox(row)
@@ -12674,11 +12746,11 @@ async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str
         return message
 
 
+
 def owner_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚡ AM Pro Otomatis • 1 Tahun", callback_data=auto_am_start_token())],
-        [InlineKeyboardButton(text="📧 Kirim Link",callback_data="tools:magiclink"),
-         InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
+        [InlineKeyboardButton(text="✅ Magic Link / Verifikasi",callback_data="tools:verification")],
         [InlineKeyboardButton(text="🚀 Apply Premium",callback_data="tools:pro_license"),
          InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
         [InlineKeyboardButton(text="📬 Temp Mail",callback_data="tools:tempmail"),
@@ -12863,8 +12935,7 @@ async def owner_tools_cleanup_cancel(call: CallbackQuery):
 
 def alight_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📧 Kirim Link",callback_data="tools:magiclink")],
-        [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
+        [InlineKeyboardButton(text="✅ Magic Link / Verifikasi",callback_data="tools:verification")],
         [InlineKeyboardButton(text="🚀 Provision 1 Tahun",callback_data="tools:alight:1y")],
         [InlineKeyboardButton(text="📊 Status",callback_data="tools:stats")],
         [InlineKeyboardButton(text="📦 Riwayat Alight Motion",callback_data="tools:history")],
@@ -14760,6 +14831,20 @@ async def owner_tools_alight(call: CallbackQuery,state: FSMContext):
     await safe_callback_notice(call)
 
 
+@router.callback_query(F.data == "tools:verification")
+async def owner_tools_verification_entry(call: CallbackQuery, state: FSMContext):
+    if not await tools_cleanup_require_owner(call): return
+    data = await state.get_data()
+    email = str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "").strip().lower()
+    if data.get("tools_apply_requested") and valid_tools_email(email):
+        await state.set_state(None)
+        await safe_callback_notice(call,"Hasil terakhir tersedia. Apply tidak diulang.")
+        return await safe_edit_or_answer(call,tools_final_result_text(data),reply_markup=tools_result_keyboard(),parse_mode="HTML")
+    if data.get("tools_magiclink_sent") and valid_tools_email(email) and not tools_session_expired(data):
+        return await owner_tools_verify_begin(call,state)
+    return await owner_tools_magiclink_begin(call,state)
+
+
 @router.callback_query(F.data == "tools:magiclink")
 async def owner_tools_magiclink_begin(call: CallbackQuery,state: FSMContext):
     if not is_owner(call.from_user.id):
@@ -15762,13 +15847,19 @@ def auto_am_flow_result(job):
 
 
 def auto_am_mail_candidate(message, job):
-    sender = str((message.get("from") or {}).get("address") or "").strip().lower()
-    name = str((message.get("from") or {}).get("name") or "").lower()
+    if not isinstance(message, dict): return False
+    sender_info = message.get("from")
+    sender_info = sender_info if isinstance(sender_info, dict) else {}
+    sender = str(sender_info.get("address") or "").strip().lower()
+    name = str(sender_info.get("name") or "").lower()
     subject = str(message.get("subject") or "").lower()
     if "alight" not in sender and "alight" not in name and "alight" not in subject:
         return False
-    recipients = {str(item.get("address") or "").lower() for item in message.get("to", []) if isinstance(item, dict)}
-    if recipients and job["email"] not in recipients:
+    targets = message.get("to")
+    targets = targets if isinstance(targets, list) else []
+    recipients = {str(item.get("address") or "").strip().lower() for item in targets if isinstance(item, dict)}
+    recipients.discard("")
+    if recipients and job["email"].strip().lower() not in recipients:
         return False
     try:
         sent = datetime.fromisoformat(job["magic_sent_at"].replace("Z", "+00:00"))
@@ -15782,27 +15873,41 @@ def auto_am_mail_candidate(message, job):
     return True
 
 
+
 async def auto_am_find_link(job, call):
     deadline = time.monotonic() + max(0, min(180, float(TOOLS_AUTO_AM_MAIL_WAIT_SECONDS)))
     checked = set()
     scans = 0
+    last_message_error = None
     while True:
         scans += 1
         inbox = await temp_mail_fetch_inbox(job["owner_id"], job["mailbox_id"])
         for item in inbox["messages"]:
             if item["id"] in checked or not auto_am_mail_candidate(item, job):
                 continue
-            message = await temp_mail_read_message(job["owner_id"], job["mailbox_id"], item["id"])
-            if not auto_am_mail_candidate(message, job):
-                continue
             checked.add(item["id"])
             try:
+                message = await temp_mail_read_message(job["owner_id"], job["mailbox_id"], item["id"])
+                if not auto_am_mail_candidate(message, job):
+                    continue
                 return auto_am_extract_magic_link(message)
+            except TempMailError as exc:
+                text = str(exc).lower()
+                local_error = exc.status in {404, 409, 422} and "identitas email provider" not in text
+                local_error = local_error or (exc.status == 502 and "pesan" in text and any(word in text for word in ("tidak valid", "terlalu besar", "terlalu banyak")))
+                if not local_error:
+                    raise
+                # An unusable message cannot block a later valid Magic Link.
+                last_message_error = exc
             except ValueError:
                 continue
         if time.monotonic() >= deadline or scans >= 61:
+            if last_message_error: raise last_message_error
             return ""
+        if scans % 5 == 0:
+            await auto_am_progress(call, "Inbox sudah diperiksa " + str(scans) + " kali. Masih menunggu Magic Link...")
         await asyncio.sleep(max(0, min(15, float(TOOLS_AUTO_AM_POLL_SECONDS))))
+
 
 
 async def auto_am_progress(call, text):
@@ -15921,7 +16026,7 @@ async def auto_am_run(call, job):
                           detail="Apply belum dikirim. Kuota atau sesi belum siap; pilih Lanjutkan.")
 
 
-async def auto_am_render(call, job):
+async def auto_am_render(call, job, *, notice=""):
     status = job["status"]
     # Recheck the durable apply evidence even when presenting a previously saved success.
     if status == "success" and (auto_am_flow_result(job) or {}).get("status") != "success":
@@ -15930,6 +16035,9 @@ async def auto_am_render(call, job):
              "unknown": "❔ HASIL BELUM DIKETAHUI", "waiting": "⏳ AKTIVASI MENUNGGU",
              "running": "⏳ AKTIVASI SEDANG BERJALAN"}.get(status, "⏳ AKTIVASI MENUNGGU")
     lines = ["<b>" + title + "</b>", "", "AM Pro • Paket diminta: 1 tahun"]
+    if notice: lines.extend(["", html.escape(notice[:400])])
+    if job.get("updated_at"):
+        lines.append("🕒 Diperiksa: " + html.escape(format_wib_datetime(job["updated_at"],compact=True)))
     if job["email"]:
         lines.extend(["", "📧 <code>" + html.escape(job["email"]) + "</code>"])
     if status == "success":
@@ -15954,11 +16062,24 @@ async def auto_am_render(call, job):
             username = str(me.username or "")
             if re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
                 url = f"https://t.me/{username}?start=am_mail_{job['mailbox_id']}"
-                rows.append([InlineKeyboardButton(text="🔗 Link Kotak Masuk", url=url)])
+                rows.append([InlineKeyboardButton(text="🔗 Buka Kotak Masuk", url=url)])
         except Exception:
             pass
     rows.append([InlineKeyboardButton(text="⬅️ Owner Tools", callback_data="tools:home")])
     await safe_edit_or_answer(call, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+
+
+async def auto_am_feedback(call, job, *, busy=False):
+    if busy:
+        return await safe_callback_notice(call,"Aktivasi ini sedang berjalan. Tunggu proses selesai, lalu periksa hasil kembali.",show_alert=True)
+    status = job["status"]
+    if status == "success" and (auto_am_flow_result(job) or {}).get("status") != "success": status = "unknown"
+    text = {"success": "Apply Premium sukses. Email dan Received Mail tersedia.",
+            "failed": "Proses belum berhasil. Lihat keterangan dan buka Received Mail.",
+            "unknown": "Hasil belum terkonfirmasi. Periksa keterangan; request yang sudah dikirim tidak diulang.",
+            "waiting": "Pemeriksaan selesai. Aktivasi masih menunggu; lihat keterangan atau buka Received Mail.",
+            "running": "Aktivasi sedang diproses. Tunggu hasilnya."}.get(status,"Status sudah diperiksa.")
+    await safe_callback_notice(call,text,show_alert=status in {"failed","unknown","waiting"})
 
 
 @router.callback_query(F.data.startswith("amauto:"))
@@ -15987,12 +16108,17 @@ async def owner_auto_am_callback(call: CallbackQuery):
             if not job:
                 return await safe_callback_notice(call, "Sesi aktivasi tidak ditemukan.", show_alert=True)
         if job and (parts[1] == "view" or job["status"] in {"success", "failed"}):
-            return await auto_am_render(call, job)
+            await auto_am_render(call, job)
+            return await auto_am_feedback(call, job)
         if job and auto_am_flow_result(job):
             lease = auto_am_lease(call.from_user.id, job["id"])
-            if lease and TOOLS_PROVIDER_ENABLED and TOOLS_PROVIDER_API_KEY:
+            if not lease:
+                await auto_am_render(call, job, notice="Aktivasi ini sedang berjalan. Tunggu proses selesai sebelum memeriksa lagi.")
+                return await auto_am_feedback(call, job, busy=True)
+            if TOOLS_PROVIDER_ENABLED and TOOLS_PROVIDER_API_KEY:
                 job = await auto_am_run(call, job)
-            return await auto_am_render(call, job)
+            await auto_am_render(call, job)
+            return await auto_am_feedback(call, job)
         if not tools_provider_ready():
             return await safe_edit_or_answer(call, "⚠️ Konfigurasi provider belum lengkap. Atur API key serta endpoint Kirim Link, Verifikasi, dan Apply Premium.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Owner Tools", callback_data="tools:home")]]))
@@ -16019,17 +16145,22 @@ async def owner_auto_am_callback(call: CallbackQuery):
             return await safe_callback_notice(call, "Sesi aktivasi tidak ditemukan.", show_alert=True)
         if parts[1] != "view":
             lease = auto_am_lease(call.from_user.id, job["id"])
-            if lease:
-                job = await auto_am_run(call, job)
+            if not lease:
+                await auto_am_render(call, job, notice="Aktivasi ini sedang berjalan. Tunggu proses selesai sebelum memeriksa lagi.")
+                return await auto_am_feedback(call, job, busy=True)
+            job = await auto_am_run(call, job)
         await auto_am_render(call, job)
+        await auto_am_feedback(call, job)
     except Exception as exc:
         if job:
             latest = auto_am_get_job(call.from_user.id, job["id"])
             if latest:
                 preserved = latest["status"] if latest["status"] in {"success", "failed", "unknown"} else "waiting"
-                detail = latest["detail"] or (str(exc)[:400] if isinstance(exc, TempMailError) else "Koneksi terputus. Periksa hasil; permintaan yang telah dikirim tidak diulang.")
+                current_error = str(exc)[:400] if isinstance(exc, TempMailError) else "Koneksi terputus. Periksa hasil; permintaan yang telah dikirim tidak diulang."
+                detail = (latest["detail"] or current_error) if preserved in {"success","failed","unknown"} else current_error
                 job = auto_am_update(call.from_user.id, job["id"], status=preserved, detail=detail)
                 await auto_am_render(call, job)
+                await auto_am_feedback(call, job)
         else:
             await safe_edit_or_answer(call, "⚠️ Aktivasi belum dapat dimulai. Silakan kembali ke /tools dan coba lagi.")
     finally:
@@ -16044,10 +16175,7 @@ async def auto_am_mail_link_open(message):
     if not match: return
     try:
         mailbox = temp_mail_public_mailbox(temp_mail_owned_row(message.from_user.id, int(match.group(1))))
-        await message.answer("📥 <b>KOTAK MASUK EMAIL</b>\n\n<code>" + html.escape(mailbox["address"]) + "</code>\n\nPilih Received Mail untuk membaca pesan.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📥 Received Mail", callback_data=f"tm:inbox:{mailbox['id']}:1")],
-                [InlineKeyboardButton(text="⬅️ Owner Tools", callback_data="tools:home")]]), parse_mode="HTML")
+        await temp_mail_render_inbox(message,mailbox["id"],1)
     except (TempMailError, sqlite3.Error):
         await message.answer("Kotak masuk tidak tersedia atau bukan milik Anda.")
 
@@ -16141,12 +16269,17 @@ async def owner_temp_mail_create(call: CallbackQuery):
     except Exception as exc:await temp_mail_ui_error(call,exc)
 
 
-@router.callback_query(F.data == "tm:address")
+@router.callback_query((F.data == "tm:address") | F.data.startswith("tm:address:"))
 async def owner_temp_mail_address(call: CallbackQuery):
     if not await temp_mail_require_owner(call):return
     await safe_callback_notice(call)
     try:
-        mailbox=temp_mail_get_active(call.from_user.id)
+        if str(call.data or "").startswith("tm:address:"):
+            values=temp_mail_parse_callback(call.data,"address",1)
+            if not values:raise TempMailError("Alamat email tidak valid. Pilih kembali dari Received Mail.",status=400)
+            mailbox=temp_mail_public_mailbox(temp_mail_owned_row(call.from_user.id,values[0]))
+        else:
+            mailbox=temp_mail_get_active(call.from_user.id)
         if not mailbox:return await temp_mail_render_home(call)
         address=str(mailbox.get("address") or "")
         keyboard=[]
@@ -16155,7 +16288,7 @@ async def owner_temp_mail_address(call: CallbackQuery):
         if mailbox.get("state")=="ready":
             keyboard.append([InlineKeyboardButton(text="📥 Received Mail",callback_data=f"tm:inbox:{mailbox['id']}:1")])
         keyboard.append([InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")])
-        await safe_edit_or_answer(call,"📋 <b>ALAMAT EMAIL AKTIF</b>\n\n"+f"<code>{html.escape(address)}</code>\n\n"
+        await safe_edit_or_answer(call,"📋 <b>ALAMAT EMAIL</b>\n\n"+f"<code>{html.escape(address)}</code>\n\n"
                                   "Gunakan tombol Salin, lalu buka Received Mail untuk membaca pesan masuk.",
                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
     except Exception as exc:await temp_mail_ui_error(call,exc)
@@ -16243,23 +16376,31 @@ async def owner_temp_mail_help(call: CallbackQuery):
     )
 
 
-@router.callback_query(F.data.startswith("tm:inbox:"))
-async def owner_temp_mail_inbox(call: CallbackQuery):
-    if not await temp_mail_require_owner(call):return
-    await safe_callback_notice(call,"Memuat pesan masuk...")
-    values=temp_mail_parse_callback(call.data,"inbox",2)
-    if not values:return await temp_mail_ui_error(call,TempMailError("Halaman pesan tidak valid. Buka kembali Received Mail."))
-    mailbox_id,page=values
-    if page>6000:return await temp_mail_ui_error(call,TempMailError("Halaman pesan tidak valid."))
+async def temp_mail_present(target, text, keyboard):
+    if isinstance(target, Message):
+        return await target.answer(text,reply_markup=keyboard,parse_mode="HTML")
+    return await safe_edit_or_answer(target,text,reply_markup=keyboard,parse_mode="HTML")
+
+
+async def temp_mail_render_inbox(target, mailbox_id, page=1):
+    owner_id = target.from_user.id
+    temp_mail_assert_owner(owner_id)
+    chat = target.chat if isinstance(target, Message) else getattr(getattr(target,"message",None),"chat",None)
+    if not chat or str(chat.type)!="private" or chat.id!=owner_id:
+        raise TempMailError("Buka kotak masuk melalui chat pribadi bot.",status=403)
+    mailbox_id = temp_mail_database_id(mailbox_id)
+    if isinstance(page,bool) or not str(page).isascii() or not str(page).isdigit() or not 1<=int(page)<=6000:
+        raise TempMailError("Halaman pesan tidak valid.",status=400)
+    page=int(page)
     try:
         provider_page=(page-1)//6+1
-        result=await temp_mail_fetch_inbox(call.from_user.id,mailbox_id,provider_page)
+        result=await temp_mail_fetch_inbox(owner_id,mailbox_id,provider_page)
         total=max(0,int(result.get("total") or 0))
         pages=max(1,min(6000,(total+4)//5))
         bounded=min(page,pages)
         bounded_provider=(bounded-1)//6+1
         if bounded_provider!=provider_page:
-            result=await temp_mail_fetch_inbox(call.from_user.id,mailbox_id,bounded_provider)
+            result=await temp_mail_fetch_inbox(owner_id,mailbox_id,bounded_provider)
         page=bounded
         messages=result.get("messages") or []
         offset=((page-1)%6)*5
@@ -16285,11 +16426,30 @@ async def owner_temp_mail_inbox(call: CallbackQuery):
         if page<pages:nav.append(InlineKeyboardButton(text="➡️",callback_data=f"tm:inbox:{mailbox_id}:{page+1}"))
         if nav:keyboard.append(nav)
         keyboard.extend([
-            [InlineKeyboardButton(text="🔄 Refresh",callback_data=f"tm:inbox:{mailbox_id}:{page}"),InlineKeyboardButton(text="📋 Alamat",callback_data="tm:address")],
+            [InlineKeyboardButton(text="🔄 Refresh",callback_data=f"tm:inbox:{mailbox_id}:{page}"),InlineKeyboardButton(text="📋 Alamat",callback_data=f"tm:address:{mailbox_id}")],
             [InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")],
         ])
-        await safe_edit_or_answer(call,"\n\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
-    except Exception as exc:await temp_mail_ui_error(call,exc)
+        await temp_mail_present(target,"\n\n".join(lines),InlineKeyboardMarkup(inline_keyboard=keyboard))
+    except Exception as exc:
+        if isinstance(target, Message):
+            detail = str(exc)[:400] if isinstance(exc, TempMailError) else "Kotak masuk belum dapat dibaca. Coba kembali nanti."
+            await target.answer("⚠️ <b>RECEIVED MAIL BELUM DAPAT DIBACA</b>\n\n"+html.escape(detail),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Periksa Lagi",callback_data=f"tm:inbox:{mailbox_id}:1")],
+                    [InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")]]),parse_mode="HTML")
+        else:
+            await temp_mail_ui_error(target,exc)
+
+
+@router.callback_query(F.data.startswith("tm:inbox:"))
+async def owner_temp_mail_inbox(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call,"Memuat pesan masuk...")
+    values=temp_mail_parse_callback(call.data,"inbox",2)
+    if not values:return await temp_mail_ui_error(call,TempMailError("Halaman pesan tidak valid. Buka kembali Received Mail."))
+    mailbox_id,page=values
+    if page>6000:return await temp_mail_ui_error(call,TempMailError("Halaman pesan tidak valid."))
+    await temp_mail_render_inbox(call,mailbox_id,page)
 
 
 @router.callback_query(F.data.startswith("tm:read:"))
@@ -17689,129 +17849,84 @@ async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 def compact_product_list_text(
-    rows,
-    stock_map,
-    *,
-    title="LIST PRODUK",
-    total=0,
-    page=1,
-    total_pages=1,
-    global_number_map=None
+    rows, stock_map, *, title="LIST PRODUK", total=0, page=1,
+    total_pages=1, global_number_map=None
 ) -> str:
     total=max(0,int(total or 0))
-    page=max(1,int(page or 1))
     total_pages=max(1,int(total_pages or 1))
+    page=max(1,min(int(page or 1),total_pages))
     number_map=global_number_map or {}
-
     lines=[
         "╭────────────────────╮",
-        f"│ 🛍️ <b>{html.escape(title)}</b>",
+        f"│ 🛍️ <b>{rating_html_excerpt(title,80)}</b>",
         f"│ Total: <b>{total} Produk</b>",
         f"│ Halaman: <b>{page}/{total_pages}</b>",
         "├────────────────────┤",
     ]
-
     if not rows:
         lines.append("│ Belum ada produk aktif.")
     else:
         for row in rows:
             stock=max(0,int(stock_map.get(int(row["id"]),0)))
             number=int(number_map.get(int(row["id"]),0) or 0)
-            if number>0:
-                lines.append(
-                    f"│ [{number}] <b>{html.escape(str(row['name']))}</b> "
-                    f"({stock} stok)"
-                )
-            else:
-                lines.append(
-                    f"│ <b>{html.escape(str(row['name']))}</b> ({stock} stok)"
-                )
-
+            prefix=f"[{number}] " if number>0 else ""
+            lines.append(f"│ {prefix}<b>{rating_html_excerpt(row['name'],140)}</b> ({stock} stok)")
     lines += [
-        "╰────────────────────╯",
-        "",
-        "Silakan pilih nomor produk di keyboard bawah",
-        "atau ketik nomor produk secara manual.",
-        "",
-        f"<i>{STORE_FOOTER}</i>",
+        "╰────────────────────╯", "",
+        "Pilih tombol produk di bawah atau ketik nomor produk.", "",
+        f"<i>{rating_html_excerpt(STORE_FOOTER,180)}</i>",
     ]
     return "\n".join(lines)
 
 
-async def show_product_list(
-    call,
-    title,
-    filter_sql="",
-    *,
-    page: int = 1,
-    view: str = "all"
-):
-    conn=db()
-    if view=="flash":
-        expire_finished_flash_sales(conn)
-        conn.commit()
-
-    all_active=conn.execute(
-        "SELECT id FROM products WHERE active=1 ORDER BY id"
-    ).fetchall()
-    global_number_map={
-        int(row["id"]): index
-        for index,row in enumerate(all_active,start=1)
-    }
-
-    total=int(conn.execute(
-        f"""SELECT COUNT(*) AS n
-            FROM products
-            WHERE active=1 {filter_sql}"""
-    ).fetchone()["n"] or 0)
-
-    total_pages=max(1,(total + PRODUCTS_PAGE_SIZE - 1)//PRODUCTS_PAGE_SIZE)
-    page=max(1,min(int(page or 1),total_pages))
-    offset=(page-1)*PRODUCTS_PAGE_SIZE
-
-    rows=conn.execute(
-        f"""SELECT * FROM products
-            WHERE active=1 {filter_sql}
-            ORDER BY id
-            LIMIT ? OFFSET ?""",
-        (PRODUCTS_PAGE_SIZE,offset)
-    ).fetchall()
-    stock_map=product_stock_map(conn,filter_sql)
-    conn.close()
+async def show_product_list(call, title, filter_sql="", *, page: int = 1, view: str = "all"):
+    view=view if view in {"all","popular","flash"} else "all"
+    conn=None
+    try:
+        conn=db()
+        if view=="flash":
+            expire_finished_flash_sales(conn)
+            conn.commit()
+        all_active=conn.execute("SELECT id FROM products WHERE active=1 ORDER BY id").fetchall()
+        global_number_map={int(row["id"]):index for index,row in enumerate(all_active,start=1)}
+        total=int(conn.execute(
+            f"SELECT COUNT(*) AS n FROM products WHERE active=1 {filter_sql}"
+        ).fetchone()["n"] or 0)
+        total_pages=max(1,(total+PRODUCTS_PAGE_SIZE-1)//PRODUCTS_PAGE_SIZE)
+        page=max(1,min(int(page or 1),total_pages))
+        order_sql="sold DESC, id" if view=="popular" else "id"
+        rows=conn.execute(
+            f"SELECT * FROM products WHERE active=1 {filter_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+            (PRODUCTS_PAGE_SIZE,(page-1)*PRODUCTS_PAGE_SIZE)
+        ).fetchall()
+        stock_map=product_stock_map(conn,filter_sql)
+    except sqlite3.Error:
+        logging.exception("Product list could not be loaded")
+        if isinstance(call,Message):
+            return await call.answer("Daftar produk belum bisa dimuat. Silakan coba lagi.")
+        return await safe_callback_notice(call,"Daftar produk belum bisa dimuat. Silakan coba lagi.",show_alert=True)
+    finally:
+        if conn is not None:conn.close()
 
     clean_title=re.sub(r"<[^>]+>","",str(title or "LIST PRODUK"))
     clean_title=clean_title.replace("🏷️","").replace("🔥","").replace("⚡","").strip()
-
     text=compact_product_list_text(
-        rows,
-        stock_map,
-        title=clean_title or "LIST PRODUK",
-        total=total,
-        page=page,
-        total_pages=total_pages,
-        global_number_map=global_number_map
+        rows,stock_map,title=clean_title or "LIST PRODUK",total=total,
+        page=page,total_pages=total_pages,global_number_map=global_number_map
     )
     if view=="flash" and rows:
-        nearest=min(
-            int(row["flash_sale_until_ts"] or 0)
-            for row in rows
-            if int(row["flash_sale_until_ts"] or 0)>0
-        )
-        nearest_text=datetime.fromtimestamp(
-            nearest,tz=timezone.utc
-        ).astimezone(DISPLAY_TIMEZONE).strftime("%d/%m/%Y • %H:%M WIB")
-        text=(
-            "⚡ <b>FLASH SALE BERJANGKA</b>\n"
-            f"⏳ Terdekat berakhir: <b>{nearest_text}</b>\n\n"
-            + text
-        )
-
-    await safe_edit_or_answer(
-        call,
-        text,
-        reply_markup=products_keyboard(page,total_pages,view),
-        parse_mode="HTML"
-    )
+        deadlines=[int(row["flash_sale_until_ts"] or 0) for row in rows
+                   if int(row["flash_sale_until_ts"] or 0)>0]
+        if deadlines:
+            nearest_text=datetime.fromtimestamp(min(deadlines),tz=timezone.utc).astimezone(
+                DISPLAY_TIMEZONE).strftime("%d/%m/%Y • %H:%M WIB")
+            text=("⚡ <b>FLASH SALE BERJANGKA</b>\n"
+                  f"⏳ Terdekat berakhir: <b>{nearest_text}</b>\n\n"+text)
+    keyboard=products_keyboard(page,total_pages,view,products=rows,
+        stock_map=stock_map,global_number_map=global_number_map)
+    if isinstance(call,Message):
+        return await call.answer(text,reply_markup=keyboard,parse_mode="HTML")
+    await safe_edit_or_answer(call,text,reply_markup=keyboard,parse_mode="HTML")
     await safe_callback_notice(call)
 
 
@@ -17889,28 +18004,17 @@ async def flash(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("productspage:"))
 async def products_page(call: CallbackQuery):
-    try:
-        _,view,page_raw=call.data.split(":")
-        page=int(page_raw)
-    except Exception:
-        return await call.answer("Halaman tidak valid.",show_alert=True)
-
-    if view not in {"all","popular","flash"}:
-        return await call.answer("Daftar produk tidak valid.",show_alert=True)
-
+    match=re.fullmatch(r"productspage:(all|popular|flash):([0-9]{1,18})",str(call.data or ""))
+    if not match or int(match.group(2))<1:
+        return await safe_callback_notice(call,"Halaman tidak valid.",show_alert=True)
+    view=match.group(1)
+    page=int(match.group(2))
     titles={
         "all":"🏷️ <b>LIST PRODUK</b>",
         "popular":"🔥 <b>PRODUK POPULER</b>",
         "flash":"⚡ <b>FLASH SALE</b>",
     }
-
-    await show_product_list(
-        call,
-        titles[view],
-        product_view_filter(view),
-        page=page,
-        view=view
-    )
+    await show_product_list(call,titles[view],product_view_filter(view),page=page,view=view)
 
 
 
@@ -25143,114 +25247,28 @@ async def owner_search_products_input(message: Message, state: FSMContext):
 async def reply_menu_products(message: Message, bot: Bot):
     if not await is_channel_member(bot,message.from_user.id):
         return await send_join_required(message)
-
-    mark_user_verified(message.from_user.id,message.from_user.username or "")
-
-    conn=db()
-    all_active=conn.execute(
-        "SELECT id FROM products WHERE active=1 ORDER BY id"
-    ).fetchall()
-    total=len(all_active)
-    total_pages=max(1,(total + PRODUCTS_PAGE_SIZE - 1)//PRODUCTS_PAGE_SIZE)
-    rows=conn.execute(
-        """SELECT * FROM products
-           WHERE active=1
-           ORDER BY id
-           LIMIT ?""",
-        (PRODUCTS_PAGE_SIZE,)
-    ).fetchall()
-    stock_map=product_stock_map(conn)
-    conn.close()
-
-    number_map={
-        int(row["id"]): index
-        for index,row in enumerate(all_active,start=1)
-    }
-
-    await message.answer(
-        compact_product_list_text(
-            rows,
-            stock_map,
-            title="LIST PRODUK",
-            total=total,
-            page=1,
-            total_pages=total_pages,
-            global_number_map=number_map
-        ),
-        reply_markup=products_keyboard(1,total_pages,"all"),
-        parse_mode="HTML"
-    )
+    try:
+        mark_user_verified(message.from_user.id,message.from_user.username or "")
+    except sqlite3.Error:
+        return await message.answer("Daftar produk belum bisa dimuat. Silakan coba lagi.")
+    return await show_product_list(message,"🏷️ <b>LIST PRODUK</b>",page=1,view="all")
 
 
 
 @router.message(F.text == "🔥 Produk Populer")
 async def reply_menu_popular(message: Message, bot: Bot):
-    if not await is_channel_member(bot, message.from_user.id):
+    if not await is_channel_member(bot,message.from_user.id):
         return await send_join_required(message)
-
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM products WHERE active=1 AND is_popular=1 ORDER BY sold DESC, id"
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        return await message.answer(
-            "🔥 <b>PRODUK POPULER</b>\n\nBelum ada produk populer.",
-            reply_markup=user_reply_menu(),
-            parse_mode="HTML"
-        )
-
-    kb = InlineKeyboardBuilder()
-    conn2 = db()
-    stock_map = product_stock_map(conn2, "AND is_popular=1")
-    conn2.close()
-    lines_text = ["🔥 <b>PRODUK POPULER</b>", ""]
-    for i, row in enumerate(rows, 1):
-        total_stock = stock_map.get(int(row["id"]), 0)
-        lines_text.append(f"{i}. {html.escape(row['name'])} — {html.escape(product_stock_label(total_stock))}")
-        kb.button(
-            text=product_stock_button_label(row["name"],total_stock),
-            callback_data=f"product:{row['id']}"
-        )
-    kb.adjust(1)
-
-    await message.answer("\n".join(lines_text), reply_markup=kb.as_markup(), parse_mode="HTML")
+    return await show_product_list(message,"🔥 <b>PRODUK POPULER</b>",
+        product_view_filter("popular"),page=1,view="popular")
 
 
 @router.message(F.text == "⚡ Flash Sale")
 async def reply_menu_flash(message: Message, bot: Bot):
-    if not await is_channel_member(bot, message.from_user.id):
+    if not await is_channel_member(bot,message.from_user.id):
         return await send_join_required(message)
-
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM products WHERE active=1 AND is_flash_sale=1 ORDER BY id"
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        return await message.answer(
-            "⚡ <b>FLASH SALE</b>\n\nBelum ada produk Flash Sale.",
-            reply_markup=user_reply_menu(),
-            parse_mode="HTML"
-        )
-
-    kb = InlineKeyboardBuilder()
-    conn2 = db()
-    stock_map = product_stock_map(conn2, "AND is_flash_sale=1")
-    conn2.close()
-    lines_text = ["⚡ <b>FLASH SALE</b>", ""]
-    for i, row in enumerate(rows, 1):
-        total_stock = stock_map.get(int(row["id"]), 0)
-        lines_text.append(f"{i}. {html.escape(row['name'])} — {html.escape(product_stock_label(total_stock))}")
-        kb.button(
-            text=product_stock_button_label(row["name"],total_stock),
-            callback_data=f"product:{row['id']}"
-        )
-    kb.adjust(1)
-
-    await message.answer("\n".join(lines_text), reply_markup=kb.as_markup(), parse_mode="HTML")
+    return await show_product_list(message,"⚡ <b>FLASH SALE</b>",
+        product_view_filter("flash"),page=1,view="flash")
 
 
 @router.message(F.text == "🏠 Menu Utama")
@@ -25360,7 +25378,7 @@ async def reply_menu_wallet(message: Message, bot: Bot):
     )
 
 
-@router.message(StateFilter(None), F.text.regexp(r"^\d{1,2}$"))
+@router.message(StateFilter(None), F.text.regexp(r"^[0-9]{1,6}$"))
 async def reply_menu_product_number(message: Message, bot: Bot):
     if not await is_channel_member(bot, message.from_user.id):
         return await send_join_required(message)
@@ -25382,18 +25400,19 @@ async def reply_menu_product_number(message: Message, bot: Bot):
         )
 
     conn = db()
-    products = conn.execute(
-        "SELECT id, name FROM products WHERE active=1 ORDER BY id LIMIT 25"
-    ).fetchall()
+    selected = conn.execute(
+        "SELECT id, name FROM products WHERE active=1 ORDER BY id LIMIT 1 OFFSET ?",
+        (index-1,)
+    ).fetchone()
 
-    if index > len(products):
+    if not selected:
         conn.close()
         return await message.answer(
             "❌ Nomor produk tidak tersedia. Tekan 🏷️ List Produk untuk melihat daftar terbaru.",
             reply_markup=user_reply_menu()
         )
 
-    product_id = int(products[index - 1]["id"])
+    product_id = int(selected["id"])
     product = conn.execute(
         "SELECT * FROM products WHERE id=? AND active=1",
         (product_id,)
@@ -31126,7 +31145,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.63"
+EXPECTED_SOURCE_VERSION = "16.64"
 
 
 def source_integrity_self_test():
