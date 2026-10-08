@@ -72,7 +72,6 @@ def env_int(name: str, default: int, minimum: int=0, maximum=None) -> int:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 TEMPMAIL_ENABLED = os.getenv("TEMPMAIL_ENABLED", "true").strip().lower() == "true"
-TEMPMAIL_PROVIDER = os.getenv("TEMPMAIL_PROVIDER", "maildrop").strip().lower() or "maildrop"
 TEMPMAIL_ENCRYPTION_KEY = os.getenv("TEMPMAIL_ENCRYPTION_KEY", "").strip()
 TEMPMAIL_TIMEOUT_SECONDS = env_int("TEMPMAIL_TIMEOUT_SECONDS", 12, 3, 30)
 ADMIN_ID = env_int("ADMIN_ID",0)
@@ -197,8 +196,8 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.66"
-SCHEMA_VERSION = 183
+BOT_VERSION = "16.64"
+SCHEMA_VERSION = 182
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1025,8 +1024,6 @@ def init_db():
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_owner_temp_mailboxes_owner ON owner_temp_mailboxes(owner_id,active)")
-    # Existing accounts remain Mail.tm; only new accounts use the selected provider.
-    add_column_if_missing(conn, "owner_temp_mailboxes", "provider", "TEXT NOT NULL DEFAULT 'mailtm'")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS owner_auto_am_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -9579,7 +9576,7 @@ def validate_system_schema():
         "tool_activity_logs": {"id","owner_id","action","target_email","status","http_status","created_at"},
         "tool_email_locks": {"email","owner_id","action","locked_until","created_at"},
         "owner_temp_mailboxes": {"id","owner_id","address","secret","state",
-                                  "provider_account_id","active","created_at","updated_at","provider"},
+                                  "provider_account_id","active","created_at","updated_at"},
         "owner_auto_am_jobs": {"id","owner_id","mailbox_id","email","correlation_id","stage","status",
                                "magic_activity_id","verify_activity_id","magic_sent_at","detail","provider_plan",
                                "provider_expiry","lease_token","lease_until","created_at","updated_at"},
@@ -12121,7 +12118,7 @@ def tools_provider_status_text() -> str:
     return "🟢 READY"
 
 
-# Temp Mail uses official provider APIs. Legacy Mail.tm credentials stay encrypted.
+# Temp Mail uses the official Mail.tm API only. Credentials stay encrypted in SQLite.
 TEMP_MAIL_API_BASE = "https://api.mail.tm"
 TEMP_MAIL_ACCOUNT_LIMIT = 5
 TEMP_MAIL_CREATE_COOLDOWN_SECONDS = 60
@@ -12223,33 +12220,10 @@ def temp_mail_decrypt_credentials(row: dict) -> dict:
         raise TempMailError("Sesi email tidak dapat dibuka. Pulihkan BOT_TOKEN/kunci enkripsi sebelumnya.", status=409) from None
 
 
-def temp_mail_selected_provider() -> str:
-    provider = str(TEMPMAIL_PROVIDER or "maildrop").strip().lower()
-    if provider == "mail.tm":
-        provider = "mailtm"
-    if provider not in {"maildrop", "mailtm"}:
-        raise TempMailError("TEMPMAIL_PROVIDER harus maildrop atau mailtm.", status=503)
-    return provider
-
-
-def temp_mail_row_provider(row) -> str:
-    provider = str(dict(row).get("provider") or "mailtm").strip().lower()
-    if provider not in {"maildrop", "mailtm"}:
-        raise TempMailError("Provider email tersimpan tidak dikenali. Data email tetap disimpan.", status=409)
-    return provider
-
-
-def temp_mail_web_inbox_url(row) -> str:
-    if temp_mail_row_provider(row) != "maildrop":
-        return ""
-    localpart = temp_mail_maildrop_localpart(dict(row))
-    return "https://maildrop.cc/inbox/?mailbox=" + localpart
-
-
 def temp_mail_public_mailbox(row) -> dict:
     item = dict(row)
     return {key: item.get(key) for key in (
-        "id", "owner_id", "address", "state", "provider_account_id", "active", "created_at", "updated_at", "provider"
+        "id", "owner_id", "address", "state", "provider_account_id", "active", "created_at", "updated_at"
     )}
 
 
@@ -12312,305 +12286,8 @@ def temp_mail_activate_account(owner_id: int, mailbox_id: int) -> dict:
     row = temp_mail_owned_row(owner_id, mailbox_id)
     if row["state"] != "ready":
         raise TempMailError("Sesi email belum siap. Gunakan Pulihkan Sesi terlebih dahulu.", status=409)
-    if temp_mail_row_provider(row) == "maildrop":
-        temp_mail_maildrop_localpart(row)
-        conn = db()
-        try:
-            begin_immediate_retry(conn)
-            conn.execute("UPDATE owner_temp_mailboxes SET active=0 WHERE owner_id=?", (int(owner_id),))
-            changed = conn.execute("UPDATE owner_temp_mailboxes SET active=1,updated_at=? WHERE id=? AND owner_id=? AND state='ready' AND provider='maildrop'",
-                                   (datetime.now(timezone.utc).isoformat(timespec="seconds"), int(row["id"]), int(owner_id))).rowcount
-            if not changed:
-                raise TempMailError("Email sudah tidak tersedia.", status=404)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-        return temp_mail_public_mailbox(temp_mail_owned_row(owner_id, mailbox_id))
     credentials = temp_mail_decrypt_credentials(row)
     return temp_mail_public_mailbox(temp_mail_save_credentials(row, credentials, state="ready", activate=True))
-
-
-# Maildrop's documented GraphQL read queries. Inbox addresses are public;
-# provider credentials and account-creation requests are never involved.
-from email import policy as _maildrop_email_policy
-from email.header import decode_header as _maildrop_decode_header
-from email.errors import MessageError as _MaildropMessageError
-from email.parser import Parser as _MaildropEmailParser
-from email.utils import parseaddr as _maildrop_parseaddr
-import quopri as _maildrop_quopri
-
-TEMP_MAIL_MAILDROP_API = "https://api.maildrop.cc/graphql"
-_TEMP_MAIL_MAILDROP_LAST_REQUEST = 0.0
-_TEMP_MAIL_MAILDROP_RATE_UNTIL = 0.0
-_TEMP_MAIL_MAILDROP_QUERIES = {
-    "inbox": "query GetInbox($mailbox: String!) { inbox(mailbox: $mailbox) { id mailfrom rcptto headerfrom subject date } }",
-    "message": "query GetMessage($mailbox: String!, $id: String!) { message(mailbox: $mailbox, id: $id) { id mailfrom rcptto headerfrom subject date data html } }",
-}
-
-
-def temp_mail_maildrop_localpart(row: dict) -> str:
-    """Validate persisted identity before selecting a public provider inbox."""
-    if not isinstance(row, dict) or row.get("provider") != "maildrop":
-        raise TempMailError("Provider email tidak cocok.", status=409)
-    address = row.get("address")
-    if not isinstance(address, str):
-        raise TempMailError("Alamat email Maildrop tidak valid.", status=409)
-    address = address.strip().lower()
-    match = re.fullmatch(r"([a-z0-9][a-z0-9_-]{0,63})@maildrop\.cc", address)
-    if not match:
-        raise TempMailError("Alamat email Maildrop tidak valid.", status=409)
-    localpart = match.group(1)
-    account_id = row.get("provider_account_id")
-    if account_id not in (None, "") and account_id != localpart:
-        raise TempMailError("Identitas email Maildrop tidak cocok.", status=409)
-    return localpart
-
-
-async def temp_mail_maildrop_http(operation: str, localpart: str, *, message_id: str = "") -> tuple:
-    """Only the two fixed vendor queries are allowed; all inputs use variables."""
-    global _TEMP_MAIL_MAILDROP_LAST_REQUEST, _TEMP_MAIL_MAILDROP_RATE_UNTIL
-    if not isinstance(operation, str) or operation not in _TEMP_MAIL_MAILDROP_QUERIES or not isinstance(localpart, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", localpart):
-        raise TempMailError("Permintaan Maildrop tidak valid.", status=400)
-    if operation == "message":
-        if not temp_mail_provider_id(message_id):
-            raise TempMailError("ID pesan tidak valid.", status=400)
-    elif message_id:
-        raise TempMailError("Permintaan Maildrop tidak valid.", status=400)
-    variables = {"mailbox": localpart}
-    if operation == "message":
-        variables["id"] = message_id
-    payload = {"query": _TEMP_MAIL_MAILDROP_QUERIES[operation], "variables": variables,
-               "operationName": "GetInbox" if operation == "inbox" else "GetMessage"}
-    headers = {"Accept": "application/json", "Content-Type": "application/json",
-               "User-Agent": f"MaboyyDigital/{BOT_VERSION}"}
-    async with temp_mail_async_locks():
-        now = time.monotonic()
-        if _TEMP_MAIL_MAILDROP_RATE_UNTIL > now:
-            remaining = max(1, int(_TEMP_MAIL_MAILDROP_RATE_UNTIL - now + 0.999))
-            raise TempMailError(f"Batas Maildrop tercapai. Coba kembali dalam {remaining} detik.", status=429)
-        delay = 0.25 - (now - _TEMP_MAIL_MAILDROP_LAST_REQUEST)
-        if delay > 0:
-            await asyncio.sleep(delay)
-        _TEMP_MAIL_MAILDROP_LAST_REQUEST = time.monotonic()
-        timeout = aiohttp.ClientTimeout(total=TEMPMAIL_TIMEOUT_SECONDS, connect=min(6, TEMPMAIL_TIMEOUT_SECONDS))
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-                async with session.request("POST", TEMP_MAIL_MAILDROP_API, headers=headers, json=payload, allow_redirects=False) as response:
-                    status = int(response.status)
-                    if 300 <= status < 400:
-                        raise TempMailError("Maildrop mengirim pengalihan yang tidak didukung.", status=status)
-                    if status == 429:
-                        try:
-                            retry_after = max(1, min(3600, int(response.headers.get("Retry-After", "10"))))
-                        except (TypeError, ValueError):
-                            retry_after = 10
-                        _TEMP_MAIL_MAILDROP_RATE_UNTIL = time.monotonic() + retry_after
-                        raise TempMailError(f"Batas Maildrop tercapai. Coba kembali dalam {retry_after} detik.", status=429)
-                    if response.content_length and response.content_length > TEMP_MAIL_RESPONSE_LIMIT:
-                        raise TempMailError("Pesan Maildrop terlalu besar untuk dibaca di bot.", status=502)
-                    body = bytearray()
-                    async for chunk in response.content.iter_chunked(16384):
-                        body.extend(chunk)
-                        if len(body) > TEMP_MAIL_RESPONSE_LIMIT:
-                            raise TempMailError("Pesan Maildrop terlalu besar untuk dibaca di bot.", status=502)
-                    try:
-                        result = json.loads(body.decode("utf-8"))
-                    except (ValueError, UnicodeError):
-                        raise TempMailError("Respons Maildrop tidak valid. Coba periksa kembali.", status=502) from None
-                    if not isinstance(result, dict):
-                        raise TempMailError("Format respons Maildrop tidak valid.", status=502)
-                    if not 200 <= status < 300:
-                        raise TempMailError("Email atau pesan Maildrop sudah tidak tersedia." if status == 404 else "Maildrop belum berhasil memproses permintaan. Coba kembali nanti.", status=status)
-                    if "errors" in result and (not isinstance(result["errors"], list) or result["errors"]):
-                        raise TempMailError("Maildrop belum berhasil membaca pesan. Coba kembali nanti.", status=502)
-                    if not isinstance(result.get("data"), dict):
-                        raise TempMailError("Data pesan Maildrop tidak valid.", status=502)
-                    return status, result
-        except TempMailError:
-            raise
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-            # The POST above is a GraphQL read; a timeout never means mutation.
-            raise TempMailError("Maildrop sedang tidak dapat dihubungi. Coba kembali nanti.") from None
-
-
-def temp_mail_maildrop_header(value: str) -> str:
-    if not isinstance(value, str) or len(value) > TEMP_MAIL_RESPONSE_LIMIT:
-        raise TempMailError("Header pesan Maildrop tidak valid.", status=502)
-    try:
-        if len(value.encode("utf-8")) > TEMP_MAIL_RESPONSE_LIMIT:
-            raise ValueError("header too large")
-        pieces = []
-        for part, charset in _maildrop_decode_header(value):
-            pieces.append(part.decode(charset or "utf-8", errors="strict") if isinstance(part, bytes) else part)
-        return re.sub(r"[\x00-\x1f\x7f]+", " ", "".join(pieces)).strip()
-    except (LookupError, ValueError, UnicodeError, _MaildropMessageError):
-        raise TempMailError("Header pesan Maildrop tidak valid.", status=502) from None
-
-
-def temp_mail_maildrop_body(item: dict) -> dict:
-    """Decode bounded SMTP MIME instead of searching encoded raw mail."""
-    raw_data, fallback = item.get("data", ""), item.get("html", "")
-    if raw_data is None:
-        raw_data = ""
-    if fallback is None:
-        fallback = ""
-    if not isinstance(raw_data, str) or not isinstance(fallback, str):
-        raise TempMailError("Isi pesan Maildrop tidak valid.", status=502)
-    if len(raw_data) + len(fallback) > TEMP_MAIL_RESPONSE_LIMIT:
-        raise TempMailError("Isi pesan Maildrop terlalu besar untuk dibaca di bot.", status=502)
-    try:
-        if len(raw_data.encode("utf-8")) + len(fallback.encode("utf-8")) > TEMP_MAIL_RESPONSE_LIMIT:
-            raise TempMailError("Isi pesan Maildrop terlalu besar untuk dibaca di bot.", status=502)
-    except UnicodeError:
-        raise TempMailError("Isi pesan Maildrop tidak valid.", status=502) from None
-    plain, markup, attachments = [], [], False
-    if raw_data:
-        try:
-            parsed = _MaildropEmailParser(policy=_maildrop_email_policy.default).parsestr(raw_data)
-            part_count, stack = 0, [parsed]
-            while stack:
-                part = stack.pop()
-                part_count += 1
-                if part_count > 100:
-                    raise ValueError("too many MIME parts")
-                if part.defects and any(type(defect).__name__ != "MissingHeaderBodySeparatorDefect" for defect in part.defects):
-                    raise ValueError("invalid MIME part")
-                if part.get_content_disposition() == "attachment":
-                    attachments = True
-                    continue
-                content_type = part.get_content_type()
-                if part.is_multipart():
-                    if not content_type.startswith("multipart/"):
-                        attachments = True
-                        continue
-                    children = part.get_payload()
-                    if not isinstance(children, list) or len(children) + part_count + len(stack) > 100:
-                        raise ValueError("too many MIME parts")
-                    stack.extend(reversed(children))
-                    continue
-                if content_type not in {"text/plain", "text/html"}:
-                    attachments = True
-                    continue
-                source = part.get_payload()
-                if not isinstance(source, str):
-                    raise ValueError("invalid MIME payload")
-                transfer = str(part.get("Content-Transfer-Encoding", "")).strip().lower()
-                charset = part.get_content_charset() or "utf-8"
-                if transfer == "base64":
-                    encoded = re.sub(r"[ \t\r\n]+", "", source)
-                    decoded = base64.b64decode(encoded.encode("ascii"), validate=True).decode(charset, errors="strict")
-                elif transfer == "quoted-printable":
-                    if re.search(r"=(?![0-9A-Fa-f]{2}|\r?\n|\Z)", source):
-                        raise ValueError("invalid quoted-printable")
-                    decoded = _maildrop_quopri.decodestring(source.encode("utf-8")).decode(charset, errors="strict")
-                elif transfer in {"", "7bit", "8bit", "binary"}:
-                    # JSON transport already decoded unencoded SMTP Unicode.
-                    # Validate a declared charset without corrupting that text.
-                    "".encode(charset)
-                    decoded = source
-                else:
-                    raise ValueError("unsupported MIME transfer encoding")
-                (markup if content_type == "text/html" else plain).append(decoded)
-        except (ValueError, TypeError, LookupError, UnicodeError, RecursionError, _MaildropMessageError):
-            raise TempMailError("Isi pesan Maildrop tidak valid.", status=502) from None
-    fallback_html = bool(re.search(r"<(?:!doctype\b|/?[a-zA-Z][^>]*>)", fallback, re.IGNORECASE))
-    fallback_allowed = not attachments and not any(value.strip() for value in plain + markup)
-    if fallback_allowed and fallback and fallback_html:
-        markup.append(fallback)
-    elif fallback_allowed and fallback and not fallback_html:
-        plain.append(fallback)
-    text, raw_html = "\n\n".join(plain), "\n\n".join(markup)
-    if len(text.encode("utf-8")) + len(raw_html.encode("utf-8")) > TEMP_MAIL_RESPONSE_LIMIT:
-        raise TempMailError("Isi pesan Maildrop terlalu besar untuk dibaca di bot.", status=502)
-    return {"text": text, "html": raw_html, "hasAttachments": attachments}
-
-
-def temp_mail_maildrop_public_message(item: dict, row: dict, *, body=False) -> dict:
-    localpart = temp_mail_maildrop_localpart(row)
-    if not isinstance(item, dict) or not temp_mail_provider_id(item.get("id")):
-        raise TempMailError("ID pesan Maildrop tidak valid.", status=502)
-    recipients = item.get("rcptto")
-    if not isinstance(recipients, list) or not 1 <= len(recipients) <= 500:
-        raise TempMailError("Penerima pesan Maildrop tidak valid.", status=502)
-    addresses = []
-    for value in recipients:
-        if not isinstance(value, str) or len(value) > 254 or not valid_tools_email(value.strip()):
-            raise TempMailError("Penerima pesan Maildrop tidak valid.", status=502)
-        addresses.append(value.strip().lower())
-    if localpart + "@maildrop.cc" not in addresses:
-        raise TempMailError("Pesan bukan milik alamat email ini.", status=409)
-    subject = temp_mail_maildrop_header(item.get("subject") or "(Tanpa subjek)")
-    sender_header = temp_mail_maildrop_header(item.get("headerfrom") or item.get("mailfrom") or "")
-    sender_name, sender_address = _maildrop_parseaddr(sender_header)
-    if not sender_address or not valid_tools_email(sender_address):
-        sender_name, sender_address = _maildrop_parseaddr(temp_mail_maildrop_header(item.get("mailfrom") or ""))
-    raw_date = item.get("date")
-    if not isinstance(raw_date, str) or len(raw_date) > 80:
-        raise TempMailError("Tanggal pesan Maildrop tidak valid.", status=502)
-    try:
-        datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        raise TempMailError("Tanggal pesan Maildrop tidak valid.", status=502) from None
-    own_address = localpart + "@maildrop.cc"
-    addresses = [own_address] + [value for value in addresses if value != own_address]
-    normalized = {"id": item["id"], "from": {"address": sender_address, "name": sender_name},
-                  "to": [{"address": value, "name": ""} for value in addresses],
-                  "subject": subject, "createdAt": raw_date, "seen": False, "intro": ""}
-    if body:
-        normalized.update(temp_mail_maildrop_body(item))
-    return temp_mail_public_message(normalized, body=body)
-
-
-async def temp_mail_maildrop_inbox_locked(row: dict, page: int) -> dict:
-    localpart = temp_mail_maildrop_localpart(row)
-    if isinstance(page, bool) or not re.fullmatch(r"[0-9]{1,4}", str(page)) or not 1 <= int(page) <= 1000:
-        raise TempMailError("Halaman pesan tidak valid.", status=400)
-    page = int(page)
-    status, result = await temp_mail_maildrop_http("inbox", localpart)
-    if not 200 <= status < 300:
-        raise TempMailError("Maildrop belum berhasil membaca kotak masuk.", status=status)
-    if (not isinstance(result, dict) or not isinstance(result.get("data"), dict)
-            or ("errors" in result and (not isinstance(result["errors"], list) or result["errors"]))):
-        raise TempMailError("Daftar pesan Maildrop tidak valid.", status=502)
-    items = result["data"].get("inbox")
-    if not isinstance(items, list) or len(items) > 10:
-        raise TempMailError("Daftar pesan Maildrop tidak valid.", status=502)
-    messages, seen = [], set()
-    for item in items:
-        try:
-            public = temp_mail_maildrop_public_message(item, row)
-        except TempMailError as exc:
-            if exc.status in {409, 502}:
-                continue
-            raise
-        if public["id"] not in seen:
-            seen.add(public["id"])
-            messages.append(public)
-    return {"messages": messages if page == 1 else [], "total": len(messages), "page": page,
-            "total_pages": 1, "mailbox": temp_mail_public_mailbox(row), "address": row["address"]}
-
-
-async def temp_mail_maildrop_read_locked(row: dict, message_id: str) -> dict:
-    localpart = temp_mail_maildrop_localpart(row)
-    if not temp_mail_provider_id(message_id):
-        raise TempMailError("ID pesan tidak valid.", status=400)
-    status, result = await temp_mail_maildrop_http("message", localpart, message_id=message_id)
-    if not 200 <= status < 300:
-        raise TempMailError("Maildrop belum berhasil membaca pesan.", status=status)
-    if (not isinstance(result, dict) or not isinstance(result.get("data"), dict)
-            or ("errors" in result and (not isinstance(result["errors"], list) or result["errors"]))):
-        raise TempMailError("Isi pesan Maildrop tidak valid.", status=502)
-    item = result["data"].get("message")
-    if item is None:
-        raise TempMailError("Pesan Maildrop sudah tidak tersedia.", status=404)
-    if not isinstance(item, dict) or item.get("id") != message_id:
-        raise TempMailError("Identitas pesan provider tidak cocok.", status=409)
-    message = temp_mail_maildrop_public_message(item, row, body=True)
-    message.update(mailbox=temp_mail_public_mailbox(row), address=row["address"])
-    return message
 
 
 async def temp_mail_http(method: str, path: str, *, payload=None, token: str = "", params=None) -> tuple:
@@ -12681,8 +12358,6 @@ def temp_mail_response_error(status: int, *, creating=False) -> TempMailError:
 
 
 async def temp_mail_domains() -> list:
-    if temp_mail_selected_provider() == "maildrop":
-        return ["maildrop.cc"]
     status, result = await temp_mail_http("GET", "/domains", params={"page": 1})
     if not 200 <= status < 300:
         raise temp_mail_response_error(status)
@@ -12703,13 +12378,6 @@ async def temp_mail_domains() -> list:
 
 
 async def temp_mail_resume_locked(row: dict, *, activate=True) -> dict:
-    if temp_mail_row_provider(row) == "maildrop":
-        temp_mail_maildrop_localpart(row)
-        if row["state"] != "ready":
-            raise TempMailError("Sesi Maildrop tersimpan belum siap.", status=409)
-        if activate:
-            temp_mail_activate_account(int(row["owner_id"]), int(row["id"]))
-        return temp_mail_owned_row(int(row["owner_id"]), int(row["id"]))
     if row["state"] == "failed":
         raise TempMailError("Pembuatan email ini ditolak provider. Buat email baru setelah cooldown.", status=409)
     credentials = temp_mail_decrypt_credentials(row)
@@ -12740,11 +12408,7 @@ async def temp_mail_resume_account(owner_id: int, mailbox_id: int) -> dict:
 
 async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
     temp_mail_assert_owner(owner_id)
-    # New AM activation jobs always use the shareable Maildrop inbox.
-    # Manual Temp Mail and mailboxes already bound to old jobs keep their provider.
-    provider = "maildrop" if auto_job_id else temp_mail_selected_provider()
-    if provider == "mailtm":
-        temp_mail_encryption_key()
+    temp_mail_encryption_key()
     async with temp_mail_async_locks(owner_id):
         conn = db()
         try:
@@ -12754,7 +12418,7 @@ async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
         now_dt = datetime.now(timezone.utc)
         pending = None
         for item in rows:
-            if item["state"] not in {"pending", "account_created"} or temp_mail_row_provider(item) != provider:
+            if item["state"] not in {"pending", "account_created"}:
                 continue
             try:
                 created = datetime.fromisoformat(str(item["created_at"]))
@@ -12769,8 +12433,8 @@ async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
             if auto_job_id:
                 auto_am_bind_mailbox(owner_id, auto_job_id, pending)
             return temp_mail_public_mailbox(await temp_mail_resume_locked(pending))
-        if sum(row["state"] != "failed" and temp_mail_row_provider(row) == provider for row in rows) >= TEMP_MAIL_ACCOUNT_LIMIT:
-            raise TempMailError("Batas 5 email untuk provider ini tercapai. Gunakan email yang sudah tersedia.", status=409)
+        if sum(row["state"] != "failed" for row in rows) >= TEMP_MAIL_ACCOUNT_LIMIT:
+            raise TempMailError("Batas 5 email tersimpan tercapai. Gunakan email yang sudah tersedia.", status=409)
         if rows:
             try:
                 created_at = datetime.fromisoformat(str(rows[0]["created_at"]))
@@ -12781,30 +12445,26 @@ async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
                     raise TempMailError(f"Tunggu {max(1, int(remaining + 0.999))} detik sebelum membuat email baru.", status=429)
             except ValueError:
                 raise TempMailError("Waktu sesi email tidak valid. Periksa data email tersimpan.", status=409) from None
-        domains = ["maildrop.cc"] if provider == "maildrop" else await temp_mail_domains()
-        address = f"mb{secrets.token_hex(16 if provider == 'maildrop' else 8)}@{domains[0]}"
-        credentials = {"password": secrets.token_urlsafe(24), "token": ""} if provider == "mailtm" else None
+        domains = await temp_mail_domains()
+        address = f"mb{secrets.token_hex(8)}@{domains[0]}"
+        credentials = {"password": secrets.token_urlsafe(24), "token": ""}
         now = now_dt.isoformat(timespec="seconds")
         conn = db()
         try:
             begin_immediate_retry(conn)
             # Recheck while holding the write lock; another worker must not create a second pending account.
-            current = conn.execute("SELECT id,state,created_at,provider FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()
-            if sum(row["state"] != "failed" and temp_mail_row_provider(row) == provider for row in current) >= TEMP_MAIL_ACCOUNT_LIMIT:
-                raise TempMailError("Batas 5 email untuk provider ini tercapai.", status=409)
+            current = conn.execute("SELECT id,state,created_at FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()
+            if sum(row["state"] != "failed" for row in current) >= TEMP_MAIL_ACCOUNT_LIMIT:
+                raise TempMailError("Batas 5 email tersimpan tercapai.", status=409)
             if current:
                 created = datetime.fromisoformat(str(current[0]["created_at"]))
                 if created.tzinfo is None:
                     created = created.replace(tzinfo=timezone.utc)
                 if (datetime.now(timezone.utc) - created).total_seconds() < TEMP_MAIL_CREATE_COOLDOWN_SECONDS:
                     raise TempMailError("Pembuatan email masih dalam cooldown 60 detik.", status=429)
-            if provider == "maildrop":
-                conn.execute("UPDATE owner_temp_mailboxes SET active=0 WHERE owner_id=?", (int(owner_id),))
             inserted = conn.execute(
-                "INSERT INTO owner_temp_mailboxes(owner_id,address,secret,state,provider_account_id,active,created_at,updated_at,provider) VALUES(?,?,?,?,?,?,?,?,?)",
-                (int(owner_id), address, temp_mail_encrypt_credentials(owner_id, address, credentials) if credentials is not None else "",
-                 "ready" if provider == "maildrop" else "pending", address.split("@",1)[0] if provider == "maildrop" else "",
-                 1 if provider == "maildrop" else 0, now, now, provider),
+                "INSERT INTO owner_temp_mailboxes(owner_id,address,secret,state,provider_account_id,active,created_at,updated_at) VALUES(?,?,?,'pending','',0,?,?)",
+                (int(owner_id), address, temp_mail_encrypt_credentials(owner_id, address, credentials), now, now),
             )
             mailbox_id = int(inserted.lastrowid)
             if auto_job_id:
@@ -12819,8 +12479,6 @@ async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
         finally:
             conn.close()
         row = temp_mail_owned_row(owner_id, mailbox_id)
-        if provider == "maildrop":
-            return temp_mail_public_mailbox(row)
         try:
             status, account = await temp_mail_http("POST", "/accounts", payload={"address": address, "password": credentials["password"]})
         except TempMailError as exc:
@@ -12980,10 +12638,7 @@ async def temp_mail_fetch_inbox(owner_id: int, mailbox_id: int, page: int = 1) -
         raise TempMailError("Halaman pesan tidak valid.", status=400)
     page = int(page)
     async with temp_mail_async_locks(owner_id):
-        row = temp_mail_owned_row(owner_id, mailbox_id)
-        if temp_mail_row_provider(row) == "maildrop":
-            return await temp_mail_maildrop_inbox_locked(row, page)
-        row, result = await temp_mail_authenticated_read_locked(row, "/messages", params={"page": page})
+        row, result = await temp_mail_authenticated_read_locked(temp_mail_owned_row(owner_id, mailbox_id), "/messages", params={"page": page})
         messages = result.get("hydra:member", result.get("member", []))
         if not isinstance(messages, list):
             raise TempMailError("Daftar pesan provider tidak valid.", status=502)
@@ -13067,10 +12722,7 @@ async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str
     if not temp_mail_provider_id(message_id):
         raise TempMailError("ID pesan tidak valid.", status=400)
     async with temp_mail_async_locks(owner_id):
-        row = temp_mail_owned_row(owner_id, mailbox_id)
-        if temp_mail_row_provider(row) == "maildrop":
-            return await temp_mail_maildrop_read_locked(row, message_id)
-        row, result = await temp_mail_authenticated_read_locked(row, "/messages/" + message_id)
+        row, result = await temp_mail_authenticated_read_locked(temp_mail_owned_row(owner_id, mailbox_id), "/messages/" + message_id)
         if result.get("id") != message_id:
             raise TempMailError("Identitas pesan provider tidak cocok.", status=409)
         account_value = result.get("accountId")
@@ -16254,8 +15906,7 @@ async def auto_am_find_link(job, call):
             return ""
         if scans % 5 == 0:
             await auto_am_progress(call, "Inbox sudah diperiksa " + str(scans) + " kali. Masih menunggu Magic Link...")
-        minimum = 10 if temp_mail_row_provider(inbox.get("mailbox") or {}) == "maildrop" else 0
-        await asyncio.sleep(max(minimum, min(15, float(TOOLS_AUTO_AM_POLL_SECONDS))))
+        await asyncio.sleep(max(0, min(15, float(TOOLS_AUTO_AM_POLL_SECONDS))))
 
 
 
@@ -16291,7 +15942,7 @@ async def auto_am_run(call, job):
         state.forget()
         return auto_am_update(owner, job_id, status="unknown", detail="Verifikasi sudah dikirim, tetapi sesi token tidak tersedia. Periksa provider; verifikasi tidak diulang.")
     if not job["mailbox_id"]:
-        await auto_am_progress(call, "Membuat email Maildrop untuk aktivasi AM Pro 1 tahun...")
+        await auto_am_progress(call, "Membuat email Temp Mail...")
         mailbox = await temp_mail_create_account(owner, auto_job_id=job_id)
         job = auto_am_bind_mailbox(owner, job_id, mailbox)
     else:
@@ -16324,10 +15975,8 @@ async def auto_am_run(call, job):
         await auto_am_progress(call, "Menunggu email dan membaca Magic Link...")
         link = await auto_am_find_link(job, call)
         if not link:
-            detail = "Magic Link belum diterima atau tautannya belum dapat dibaca. Pilih Lanjutkan untuk memeriksa email lagi."
-            if temp_mail_row_provider(mailbox) == "maildrop":
-                detail += " Pengiriman pertama Maildrop kadang tertunda 15 menit–1 jam; alamat tetap sama dan link tidak dikirim ulang."
-            return auto_am_update(owner, job_id, stage="waiting_mail", status="waiting", detail=detail)
+            return auto_am_update(owner, job_id, stage="waiting_mail", status="waiting",
+                detail="Magic Link belum diterima atau tautannya belum dapat dibaca. Pilih Lanjutkan untuk memeriksa email lagi.")
         locked, _ = acquire_tool_email_lock(owner, job["email"], "verify_account")
         if not locked:
             return auto_am_update(owner, job_id, status="waiting", detail="Email sedang diproses. Coba Lanjutkan setelah selesai.")
@@ -16398,16 +16047,6 @@ async def auto_am_render(call, job, *, notice=""):
         else: lines.append("Durasi belum diinformasikan provider; periksa paket pada akun.")
     elif job["detail"]:
         lines.append(html.escape(job["detail"][:500]))
-    inbox_url = ""
-    if job["mailbox_id"]:
-        try:
-            mailbox = temp_mail_owned_row(job["owner_id"], job["mailbox_id"])
-            if str(mailbox["address"]).lower() == str(job["email"]).lower():
-                inbox_url = temp_mail_web_inbox_url(mailbox)
-                if inbox_url:
-                    lines.append(temp_mail_inbox_link_text(mailbox))
-        except TempMailError:
-            lines.append("Link inbox belum tersedia. Buka Received Mail untuk memeriksa email tersimpan.")
     rows = []
     if job["mailbox_id"]:
         rows.append([InlineKeyboardButton(text="📥 Received Mail", callback_data=f"tm:inbox:{job['mailbox_id']}:1")])
@@ -16417,9 +16056,7 @@ async def auto_am_render(call, job, *, notice=""):
         rows.append([InlineKeyboardButton(text="🔄 Lanjutkan / Periksa Hasil", callback_data=f"amauto:resume:{job['id']}")])
     if status in {"success", "failed", "unknown"}:
         rows.append([InlineKeyboardButton(text="⚡ Aktivasi Baru", callback_data=auto_am_start_token())])
-    if inbox_url:
-        rows.append([InlineKeyboardButton(text="🔗 Buka Kotak Masuk", url=inbox_url)])
-    elif job["mailbox_id"]:
+    if job["mailbox_id"]:
         try:
             me = await call.bot.get_me()
             username = str(me.username or "")
@@ -16570,21 +16207,6 @@ def temp_mail_body_pages(text: str, units: int = 2800) -> list:
     return pages or [""]
 
 
-def temp_mail_provider_caption(mailbox=None) -> str:
-    provider = temp_mail_row_provider(mailbox) if mailbox is not None else temp_mail_selected_provider()
-    if provider == "maildrop":
-        return 'Provider: <a href="https://maildrop.cc">Maildrop</a> • Gratis tanpa API key.'
-    return 'Provider: <a href="https://mail.tm">Mail.tm</a> • Gratis tanpa API key.'
-
-
-def temp_mail_inbox_link_text(mailbox) -> str:
-    url = temp_mail_web_inbox_url(mailbox)
-    if not url:
-        return ""
-    return ('\n\n🔗 Link inbox untuk dibagikan:\n<a href="' + html.escape(url, quote=True) + '">' + html.escape(url)
-            + '</a>\nInbox publik; siapa pun yang mengetahui alamat dapat membaca pesan. Pesan dapat dihapus setelah 24 jam tanpa email baru.')
-
-
 def temp_mail_ui_keyboard(mailbox=None):
     keyboard=[[InlineKeyboardButton(text="📧 Buat Email",callback_data="tm:create")]]
     if mailbox:
@@ -16611,10 +16233,9 @@ async def temp_mail_render_home(call: CallbackQuery, *, notice=""):
         text+=f"📧 Email aktif:\n<code>{html.escape(str(mailbox.get('address') or '-'))}</code>\n"
         text+=("Status: <b>Siap menerima pesan</b>\n" if mailbox.get("state")=="ready" else "Status: <b>Pembuatan belum selesai</b>\n")
     else:text+="Belum ada email aktif. Pilih Buat Email untuk memulai.\n"
-    if mailbox and mailbox.get("state")=="ready":text+=temp_mail_inbox_link_text(mailbox)
     text+=("\nGunakan fitur dengan bijak. Alamat ini untuk kebutuhan sementara.\n"
            "Pesan masuk dibuka melalui Received Mail.\n"
-           +temp_mail_provider_caption(mailbox))
+           "Provider: <a href=\"https://mail.tm\">Mail.tm</a> • Gratis tanpa API key.")
     await safe_edit_or_answer(call,text,reply_markup=temp_mail_ui_keyboard(mailbox),parse_mode="HTML")
 
 
@@ -16668,8 +16289,7 @@ async def owner_temp_mail_address(call: CallbackQuery):
             keyboard.append([InlineKeyboardButton(text="📥 Received Mail",callback_data=f"tm:inbox:{mailbox['id']}:1")])
         keyboard.append([InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")])
         await safe_edit_or_answer(call,"📋 <b>ALAMAT EMAIL</b>\n\n"+f"<code>{html.escape(address)}</code>\n\n"
-                                  "Gunakan tombol Salin, lalu buka Received Mail untuk membaca pesan masuk."
-                                  + (temp_mail_inbox_link_text(mailbox) if mailbox.get("state")=="ready" else ""),
+                                  "Gunakan tombol Salin, lalu buka Received Mail untuk membaca pesan masuk.",
                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
     except Exception as exc:await temp_mail_ui_error(call,exc)
 
@@ -16680,9 +16300,9 @@ async def owner_temp_mail_accounts(call: CallbackQuery):
     await safe_callback_notice(call)
     try:
         accounts=[mailbox for mailbox in temp_mail_list_accounts(call.from_user.id) if mailbox.get("state")!="failed"]
-        lines=["🗂 <b>DAFTAR EMAIL</b>","","Pilih alamat untuk digunakan. Maksimal 5 alamat per provider; email lama tetap tersedia."]
+        lines=["🗂 <b>DAFTAR EMAIL</b>","","Pilih alamat untuk digunakan. Maksimal 5 alamat per owner."]
         keyboard=[]
-        for mailbox in accounts[:TEMP_MAIL_ACCOUNT_LIMIT*2]:
+        for mailbox in accounts[:5]:
             address=str(mailbox.get("address") or "-")
             ready=mailbox.get("state")=="ready"
             icon="✅" if mailbox.get("active") else "▫️"
@@ -16690,7 +16310,7 @@ async def owner_temp_mail_accounts(call: CallbackQuery):
             action="use" if ready else "resume"
             keyboard.append([InlineKeyboardButton(text=("📧 " if ready else "♻️ ")+address[:55],callback_data=f"tm:{action}:{mailbox['id']}")])
         if not accounts:lines.append("Belum ada alamat. Buat email baru untuk memulai.")
-        if sum(temp_mail_row_provider(mailbox)==temp_mail_selected_provider() for mailbox in accounts)<TEMP_MAIL_ACCOUNT_LIMIT:keyboard.append([InlineKeyboardButton(text="📧 Buat Email",callback_data="tm:create")])
+        if len(accounts)<5:keyboard.append([InlineKeyboardButton(text="📧 Buat Email",callback_data="tm:create")])
         keyboard.append([InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")])
         await safe_edit_or_answer(call,"\n\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
     except Exception as exc:await temp_mail_ui_error(call,exc)
@@ -16726,10 +16346,10 @@ async def owner_temp_mail_domains(call: CallbackQuery):
     await safe_callback_notice(call,"Memuat domain...")
     try:
         domains=await temp_mail_domains()
-        lines=["🌐 <b>DOMAIN TEMP MAIL</b>","","Domain untuk email baru:"]
+        lines=["🌐 <b>DOMAIN TEMP MAIL</b>","","Domain aktif dari Mail.tm:"]
         lines.extend("• <code>"+rating_html_excerpt(domain,100)+"</code>" for domain in domains[:20])
         if not domains:lines.append("Belum ada domain aktif. Silakan coba lagi nanti.")
-        lines.extend(["","Saat Buat Email, bot memakai domain aktif yang tersedia.",temp_mail_provider_caption()])
+        lines.extend(["","Saat Buat Email, bot memakai domain aktif yang tersedia.","Provider: <a href=\"https://mail.tm\">Mail.tm</a>"])
         await safe_edit_or_answer(call,"\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Refresh Domain",callback_data="tm:domains")],
             [InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")],
@@ -16747,13 +16367,10 @@ async def owner_temp_mail_help(call: CallbackQuery):
         "2. Gunakan alamat untuk menerima email sementara.\n"
         "3. Buka Received Mail dan tekan Refresh.\n"
         "4. Pilih pesan untuk membaca isi lengkapnya.\n\n"
-        "Daftar Email menyimpan maksimal 5 alamat per provider. Alamat dan akses email tetap tersedia setelah bot restart.\n"
+        "Daftar Email menyimpan maksimal 5 alamat. Alamat dan akses email tetap tersedia setelah bot restart.\n"
         "Isi pesan ditampilkan sebagai teks. Link dibuka sendiri; bot tidak otomatis menjalankan link atau Apply Premium.\n\n"
         "Gunakan fitur dengan bijak. Hindari data penting karena provider dapat menghapus email sementara.\n"
-        "Email baru Maildrop mempunyai link inbox situs yang dapat dibagikan tanpa login bot. Inbox publik; jangan gunakan untuk data penting.\n"
-        "Pesan dapat dihapus setelah 24 jam tanpa email baru. Pengiriman pertama kadang tertunda 15 menit–1 jam.\n"
-        "Email Mail.tm lama tetap dapat dibuka melalui Received Mail.\n"
-        +temp_mail_provider_caption(),
+        "Provider: <a href=\"https://mail.tm\">Mail.tm</a> • Gratis tanpa API key.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")]]),
         parse_mode="HTML",
     )
@@ -31528,7 +31145,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.66"
+EXPECTED_SOURCE_VERSION = "16.64"
 
 
 def source_integrity_self_test():
