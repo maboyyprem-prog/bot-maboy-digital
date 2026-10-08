@@ -1802,3 +1802,63 @@ Owner dapat membaca seluruh ulasan lewat halaman 5 penilaian; ringkasan toko mem
 sebaran bintang dan ulasan terbaru. Validasi callback, duplikasi, status pesanan,
 sesi ulasan, serta error database diperbaiki tanpa mengubah alur pembayaran/provider.
 Tidak ada variable/dependensi baru; schema tetap `180`. Upload enam file v16.59 bersama.
+
+## v16.60 — Temp Mail Owner
+
+Owner di chat pribadi: /tools → Temp Mail → Buat Email → Received Mail.
+Tersedia daftar alamat, salin alamat, domain aktif, serta baca pesan masuk.
+API [Mail.tm](https://docs.mail.tm/) gratis tanpa API key, dengan token akun per inbox.
+Referensi: [akun](https://docs.mail.tm/api/accounts),
+[pesan masuk](https://docs.mail.tm/api/messages),
+[alternatif Guerrilla Mail](https://www.guerrillamail.com/GuerrillaMailAPI.html).
+
+- `TEMPMAIL_ENABLED=true` mengaktifkan menu; `false` menahan request provider.
+- `TEMPMAIL_TIMEOUT_SECONDS=12` membatasi request (3–30 detik).
+- `TEMPMAIL_ENCRYPTION_KEY` opsional, simpan sebagai Railway Secret tetap.
+  Jika kosong, enkripsi menggunakan BOT_TOKEN. Pertahankan secret/token yang sama
+  untuk membuka inbox lama; database tidak menyimpan password/token email sebagai teks.
+
+Schema `181` menambahkan tabel mailbox owner; migrasi mempertahankan data lama.
+Tidak ada dependency baru. Temp Mail tetap khusus owner; VIP /tools tetap Magic Link
+dan Rating Toko. Pesan masuk dibaca melalui menu refresh, tanpa apply otomatis.
+Provider Mail.tm dicantumkan di menu sesuai persyaratan atribusi API.
+
+Menu utama /tools diringkas; tombol Lainnya tidak ditampilkan. Bersihkan Log Lama
+meminta konfirmasi sekali pakai (5 menit) untuk log final owner lebih dari 30 hari.
+Hasil apply, flow provider, VIP, rating, inbox, dan data belanja tetap tersimpan.
+Riwayat belanja tersedia langsung dari /start dan selesai transaksi; layar
+pembayaran/bukti memakai tombol status dan kembali ke transaksi yang sama.
+
+## v16.61 — Riwayat Belanja
+
+Tombol Riwayat tersedia di menu awal dan selesai transaksi; keyboard bawah
+tidak mengulang tombol tersebut. Tombol/teks lama memakai halaman yang sama,
+dengan detail tiap invoice dan pagination. Kirim ulang akun ada di detail
+pesanan selesai. Keluar ke menu/Riwayat mengakhiri input belanja dan sesi
+bukti tanpa mengubah pembayaran atau stok. Tombol Kembali user/owner memakai
+callback berbeda; callback lama tetap kompatibel. Tidak ada variable atau
+dependency baru; schema tetap `181`. Upload enam file v16.61 bersama.
+
+## v16.62 — Aktivasi AM Otomatis
+
+Owner di chat pribadi: /tools → Aktivasi AM Otomatis. Bot membuat Temp Mail,
+mengirim Magic Link, membaca link dari inbox, memverifikasi, lalu mengirim Apply Premium sekali.
+Hasil final memuat email dan Received Mail/tautan inbox Telegram untuk akun tersebut.
+Status sukses harus berasal dari hasil apply provider; target 1 tahun hanya dikonfirmasi
+jika paket/masa aktif tersedia dari provider. Endpoint apply tetap memakai email dan idToken.
+
+- `TOOLS_AUTO_AM_MAIL_WAIT_SECONDS=90`: batas menunggu Magic Link masuk ke inbox.
+- `TOOLS_AUTO_AM_POLL_SECONDS=3`: jarak pemeriksaan inbox selama menunggu.
+
+Perlu konfigurasi Temp Mail dan endpoint Send Magic Link, Verify Account, Apply Premium,
+serta API key provider. Request aksi tidak diulang saat pending/hasil belum diketahui;
+lanjutkan melalui status yang tersedia. Password/token inbox tetap terenkripsi dan
+link/idToken verifikasi hanya sementara. Pengujian API memakai simulasi; apply asli belum diuji.
+Schema `182` menambahkan job aktivasi agar klik ulang/restart tidak mengulang request.
+Tidak ada dependency baru. Upload enam file v16.62 bersama.
+
+## v16.63 — Informasi VIP /tools
+
+Layar awal VIP menampilkan teks statis `0/15 akun/jam`; bukan penghitung pemakaian.
+Aktivasi sekali klik tetap khusus owner. Tidak ada variable/dependency baru; schema tetap `182`.
+Upload enam file v16.63 bersama.

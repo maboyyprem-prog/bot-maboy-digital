@@ -10,12 +10,14 @@ import sqlite3
 import logging
 import time
 import random
+import secrets
 import json
 import hashlib
 from urllib.parse import urlparse, unquote
 import hmac
 import base64
 import html
+from html.parser import HTMLParser
 import asyncio
 import ast
 import shutil
@@ -30,6 +32,7 @@ from aiohttp import web, ClientSession
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
 from Crypto.Hash import SHA256
+from Crypto.Cipher import AES
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramBadRequest, TelegramConflictError
@@ -68,6 +71,9 @@ def env_int(name: str, default: int, minimum: int=0, maximum=None) -> int:
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+TEMPMAIL_ENABLED = os.getenv("TEMPMAIL_ENABLED", "true").strip().lower() == "true"
+TEMPMAIL_ENCRYPTION_KEY = os.getenv("TEMPMAIL_ENCRYPTION_KEY", "").strip()
+TEMPMAIL_TIMEOUT_SECONDS = env_int("TEMPMAIL_TIMEOUT_SECONDS", 12, 3, 30)
 ADMIN_ID = env_int("ADMIN_ID",0)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").replace("@", "")
 DEFAULT_PAYMENT_NOTE = os.getenv("PAYMENT_NOTE", "QRIS Maboyy Digital").strip()
@@ -190,8 +196,8 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.59"
-SCHEMA_VERSION = 180
+BOT_VERSION = "16.63"
+SCHEMA_VERSION = 182
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1004,6 +1010,50 @@ def init_db():
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_tools_user_reviews_user ON tools_user_reviews(user_id,created_at)")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_temp_mailboxes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            address TEXT NOT NULL UNIQUE,
+            secret TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            provider_account_id TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_owner_temp_mailboxes_owner ON owner_temp_mailboxes(owner_id,active)")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_auto_am_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            mailbox_id INTEGER NOT NULL DEFAULT 0,
+            email TEXT NOT NULL DEFAULT '',
+            correlation_id TEXT NOT NULL DEFAULT '',
+            stage TEXT NOT NULL DEFAULT 'create_mail',
+            status TEXT NOT NULL DEFAULT 'running',
+            magic_activity_id INTEGER NOT NULL DEFAULT 0,
+            verify_activity_id INTEGER NOT NULL DEFAULT 0,
+            magic_sent_at TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            provider_plan TEXT NOT NULL DEFAULT '',
+            provider_expiry TEXT NOT NULL DEFAULT '',
+            lease_token TEXT NOT NULL DEFAULT '',
+            lease_until TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_owner_auto_am_jobs_owner ON owner_auto_am_jobs(owner_id,status)")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_auto_am_tickets (
+            token TEXT PRIMARY KEY,
+            owner_id INTEGER NOT NULL,
+            job_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
     add_column_if_missing(conn,"tool_provision_logs","request_metered","INTEGER DEFAULT 0")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tool_provider_requests (
@@ -1857,32 +1907,28 @@ async def force_refresh_user_keyboard(message: Message):
 
 
 def start_view_keyboard():
-    rows=[
-        [
-            InlineKeyboardButton(
-                text="⭐ Rating Toko",
-                callback_data="store:rating"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="🛍️ Buka Menu Utama",
-                callback_data="home"
-            )
-        ]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛍️ Belanja",callback_data="products"),
+         InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")],
+        [InlineKeyboardButton(text="⭐ Rating Toko",callback_data="store:rating"),
+         InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")]
+    ])
 
 
 def start_view_text() -> str:
+    try:
+        rating=store_rating_text()
+    except sqlite3.Error:
+        rating="⭐ Rating Toko: <b>Belum tersedia</b>"
     return (
-        f"🛍️ <b>{STORE_NAME}</b>\n\n"
+        f"🛍️ <b>{rating_html_excerpt(STORE_NAME,200)}</b>\n\n"
         "Selamat datang di Maboyy Digital.\n"
-        f"{store_rating_text()}\n\n"
-        "Lihat rating dan ulasan pembeli melalui tombol di bawah.\n"
-        "Untuk belanja, gunakan keyboard menu yang tersedia.\n\n"
-        f"<i>{STORE_FOOTER}</i>"
+        f"{rating}\n\n"
+        "Pilih Belanja untuk melihat produk, atau Riwayat untuk cek pesanan.\n"
+        "Rating dan ulasan toko tersedia melalui tombol di bawah.\n\n"
+        f"<i>{rating_html_excerpt(STORE_FOOTER,200)}</i>"
     )
+
 
 
 async def show_main_menu_message(message: Message):
@@ -1892,13 +1938,18 @@ async def show_main_menu_message(message: Message):
         reply_markup=start_view_keyboard(),
         parse_mode="HTML"
     )
+    try:
+        keyboard=user_reply_menu()
+    except sqlite3.Error:
+        keyboard=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🏠 Menu Utama")]],resize_keyboard=True)
     # Persistent Telegram reply keyboard must be sent separately because
     # one message cannot carry inline + reply keyboards at the same time.
     await message.answer(
         "⌨️ <b>Menu belanja aktif.</b>",
-        reply_markup=user_reply_menu(),
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
+
 
 
 def effective_unit_price(variant, qty):
@@ -2602,8 +2653,8 @@ def user_delivery_actions_keyboard(order_id: int):
     if btn:
         rows.append([btn])
     rows.extend([
-        [InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")],
-        [InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")],
+        [InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders"),
+         InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")],
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3918,34 +3969,13 @@ def checkout_transaction_keyboard(variant_id: int, qty: int):
 
 def transaction_pending_keyboard(order_id: int, include_proof: bool = True):
     rows=[]
-
     if include_proof:
-        rows.append([
-            InlineKeyboardButton(
-                text="📤 Kirim Bukti",
-                callback_data=f"proofsubmit:order:{order_id}"
-            )
-        ])
-
+        rows.append([InlineKeyboardButton(text="📤 Kirim Bukti",callback_data=f"proofsubmit:order:{order_id}")])
     rows.append([
-        InlineKeyboardButton(
-            text="🔄 Cek Status",
-            callback_data=f"statuscheck:order:{order_id}"
-        )
+        InlineKeyboardButton(text="🔄 Cek Status",callback_data=f"statuscheck:order:{order_id}"),
+        InlineKeyboardButton(text="❌ Batalkan",callback_data=f"usercancel:{order_id}")
     ])
-
-    rows.append([
-        InlineKeyboardButton(
-            text="❌ Batalkan Pesanan",
-            callback_data=f"usercancel:{order_id}"
-        )
-    ])
-
-    rows.append([
-        InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders"),
-        InlineKeyboardButton(text="🏠 Menu",callback_data="home")
-    ])
-
+    rows.append([InlineKeyboardButton(text="🏠 Menu",callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -7716,23 +7746,23 @@ def order_detail_text(order) -> str:
         "🧾 <b>DETAIL PESANAN</b>",
         "",
         f"Invoice: <b>{invoice(int(order['id']))}</b>",
-        f"🔎 Ref: <code>{html.escape(str(order['trace_id'] or invoice(int(order['id']))))}</code>",
-        f"📦 Produk: <b>{html.escape(str(product_name))}</b>",
-        f"🧩 Varian: <b>{html.escape(str(variant_name))}</b>",
+        f"🔎 Ref: <code>{rating_html_excerpt(order['trace_id'] or invoice(int(order['id'])),100)}</code>",
+        f"📦 Produk: <b>{rating_html_excerpt(product_name,200)}</b>",
+        f"🧩 Varian: <b>{rating_html_excerpt(variant_name,150)}</b>",
         f"🔢 Qty: <b>{int(order['qty'] or 0)}</b>",
-        f"💳 Metode: <b>{html.escape(str(method))}</b>",
+        f"💳 Metode: <b>{rating_html_excerpt(method,80)}</b>",
         f"💰 Total: <b>{rupiah(total)}</b>",
-        f"📌 Status: <b>{html.escape(order_user_status_label(order))}</b>",
-        f"📝 Catatan: <b>{html.escape(str(note))}</b>",
-        f"🕒 Dibuat: <code>{html.escape(str(created))}</code>",
+        f"📌 Status: <b>{rating_html_excerpt(order_user_status_label(order),150)}</b>",
+        f"📝 Catatan: <b>{rating_html_excerpt(note,1000)}</b>",
+        f"🕒 Dibuat: <code>{rating_html_excerpt(created,70)}</code>",
     ]
     if rating_line:
         lines.append(rating_line)
     if completed and completed!="-":
-        lines.append(f"✅ Selesai: <code>{html.escape(str(completed))}</code>")
+        lines.append(f"✅ Selesai: <code>{rating_html_excerpt(completed,70)}</code>")
     if reject_reason:
-        lines.append(f"❌ Alasan: <b>{html.escape(reject_reason)}</b>")
-    lines += ["", f"<i>{STORE_FOOTER}</i>"]
+        lines.append(f"❌ Alasan: <b>{rating_html_excerpt(reject_reason,500)}</b>")
+    lines += ["", f"<i>{rating_html_excerpt(STORE_FOOTER,200)}</i>"]
     return "\n".join(lines)
 
 
@@ -7771,7 +7801,6 @@ def proof_rejected_keyboard(entity: str, entity_id: int):
             )
         ])
         rows.append([
-            InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders"),
             InlineKeyboardButton(text="🏠 Menu",callback_data="home")
         ])
     else:
@@ -7792,7 +7821,7 @@ def order_has_review(order_id: int) -> bool:
         conn.close()
 
 
-def order_detail_keyboard(order):
+def order_detail_keyboard(order, *, include_history: bool = True):
     rows=[]
     status=str(order["status"] or "")
     payment_status=str(order["payment_status"] or "")
@@ -7807,12 +7836,10 @@ def order_detail_keyboard(order):
                     callback_data=f"reviewopen:{order['id']}"
                 )
             ])
-        rows.append([
-            InlineKeyboardButton(
-                text="📸 Kirim Bukti Login",
-                callback_data=f"loginproof:{order['id']}"
-            )
-        ])
+        actions=[InlineKeyboardButton(text="📸 Kirim Bukti Login",callback_data=f"loginproof:{order['id']}")]
+        if payment_status=="paid" and str(order["delivery_text"] or "").strip():
+            actions.append(InlineKeyboardButton(text="📩 Kirim Ulang Akun",callback_data=f"resendorder:{order['id']}"))
+        rows.append(actions)
     elif payment_status!="paid" and status not in {"expired","cancelled","completed"}:
         if not proof_used:
             rows.append([
@@ -7842,10 +7869,11 @@ def order_detail_keyboard(order):
             )
         ])
 
-    rows.append([
-        InlineKeyboardButton(text="⬅️ Riwayat",callback_data="my_orders"),
-        InlineKeyboardButton(text="🏠 Menu",callback_data="home")
-    ])
+    navigation=[]
+    if include_history:
+        navigation.append(InlineKeyboardButton(text="⬅️ Riwayat",callback_data="my_orders"))
+    navigation.append(InlineKeyboardButton(text="🏠 Menu",callback_data="home"))
+    rows.append(navigation)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -7873,7 +7901,6 @@ def payment_proof_keyboard(entity: str, entity_id: int):
             )
         ])
         rows.append([
-            InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders"),
             InlineKeyboardButton(text="🏠 Menu",callback_data="home")
         ])
     else:
@@ -8952,11 +8979,7 @@ def user_reply_menu():
     ])
 
     keyboard.append([
-        KeyboardButton(text="🧾 Riwayat"),
         KeyboardButton(text="💬 Hubungi Owner"),
-    ])
-
-    keyboard.append([
         KeyboardButton(text="🏠 Menu Utama"),
     ])
 
@@ -8966,6 +8989,7 @@ def user_reply_menu():
         is_persistent=True,
         input_field_placeholder="Pilih menu atau nomor produk"
     )
+
 
 
 def main_menu():
@@ -9551,6 +9575,12 @@ def validate_system_schema():
         "tool_provision_logs": {"id","owner_id","tool_name","target_email","plan","status","created_at"},
         "tool_activity_logs": {"id","owner_id","action","target_email","status","http_status","created_at"},
         "tool_email_locks": {"email","owner_id","action","locked_until","created_at"},
+        "owner_temp_mailboxes": {"id","owner_id","address","secret","state",
+                                  "provider_account_id","active","created_at","updated_at"},
+        "owner_auto_am_jobs": {"id","owner_id","mailbox_id","email","correlation_id","stage","status",
+                               "magic_activity_id","verify_activity_id","magic_sent_at","detail","provider_plan",
+                               "provider_expiry","lease_token","lease_until","created_at","updated_at"},
+        "owner_auto_am_tickets": {"token","owner_id","job_id","created_at"},
         "tool_provider_flows": {"correlation_id","owner_id","target_email","stage","status","http_status","created_at"},
         "settings": {"key","value"},
         "system_errors": {"id","error_text","created_at"},
@@ -11197,16 +11227,84 @@ class CallbackTraceMiddleware(BaseMiddleware):
             )
 
 
+def shopping_navigation_states() -> set:
+    return {
+        CheckoutState.waiting_note.state, CheckoutState.waiting_voucher.state,
+        CheckoutState.waiting_payment_proof.state, CheckoutState.waiting_family_gmail.state,
+        ReviewState.waiting_comment.state, LoginProofState.waiting_photo.state,
+        UserComplaintState.waiting_reason.state, FamilySupportState.waiting_issue_reason.state,
+        BundleState.choose_second.state,
+    }
+
+
+async def shopping_navigation_exit(user_id: int, state: FSMContext = None):
+    """Disarm shopping input and proof recovery without touching financial records."""
+    if state is None:
+        return
+    current = await state.get_state()
+    if current is not None and current not in shopping_navigation_states():
+        return
+    conn = db()
+    try:
+        conn.execute("DELETE FROM payment_proof_sessions WHERE user_id=?", (int(user_id),))
+        conn.commit()
+    finally:
+        conn.close()
+    if current is not None:
+        data = await state.get_data()
+        # Tools credentials and unrelated metadata remain available when returning.
+        prefixes = ("checkout_", "proof_", "review_", "login_proof_", "user_complaint_", "family_", "bundle_")
+        retained = {key: value for key, value in data.items() if not str(key).startswith(prefixes)}
+        await state.set_data(retained)
+        await state.set_state(None)
+
+
+async def user_history_present(target, text: str, keyboard):
+    if isinstance(target, Message):
+        return await target.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    return await safe_edit_or_answer(target, text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def user_history_error(target):
+    return await user_history_present(target, "🧾 Riwayat belum bisa dibuka. Silakan coba lagi.",
+        InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Coba Lagi", callback_data="my_orders"),
+            InlineKeyboardButton(text="🏠 Menu", callback_data="home")]]))
+
+
+@router.message(F.text.in_({"🧾 Riwayat", "🧾 Pesanan Saya"}),
+    lambda message, raw_state=None: raw_state is None or raw_state in shopping_navigation_states())
+async def shopping_history_reply_navigation(message: Message, state: FSMContext, bot: Bot):
+    # Register ahead of waiting-note/Gmail/proof/review input handlers.
+    await reply_menu_orders(message, bot, state)
+
+
+@router.message(Command("start"), F.text.regexp(r"^/start(?:@[A-Za-z0-9_]+)?\s+am_mail_[1-9][0-9]{0,9}\s*$"))
+async def owner_auto_am_mail_deep_link(message: Message):
+    await auto_am_mail_link_open(message)
+
+
 @router.message(Command("start"))
-async def start(message: Message, bot: Bot):
+async def start(message: Message, bot: Bot, state: FSMContext = None):
     if not await is_channel_member(bot, message.from_user.id):
         return await send_join_required(message)
 
-    mark_user_verified(
-        message.from_user.id,
-        message.from_user.username or ""
-    )
+    try:
+        await shopping_navigation_exit(message.from_user.id,state)
+    except sqlite3.Error:
+        return await message.answer("Menu belum bisa dibuka. Silakan coba lagi.")
+
+    try:
+        mark_user_verified(
+            message.from_user.id,
+            message.from_user.username or ""
+        )
+
+    except sqlite3.Error:
+        return await message.answer("Menu belum bisa dibuka. Silakan coba lagi.")
     await show_main_menu_message(message)
+
+
 
 
 
@@ -11584,41 +11682,128 @@ async def bundle_add_cart(call: CallbackQuery):
 
 
 
+def payment_transaction_callback(data: str, prefix: str):
+    if not isinstance(data,str):
+        return None
+    parts=data.split(":")
+    if len(parts)!=3 or parts[0]!=prefix or parts[1] not in {"order","topup"}:
+        return None
+    numbers=callback_positive_numbers("invoice:"+parts[2],"invoice")
+    return (parts[1],numbers[0]) if numbers else None
+
+
+def payment_proof_data_target(data):
+    entity=data.get("proof_entity")
+    raw=data.get("proof_entity_id")
+    numbers=callback_positive_numbers("invoice:"+str(raw),"invoice") if not isinstance(raw,bool) else None
+    return (entity,numbers[0]) if isinstance(entity,str) and entity in {"order","topup"} and numbers else (None,0)
+
+
+def payment_proof_status_keyboard(entity: str, entity_id: int):
+    rows=[]
+    if payment_transaction_callback(f"statuscheck:{entity}:{entity_id}","statuscheck"):
+        rows.append([InlineKeyboardButton(text="🔄 Cek Status",callback_data=f"statuscheck:{entity}:{entity_id}")])
+    rows.append([InlineKeyboardButton(text="🏠 Menu",callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("userproofback:") | F.data.startswith("proofback:"))
+async def payment_proof_back(call: CallbackQuery, state: FSMContext):
+    prefix=str(call.data or "").split(":",1)[0]
+    if prefix not in {"userproofback","proofback"}:
+        return await safe_callback_notice(call,"Transaksi tidak valid.",show_alert=True)
+    target=payment_transaction_callback(call.data,prefix)
+    if not target:
+        return await safe_callback_notice(call,"Transaksi tidak valid.",show_alert=True)
+    if prefix=="proofback" and is_owner(call.from_user.id):
+        try:
+            current=await state.get_state()
+        except sqlite3.Error:
+            return await safe_callback_notice(call,"Sesi belum bisa dibuka. Coba lagi.",show_alert=True)
+        if current!=CheckoutState.waiting_payment_proof.state:
+            # Older owner review cards shared this callback with buyer uploads.
+            return await owner_proof_back(call)
+    entity,entity_id=target
+    conn=None
+    try:
+        conn=db()
+        table="orders" if entity=="order" else "topups"
+        row=conn.execute(f"SELECT * FROM {table} WHERE id=? AND user_id=?",
+                         (entity_id,call.from_user.id)).fetchone()
+        if not row:
+            return await safe_callback_notice(call,"Transaksi tidak ditemukan.",show_alert=True)
+        conn.execute("DELETE FROM payment_proof_sessions WHERE user_id=? AND entity_type=? AND entity_id=?",
+                     (call.from_user.id,entity,entity_id))
+        conn.commit()
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Transaksi belum bisa dibuka. Coba lagi.",show_alert=True)
+    finally:
+        if conn is not None:
+            conn.close()
+    if await state.get_state()==CheckoutState.waiting_payment_proof.state:
+        data=await state.get_data()
+        if payment_proof_data_target(data)==target:
+            await state.clear()
+    if entity=="order":
+        # Reuse the invoice view directly; no intermediate history page.
+        conn=None
+        try:
+            conn=db()
+            row=conn.execute("""SELECT o.*,p.name AS product_name,v.name AS variant_name
+                FROM orders o LEFT JOIN products p ON p.id=o.product_id
+                LEFT JOIN product_variants v ON v.id=o.variant_id
+                WHERE o.id=? AND o.user_id=?""",(entity_id,call.from_user.id)).fetchone()
+            if not row:
+                return await safe_callback_notice(call,"Pesanan tidak ditemukan.",show_alert=True)
+            await safe_edit_or_answer(call,order_detail_text(row),
+                reply_markup=order_detail_keyboard(row,include_history=str(row["status"] or "") in {"completed","cancelled","expired"}),parse_mode="HTML")
+        except sqlite3.Error:
+            return await safe_callback_notice(call,"Pesanan belum bisa dibuka. Coba lagi.",show_alert=True)
+        finally:
+            if conn is not None:
+                conn.close()
+    else:
+        await safe_edit_or_answer(call,
+            "💰 <b>TOP UP</b>\n\n"+f"🧾 {topup_invoice(entity_id)}\n"
+            +f"💵 Nominal: <b>{rupiah(row['amount'])}</b>\n"
+            +"Pilih Cek Status untuk melanjutkan transaksi.",
+            reply_markup=payment_proof_status_keyboard(entity,entity_id),parse_mode="HTML")
+    await safe_callback_notice(call)
+
+
 @router.callback_query(F.data.startswith("proofsubmit:"))
 async def payment_proof_start(call: CallbackQuery, state: FSMContext):
+    target=payment_transaction_callback(call.data,"proofsubmit")
+    if not target:
+        return await safe_callback_notice(call,"Data invoice tidak valid.",show_alert=True)
+    entity,entity_id=target
+
     try:
-        _, entity, raw_id = call.data.split(":")
-        entity_id = int(raw_id)
-    except Exception:
-        return await call.answer("Data invoice tidak valid.", show_alert=True)
-
-    if entity not in {"order", "topup"}:
-        return await call.answer("Jenis transaksi tidak valid.", show_alert=True)
-
-    rate_ok,retry_after=persistent_rate_limit(
-        call.from_user.id,
-        "payment_proof",
-        limit=3,
-        window_seconds=60
-    )
+        rate_ok,retry_after=persistent_rate_limit(
+            call.from_user.id,
+            "payment_proof",
+            limit=3,
+            window_seconds=60
+        )
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Transaksi belum bisa dibuka. Coba lagi.",show_alert=True)
     if not rate_ok:
         return await call.answer(
             f"Terlalu banyak percobaan. Coba lagi dalam {retry_after} detik.",
             show_alert=True
         )
 
-    conn = db()
-    if entity == "order":
-        row = conn.execute(
-            "SELECT * FROM orders WHERE id=? AND user_id=?",
-            (entity_id, call.from_user.id)
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT * FROM topups WHERE id=? AND user_id=?",
-            (entity_id, call.from_user.id)
-        ).fetchone()
-    conn.close()
+    conn=None
+    try:
+        conn=db()
+        table="orders" if entity=="order" else "topups"
+        row=conn.execute(f"SELECT * FROM {table} WHERE id=? AND user_id=?",
+                         (entity_id,call.from_user.id)).fetchone()
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Data transaksi belum bisa dibuka. Coba lagi.",show_alert=True)
+    finally:
+        if conn is not None:
+            conn.close()
 
     if not row:
         return await call.answer("Invoice tidak ditemukan.", show_alert=True)
@@ -11652,7 +11837,10 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
                 show_alert=True
             )
 
-    set_payment_proof_session(call.from_user.id, entity, entity_id)
+    try:
+        set_payment_proof_session(call.from_user.id,entity,entity_id)
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Bukti belum bisa dikirim. Coba lagi.",show_alert=True)
 
     await state.update_data(
         proof_entity=entity,
@@ -11666,7 +11854,7 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
         "Kirim <b>foto/screenshot bukti transfer</b> ke chat ini.\n\n"
         "Bukti akan diteruskan ke owner untuk diperiksa.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Batal", callback_data="my_orders")]
+            [InlineKeyboardButton(text="⬅️ Kembali ke Transaksi", callback_data=f"userproofback:{entity}:{entity_id}")]
         ]),
         parse_mode="HTML"
     )
@@ -11676,8 +11864,7 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
 @router.message(CheckoutState.waiting_payment_proof, F.photo)
 async def payment_proof_photo(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    entity = data.get("proof_entity")
-    entity_id = int(data.get("proof_entity_id") or 0)
+    entity,entity_id=payment_proof_data_target(data)
 
     if entity not in {"order", "topup"} or not entity_id:
         session = get_payment_proof_session(message.from_user.id)
@@ -11697,7 +11884,8 @@ async def payment_proof_photo(message: Message, state: FSMContext, bot: Bot):
         return await message.answer(
             "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
             f"{html.escape(error)}\n\n"
-            "Silakan cek status transaksi melalui Riwayat.",
+            "Silakan cek status melalui tombol di bawah.",
+            reply_markup=payment_proof_status_keyboard(entity,entity_id),
             parse_mode="HTML"
         )
 
@@ -11705,11 +11893,8 @@ async def payment_proof_photo(message: Message, state: FSMContext, bot: Bot):
         "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
         "Bukti sudah benar-benar diteruskan ke PM owner.\n"
         "Owner akan memeriksa dan mengonfirmasi pembayaran.\n"
-        "Kamu bisa cek status dari Riwayat.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🧾 Riwayat", callback_data="my_orders")],
-            [InlineKeyboardButton(text="🏠 Menu", callback_data="home")]
-        ]),
+        "Tekan Cek Status untuk melihat hasil pemeriksaan.",
+        reply_markup=payment_proof_status_keyboard(entity,entity_id),
         parse_mode="HTML"
     )
 
@@ -11725,8 +11910,7 @@ async def payment_proof_document(message: Message, state: FSMContext, bot: Bot):
         )
 
     data = await state.get_data()
-    entity = data.get("proof_entity")
-    entity_id = int(data.get("proof_entity_id") or 0)
+    entity,entity_id=payment_proof_data_target(data)
 
     if entity not in {"order", "topup"} or not entity_id:
         session = get_payment_proof_session(message.from_user.id)
@@ -11746,18 +11930,16 @@ async def payment_proof_document(message: Message, state: FSMContext, bot: Bot):
         return await message.answer(
             "❌ <b>BUKTI BELUM TERKIRIM KE OWNER</b>\n\n"
             f"{html.escape(error)}\n\n"
-            "Silakan cek status transaksi melalui Riwayat.",
+            "Silakan cek status melalui tombol di bawah.",
+            reply_markup=payment_proof_status_keyboard(entity,entity_id),
             parse_mode="HTML"
         )
 
     await message.answer(
         "✅ <b>BUKTI PEMBAYARAN TERKIRIM</b>\n\n"
         "Bukti sudah benar-benar diteruskan ke PM owner.\n"
-        "Kamu bisa cek status dari Riwayat.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🧾 Riwayat", callback_data="my_orders")],
-            [InlineKeyboardButton(text="🏠 Menu", callback_data="home")]
-        ]),
+        "Tekan Cek Status untuk melihat hasil pemeriksaan.",
+        reply_markup=payment_proof_status_keyboard(entity,entity_id),
         parse_mode="HTML"
     )
 
@@ -11782,6 +11964,8 @@ async def payment_proof_exit_to_menu(message: Message, state: FSMContext, bot: B
     """Reply-keyboard navigation must exit proof-upload mode instead of being treated as proof."""
     text=(message.text or "").strip()
 
+    if text in {"🧾 Riwayat","🧾 Pesanan Saya"}:
+        return await reply_menu_orders(message, bot, state)
     clear_payment_proof_session(message.from_user.id)
     await state.clear()
 
@@ -11795,12 +11979,13 @@ async def payment_proof_exit_to_menu(message: Message, state: FSMContext, bot: B
         return await reply_menu_wallet(message, bot)
     if text=="❓ Cara Order":
         return await reply_menu_howto(message)
-    if text in {"🧾 Riwayat","🧾 Riwayat"}:
+    if text in {"🧾 Riwayat","🧾 Pesanan Saya"}:
         return await reply_menu_orders(message, bot)
     if text=="💬 Hubungi Owner":
         return await reply_menu_owner_contact(message)
     if text=="🏠 Menu Utama":
         return await reply_menu_home(message, bot, state)
+
 
 
 @router.message(
@@ -11934,43 +12119,746 @@ def tools_provider_status_text() -> str:
     return "🟢 READY"
 
 
+# Temp Mail uses the official Mail.tm API only. Credentials stay encrypted in SQLite.
+TEMP_MAIL_API_BASE = "https://api.mail.tm"
+TEMP_MAIL_ACCOUNT_LIMIT = 5
+TEMP_MAIL_CREATE_COOLDOWN_SECONDS = 60
+TEMP_MAIL_RESPONSE_LIMIT = 512 * 1024
+_TEMP_MAIL_LOOP = None
+_TEMP_MAIL_HTTP_GATE = None
+_TEMP_MAIL_OWNER_LOCKS = {}
+_TEMP_MAIL_LAST_REQUEST = 0.0
+_TEMP_MAIL_RATE_UNTIL = 0.0
+
+
+class TempMailError(Exception):
+    def __init__(self, message: str, *, status: int = 0, outcome_unknown: bool = False):
+        super().__init__(message)
+        self.status = int(status or 0)
+        self.outcome_unknown = bool(outcome_unknown)
+
+
+def temp_mail_assert_owner(owner_id: int):
+    if not is_owner(owner_id):
+        raise TempMailError("Temp Mail khusus owner.", status=403)
+    if not TEMPMAIL_ENABLED:
+        raise TempMailError("Temp Mail sedang dinonaktifkan.", status=503)
+
+
+async def temp_mail_require_owner(call: CallbackQuery) -> bool:
+    if not is_owner(call.from_user.id):
+        await deny_owner_callback(call)
+        return False
+    message = call.message
+    if not message or str(message.chat.type) != "private" or message.chat.id != call.from_user.id:
+        await safe_callback_notice(call, "Buka Temp Mail melalui chat pribadi bot.", show_alert=True)
+        return False
+    if not TEMPMAIL_ENABLED:
+        await safe_callback_notice(call, "Temp Mail sedang dinonaktifkan.", show_alert=True)
+        return False
+    return True
+
+
+def temp_mail_async_locks(owner_id=None):
+    global _TEMP_MAIL_LOOP, _TEMP_MAIL_HTTP_GATE, _TEMP_MAIL_OWNER_LOCKS
+    loop = asyncio.get_running_loop()
+    if _TEMP_MAIL_LOOP is not loop:
+        _TEMP_MAIL_LOOP = loop
+        _TEMP_MAIL_HTTP_GATE = asyncio.Lock()
+        _TEMP_MAIL_OWNER_LOCKS = {}
+    if owner_id is None:
+        return _TEMP_MAIL_HTTP_GATE
+    return _TEMP_MAIL_OWNER_LOCKS.setdefault(int(owner_id), asyncio.Lock())
+
+
+def temp_mail_provider_id(value) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value))
+
+
+def temp_mail_database_id(value) -> int:
+    if isinstance(value, bool) or not re.fullmatch(r"[0-9]{1,19}", str(value or "")):
+        raise TempMailError("Kotak masuk tidak valid.", status=400)
+    mailbox_id = int(value)
+    if not 0 < mailbox_id <= 9223372036854775807:
+        raise TempMailError("Kotak masuk tidak valid.", status=400)
+    return mailbox_id
+
+
+def temp_mail_encryption_key() -> bytes:
+    configured = TEMPMAIL_ENCRYPTION_KEY or BOT_TOKEN
+    if not configured:
+        raise TempMailError("BOT_TOKEN atau TEMPMAIL_ENCRYPTION_KEY belum dikonfigurasi.", status=503)
+    return hashlib.sha256(b"MaboyyDigital/TempMail/v1\x00" + configured.encode("utf-8")).digest()
+
+
+def temp_mail_encrypt_credentials(owner_id: int, address: str, credentials: dict) -> str:
+    cipher = AES.new(temp_mail_encryption_key(), AES.MODE_GCM)
+    cipher.update(f"{int(owner_id)}:{address.lower()}".encode("utf-8"))
+    raw = json.dumps(credentials, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    encrypted, tag = cipher.encrypt_and_digest(raw)
+    return "v1:" + base64.urlsafe_b64encode(cipher.nonce + tag + encrypted).decode("ascii")
+
+
+def temp_mail_decrypt_credentials(row: dict) -> dict:
+    try:
+        secret = str(row.get("secret") or "")
+        if not secret.startswith("v1:") or len(secret) > 18000:
+            raise ValueError("invalid encrypted credentials")
+        raw = base64.b64decode(secret[3:], altchars=b"-_", validate=True)
+        if len(raw) < 33:
+            raise ValueError("invalid encrypted credentials")
+        cipher = AES.new(temp_mail_encryption_key(), AES.MODE_GCM, nonce=raw[:16])
+        cipher.update(f"{int(row['owner_id'])}:{str(row['address']).lower()}".encode("utf-8"))
+        result = json.loads(cipher.decrypt_and_verify(raw[32:], raw[16:32]).decode("utf-8"))
+        if not isinstance(result, dict) or not isinstance(result.get("password"), str) or not result["password"]:
+            raise ValueError("invalid credentials")
+        if not isinstance(result.get("token", ""), str):
+            raise ValueError("invalid token")
+        return result
+    except TempMailError:
+        raise
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        raise TempMailError("Sesi email tidak dapat dibuka. Pulihkan BOT_TOKEN/kunci enkripsi sebelumnya.", status=409) from None
+
+
+def temp_mail_public_mailbox(row) -> dict:
+    item = dict(row)
+    return {key: item.get(key) for key in (
+        "id", "owner_id", "address", "state", "provider_account_id", "active", "created_at", "updated_at"
+    )}
+
+
+def temp_mail_owned_row(owner_id: int, mailbox_id: int) -> dict:
+    temp_mail_assert_owner(owner_id)
+    mailbox_id = temp_mail_database_id(mailbox_id)
+    conn = db()
+    try:
+        row = conn.execute("SELECT * FROM owner_temp_mailboxes WHERE id=? AND owner_id=?", (mailbox_id, int(owner_id))).fetchone()
+        if not row:
+            raise TempMailError("Kotak masuk tidak ditemukan atau bukan milik owner.", status=404)
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def temp_mail_get_active(owner_id: int):
+    temp_mail_assert_owner(owner_id)
+    conn = db()
+    try:
+        row = conn.execute("SELECT * FROM owner_temp_mailboxes WHERE owner_id=? AND active=1 ORDER BY id DESC LIMIT 1", (int(owner_id),)).fetchone()
+        return temp_mail_public_mailbox(row) if row else None
+    finally:
+        conn.close()
+
+
+def temp_mail_list_accounts(owner_id: int) -> list:
+    temp_mail_assert_owner(owner_id)
+    conn = db()
+    try:
+        return [temp_mail_public_mailbox(row) for row in conn.execute("SELECT * FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()]
+    finally:
+        conn.close()
+
+
+def temp_mail_save_credentials(row: dict, credentials: dict, *, state: str, provider_account_id: str = "", activate=False) -> dict:
+    secret = temp_mail_encrypt_credentials(int(row["owner_id"]), str(row["address"]), credentials)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        if activate:
+            conn.execute("UPDATE owner_temp_mailboxes SET active=0 WHERE owner_id=?", (int(row["owner_id"]),))
+        changed = conn.execute(
+            "UPDATE owner_temp_mailboxes SET secret=?,state=?,provider_account_id=?,active=?,updated_at=? WHERE id=? AND owner_id=?",
+            (secret, state, provider_account_id or str(row.get("provider_account_id") or ""), 1 if activate else int(row.get("active") or 0), now, int(row["id"]), int(row["owner_id"])),
+        ).rowcount
+        if not changed:
+            raise TempMailError("Kotak masuk sudah tidak tersedia.", status=404)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return temp_mail_owned_row(int(row["owner_id"]), int(row["id"]))
+
+
+def temp_mail_activate_account(owner_id: int, mailbox_id: int) -> dict:
+    row = temp_mail_owned_row(owner_id, mailbox_id)
+    if row["state"] != "ready":
+        raise TempMailError("Sesi email belum siap. Gunakan Pulihkan Sesi terlebih dahulu.", status=409)
+    credentials = temp_mail_decrypt_credentials(row)
+    return temp_mail_public_mailbox(temp_mail_save_credentials(row, credentials, state="ready", activate=True))
+
+
+async def temp_mail_http(method: str, path: str, *, payload=None, token: str = "", params=None) -> tuple:
+    global _TEMP_MAIL_LAST_REQUEST, _TEMP_MAIL_RATE_UNTIL
+    method = str(method).upper()
+    valid_path = path in {"/domains", "/accounts", "/token", "/me", "/messages"} or bool(re.fullmatch(r"/messages/[A-Za-z0-9_-]{1,64}", str(path)))
+    allowed = (method == "POST" and path in {"/accounts", "/token"}) or (method == "GET" and path not in {"/accounts", "/token"})
+    if not valid_path or not allowed:
+        raise TempMailError("Permintaan Temp Mail tidak valid.", status=400)
+    headers = {"Accept": "application/ld+json", "User-Agent": f"MaboyyDigital/{BOT_VERSION}"}
+    if token:
+        if not isinstance(token, str) or len(token) > 8192 or any(c.isspace() for c in token):
+            raise TempMailError("Sesi provider tidak valid.", status=401)
+        headers["Authorization"] = f"Bearer {token}"
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    async with temp_mail_async_locks():
+        now = time.monotonic()
+        if _TEMP_MAIL_RATE_UNTIL > now:
+            remaining = max(1, int(_TEMP_MAIL_RATE_UNTIL - now + 0.999))
+            raise TempMailError(f"Batas provider tercapai. Coba kembali dalam {remaining} detik.", status=429)
+        delay = 0.25 - (now - _TEMP_MAIL_LAST_REQUEST)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _TEMP_MAIL_LAST_REQUEST = time.monotonic()
+        timeout = aiohttp.ClientTimeout(total=TEMPMAIL_TIMEOUT_SECONDS, connect=min(6, TEMPMAIL_TIMEOUT_SECONDS))
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.request(method, TEMP_MAIL_API_BASE + path, headers=headers, json=payload, params=params, allow_redirects=False) as response:
+                    status = int(response.status)
+                    if 300 <= status < 400:
+                        raise TempMailError("Provider mengirim pengalihan yang tidak didukung.", status=status, outcome_unknown=method == "POST")
+                    if status == 429:
+                        try:
+                            retry_after = max(1, min(3600, int(response.headers.get("Retry-After", "5"))))
+                        except (TypeError, ValueError):
+                            retry_after = 5
+                        _TEMP_MAIL_RATE_UNTIL = time.monotonic() + retry_after
+                        raise TempMailError(f"Batas provider tercapai. Coba kembali dalam {retry_after} detik.", status=429)
+                    if response.content_length and response.content_length > TEMP_MAIL_RESPONSE_LIMIT:
+                        raise TempMailError("Pesan provider terlalu besar untuk dibaca di bot.", status=status, outcome_unknown=method == "POST")
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(16384):
+                        body.extend(chunk)
+                        if len(body) > TEMP_MAIL_RESPONSE_LIMIT:
+                            raise TempMailError("Pesan provider terlalu besar untuk dibaca di bot.", status=status, outcome_unknown=method == "POST")
+                    try:
+                        data = json.loads(body.decode("utf-8"))
+                    except (ValueError, UnicodeError):
+                        raise TempMailError("Respons provider tidak valid. Coba periksa sesi kembali.", status=status, outcome_unknown=method == "POST") from None
+                    if not isinstance(data, dict):
+                        raise TempMailError("Format respons provider tidak didukung.", status=status, outcome_unknown=method == "POST")
+                    return status, data
+        except TempMailError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            raise TempMailError("Provider sedang tidak dapat dihubungi. Coba kembali nanti.", outcome_unknown=method == "POST") from None
+
+
+def temp_mail_response_error(status: int, *, creating=False) -> TempMailError:
+    if status in {401, 403}:
+        return TempMailError("Sesi provider belum siap atau kedaluwarsa. Gunakan Pulihkan Sesi.", status=status)
+    if status == 404:
+        return TempMailError("Email atau pesan sudah tidak tersedia di provider.", status=status)
+    if status in {400, 422}:
+        return TempMailError("Provider menolak data email sementara.", status=status)
+    return TempMailError("Provider belum berhasil memproses permintaan. Coba periksa sesi kembali.", status=status, outcome_unknown=creating and (status >= 500 or status == 0))
+
+
+async def temp_mail_domains() -> list:
+    status, result = await temp_mail_http("GET", "/domains", params={"page": 1})
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    items = result.get("hydra:member", result.get("member", []))
+    if not isinstance(items, list):
+        raise TempMailError("Daftar domain provider tidak valid.", status=502)
+    domains = []
+    for row in items[:100]:
+        if not isinstance(row, dict) or row.get("isActive") is not True or row.get("isPrivate") is True:
+            continue
+        domain = str(row.get("domain") or "").strip().lower()
+        if len(domain) <= 253 and re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", domain):
+            if domain not in domains:
+                domains.append(domain)
+    if not domains:
+        raise TempMailError("Provider belum menyediakan domain publik aktif.", status=503)
+    return domains
+
+
+async def temp_mail_resume_locked(row: dict, *, activate=True) -> dict:
+    if row["state"] == "failed":
+        raise TempMailError("Pembuatan email ini ditolak provider. Buat email baru setelah cooldown.", status=409)
+    credentials = temp_mail_decrypt_credentials(row)
+    status, result = await temp_mail_http("POST", "/token", payload={"address": row["address"], "password": credentials["password"]})
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    token = result.get("token")
+    account_id = result.get("id")
+    if not isinstance(token, str) or not token or len(token) > 8192 or any(c.isspace() for c in token) or not temp_mail_provider_id(account_id):
+        raise TempMailError("Sesi provider tidak valid. Coba Pulihkan Sesi kembali.", status=502)
+    expected_id = str(row.get("provider_account_id") or "")
+    if expected_id and expected_id != account_id:
+        raise TempMailError("Identitas email provider tidak cocok. Sesi tidak digunakan.", status=409)
+    check_status, account = await temp_mail_http("GET", "/me", token=token)
+    if not 200 <= check_status < 300:
+        raise temp_mail_response_error(check_status)
+    if account.get("id") != account_id or str(account.get("address") or "").lower() != str(row["address"]).lower() or account.get("isDeleted") is True or account.get("isDisabled") is True:
+        raise TempMailError("Identitas email provider tidak cocok. Sesi tidak digunakan.", status=409)
+    credentials["token"] = token
+    return temp_mail_save_credentials(row, credentials, state="ready", provider_account_id=account_id, activate=activate)
+
+
+async def temp_mail_resume_account(owner_id: int, mailbox_id: int) -> dict:
+    temp_mail_assert_owner(owner_id)
+    async with temp_mail_async_locks(owner_id):
+        return temp_mail_public_mailbox(await temp_mail_resume_locked(temp_mail_owned_row(owner_id, mailbox_id)))
+
+
+async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
+    temp_mail_assert_owner(owner_id)
+    temp_mail_encryption_key()
+    async with temp_mail_async_locks(owner_id):
+        conn = db()
+        try:
+            rows = [dict(row) for row in conn.execute("SELECT * FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()]
+        finally:
+            conn.close()
+        now_dt = datetime.now(timezone.utc)
+        pending = None
+        for item in rows:
+            if item["state"] not in {"pending", "account_created"}:
+                continue
+            try:
+                created = datetime.fromisoformat(str(item["created_at"]))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                raise TempMailError("Waktu sesi email tidak valid. Periksa data email tersimpan.", status=409) from None
+            if (now_dt - created).total_seconds() < TEMP_MAIL_CREATE_COOLDOWN_SECONDS:
+                pending = item
+                break
+        if pending:
+            if auto_job_id:
+                auto_am_bind_mailbox(owner_id, auto_job_id, pending)
+            return temp_mail_public_mailbox(await temp_mail_resume_locked(pending))
+        if sum(row["state"] != "failed" for row in rows) >= TEMP_MAIL_ACCOUNT_LIMIT:
+            raise TempMailError("Batas 5 email tersimpan tercapai. Gunakan email yang sudah tersedia.", status=409)
+        if rows:
+            try:
+                created_at = datetime.fromisoformat(str(rows[0]["created_at"]))
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                remaining = TEMP_MAIL_CREATE_COOLDOWN_SECONDS - (now_dt - created_at).total_seconds()
+                if remaining > 0:
+                    raise TempMailError(f"Tunggu {max(1, int(remaining + 0.999))} detik sebelum membuat email baru.", status=429)
+            except ValueError:
+                raise TempMailError("Waktu sesi email tidak valid. Periksa data email tersimpan.", status=409) from None
+        domains = await temp_mail_domains()
+        address = f"mb{secrets.token_hex(8)}@{domains[0]}"
+        credentials = {"password": secrets.token_urlsafe(24), "token": ""}
+        now = now_dt.isoformat(timespec="seconds")
+        conn = db()
+        try:
+            begin_immediate_retry(conn)
+            # Recheck while holding the write lock; another worker must not create a second pending account.
+            current = conn.execute("SELECT id,state,created_at FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()
+            if sum(row["state"] != "failed" for row in current) >= TEMP_MAIL_ACCOUNT_LIMIT:
+                raise TempMailError("Batas 5 email tersimpan tercapai.", status=409)
+            if current:
+                created = datetime.fromisoformat(str(current[0]["created_at"]))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - created).total_seconds() < TEMP_MAIL_CREATE_COOLDOWN_SECONDS:
+                    raise TempMailError("Pembuatan email masih dalam cooldown 60 detik.", status=429)
+            inserted = conn.execute(
+                "INSERT INTO owner_temp_mailboxes(owner_id,address,secret,state,provider_account_id,active,created_at,updated_at) VALUES(?,?,?,'pending','',0,?,?)",
+                (int(owner_id), address, temp_mail_encrypt_credentials(owner_id, address, credentials), now, now),
+            )
+            mailbox_id = int(inserted.lastrowid)
+            if auto_job_id:
+                bound = conn.execute("UPDATE owner_auto_am_jobs SET mailbox_id=?,email=?,updated_at=? WHERE id=? AND owner_id=? AND mailbox_id=0",
+                                     (mailbox_id, address, now, int(auto_job_id), int(owner_id))).rowcount
+                if not bound:
+                    raise TempMailError("Sesi aktivasi tidak tersedia.", status=409)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        row = temp_mail_owned_row(owner_id, mailbox_id)
+        try:
+            status, account = await temp_mail_http("POST", "/accounts", payload={"address": address, "password": credentials["password"]})
+        except TempMailError as exc:
+            # Credentials were persisted before POST. Never repeat an uncertain account-creation POST.
+            if 400 <= exc.status < 500 and not exc.outcome_unknown:
+                temp_mail_save_credentials(row, credentials, state="failed")
+            raise
+        if not 200 <= status < 300:
+            if 400 <= status < 500:
+                temp_mail_save_credentials(row, credentials, state="failed")
+            raise temp_mail_response_error(status, creating=True)
+        account_id = account.get("id")
+        if not temp_mail_provider_id(account_id) or str(account.get("address") or "").lower() != address:
+            raise TempMailError("Pembuatan email belum dapat dipastikan. Gunakan Pulihkan Sesi.", status=502, outcome_unknown=True)
+        row = temp_mail_save_credentials(row, credentials, state="account_created", provider_account_id=account_id)
+        return temp_mail_public_mailbox(await temp_mail_resume_locked(row))
+
+
+async def temp_mail_authenticated_read_locked(row: dict, path: str, *, params=None) -> tuple:
+    refreshed = False
+    credentials = temp_mail_decrypt_credentials(row)
+    if row["state"] != "ready" or not credentials.get("token"):
+        row = await temp_mail_resume_locked(row, activate=False)
+        credentials = temp_mail_decrypt_credentials(row)
+        refreshed = True
+    status, account = await temp_mail_http("GET", "/me", token=credentials["token"])
+    if status == 401 and not refreshed:
+        row = await temp_mail_resume_locked(row, activate=False)
+        credentials = temp_mail_decrypt_credentials(row)
+        refreshed = True
+        status, account = await temp_mail_http("GET", "/me", token=credentials["token"])
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    if account.get("id") != row.get("provider_account_id") or str(account.get("address") or "").lower() != str(row["address"]).lower() or account.get("isDeleted") is True or account.get("isDisabled") is True:
+        raise TempMailError("Identitas email provider tidak cocok. Pesan tidak dibuka.", status=409)
+    status, result = await temp_mail_http("GET", path, token=credentials["token"], params=params)
+    if status == 401 and not refreshed:
+        row = await temp_mail_resume_locked(row, activate=False)
+        credentials = temp_mail_decrypt_credentials(row)
+        status, result = await temp_mail_http("GET", path, token=credentials["token"], params=params)
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    return row, result
+
+
+class TempMailHTMLTextParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.skipping = 0
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "head"}:
+            self.skipping += 1
+        elif not self.skipping:
+            if tag in {"br", "p", "div", "li", "tr", "h1", "h2", "h3", "blockquote"}:
+                self.parts.append("\n")
+            if tag == "a":
+                href = next((value for key, value in attrs if key.lower() == "href"), "") or ""
+                self.links.append(href if href.lower().startswith(("https://", "http://")) else "")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "head"}:
+            self.skipping = max(0, self.skipping - 1)
+        elif not self.skipping:
+            if tag == "a" and self.links:
+                href = self.links.pop()
+                if href:
+                    self.parts.append(" (" + href + ")")
+            if tag in {"p", "div", "li", "tr", "blockquote"}:
+                self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.skipping:
+            self.parts.append(data)
+
+
+def temp_mail_message_text(message: dict) -> str:
+    """Keep plain mail content and HTML-only links, without rendering HTML."""
+    raw_text = message.get("text")
+    raw_text = raw_text if isinstance(raw_text, str) else ""
+    raw_html = message.get("html", "")
+    html_parts = [part for part in raw_html if isinstance(part, str)] if isinstance(raw_html, list) else [raw_html] if isinstance(raw_html, str) else []
+    # The HTTP adapter already bounds responses; keep direct/helper callers
+    # bounded too and never silently drop a verification link at the boundary.
+    if len(raw_text) + sum(len(part) for part in html_parts) > TEMP_MAIL_RESPONSE_LIMIT:
+        raise TempMailError("Isi pesan terlalu besar untuk dibaca di bot.", status=502)
+    raw_html = "\n".join(html_parts)
+    if len(raw_text.encode("utf-8")) + len(raw_html.encode("utf-8")) > TEMP_MAIL_RESPONSE_LIMIT:
+        raise TempMailError("Isi pesan terlalu besar untuk dibaca di bot.", status=502)
+    text = raw_text.replace("\x00", "")
+    if text.strip():
+        if not raw_html.strip():
+            return text
+        parser = AutoAMLinkParser()
+        try:
+            parser.feed(raw_html)
+            parser.close()
+        except (ValueError, AssertionError):
+            return text
+        if len(parser.links) > 256:
+            raise TempMailError("Pesan berisi terlalu banyak tautan untuk dibaca otomatis.", status=502)
+        existing = html.unescape(text)
+        extra_links = []
+        seen_links = set()
+        for href in parser.links:
+            link = html.unescape(href).strip()
+            if not link or len(link) > 8192 or link in seen_links or link in existing or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in link):
+                continue
+            try:
+                parsed = urlparse(link)
+                if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+                    continue
+            except ValueError:
+                continue
+            seen_links.add(link)
+            extra_links.append(link)
+        return text + ("\n\n" + "\n".join(extra_links) if extra_links else "")
+    parser = TempMailHTMLTextParser()
+    try:
+        parser.feed(raw_html)
+        parser.close()
+    except (ValueError, AssertionError):
+        return str(message.get("intro") or "")[:2000]
+    result = "".join(parser.parts).replace("\x00", "")
+    return re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", result).strip() or str(message.get("intro") or "")[:2000]
+
+
+def temp_mail_public_message(message: dict, *, body=False) -> dict:
+    message_id = message.get("id")
+    if not temp_mail_provider_id(message_id):
+        raise TempMailError("ID pesan provider tidak valid.", status=502)
+    sender = message.get("from")
+    sender = sender if isinstance(sender, dict) else {}
+    recipients = message.get("to")
+    recipients = recipients if isinstance(recipients, list) else []
+    result = {
+        "id": message_id,
+        "from": {"address": str(sender.get("address") or "")[:254], "name": str(sender.get("name") or "")[:160]},
+        "to": [{"address": str(item.get("address") or "")[:254], "name": str(item.get("name") or "")[:160]} for item in recipients[:10] if isinstance(item, dict)],
+        "subject": str(message.get("subject") or "(Tanpa subjek)")[:500],
+        "intro": str(message.get("intro") or "")[:1000],
+        "seen": message.get("seen") is True,
+        "createdAt": str(message.get("createdAt") or "")[:80],
+        "hasAttachments": message.get("hasAttachments") is True,
+    }
+    if body:
+        result["text"] = temp_mail_message_text(message)
+        result["html"] = ""
+    return result
+
+
+async def temp_mail_fetch_inbox(owner_id: int, mailbox_id: int, page: int = 1) -> dict:
+    temp_mail_assert_owner(owner_id)
+    if isinstance(page, bool) or not re.fullmatch(r"[0-9]{1,4}", str(page)) or not 1 <= int(page) <= 1000:
+        raise TempMailError("Halaman pesan tidak valid.", status=400)
+    page = int(page)
+    async with temp_mail_async_locks(owner_id):
+        row, result = await temp_mail_authenticated_read_locked(temp_mail_owned_row(owner_id, mailbox_id), "/messages", params={"page": page})
+        messages = result.get("hydra:member", result.get("member", []))
+        if not isinstance(messages, list):
+            raise TempMailError("Daftar pesan provider tidak valid.", status=502)
+        try:
+            total = max(0, min(1000000, int(result.get("hydra:totalItems", result.get("totalItems", len(messages))))))
+        except (TypeError, ValueError):
+            raise TempMailError("Jumlah pesan provider tidak valid.", status=502) from None
+        public = [temp_mail_public_message(item) for item in messages[:30] if isinstance(item, dict)]
+        return {"messages": public, "total": total, "page": page, "total_pages": max(1, min(1000, (total + 29) // 30)), "mailbox": temp_mail_public_mailbox(row), "address": row["address"]}
+
+
+async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str) -> dict:
+    temp_mail_assert_owner(owner_id)
+    if not temp_mail_provider_id(message_id):
+        raise TempMailError("ID pesan tidak valid.", status=400)
+    async with temp_mail_async_locks(owner_id):
+        row, result = await temp_mail_authenticated_read_locked(temp_mail_owned_row(owner_id, mailbox_id), "/messages/" + message_id)
+        if result.get("id") != message_id:
+            raise TempMailError("Identitas pesan provider tidak cocok.", status=409)
+        account_id = result.get("accountId")
+        if account_id and account_id != row.get("provider_account_id"):
+            raise TempMailError("Pesan bukan milik alamat email ini.", status=409)
+        recipients = result.get("to")
+        recipients = recipients if isinstance(recipients, list) else []
+        addresses = {str(item.get("address") or "").strip().lower() for item in recipients if isinstance(item, dict)}
+        addresses.discard("")
+        if addresses and str(row["address"]).lower() not in addresses and not account_id:
+            raise TempMailError("Penerima pesan tidak cocok dengan alamat email ini.", status=409)
+        message = temp_mail_public_message(result, body=True)
+        message["mailbox"] = temp_mail_public_mailbox(row)
+        message["address"] = row["address"]
+        return message
+
+
 def owner_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📧 Kirim Link",callback_data="tools:magiclink"),
-            InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify"),
-        ],
-        [
-            InlineKeyboardButton(text="🚀 Apply Premium",callback_data="tools:pro_license"),
-            InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result"),
-        ],
-        [
-            InlineKeyboardButton(text="📊 Status",callback_data="tools:summary"),
-            InlineKeyboardButton(text="📦 Riwayat",callback_data="tools:history"),
-        ],
-        [InlineKeyboardButton(text="⚙️ Lainnya",callback_data="tools:more")],
-        [InlineKeyboardButton(text="👑 VIP /tools",callback_data="tools:access")],
-        [InlineKeyboardButton(text="⬅️ Owner Panel",callback_data="owner:panel")],
+        [InlineKeyboardButton(text="⚡ AM Pro Otomatis • 1 Tahun", callback_data=auto_am_start_token())],
+        [InlineKeyboardButton(text="📧 Kirim Link",callback_data="tools:magiclink"),
+         InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
+        [InlineKeyboardButton(text="🚀 Apply Premium",callback_data="tools:pro_license"),
+         InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
+        [InlineKeyboardButton(text="📬 Temp Mail",callback_data="tools:tempmail"),
+         InlineKeyboardButton(text="👑 VIP /tools",callback_data="tools:access")],
+        [InlineKeyboardButton(text="📦 Riwayat",callback_data="tools:history"),
+         InlineKeyboardButton(text="📊 Status",callback_data="tools:summary")],
+        [InlineKeyboardButton(text="🧹 Bersihkan Log Lama",callback_data="tools:cleanup"),
+         InlineKeyboardButton(text="⬅️ Owner Panel",callback_data="owner:panel")],
     ])
 
 
 def owner_tools_more_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🔐 idToken",callback_data="tools:token_status"),
-            InlineKeyboardButton(text="♻️ Lanjutkan",callback_data="tools:resume"),
-        ],
-        [
-            InlineKeyboardButton(text="🧪 Diagnostik",callback_data="tools:diagnostics"),
-            InlineKeyboardButton(text="❤️ Health",callback_data="tools:health"),
-        ],
-        [
-            InlineKeyboardButton(text="⚙️ Provider",callback_data="tools:provider"),
-            InlineKeyboardButton(text="🔌 Config",callback_data="tools:status"),
-        ],
-        [InlineKeyboardButton(text="🧹 Reset Session",callback_data="tools:reset_session")],
-        [InlineKeyboardButton(text="⬅️ Kembali",callback_data="tools:home")],
-    ])
+    # Old messages keep working while the main menu no longer has extra submenus.
+    return owner_tools_menu()
+
+
+# Cleanup previews are short lived and contain only already eligible local IDs.
+# A restart invalidates confirmation buttons instead of deleting unreviewed data.
+_TOOLS_CLEANUP_PREVIEWS = {}
+TOOLS_CLEANUP_RETENTION_DAYS = 30
+TOOLS_CLEANUP_BATCH_LIMIT = 5000
+TOOLS_CLEANUP_PREVIEW_SECONDS = 300
+
+
+def owner_tools_home_text(owner_id: int) -> str:
+    try:
+        used = tools_stats_snapshot(owner_id)["used_requests"]
+        quota = f"{used}/{TOOLS_PROVIDER_HOURLY_LIMIT}"
+    except sqlite3.Error:
+        quota = "belum tersedia"
+    return (
+        "🧰 <b>OWNER TOOLS</b>\n"
+        "Gunakan fitur dengan bijak.\n\n"
+        f"Provider: <b>{html.escape(str(TOOLS_PROVIDER_NAME)[:120])}</b>\n"
+        f"Status: <b>{html.escape(tools_provider_status_text())}</b>\n"
+        f"Kuota lokal: <b>{quota}</b>"
+    )
+
+
+async def tools_cleanup_require_owner(call: CallbackQuery) -> bool:
+    if not is_owner(call.from_user.id):
+        await deny_owner_callback(call)
+        return False
+    if not call.message or call.message.chat.type != "private" or call.message.chat.id != call.from_user.id:
+        await safe_callback_notice(call,"Buka /tools melalui chat pribadi dengan bot.",show_alert=True)
+        return False
+    return True
+
+
+def tools_cleanup_activity_predicate() -> str:
+    return """owner_id=? AND datetime(created_at)<datetime(?)
+        AND datetime(updated_at)<datetime(?)
+        AND status IN ('success','failed','cancelled','rejected')
+        AND lower(trim(action))!='apply_premium'
+        AND NOT EXISTS (SELECT 1 FROM tool_provider_flows f
+                        WHERE f.apply_activity_id=tool_activity_logs.id)"""
+
+
+def tools_cleanup_request_predicate() -> str:
+    return """owner_id=? AND datetime(created_at)<datetime(?)
+        AND status IN ('success','failed','cancelled','rejected')"""
+
+
+def tools_cleanup_preview(owner_id: int) -> dict:
+    if not is_owner(owner_id):
+        raise PermissionError("Fitur ini khusus owner.")
+    now=time.time()
+    for key,value in list(_TOOLS_CLEANUP_PREVIEWS.items()):
+        if value["expires"]<=now:
+            _TOOLS_CLEANUP_PREVIEWS.pop(key,None)
+    cutoff=(datetime.now(timezone.utc)-timedelta(days=TOOLS_CLEANUP_RETENTION_DAYS)).replace(tzinfo=None).isoformat(timespec="seconds")
+    conn=db()
+    try:
+        activity_ids=[int(row["id"]) for row in conn.execute(
+            "SELECT id FROM tool_activity_logs WHERE "+tools_cleanup_activity_predicate()+" ORDER BY id LIMIT ?",
+            (owner_id,cutoff,cutoff,TOOLS_CLEANUP_BATCH_LIMIT))]
+        request_ids=[int(row["id"]) for row in conn.execute(
+            "SELECT id FROM tool_provider_requests WHERE "+tools_cleanup_request_predicate()+" ORDER BY id LIMIT ?",
+            (owner_id,cutoff,TOOLS_CLEANUP_BATCH_LIMIT))]
+    finally:
+        conn.close()
+    token=secrets.token_hex(12)
+    _TOOLS_CLEANUP_PREVIEWS[owner_id]={"token":token,"cutoff":cutoff,"expires":now+TOOLS_CLEANUP_PREVIEW_SECONDS,
+                                    "activity_ids":activity_ids,"request_ids":request_ids}
+    return {"token":token,"activities":len(activity_ids),"requests":len(request_ids)}
+
+
+def tools_cleanup_execute(owner_id: int, token: str) -> dict:
+    if not is_owner(owner_id):
+        raise PermissionError("Fitur ini khusus owner.")
+    preview=_TOOLS_CLEANUP_PREVIEWS.get(owner_id)
+    if (not isinstance(token,str) or not re.fullmatch(r"[0-9a-f]{24}",token)
+            or not preview or not hmac.compare_digest(preview["token"],token)
+            or preview["expires"]<=time.time()):
+        raise ValueError("Konfirmasi kedaluwarsa. Buka Bersihkan Log Lama kembali.")
+    _TOOLS_CLEANUP_PREVIEWS.pop(owner_id,None)
+    conn=None
+    try:
+        conn=db()
+        begin_immediate_retry(conn)
+        removed={"activities":0,"requests":0}
+        for table,key,predicate,parameters in (
+            ("tool_activity_logs","activities",tools_cleanup_activity_predicate(),
+             (owner_id,preview["cutoff"],preview["cutoff"])),
+            ("tool_provider_requests","requests",tools_cleanup_request_predicate(),
+             (owner_id,preview["cutoff"]))):
+            ids=preview["activity_ids" if key=="activities" else "request_ids"]
+            for offset in range(0,len(ids),400):
+                batch=ids[offset:offset+400]
+                placeholders=",".join("?" for _ in batch)
+                cursor=conn.execute("DELETE FROM "+table+" WHERE "+predicate+" AND id IN ("+placeholders+")",
+                                    parameters+tuple(batch))
+                removed[key]+=cursor.rowcount
+        conn.commit()
+        return removed
+    except Exception:
+        if conn is not None:conn.rollback()
+        if preview["expires"]>time.time() and owner_id not in _TOOLS_CLEANUP_PREVIEWS:
+            _TOOLS_CLEANUP_PREVIEWS[owner_id]=preview
+        raise
+    finally:
+        if conn is not None:conn.close()
+
+
+@router.callback_query(F.data == "tools:cleanup")
+async def owner_tools_cleanup_preview(call: CallbackQuery):
+    if not await tools_cleanup_require_owner(call):return
+    await safe_callback_notice(call)
+    try:
+        preview=tools_cleanup_preview(call.from_user.id)
+    except sqlite3.Error:
+        await safe_edit_or_answer(call,"Log belum dapat dibaca. Coba kembali sebentar lagi.",
+                                  reply_markup=owner_tools_menu())
+        return
+    total=preview["activities"]+preview["requests"]
+    text=("🧹 <b>BERSIHKAN LOG LAMA</b>\n\n"
+          "Log berstatus final yang berumur lebih dari 30 hari:\n"
+          f"• Aktivitas: <b>{preview['activities']}</b>\n"
+          f"• Request provider: <b>{preview['requests']}</b>\n\n"
+          "Hasil Apply Premium, rating, VIP, inbox, dan data belanja tetap tersimpan.")
+    keyboard=[]
+    if total:
+        keyboard.append([InlineKeyboardButton(text=f"🗑 Hapus {total} log",callback_data="toolsclean:"+preview["token"])])
+        text+="\nKonfirmasi berlaku 5 menit."
+    else:
+        _TOOLS_CLEANUP_PREVIEWS.pop(call.from_user.id,None)
+        text+="\n\nBelum ada log lama yang perlu dibersihkan."
+    keyboard.append([InlineKeyboardButton(text="⬅️ Kembali",callback_data="tools:cleanup_cancel")])
+    await safe_edit_or_answer(call,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("toolsclean:"))
+async def owner_tools_cleanup_confirm(call: CallbackQuery):
+    if not await tools_cleanup_require_owner(call):return
+    await safe_callback_notice(call)
+    parts=str(call.data or "").split(":")
+    token=parts[1] if len(parts)==2 else ""
+    try:
+        removed=tools_cleanup_execute(call.from_user.id,token)
+    except ValueError as exc:
+        await safe_edit_or_answer(call,html.escape(str(exc)),reply_markup=owner_tools_menu())
+        return
+    except sqlite3.Error:
+        await safe_edit_or_answer(call,"Pembersihan belum berhasil. Buka Bersihkan Log Lama untuk mencoba kembali.",
+                                  reply_markup=owner_tools_menu())
+        return
+    await safe_edit_or_answer(call,
+        "✅ <b>LOG LAMA DIBERSIHKAN</b>\n\n"
+        f"Aktivitas: <b>{removed['activities']}</b>\n"
+        f"Request provider: <b>{removed['requests']}</b>",
+        reply_markup=owner_tools_menu(),parse_mode="HTML")
+
+
+@router.callback_query(F.data == "tools:cleanup_cancel")
+async def owner_tools_cleanup_cancel(call: CallbackQuery):
+    if not await tools_cleanup_require_owner(call):return
+    _TOOLS_CLEANUP_PREVIEWS.pop(call.from_user.id,None)
+    await safe_edit_or_answer(call,owner_tools_home_text(call.from_user.id),reply_markup=owner_tools_menu())
+    await safe_callback_notice(call)
+
 
 
 def alight_tools_menu():
@@ -12674,7 +13562,7 @@ async def _save_tools_apply_result(state, email, correlation_id, parsed, http_st
                              detail=tool_response_preview(parsed))
 
 
-async def run_tools_apply_once(call, state, *, user_mode=False):
+async def run_tools_apply_once(call, state, *, user_mode=False, progress=True):
     data=await state.get_data()
     if user_mode and not tools_user_allowed(call.from_user.id):
         return {}
@@ -12715,9 +13603,10 @@ async def run_tools_apply_once(call, state, *, user_mode=False):
                                     tools_provider_apply_premium_result=parsed,tools_apply_http_status=claimed.get("http_status",0))
             return parsed
         await state.update_data(tools_apply_requested=True,tools_apply_notice="")
-        await safe_callback_notice(call,"Memproses Magic Link..." if user_mode else "Menerapkan premium...")
-        await safe_edit_or_answer(call,("⏳ <b>MENYELESAIKAN MAGIC LINK...</b>\n\n📧 " if user_mode else
-                                       "⏳ <b>APPLY PREMIUM...</b>\n\n📧 ")+html.escape(email),parse_mode="HTML")
+        if progress:
+            await safe_callback_notice(call,"Memproses Magic Link..." if user_mode else "Menerapkan premium...")
+            await safe_edit_or_answer(call,("⏳ <b>MENYELESAIKAN MAGIC LINK...</b>\n\n📧 " if user_mode else
+                                           "⏳ <b>APPLY PREMIUM...</b>\n\n📧 ")+html.escape(email),parse_mode="HTML")
         if user_mode and not tools_user_allowed(call.from_user.id):
             parsed={"known":True,"success":False,"status":"failed","message":"Akses telah dicabut owner.","reference":""}
             await _save_tools_apply_result(state,email,correlation_id,parsed,0)
@@ -12725,6 +13614,7 @@ async def run_tools_apply_once(call, state, *, user_mode=False):
         ok,http_status,result=await tools_provider_request(
             "POST",TOOLS_PROVIDER_APPLY_URL,payload={"email":email,"idToken":token},owner_id=call.from_user.id,
         )
+        result=auto_am_redact_token(result,token)
         parsed=parse_provider_apply_premium_result(result,from_apply=True,target_email=email)
         if http_status==202:parsed.update(known=False,success=False,status="pending")
         if not ok:
@@ -12732,6 +13622,7 @@ async def run_tools_apply_once(call, state, *, user_mode=False):
             parsed.update(known=not unknown,success=False,status="unknown" if unknown else "failed",
                           message=parsed.get("message") if not unknown and parsed.get("known") and parsed.get("message")
                           else tools_retry_hint(http_status,result))
+        await state.update_data(tools_apply_license_status=auto_am_safe_license_metadata(result, token))
         await _save_tools_apply_result(state,email,correlation_id,parsed,http_status,tool_response_preview(result))
         if parsed["status"] in {"pending","unknown"} and TOOLS_PROVIDER_APPLY_STATUS_URL:
             await refresh_tools_apply_result(state,call.from_user.id)
@@ -12761,6 +13652,7 @@ async def refresh_tools_apply_result(state, owner_id):
     if http_status==202:parsed.update(known=False,success=False,status="pending")
     # Failure to read status must never overwrite an existing confirmed apply result.
     if ok and (parsed["known"] or parsed["status"]=="pending"):
+        await state.update_data(tools_apply_license_status=auto_am_safe_license_metadata(result, str(data.get("tools_verify_id_token") or "")))
         await _save_tools_apply_result(state,email,correlation_id,parsed,http_status,tool_response_preview(result))
         await state.update_data(tools_apply_notice="")
     elif not ok:
@@ -13460,6 +14352,7 @@ def tools_user_menu(user_id: int):
 
 def tools_user_welcome_text() -> str:
     return ("👑 <b>VIP KHUSUS /TOOLS</b>\n\n"
+            "📊 Info kuota: <b>0/15 akun/jam</b>\n\n"
             "Gunakan fitur dengan bijak. Pastikan email dan link yang Anda kirim sudah benar.\n\n"
             "📧 Pilih Magic Link untuk mengirim link ke email, melakukan verifikasi, "
             "dan menerapkan premium.\n\n"
@@ -13826,36 +14719,23 @@ async def owner_tools_access_stale_callback(call: CallbackQuery,state: FSMContex
 
 @router.message(Command("tools"))
 async def owner_tools_command(message: Message,state: FSMContext):
-    # Preserve verified email/idToken/final metadata while reopening /tools.
     if not is_owner(message.from_user.id):
         return await user_tools_command(message,state)
+    if message.chat.type != "private" or message.chat.id != message.from_user.id:
+        return await message.answer("Buka /tools melalui chat pribadi dengan bot.")
+    # Preserve verified email/idToken/final metadata while reopening /tools.
     await state.set_state(None)
-    await message.answer(
-        "🧰 <b>OWNER TOOLS</b>\n\n"
-        "Modul ini terpisah dari checkout utama.\n"
-        "Gunakan hanya dengan API provider resmi/berizin.\n\n"
-        f"Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
-        f"Status: <b>{tools_provider_status_text()}</b>\n"
-        f"Auth: <b>{html.escape(TOOLS_PROVIDER_AUTH_MODE)}</b>\n"
-        f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b> • Retry: <b>{TOOLS_PROVIDER_MAX_RETRIES}</b>\n"
-        f"Kuota lokal: <b>{tools_stats_snapshot(message.from_user.id)['used_requests']}/{TOOLS_PROVIDER_HOURLY_LIMIT}</b>",
-        reply_markup=owner_tools_menu(),parse_mode="HTML"
-    )
+    await message.answer(owner_tools_home_text(message.from_user.id),
+                         reply_markup=owner_tools_menu(),parse_mode="HTML")
 
 
 @router.callback_query(F.data == "tools:home")
 async def owner_tools_home(call: CallbackQuery,state: FSMContext):
-    if not is_owner(call.from_user.id): return await deny_owner_callback(call)
+    if not await tools_cleanup_require_owner(call):return
     # Preserve verified email/idToken/final metadata while navigating.
     await state.set_state(None)
-    await safe_edit_or_answer(
-        call,
-        "🧰 <b>OWNER TOOLS</b>\n\n"
-        f"Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
-        f"Status: <b>{tools_provider_status_text()}</b>\n"
-        f"Kuota lokal: <b>{tools_stats_snapshot(call.from_user.id)['used_requests']}/{TOOLS_PROVIDER_HOURLY_LIMIT}</b>",
-        reply_markup=owner_tools_menu(),parse_mode="HTML"
-    )
+    await safe_edit_or_answer(call,owner_tools_home_text(call.from_user.id),
+                              reply_markup=owner_tools_menu(),parse_mode="HTML")
     await safe_callback_notice(call)
 
 
@@ -14479,17 +15359,978 @@ async def owner_tools_summary(call: CallbackQuery):
     await safe_callback_notice(call)
 
 
+def temp_mail_parse_callback(data, action: str, count: int):
+    if len(str(data or "").encode("utf-8")) > 64:return None
+    parts=str(data or "").split(":")
+    if len(parts)!=count+2 or parts[:2]!=["tm",action]:
+        return None
+    values=[]
+    for index,value in enumerate(parts[2:]):
+        if action=="read" and index==1:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}",value):return None
+            values.append(value)
+        else:
+            if not value.isascii() or not value.isdigit() or len(value)>19:return None
+            number=int(value)
+            if not 0<number<=9223372036854775807:return None
+            values.append(number)
+    return tuple(values)
+
+
+class AutoAMLinkParser(HTMLParser):
+    """Collect visible mail text and anchor targets without opening any URL."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text_parts = []
+        self.links = []
+        self.hidden_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "head"}:
+            self.hidden_depth += 1
+        elif not self.hidden_depth:
+            if tag in {"br", "p", "div", "li", "tr", "blockquote"}:
+                self.text_parts.append("\n")
+            if tag == "a":
+                for key, value in attrs:
+                    if key.lower() == "href" and isinstance(value, str):
+                        self.links.append(value)
+                        break
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "head"}:
+            self.hidden_depth = max(0, self.hidden_depth - 1)
+        elif not self.hidden_depth and tag in {"p", "div", "li", "tr", "blockquote"}:
+            self.text_parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden_depth:
+            self.text_parts.append(data)
+
+
+def auto_am_link_public_https(value) -> str:
+    """Validate a public HTTPS target syntactically; no DNS or HTTP requests."""
+    if not isinstance(value, str):
+        return ""
+    value = html.unescape(value).strip().rstrip(").,;!:?]}>")
+    if not value or len(value) > 8192 or "\\" in value or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value):
+        return ""
+    try:
+        parsed = urlparse(value)
+        host = str(parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme.lower() != "https" or parsed.username is not None or parsed.password is not None or parsed.port not in {None, 443}:
+            return ""
+        if host == "localhost" or host.endswith((".localhost", ".local", ".localdomain", ".internal", ".lan", ".home")):
+            return ""
+        try:
+            ipaddress.ip_address(host)
+            return ""
+        except ValueError:
+            pass
+        if len(host) > 253 or not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", host):
+            return ""
+        # Keep the original escaped query intact for the verification provider.
+        return value
+    except (ValueError, UnicodeError):
+        return ""
+
+
+def auto_am_link_action_candidates(value, depth: int = 0) -> set:
+    """Recognize Firebase action URLs, including encoded Dynamic Link wrappers."""
+    from urllib.parse import parse_qs
+    if depth > 3:
+        return set()
+    value = auto_am_link_public_https(value)
+    if not value:
+        return set()
+    try:
+        parsed = urlparse(value)
+        query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=64)
+    except ValueError:
+        return set()
+    candidates = set()
+    keys = ("mode", "oobCode", "apiKey")
+    if all(len(query.get(key, [])) == 1 for key in keys):
+        mode, code, api_key = (query[key][0] for key in keys)
+        host = str(parsed.hostname or "").lower().rstrip(".")
+        known_alight = any(host == domain or host.endswith("." + domain) for domain in ("alightmotion.com", "alightcreative.com", "alight.link"))
+        action_path = parsed.path.rstrip("/") == "/__/auth/action"
+        if (action_path or known_alight) and mode in {"signIn", "verifyEmail"} and re.fullmatch(r"[A-Za-z0-9_.~-]{6,4096}", code) and re.fullmatch(r"[A-Za-z0-9_-]{6,200}", api_key):
+            candidates.add(value)
+    for key in ("link", "deep_link_id"):
+        nested = query.get(key, [])
+        if len(nested) != 1:
+            continue
+        inner = nested[0]
+        # Some mail clients/providers double-escape the inner URL.
+        for _ in range(2):
+            if inner.lower().startswith("https://"):
+                break
+            decoded = unquote(inner)
+            if decoded == inner:
+                break
+            inner = decoded
+        candidates.update(auto_am_link_action_candidates(inner, depth + 1))
+    return candidates
+
+
+def auto_am_link_text_urls(text: str) -> list:
+    """Read URLs from plain mail text, joining safe query-line continuations."""
+    text = html.unescape(text)
+    # MIME soft wraps sometimes remain in providers' plain-text responses.
+    text = re.sub(r"=\r?\n", "", text)
+    continuation = re.compile(r"(https://[^\s<>\"']+[?&])\r?\n[ \t]*((?:mode|oobCode|apiKey|continueUrl|link|deep_link_id)=[^\s<>\"']+)", re.I)
+    for _ in range(12):
+        joined = continuation.sub(lambda match: match.group(1) + match.group(2), text)
+        if joined == text:
+            break
+        text = joined
+    return re.findall(r"https://[^\s<>\"']+", text, re.I)
+
+
+def auto_am_extract_magic_link(message) -> str:
+    """Return one actionable HTTPS verification URL, or a safe ValueError.
+
+    Accept a Mail.tm detail/public-message dict or a body string. An encoded
+    Firebase Dynamic Link is reduced to its actionable inner URL. Opaque short
+    links are not resolved, and tokens/links never appear in error messages.
+    """
+    if isinstance(message, str):
+        parts = [message]
+    elif isinstance(message, dict):
+        parts = []
+        for key in ("text", "html", "intro"):
+            value = message.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+            elif key == "html" and isinstance(value, list):
+                if len(value) > 20:
+                    raise ValueError("Pesan memiliki terlalu banyak bagian untuk diperiksa otomatis.")
+                parts.extend(item for item in value if isinstance(item, str))
+    else:
+        raise ValueError("Isi pesan verifikasi tidak valid.")
+    if sum(len(part) for part in parts) > 524288:
+        raise ValueError("Pesan verifikasi terlalu besar untuk diperiksa otomatis.")
+    urls = []
+    for part in parts:
+        parser = AutoAMLinkParser()
+        try:
+            parser.feed(part)
+            parser.close()
+        except (ValueError, AssertionError):
+            raise ValueError("Isi pesan verifikasi tidak dapat dibaca otomatis.") from None
+        urls.extend(parser.links)
+        urls.extend(auto_am_link_text_urls("".join(parser.text_parts)))
+        if len(urls) > 256:
+            raise ValueError("Pesan berisi terlalu banyak tautan untuk dipilih otomatis.")
+    from urllib.parse import parse_qs
+    candidates = {}
+    for url in urls:
+        for action_url in auto_am_link_action_candidates(url):
+            parsed = urlparse(action_url)
+            query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=64)
+            identity = (str(parsed.hostname or "").lower().rstrip("."), parsed.path.rstrip("/"), query["mode"][0], query["apiKey"][0], query["oobCode"][0])
+            candidates.setdefault(identity, action_url)
+        if len(candidates) > 1:
+            raise ValueError("Ada beberapa link verifikasi berbeda. Pilih link melalui Received Mail.")
+    if not candidates:
+        raise ValueError("Link verifikasi belum ditemukan pada pesan masuk.")
+    return next(iter(candidates.values()))
+
+
+# Automatic AM jobs keep credentials in memory and irreversible request claims in SQLite.
+TOOLS_AUTO_AM_MAIL_WAIT_SECONDS = env_int("TOOLS_AUTO_AM_MAIL_WAIT_SECONDS", 90, 15, 180)
+TOOLS_AUTO_AM_POLL_SECONDS = env_int("TOOLS_AUTO_AM_POLL_SECONDS", 3, 1, 15)
+_AUTO_AM_SESSIONS = {}
+
+
+class AutoAMJobState:
+    def __init__(self, owner_id, job_id):
+        self.key = (str(DB_PATH), int(owner_id), int(job_id))
+
+    async def get_data(self):
+        values = _AUTO_AM_SESSIONS.get(self.key, {})
+        if values and tools_session_expired(values):
+            values.pop("tools_verify_id_token", None)
+            values.pop("tools_raw_link", None)
+        return dict(values)
+
+    async def update_data(self, data=None, **kwargs):
+        values = _AUTO_AM_SESSIONS.setdefault(self.key, {})
+        values.update(data or {})
+        values.update(kwargs)
+        metadata = kwargs.get("tools_apply_license_status")
+        if isinstance(metadata, dict):
+            auto_am_update(self.key[1], self.key[2], provider_plan=str(metadata.get("plan") or "")[:200],
+                           provider_expiry=str(metadata.get("expires_at") or "")[:100])
+        if values.get("tools_apply_requested"):
+            values.pop("tools_verify_id_token", None)
+            values.pop("tools_raw_link", None)
+        return dict(values)
+
+    def forget(self):
+        _AUTO_AM_SESSIONS.pop(self.key, None)
+
+
+def auto_am_redact_token(value, token, depth=0):
+    if not token: return value
+    if depth > 12: return "<truncated>"
+    if isinstance(value, str): return value.replace(token, "***")
+    if isinstance(value, dict):
+        return {str(key).replace(token, "***"): auto_am_redact_token(item, token, depth + 1) for key, item in value.items()}
+    if isinstance(value, list): return [auto_am_redact_token(item, token, depth + 1) for item in value]
+    return value
+
+
+def auto_am_safe_license_metadata(result, token=""):
+    parsed = parse_provider_license_status(result)
+    try:
+        # Include credential context so provider echoes under unrelated keys are redacted.
+        safe = json.loads(tool_response_preview({"plan": parsed["plan"], "expires_at": parsed["expires_at"],
+                                                 "idToken": token or extract_verify_id_token(result), "source": result}))
+    except (ValueError, TypeError):
+        return {"plan": "", "expires_at": ""}
+    plan = str(safe.get("plan") or "").strip()
+    if len(plan) > 200 or "***" in plan or any(ord(c) < 32 for c in plan) or re.search(r"[A-Za-z0-9_.~+/=-]{20,}", plan):
+        plan = ""
+    expiry = str(safe.get("expires_at") or "").strip()
+    try:
+        if re.fullmatch(r"[0-9]{10}|[0-9]{13}", expiry):
+            expiry = datetime.fromtimestamp(int(expiry) / (1000 if len(expiry) == 13 else 1), timezone.utc).isoformat(timespec="seconds")
+        else:
+            datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        if len(expiry) > 80: expiry = ""
+    except (ValueError, OverflowError, OSError):
+        expiry = ""
+    return {"plan": plan, "expires_at": expiry}
+
+
+def auto_am_start_token():
+    return "amauto:new:" + secrets.token_hex(8)
+
+
+def auto_am_get_job(owner_id, job_id):
+    temp_mail_assert_owner(owner_id)
+    conn = db()
+    try:
+        row = conn.execute("SELECT * FROM owner_auto_am_jobs WHERE id=? AND owner_id=?",
+                           (int(job_id), int(owner_id))).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def auto_am_latest_job(owner_id):
+    temp_mail_assert_owner(owner_id)
+    conn = db()
+    try:
+        row = conn.execute("SELECT * FROM owner_auto_am_jobs WHERE owner_id=? ORDER BY id DESC LIMIT 1",
+                           (int(owner_id),)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def auto_am_update(owner_id, job_id, **values):
+    allowed = {"mailbox_id", "email", "correlation_id", "stage", "status", "detail",
+               "provider_plan", "provider_expiry", "magic_activity_id", "verify_activity_id", "magic_sent_at"}
+    if not values or not set(values) <= allowed:
+        raise ValueError("Perubahan aktivasi tidak valid.")
+    values["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn = db()
+    try:
+        conn.execute("UPDATE owner_auto_am_jobs SET " + ",".join(key + "=?" for key in values)
+                     + " WHERE id=? AND owner_id=?", (*values.values(), int(job_id), int(owner_id)))
+        conn.commit()
+    finally:
+        conn.close()
+    return auto_am_get_job(owner_id, job_id)
+
+
+def auto_am_bind_mailbox(owner_id, job_id, mailbox):
+    job = auto_am_get_job(owner_id, job_id)
+    if not job or (job["mailbox_id"] and int(job["mailbox_id"]) != int(mailbox["id"])):
+        raise TempMailError("Sesi aktivasi tidak cocok dengan email.", status=409)
+    return auto_am_update(owner_id, job_id, mailbox_id=int(mailbox["id"]), email=str(mailbox["address"]).lower())
+
+
+def auto_am_job_for_ticket(owner_id, ticket):
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        row = conn.execute("SELECT j.* FROM owner_auto_am_tickets t JOIN owner_auto_am_jobs j ON j.id=t.job_id "
+                           "WHERE t.token=? AND t.owner_id=? AND j.owner_id=?",
+                           (ticket, int(owner_id), int(owner_id))).fetchone()
+        if row:
+            conn.rollback()
+            return dict(row)
+        if conn.execute("SELECT 1 FROM owner_auto_am_tickets WHERE token=?", (ticket,)).fetchone():
+            raise ValueError("Tombol aktivasi tidak valid.")
+        row = conn.execute("SELECT * FROM owner_auto_am_jobs WHERE owner_id=? "
+                           "AND status IN ('running','waiting') ORDER BY id DESC LIMIT 1", (int(owner_id),)).fetchone()
+        if not row:
+            cur = conn.execute("INSERT INTO owner_auto_am_jobs(owner_id,created_at,updated_at) VALUES(?,?,?)",
+                               (int(owner_id), now, now))
+            row = conn.execute("SELECT * FROM owner_auto_am_jobs WHERE id=?", (int(cur.lastrowid),)).fetchone()
+        conn.execute("INSERT INTO owner_auto_am_tickets(token,owner_id,job_id,created_at) VALUES(?,?,?,?)",
+                     (ticket, int(owner_id), int(row["id"]), now))
+        conn.commit()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def auto_am_lease(owner_id, job_id):
+    now = datetime.now(timezone.utc)
+    token = secrets.token_hex(16)
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        changed = conn.execute("UPDATE owner_auto_am_jobs SET lease_token=?,lease_until=? "
+                               "WHERE id=? AND owner_id=? AND (lease_token='' OR lease_until<=?)",
+                               (token, (now + timedelta(minutes=5)).isoformat(timespec="seconds"),
+                                int(job_id), int(owner_id), now.isoformat(timespec="seconds"))).rowcount
+        conn.commit()
+        return token if changed else ""
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def auto_am_release(owner_id, job_id, token):
+    conn = db()
+    try:
+        conn.execute("UPDATE owner_auto_am_jobs SET lease_token='',lease_until='' "
+                     "WHERE id=? AND owner_id=? AND lease_token=?", (int(job_id), int(owner_id), token))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def auto_am_claim_stage(job, action):
+    column = {"send_verification_link": "magic_activity_id", "verify_account": "verify_activity_id"}[action]
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        row = conn.execute("SELECT * FROM owner_auto_am_jobs WHERE id=? AND owner_id=?",
+                           (job["id"], job["owner_id"])).fetchone()
+        if not row or row[column]:
+            conn.rollback()
+            return 0
+        activity = conn.execute("INSERT INTO tool_activity_logs(owner_id,action,target_email,status,http_status,detail,created_at,updated_at) "
+                                "VALUES(?,?,?,'pending',0,'',?,?)", (job["owner_id"], action, job["email"], now, now))
+        fields = {column: int(activity.lastrowid), "stage": "send_requested" if action == "send_verification_link" else "verify_requested"}
+        if action == "send_verification_link":
+            fields["magic_sent_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        conn.execute("UPDATE owner_auto_am_jobs SET " + ",".join(key + "=?" for key in fields) + " WHERE id=?",
+                     (*fields.values(), job["id"]))
+        conn.commit()
+        return int(activity.lastrowid)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def auto_am_flow_result(job):
+    if not job.get("correlation_id"):
+        return None
+    conn = db()
+    try:
+        row = conn.execute("SELECT f.status,f.http_status,f.provider_ref,f.apply_started_at,a.status AS activity_status "
+                           "FROM tool_provider_flows f LEFT JOIN tool_activity_logs a ON a.id=f.apply_activity_id "
+                           "AND a.owner_id=f.owner_id AND a.target_email=f.target_email AND a.action='apply_premium' "
+                           "WHERE f.correlation_id=? AND f.owner_id=? AND f.target_email=? AND f.stage='apply_premium'",
+                           (job["correlation_id"], job["owner_id"], job["email"])).fetchone()
+        if not row or not row["apply_started_at"]:
+            return None
+        result = dict(row)
+        # Only a completed, matching apply activity can certify this account's success.
+        if result["status"] == "success" and result["activity_status"] != "success":
+            result["status"] = "unknown"
+        return result
+    finally:
+        conn.close()
+
+
+def auto_am_mail_candidate(message, job):
+    sender = str((message.get("from") or {}).get("address") or "").strip().lower()
+    name = str((message.get("from") or {}).get("name") or "").lower()
+    subject = str(message.get("subject") or "").lower()
+    if "alight" not in sender and "alight" not in name and "alight" not in subject:
+        return False
+    recipients = {str(item.get("address") or "").lower() for item in message.get("to", []) if isinstance(item, dict)}
+    if recipients and job["email"] not in recipients:
+        return False
+    try:
+        sent = datetime.fromisoformat(job["magic_sent_at"].replace("Z", "+00:00"))
+        received = datetime.fromisoformat(str(message.get("createdAt") or "").replace("Z", "+00:00"))
+        if sent.tzinfo is None: sent = sent.replace(tzinfo=timezone.utc)
+        if received.tzinfo is None: received = received.replace(tzinfo=timezone.utc)
+        if received < sent - timedelta(seconds=120):
+            return False
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+async def auto_am_find_link(job, call):
+    deadline = time.monotonic() + max(0, min(180, float(TOOLS_AUTO_AM_MAIL_WAIT_SECONDS)))
+    checked = set()
+    scans = 0
+    while True:
+        scans += 1
+        inbox = await temp_mail_fetch_inbox(job["owner_id"], job["mailbox_id"])
+        for item in inbox["messages"]:
+            if item["id"] in checked or not auto_am_mail_candidate(item, job):
+                continue
+            message = await temp_mail_read_message(job["owner_id"], job["mailbox_id"], item["id"])
+            if not auto_am_mail_candidate(message, job):
+                continue
+            checked.add(item["id"])
+            try:
+                return auto_am_extract_magic_link(message)
+            except ValueError:
+                continue
+        if time.monotonic() >= deadline or scans >= 61:
+            return ""
+        await asyncio.sleep(max(0, min(15, float(TOOLS_AUTO_AM_POLL_SECONDS))))
+
+
+async def auto_am_progress(call, text):
+    await safe_edit_or_answer(call, "⏳ <b>AKTIVASI AM PRO OTOMATIS</b>\n\n" + text
+                              + "\n\nTunggu hasil akhir. Gunakan fitur dengan bijak.", parse_mode="HTML")
+
+
+async def auto_am_run(call, job):
+    owner, job_id = int(job["owner_id"]), int(job["id"])
+    state = AutoAMJobState(owner, job_id)
+    if job["status"] == "success" or job["status"] == "failed":
+        return job
+    persisted = auto_am_flow_result(job)
+    if persisted:
+        await state.update_data(tools_target_email=job["email"], tools_verify_email=job["email"],
+                                tools_correlation_id=job["correlation_id"], tools_apply_requested=True)
+        if persisted["status"] in {"pending", "unknown"} and TOOLS_PROVIDER_APPLY_STATUS_URL:
+            await auto_am_progress(call, "Memeriksa hasil Apply Premium...")
+            await refresh_tools_apply_result(state, owner)
+            persisted = auto_am_flow_result(job) or persisted
+        data = await state.get_data()
+        metadata = data.get("tools_apply_license_status") or {}
+        status = persisted["status"]
+        job = auto_am_update(owner, job_id, stage="apply_premium", status="waiting" if status == "pending" else status,
+                            detail="Apply masih diproses provider." if status == "pending" else
+                            ("Status Apply belum diketahui. Periksa hasil tanpa mengulang Apply." if status == "unknown" else ""),
+                            provider_plan=str(metadata.get("plan") or job["provider_plan"])[:200],
+                            provider_expiry=str(metadata.get("expires_at") or job["provider_expiry"])[:100])
+        if status in {"success", "failed"}: state.forget()
+        return job
+    if job["verify_activity_id"] and not (await state.get_data()).get("tools_verify_id_token"):
+        state.forget()
+        return auto_am_update(owner, job_id, status="unknown", detail="Verifikasi sudah dikirim, tetapi sesi token tidak tersedia. Periksa provider; verifikasi tidak diulang.")
+    if not job["mailbox_id"]:
+        await auto_am_progress(call, "Membuat email Temp Mail...")
+        mailbox = await temp_mail_create_account(owner, auto_job_id=job_id)
+        job = auto_am_bind_mailbox(owner, job_id, mailbox)
+    else:
+        mailbox = temp_mail_public_mailbox(temp_mail_owned_row(owner, job["mailbox_id"]))
+        if mailbox["state"] != "ready":
+            mailbox = await temp_mail_resume_account(owner, job["mailbox_id"])
+    if not job["correlation_id"]:
+        flow = create_tool_provider_flow(owner, job["email"], "send_magic_link")
+        job = auto_am_update(owner, job_id, correlation_id=flow)
+    if not job["magic_activity_id"]:
+        await auto_am_progress(call, "Mengirim Magic Link otomatis...")
+        activity = auto_am_claim_stage(job, "send_verification_link")
+        if not activity:
+            return auto_am_get_job(owner, job_id)
+        try:
+            ok, http_status, result = await tools_provider_request("POST", TOOLS_PROVIDER_MAGICLINK_URL,
+                payload={"email": job["email"]}, owner_id=owner)
+            status = provider_response_state(result, http_status=http_status)
+            unknown = bool(isinstance(result, dict) and result.get("_outcome_unknown"))
+            if not ok: status = "unknown" if unknown else "failed"
+            update_tool_activity(activity, status=status, http_status=http_status, detail=tool_response_preview(result))
+        except BaseException:
+            update_tool_activity(activity, status="unknown", detail="Kirim Magic Link terputus; periksa kotak masuk.")
+            auto_am_update(owner, job_id, stage="waiting_mail", status="waiting", detail="Periksa kotak masuk; pengiriman link tidak diulang.")
+            raise
+        if status == "failed":
+            return auto_am_update(owner, job_id, status="failed", detail="Provider gagal mengirim Magic Link. Email tetap tersimpan.")
+        job = auto_am_update(owner, job_id, stage="waiting_mail", status="waiting", detail="")
+    if not job["verify_activity_id"]:
+        await auto_am_progress(call, "Menunggu email dan membaca Magic Link...")
+        link = await auto_am_find_link(job, call)
+        if not link:
+            return auto_am_update(owner, job_id, stage="waiting_mail", status="waiting",
+                detail="Magic Link belum diterima atau tautannya belum dapat dibaca. Pilih Lanjutkan untuk memeriksa email lagi.")
+        locked, _ = acquire_tool_email_lock(owner, job["email"], "verify_account")
+        if not locked:
+            return auto_am_update(owner, job_id, status="waiting", detail="Email sedang diproses. Coba Lanjutkan setelah selesai.")
+        activity = 0
+        try:
+            await auto_am_progress(call, "Memverifikasi Magic Link otomatis...")
+            activity = auto_am_claim_stage(job, "verify_account")
+            if not activity:
+                return auto_am_get_job(owner, job_id)
+            ok, http_status, result = await tools_provider_request("POST", TOOLS_PROVIDER_VERIFY_URL,
+                payload={"email": job["email"], "rawLink": link}, owner_id=owner)
+            status = provider_response_state(result, http_status=http_status)
+            token = extract_verify_id_token(result) if ok and status == "success" else ""
+            returned_email = find_provider_value(result, ("email",))
+            if returned_email and str(returned_email).strip().lower() != job["email"]:
+                token = ""
+                status = "failed"
+            if not ok:
+                status = "unknown" if isinstance(result, dict) and result.get("_outcome_unknown") else "failed"
+            if status == "success" and not token: status = "failed"
+            update_tool_activity(activity, status=status, http_status=http_status, detail="Verifikasi akun: " + status)
+            update_tool_provider_flow(job["correlation_id"], stage="verify_account", status=status, http_status=http_status)
+            if not token:
+                state.forget()
+                return auto_am_update(owner, job_id, stage="verify_requested", status="unknown" if status in {"pending", "unknown"} else "failed",
+                    detail="Verifikasi belum menghasilkan token yang cocok. Apply belum dikirim; verifikasi tidak diulang.")
+            now = datetime.now().isoformat(timespec="seconds")
+            await state.update_data(tools_target_email=job["email"], tools_verify_email=job["email"],
+                tools_verify_id_token=token, tools_verify_id_token_at=now, tools_session_started_at=now,
+                tools_final_status="success", tools_correlation_id=job["correlation_id"],
+                tools_provider_apply_premium_result={}, tools_apply_requested=False)
+            job = auto_am_update(owner, job_id, stage="ready_apply", status="running", detail="")
+        except BaseException:
+            if activity:
+                update_tool_activity(activity, status="unknown", detail="Verifikasi terputus; verifikasi tidak diulang.")
+                auto_am_update(owner, job_id, stage="verify_requested", status="unknown", detail="Hasil verifikasi belum diketahui; verifikasi tidak diulang.")
+            raise
+        finally:
+            release_tool_email_lock(job["email"])
+            link = ""
+    await auto_am_progress(call, "Menerapkan premium dan membaca hasil provider...")
+    await run_tools_apply_once(call, state, progress=False)
+    job = auto_am_get_job(owner, job_id)
+    if auto_am_flow_result(job):
+        return await auto_am_run(call, job)
+    return auto_am_update(owner, job_id, stage="ready_apply", status="waiting",
+                          detail="Apply belum dikirim. Kuota atau sesi belum siap; pilih Lanjutkan.")
+
+
+async def auto_am_render(call, job):
+    status = job["status"]
+    # Recheck the durable apply evidence even when presenting a previously saved success.
+    if status == "success" and (auto_am_flow_result(job) or {}).get("status") != "success":
+        status = "unknown"
+    title = {"success": "✅ APPLY PREMIUM SUKSES", "failed": "❌ AKTIVASI BELUM BERHASIL",
+             "unknown": "❔ HASIL BELUM DIKETAHUI", "waiting": "⏳ AKTIVASI MENUNGGU",
+             "running": "⏳ AKTIVASI SEDANG BERJALAN"}.get(status, "⏳ AKTIVASI MENUNGGU")
+    lines = ["<b>" + title + "</b>", "", "AM Pro • Paket diminta: 1 tahun"]
+    if job["email"]:
+        lines.extend(["", "📧 <code>" + html.escape(job["email"]) + "</code>"])
+    if status == "success":
+        lines.append("Email sudah melalui verifikasi dan Apply Premium sukses menurut provider.")
+        if job["provider_plan"]: lines.append("Paket provider: " + html.escape(job["provider_plan"]))
+        if job["provider_expiry"]: lines.append("Berlaku sampai: " + html.escape(job["provider_expiry"]))
+        else: lines.append("Durasi belum diinformasikan provider; periksa paket pada akun.")
+    elif job["detail"]:
+        lines.append(html.escape(job["detail"][:500]))
+    rows = []
+    if job["mailbox_id"]:
+        rows.append([InlineKeyboardButton(text="📥 Received Mail", callback_data=f"tm:inbox:{job['mailbox_id']}:1")])
+    if job["email"]:
+        rows.append([InlineKeyboardButton(text="📋 Salin Email", copy_text=CopyTextButton(text=job["email"]))])
+    if status in {"waiting", "unknown", "running"}:
+        rows.append([InlineKeyboardButton(text="🔄 Lanjutkan / Periksa Hasil", callback_data=f"amauto:resume:{job['id']}")])
+    if status in {"success", "failed", "unknown"}:
+        rows.append([InlineKeyboardButton(text="⚡ Aktivasi Baru", callback_data=auto_am_start_token())])
+    if job["mailbox_id"]:
+        try:
+            me = await call.bot.get_me()
+            username = str(me.username or "")
+            if re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+                url = f"https://t.me/{username}?start=am_mail_{job['mailbox_id']}"
+                rows.append([InlineKeyboardButton(text="🔗 Link Kotak Masuk", url=url)])
+        except Exception:
+            pass
+    rows.append([InlineKeyboardButton(text="⬅️ Owner Tools", callback_data="tools:home")])
+    await safe_edit_or_answer(call, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("amauto:"))
+async def owner_auto_am_callback(call: CallbackQuery):
+    if not await temp_mail_require_owner(call): return
+    parts = str(call.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in {"new", "resume", "view"}:
+        return await safe_callback_notice(call, "Tombol aktivasi tidak valid.", show_alert=True)
+    if parts[1] == "new" and not re.fullmatch(r"[a-f0-9]{16}", parts[2]):
+        return await safe_callback_notice(call, "Tombol aktivasi tidak valid.", show_alert=True)
+    if parts[1] != "new" and not re.fullmatch(r"[1-9][0-9]{0,9}", parts[2]):
+        return await safe_callback_notice(call, "Sesi aktivasi tidak valid.", show_alert=True)
+    await safe_callback_notice(call, "Memproses aktivasi...")
+    job = None
+    lease = ""
+    try:
+        if parts[1] == "new":
+            conn = db()
+            try:
+                previous = conn.execute("SELECT job_id FROM owner_auto_am_tickets WHERE token=? AND owner_id=?", (parts[2], call.from_user.id)).fetchone()
+            finally:
+                conn.close()
+            if previous: job = auto_am_get_job(call.from_user.id, previous["job_id"])
+        else:
+            job = auto_am_get_job(call.from_user.id, int(parts[2]))
+            if not job:
+                return await safe_callback_notice(call, "Sesi aktivasi tidak ditemukan.", show_alert=True)
+        if job and (parts[1] == "view" or job["status"] in {"success", "failed"}):
+            return await auto_am_render(call, job)
+        if job and auto_am_flow_result(job):
+            lease = auto_am_lease(call.from_user.id, job["id"])
+            if lease and TOOLS_PROVIDER_ENABLED and TOOLS_PROVIDER_API_KEY:
+                job = await auto_am_run(call, job)
+            return await auto_am_render(call, job)
+        if not tools_provider_ready():
+            return await safe_edit_or_answer(call, "⚠️ Konfigurasi provider belum lengkap. Atur API key serta endpoint Kirim Link, Verifikasi, dan Apply Premium.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Owner Tools", callback_data="tools:home")]]))
+        for url in (TOOLS_PROVIDER_MAGICLINK_URL, TOOLS_PROVIDER_VERIFY_URL, TOOLS_PROVIDER_APPLY_URL):
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+                return await safe_callback_notice(call, "Endpoint provider tidak valid.", show_alert=True)
+        if parts[1] == "new":
+            # A replay must recover its existing result even when the quota is now exhausted.
+            conn = db()
+            try:
+                ticket = conn.execute("SELECT job_id FROM owner_auto_am_tickets WHERE token=? AND owner_id=?", (parts[2], call.from_user.id)).fetchone()
+            finally:
+                conn.close()
+            if not ticket:
+                quota_ok, quota = tools_quota_can_process(call.from_user.id, requests_needed=3)
+                if not quota_ok:
+                    return await safe_edit_or_answer(call, "⚠️ Kuota tidak cukup untuk Kirim Link → Verifikasi → Apply (3 request). Reset " + html.escape(quota["reset_at"]),
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Owner Tools", callback_data="tools:home")]]), parse_mode="HTML")
+            job = auto_am_job_for_ticket(call.from_user.id, parts[2])
+        else:
+            job = auto_am_get_job(call.from_user.id, int(parts[2]))
+        if not job:
+            return await safe_callback_notice(call, "Sesi aktivasi tidak ditemukan.", show_alert=True)
+        if parts[1] != "view":
+            lease = auto_am_lease(call.from_user.id, job["id"])
+            if lease:
+                job = await auto_am_run(call, job)
+        await auto_am_render(call, job)
+    except Exception as exc:
+        if job:
+            latest = auto_am_get_job(call.from_user.id, job["id"])
+            if latest:
+                preserved = latest["status"] if latest["status"] in {"success", "failed", "unknown"} else "waiting"
+                detail = latest["detail"] or (str(exc)[:400] if isinstance(exc, TempMailError) else "Koneksi terputus. Periksa hasil; permintaan yang telah dikirim tidak diulang.")
+                job = auto_am_update(call.from_user.id, job["id"], status=preserved, detail=detail)
+                await auto_am_render(call, job)
+        else:
+            await safe_edit_or_answer(call, "⚠️ Aktivasi belum dapat dimulai. Silakan kembali ke /tools dan coba lagi.")
+    finally:
+        if lease and job:
+            auto_am_release(call.from_user.id, job["id"], lease)
+
+
+async def auto_am_mail_link_open(message):
+    if not is_owner(message.from_user.id) or str(message.chat.type) != "private" or message.chat.id != message.from_user.id:
+        return await message.answer("Kotak masuk ini khusus owner melalui chat pribadi bot.")
+    match = re.fullmatch(r"/start(?:@[A-Za-z0-9_]+)?\s+am_mail_([1-9][0-9]{0,9})\s*", message.text or "")
+    if not match: return
+    try:
+        mailbox = temp_mail_public_mailbox(temp_mail_owned_row(message.from_user.id, int(match.group(1))))
+        await message.answer("📥 <b>KOTAK MASUK EMAIL</b>\n\n<code>" + html.escape(mailbox["address"]) + "</code>\n\nPilih Received Mail untuk membaca pesan.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📥 Received Mail", callback_data=f"tm:inbox:{mailbox['id']}:1")],
+                [InlineKeyboardButton(text="⬅️ Owner Tools", callback_data="tools:home")]]), parse_mode="HTML")
+    except (TempMailError, sqlite3.Error):
+        await message.answer("Kotak masuk tidak tersedia atau bukan milik Anda.")
+
+
+def temp_mail_plain_body(message: dict) -> str:
+    """Display provider content as plain text; retain links without fetching them."""
+    result = temp_mail_message_text(message)
+    result = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(result)).replace("\r\n", "\n").replace("\r", "\n")
+    result = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", result).strip()
+    return result or "Pesan ini tidak memiliki isi teks. Lampiran tidak diunduh oleh bot."
+
+
+def temp_mail_body_pages(text: str, units: int = 2800) -> list:
+    # Budget the escaped output too: entities and emoji must fit Telegram's limit.
+    pages = []
+    buffer = []
+    size = 0
+    for character in text:
+        escaped = html.escape(character)
+        width = len(escaped.encode("utf-16-le")) // 2
+        if buffer and size + width > units:
+            pages.append("".join(buffer))
+            buffer = []
+            size = 0
+        buffer.append(character)
+        size += width
+    if buffer:
+        pages.append("".join(buffer))
+    return pages or [""]
+
+
+def temp_mail_ui_keyboard(mailbox=None):
+    keyboard=[[InlineKeyboardButton(text="📧 Buat Email",callback_data="tm:create")]]
+    if mailbox:
+        if str(mailbox.get("state") or "")=="ready":
+            keyboard.append([
+                InlineKeyboardButton(text="📥 Received Mail",callback_data=f"tm:inbox:{mailbox['id']}:1"),
+                InlineKeyboardButton(text="📋 Alamat Email",callback_data="tm:address"),
+            ])
+        else:
+            keyboard.append([InlineKeyboardButton(text="♻️ Lanjutkan Pembuatan",callback_data=f"tm:resume:{mailbox['id']}")])
+    keyboard.extend([
+        [InlineKeyboardButton(text="🗂 Daftar Email",callback_data="tm:accounts"),InlineKeyboardButton(text="🌐 Domain",callback_data="tm:domains")],
+        [InlineKeyboardButton(text="ℹ️ Panduan",callback_data="tm:help"),InlineKeyboardButton(text="🔄 Refresh",callback_data="tm:home")],
+        [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def temp_mail_render_home(call: CallbackQuery, *, notice=""):
+    mailbox=temp_mail_get_active(call.from_user.id)
+    text="📬 <b>TEMP MAIL — KHUSUS OWNER</b>\n\n"
+    if notice:text+=html.escape(notice)+"\n\n"
+    if mailbox:
+        text+=f"📧 Email aktif:\n<code>{html.escape(str(mailbox.get('address') or '-'))}</code>\n"
+        text+=("Status: <b>Siap menerima pesan</b>\n" if mailbox.get("state")=="ready" else "Status: <b>Pembuatan belum selesai</b>\n")
+    else:text+="Belum ada email aktif. Pilih Buat Email untuk memulai.\n"
+    text+=("\nGunakan fitur dengan bijak. Alamat ini untuk kebutuhan sementara.\n"
+           "Pesan masuk dibuka melalui Received Mail.\n"
+           "Provider: <a href=\"https://mail.tm\">Mail.tm</a> • Gratis tanpa API key.")
+    await safe_edit_or_answer(call,text,reply_markup=temp_mail_ui_keyboard(mailbox),parse_mode="HTML")
+
+
+async def temp_mail_ui_error(call: CallbackQuery, exc):
+    detail=str(exc) if isinstance(exc,TempMailError) else "Terjadi kendala sementara. Silakan coba lagi."
+    await safe_edit_or_answer(
+        call,"⚠️ <b>TEMP MAIL BELUM BERHASIL</b>\n\n"+html.escape(detail[:400])+"\n\n"
+        "Email yang sudah dibuat tetap tersimpan. Buka Daftar Email untuk melanjutkan atau memilih alamat.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗂 Daftar Email",callback_data="tm:accounts")],
+            [InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")],
+        ]),parse_mode="HTML",
+    )
+
+
+@router.callback_query((F.data == "tools:tempmail") | (F.data == "tm:home"))
+async def owner_temp_mail_home(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call)
+    try:await temp_mail_render_home(call)
+    except Exception as exc:await temp_mail_ui_error(call,exc)
+
+
+@router.callback_query(F.data == "tm:create")
+async def owner_temp_mail_create(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call,"Membuat email...")
+    try:
+        await temp_mail_create_account(call.from_user.id)
+        await temp_mail_render_home(call,notice="✅ Email berhasil dibuat.")
+    except Exception as exc:await temp_mail_ui_error(call,exc)
+
+
+@router.callback_query(F.data == "tm:address")
+async def owner_temp_mail_address(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call)
+    try:
+        mailbox=temp_mail_get_active(call.from_user.id)
+        if not mailbox:return await temp_mail_render_home(call)
+        address=str(mailbox.get("address") or "")
+        keyboard=[]
+        if address and len(address)<=256:
+            keyboard.append([InlineKeyboardButton(text="📋 Salin Alamat Email",copy_text=CopyTextButton(text=address))])
+        if mailbox.get("state")=="ready":
+            keyboard.append([InlineKeyboardButton(text="📥 Received Mail",callback_data=f"tm:inbox:{mailbox['id']}:1")])
+        keyboard.append([InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")])
+        await safe_edit_or_answer(call,"📋 <b>ALAMAT EMAIL AKTIF</b>\n\n"+f"<code>{html.escape(address)}</code>\n\n"
+                                  "Gunakan tombol Salin, lalu buka Received Mail untuk membaca pesan masuk.",
+                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
+    except Exception as exc:await temp_mail_ui_error(call,exc)
+
+
+@router.callback_query(F.data == "tm:accounts")
+async def owner_temp_mail_accounts(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call)
+    try:
+        accounts=[mailbox for mailbox in temp_mail_list_accounts(call.from_user.id) if mailbox.get("state")!="failed"]
+        lines=["🗂 <b>DAFTAR EMAIL</b>","","Pilih alamat untuk digunakan. Maksimal 5 alamat per owner."]
+        keyboard=[]
+        for mailbox in accounts[:5]:
+            address=str(mailbox.get("address") or "-")
+            ready=mailbox.get("state")=="ready"
+            icon="✅" if mailbox.get("active") else "▫️"
+            lines.append(f"{icon} <code>{html.escape(address)}</code>\n"+("Siap menerima pesan" if ready else "Pembuatan belum selesai"))
+            action="use" if ready else "resume"
+            keyboard.append([InlineKeyboardButton(text=("📧 " if ready else "♻️ ")+address[:55],callback_data=f"tm:{action}:{mailbox['id']}")])
+        if not accounts:lines.append("Belum ada alamat. Buat email baru untuk memulai.")
+        if len(accounts)<5:keyboard.append([InlineKeyboardButton(text="📧 Buat Email",callback_data="tm:create")])
+        keyboard.append([InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")])
+        await safe_edit_or_answer(call,"\n\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
+    except Exception as exc:await temp_mail_ui_error(call,exc)
+
+
+@router.callback_query(F.data.startswith("tm:use:"))
+async def owner_temp_mail_activate(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call)
+    values=temp_mail_parse_callback(call.data,"use",1)
+    if not values:return await temp_mail_ui_error(call,TempMailError("Alamat email tidak valid. Pilih kembali dari Daftar Email."))
+    try:
+        temp_mail_activate_account(call.from_user.id,values[0])
+        await temp_mail_render_home(call,notice="✅ Alamat email aktif diperbarui.")
+    except Exception as exc:await temp_mail_ui_error(call,exc)
+
+
+@router.callback_query(F.data.startswith("tm:resume:"))
+async def owner_temp_mail_resume(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call,"Melanjutkan pembuatan...")
+    values=temp_mail_parse_callback(call.data,"resume",1)
+    if not values:return await temp_mail_ui_error(call,TempMailError("Alamat email tidak valid. Pilih kembali dari Daftar Email."))
+    try:
+        await temp_mail_resume_account(call.from_user.id,values[0])
+        await temp_mail_render_home(call,notice="✅ Email siap digunakan.")
+    except Exception as exc:await temp_mail_ui_error(call,exc)
+
+
+@router.callback_query(F.data == "tm:domains")
+async def owner_temp_mail_domains(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call,"Memuat domain...")
+    try:
+        domains=await temp_mail_domains()
+        lines=["🌐 <b>DOMAIN TEMP MAIL</b>","","Domain aktif dari Mail.tm:"]
+        lines.extend("• <code>"+rating_html_excerpt(domain,100)+"</code>" for domain in domains[:20])
+        if not domains:lines.append("Belum ada domain aktif. Silakan coba lagi nanti.")
+        lines.extend(["","Saat Buat Email, bot memakai domain aktif yang tersedia.","Provider: <a href=\"https://mail.tm\">Mail.tm</a>"])
+        await safe_edit_or_answer(call,"\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Refresh Domain",callback_data="tm:domains")],
+            [InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")],
+        ]),parse_mode="HTML")
+    except Exception as exc:await temp_mail_ui_error(call,exc)
+
+
+@router.callback_query(F.data == "tm:help")
+async def owner_temp_mail_help(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call)
+    await safe_edit_or_answer(
+        call,"ℹ️ <b>PANDUAN TEMP MAIL</b>\n\n"
+        "1. Buat Email, lalu salin alamatnya.\n"
+        "2. Gunakan alamat untuk menerima email sementara.\n"
+        "3. Buka Received Mail dan tekan Refresh.\n"
+        "4. Pilih pesan untuk membaca isi lengkapnya.\n\n"
+        "Daftar Email menyimpan maksimal 5 alamat. Alamat dan akses email tetap tersedia setelah bot restart.\n"
+        "Isi pesan ditampilkan sebagai teks. Link dibuka sendiri; bot tidak otomatis menjalankan link atau Apply Premium.\n\n"
+        "Gunakan fitur dengan bijak. Hindari data penting karena provider dapat menghapus email sementara.\n"
+        "Provider: <a href=\"https://mail.tm\">Mail.tm</a> • Gratis tanpa API key.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")]]),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("tm:inbox:"))
+async def owner_temp_mail_inbox(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call,"Memuat pesan masuk...")
+    values=temp_mail_parse_callback(call.data,"inbox",2)
+    if not values:return await temp_mail_ui_error(call,TempMailError("Halaman pesan tidak valid. Buka kembali Received Mail."))
+    mailbox_id,page=values
+    if page>6000:return await temp_mail_ui_error(call,TempMailError("Halaman pesan tidak valid."))
+    try:
+        provider_page=(page-1)//6+1
+        result=await temp_mail_fetch_inbox(call.from_user.id,mailbox_id,provider_page)
+        total=max(0,int(result.get("total") or 0))
+        pages=max(1,min(6000,(total+4)//5))
+        bounded=min(page,pages)
+        bounded_provider=(bounded-1)//6+1
+        if bounded_provider!=provider_page:
+            result=await temp_mail_fetch_inbox(call.from_user.id,mailbox_id,bounded_provider)
+        page=bounded
+        messages=result.get("messages") or []
+        offset=((page-1)%6)*5
+        visible=messages[offset:offset+5]
+        address=str(result.get("address") or (result.get("mailbox") or {}).get("address") or "")[:254]
+        lines=["📥 <b>RECEIVED MAIL</b>"]
+        if address:lines.append(f"📧 <code>{html.escape(address)}</code>")
+        lines.extend([f"Pesan: <b>{total}</b> • Halaman <b>{page}/{pages}</b>",""])
+        keyboard=[]
+        for number,message in enumerate(visible,(page-1)*5+1):
+            subject=str(message.get("subject") or "Tanpa subjek")[:140]
+            sender=message.get("from") or {}
+            sender=str(sender.get("address") or sender.get("name") or "-")[:140] if isinstance(sender,dict) else str(sender)[:140]
+            icon="📩" if not message.get("seen") else "📨"
+            lines.append(f"{icon} <b>{number}. {rating_html_excerpt(subject,180)}</b>\nDari: {rating_html_excerpt(sender,180)}")
+            message_id=str(message.get("id") or "")
+            callback=f"tm:read:{mailbox_id}:{message_id}:1"
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,32}",message_id) and len(callback.encode())<=64:
+                keyboard.append([InlineKeyboardButton(text=f"{number}. "+subject[:50],callback_data=callback)])
+        if not visible:lines.append("Belum ada pesan masuk. Tunggu sebentar, lalu tekan Refresh.")
+        nav=[]
+        if page>1:nav.append(InlineKeyboardButton(text="⬅️",callback_data=f"tm:inbox:{mailbox_id}:{page-1}"))
+        if page<pages:nav.append(InlineKeyboardButton(text="➡️",callback_data=f"tm:inbox:{mailbox_id}:{page+1}"))
+        if nav:keyboard.append(nav)
+        keyboard.extend([
+            [InlineKeyboardButton(text="🔄 Refresh",callback_data=f"tm:inbox:{mailbox_id}:{page}"),InlineKeyboardButton(text="📋 Alamat",callback_data="tm:address")],
+            [InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")],
+        ])
+        await safe_edit_or_answer(call,"\n\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
+    except Exception as exc:await temp_mail_ui_error(call,exc)
+
+
+@router.callback_query(F.data.startswith("tm:read:"))
+async def owner_temp_mail_read(call: CallbackQuery):
+    if not await temp_mail_require_owner(call):return
+    await safe_callback_notice(call,"Membaca pesan...")
+    values=temp_mail_parse_callback(call.data,"read",3)
+    if not values:return await temp_mail_ui_error(call,TempMailError("Pesan tidak valid. Pilih kembali dari Received Mail."))
+    mailbox_id,message_id,page=values
+    try:
+        message=await temp_mail_read_message(call.from_user.id,mailbox_id,message_id)
+        body_pages=temp_mail_body_pages(temp_mail_plain_body(message))
+        page=min(page,len(body_pages))
+        sender=message.get("from") or {}
+        sender=str(sender.get("address") or sender.get("name") or "-")[:160] if isinstance(sender,dict) else str(sender)[:160]
+        subject=str(message.get("subject") or "Tanpa subjek")[:160]
+        date=format_wib_datetime(str(message.get("createdAt") or message.get("updatedAt") or "-")[:50],compact=True)
+        address=str(message.get("address") or (message.get("mailbox") or {}).get("address") or "")[:254]
+        text=("📨 <b>ISI PESAN</b>\n\n"
+              +(f"Email: <code>{html.escape(address)}</code>\n" if address else "")
+              +
+              f"Dari: <code>{rating_html_excerpt(sender,200)}</code>\n"
+              f"Subjek: <b>{rating_html_excerpt(subject,250)}</b>\n"
+              f"Waktu: {rating_html_excerpt(date,80)}\n"
+              f"Halaman: <b>{page}/{len(body_pages)}</b>\n\n"
+              +html.escape(body_pages[page-1]))
+        nav=[]
+        if page>1:nav.append(InlineKeyboardButton(text="⬅️ Isi sebelumnya",callback_data=f"tm:read:{mailbox_id}:{message_id}:{page-1}"))
+        if page<len(body_pages):nav.append(InlineKeyboardButton(text="Isi berikutnya ➡️",callback_data=f"tm:read:{mailbox_id}:{message_id}:{page+1}"))
+        # Rare long provider IDs with a huge mailbox ID can exceed Telegram's limit.
+        nav=[button for button in nav if len(str(button.callback_data).encode())<=64]
+        keyboard=([nav] if nav else [])+[[InlineKeyboardButton(text="⬅️ Received Mail",callback_data=f"tm:inbox:{mailbox_id}:1")]]
+        await safe_edit_or_answer(call,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
+    except Exception as exc:await temp_mail_ui_error(call,exc)
+
+
 @router.callback_query(F.data == "tools:more")
 async def owner_tools_more(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await deny_owner_callback(call)
-    await safe_edit_or_answer(
-        call,
-        "⚙️ <b>TOOLS LAINNYA</b>\n\n"
-        "Diagnostik, recovery, token, dan status provider.",
-        reply_markup=owner_tools_more_menu(),
-        parse_mode="HTML"
-    )
+    if not await tools_cleanup_require_owner(call):return
+    await safe_edit_or_answer(call,owner_tools_home_text(call.from_user.id),
+                              reply_markup=owner_tools_more_menu(),parse_mode="HTML")
     await safe_callback_notice(call)
 
 
@@ -15778,7 +17619,11 @@ async def verify_join(call: CallbackQuery, bot: Bot, state: FSMContext):
 
 @router.callback_query(F.data == "start:view")
 async def cb_start_view(call: CallbackQuery, state: FSMContext, bot: Bot):
-    await state.clear()
+    try:
+        await shopping_navigation_exit(call.from_user.id,state)
+        await state.clear()
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Menu belum bisa dibuka. Coba lagi.",show_alert=True)
     if not await is_channel_member(bot,call.from_user.id):
         await safe_edit_or_answer(
             call,
@@ -15789,7 +17634,11 @@ async def cb_start_view(call: CallbackQuery, state: FSMContext, bot: Bot):
         )
         return await safe_callback_notice(call)
 
-    mark_user_verified(call.from_user.id,call.from_user.username or "")
+    try:
+        mark_user_verified(call.from_user.id,call.from_user.username or "")
+
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Menu belum bisa dibuka. Coba lagi.",show_alert=True)
     await safe_edit_or_answer(
         call,
         start_view_text(),
@@ -15799,9 +17648,15 @@ async def cb_start_view(call: CallbackQuery, state: FSMContext, bot: Bot):
     await safe_callback_notice(call)
 
 
+
+
 @router.callback_query(F.data == "home")
 async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
-    await state.clear()
+    try:
+        await shopping_navigation_exit(call.from_user.id,state)
+        await state.clear()
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Menu belum bisa dibuka. Coba lagi.",show_alert=True)
 
     if not await is_channel_member(bot, call.from_user.id):
         await safe_edit_or_answer(call, 
@@ -15812,19 +17667,25 @@ async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
         )
         return await call.answer()
 
-    mark_user_verified(
-        call.from_user.id,
-        call.from_user.username or ""
-    )
+    try:
+        mark_user_verified(
+            call.from_user.id,
+            call.from_user.username or ""
+        )
+
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Menu belum bisa dibuka. Coba lagi.",show_alert=True)
 
     await safe_edit_or_answer(call, 
-        f"🛍️ <b>{STORE_NAME}</b>\n\n"
+        f"🛍️ <b>{rating_html_excerpt(STORE_NAME,200)}</b>\n\n"
         "Pilih menu yang ingin dibuka.\n\n"
-        f"<i>{STORE_FOOTER}</i>",
+        f"<i>{rating_html_excerpt(STORE_FOOTER,200)}</i>",
         reply_markup=main_menu(),
         parse_mode="HTML"
     )
     await call.answer()
+
+
 
 
 def compact_product_list_text(
@@ -17674,87 +19535,67 @@ USER_HISTORY_PAGE_SIZE = 4
 
 
 def user_history_keyboard(rows, page: int, total_pages: int):
-    rows_kb=[]
     page=max(1,int(page))
     total_pages=max(1,int(total_pages))
-
-    # One compact detail/rating row for each visible order.
-    for row in rows:
-        actions=[
-            InlineKeyboardButton(
-                text=f"🧾 {invoice(row['id'])}",
-                callback_data=f"orderdetail:{row['id']}"
-            )
-        ]
-        if (
-            row["status"]=="completed"
-            and row["fulfillment_status"]=="delivered"
-            and int(row["reviewed"] or 0)==0
-            and str(row["payment_method"] or "")!="OWNER_FREE"
-        ):
-            actions.append(
-                InlineKeyboardButton(
-                    text="⭐ Beri Rating",
-                    callback_data=f"reviewopen:{row['id']}"
-                )
-            )
-        rows_kb.append(actions)
-
+    rows_kb=[[
+        InlineKeyboardButton(text=f"🧾 {invoice(row['id'])} · Detail",callback_data=f"orderdetail:{row['id']}")
+    ] for row in rows]
     nav=[]
     if page>1:
         nav.append(InlineKeyboardButton(text="⬅️",callback_data=f"myorderspage:{page-1}"))
-    nav.append(InlineKeyboardButton(text=f"{page}/{total_pages}",callback_data=f"myorderspage:{page}"))
+    nav.append(InlineKeyboardButton(text="🔄 Perbarui",callback_data=f"myorderspage:{page}"))
     if page<total_pages:
         nav.append(InlineKeyboardButton(text="➡️",callback_data=f"myorderspage:{page+1}"))
     rows_kb.append(nav)
-
-    rows_kb.append([
-        InlineKeyboardButton(text="🔄 Refresh",callback_data=f"myorderspage:{page}")
-    ])
-    rows_kb.append([
-        InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")
-    ])
+    rows_kb.append([InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows_kb)
 
 
-async def render_user_history_page(call: CallbackQuery, page: int = 1):
+async def render_user_history_page(call, page: int = 1, state: FSMContext = None):
     page=max(1,int(page))
     cutoff=user_final_order_cutoff_iso()
-    conn=db()
+    conn=None
+    try:
+        conn=db()
 
-    total=int(conn.execute(
-        f"""SELECT COUNT(*) AS n
-            FROM orders o
-            WHERE o.user_id=?
-              AND ({user_order_visible_sql('o')})""",
-        (call.from_user.id,cutoff)
-    ).fetchone()["n"] or 0)
+        total=int(conn.execute(
+            f"""SELECT COUNT(*) AS n
+                FROM orders o
+                WHERE o.user_id=?
+                  AND ({user_order_visible_sql('o')})""",
+            (call.from_user.id,cutoff)
+        ).fetchone()["n"] or 0)
 
-    total_pages=max(1,(total + USER_HISTORY_PAGE_SIZE - 1)//USER_HISTORY_PAGE_SIZE)
-    page=min(page,total_pages)
-    offset=(page-1)*USER_HISTORY_PAGE_SIZE
+        total_pages=max(1,(total + USER_HISTORY_PAGE_SIZE - 1)//USER_HISTORY_PAGE_SIZE)
+        page=min(page,total_pages)
+        offset=(page-1)*USER_HISTORY_PAGE_SIZE
 
-    rows=conn.execute(
-        f"""SELECT o.*,p.name AS product_name,v.name AS variant_name,
-                   EXISTS(
-                       SELECT 1 FROM reviews r WHERE r.order_id=o.id
-                   ) AS reviewed
-            FROM orders o
-            LEFT JOIN products p ON p.id=o.product_id
-            LEFT JOIN product_variants v ON v.id=o.variant_id
-            WHERE o.user_id=?
-              AND ({user_order_visible_sql('o')})
-            ORDER BY o.id DESC
-            LIMIT ? OFFSET ?""",
-        (call.from_user.id,cutoff,USER_HISTORY_PAGE_SIZE,offset)
-    ).fetchall()
-    conn.close()
+        rows=conn.execute(
+            f"""SELECT o.*,p.name AS product_name,v.name AS variant_name,
+                       EXISTS(
+                           SELECT 1 FROM reviews r WHERE r.order_id=o.id
+                       ) AS reviewed
+                FROM orders o
+                LEFT JOIN products p ON p.id=o.product_id
+                LEFT JOIN product_variants v ON v.id=o.variant_id
+                WHERE o.user_id=?
+                  AND ({user_order_visible_sql('o')})
+                ORDER BY o.id DESC
+                LIMIT ? OFFSET ?""",
+            (call.from_user.id,cutoff,USER_HISTORY_PAGE_SIZE,offset)
+        ).fetchall()
+    except sqlite3.Error:
+        await user_history_error(call)
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
 
     if not rows:
         text=(
             "🧾 <b>RIWAYAT TRANSAKSI</b>\n\n"
             "Belum ada transaksi.\n\n"
-            f"<i>{STORE_FOOTER}</i>"
+            f"<i>{rating_html_excerpt(STORE_FOOTER,200)}</i>"
         )
     else:
         lines=[
@@ -17789,91 +19630,108 @@ async def render_user_history_page(call: CallbackQuery, page: int = 1):
                 )
 
             lines.append(
-                f"{icon} <b>{invoice(row['id'])}</b> • {html.escape(display_status)}\n"
-                f"📦 {html.escape(str(row['product_name'] or 'Produk'))} — "
-                f"{html.escape(str(row['variant_name'] or 'Standard'))}\n"
+                f"{icon} <b>{invoice(row['id'])}</b> • {rating_html_excerpt(display_status,100)}\n"
+                f"📦 {rating_html_excerpt(row['product_name'] or 'Produk',150)} — "
+                f"{rating_html_excerpt(row['variant_name'] or 'Standard',100)}\n"
                 f"💰 {rupiah(row['payment_total'] or row['total'])}{rating_text}\n"
-                f"🕒 {html.escape(format_wib_datetime(raw_time,compact=True))}"
+                f"🕒 {rating_html_excerpt(format_wib_datetime(raw_time,compact=True),70)}"
             )
 
         lines.extend([
             "",
             f"<i>Pesanan final ditampilkan selama {USER_FINAL_ORDER_VISIBLE_HOURS} jam.</i>",
-            f"<i>{STORE_FOOTER}</i>"
+            f"<i>{rating_html_excerpt(STORE_FOOTER,200)}</i>"
         ])
         text="\n\n".join(lines)
 
-    await safe_edit_or_answer(
-        call,
-        text,
-        reply_markup=user_history_keyboard(rows,page,total_pages),
-        parse_mode="HTML"
-    )
+    try:
+        await shopping_navigation_exit(call.from_user.id, state)
+    except sqlite3.Error:
+        await user_history_error(call)
+        return False
+    await user_history_present(call, text, user_history_keyboard(rows,page,total_pages))
+    return True
+
 
 
 @router.callback_query(F.data == "my_orders")
-async def my_orders(call: CallbackQuery):
-    await render_user_history_page(call,1)
+async def my_orders(call: CallbackQuery, state: FSMContext = None):
+    await render_user_history_page(call,1,state)
     await safe_callback_notice(call)
+
 
 
 @router.callback_query(F.data.startswith("myorderspage:"))
-async def my_orders_page(call: CallbackQuery):
-    try:
-        page=max(1,int(call.data.split(":")[-1]))
-    except Exception:
-        page=1
-    await render_user_history_page(call,page)
+async def my_orders_page(call: CallbackQuery, state: FSMContext = None):
+    numbers=callback_positive_numbers(call.data,"myorderspage")
+    if not numbers:
+        return await safe_callback_notice(call,"Halaman riwayat tidak valid.",show_alert=True)
+    await render_user_history_page(call,numbers[0],state)
     await safe_callback_notice(call)
+
 
 
 
 @router.callback_query(F.data == "history:latest")
-async def history_latest(call: CallbackQuery):
-    conn=db()
-    cutoff=user_final_order_cutoff_iso()
-    order=conn.execute(
-        f"""SELECT o.*,p.name AS product_name,v.name AS variant_name
-            FROM orders o
-            LEFT JOIN products p ON p.id=o.product_id
-            LEFT JOIN product_variants v ON v.id=o.variant_id
-            WHERE o.user_id=?
-              AND ({user_order_visible_sql('o')})
-            ORDER BY o.id DESC
-            LIMIT 1""",
-        (call.from_user.id,cutoff)
-    ).fetchone()
-    conn.close()
+async def history_latest(call: CallbackQuery, state: FSMContext = None):
+    conn=None
+    try:
+        conn=db()
+        cutoff=user_final_order_cutoff_iso()
+        order=conn.execute(
+            f"""SELECT o.*,p.name AS product_name,v.name AS variant_name
+                FROM orders o
+                LEFT JOIN products p ON p.id=o.product_id
+                LEFT JOIN product_variants v ON v.id=o.variant_id
+                WHERE o.user_id=?
+                  AND ({user_order_visible_sql('o')})
+                ORDER BY o.id DESC
+                LIMIT 1""",
+            (call.from_user.id,cutoff)
+        ).fetchone()
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Riwayat belum bisa dibuka. Coba lagi.",show_alert=True)
+    finally:
+        if conn is not None:
+            conn.close()
 
     if not order:
         return await call.answer("Belum ada riwayat transaksi.",show_alert=True)
 
-    await safe_edit_or_answer(
-        call,
-        order_detail_text(order),
-        reply_markup=order_detail_keyboard(order),
-        parse_mode="HTML"
-    )
+    try:
+        text=order_detail_text(order)
+        keyboard=order_detail_keyboard(order)
+        await shopping_navigation_exit(call.from_user.id,state)
+        await safe_edit_or_answer(call,text,reply_markup=keyboard,parse_mode="HTML")
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Pesanan belum bisa dibuka. Coba lagi.",show_alert=True)
     await safe_callback_notice(call)
 
 
-@router.callback_query(F.data.startswith("orderdetail:"))
-async def user_order_detail(call: CallbackQuery):
-    try:
-        order_id=int(call.data.split(":")[-1])
-    except Exception:
-        return await call.answer("Invoice tidak valid.",show_alert=True)
 
-    conn=db()
-    order=conn.execute(
-        """SELECT o.*,p.name AS product_name,v.name AS variant_name
-           FROM orders o
-           LEFT JOIN products p ON p.id=o.product_id
-           LEFT JOIN product_variants v ON v.id=o.variant_id
-           WHERE o.id=? AND o.user_id=?""",
-        (order_id,call.from_user.id)
-    ).fetchone()
-    conn.close()
+@router.callback_query(F.data.startswith("orderdetail:"))
+async def user_order_detail(call: CallbackQuery, state: FSMContext = None):
+    numbers=callback_positive_numbers(call.data,"orderdetail")
+    if not numbers:
+        return await safe_callback_notice(call,"Invoice tidak valid.",show_alert=True)
+    order_id=numbers[0]
+
+    conn=None
+    try:
+        conn=db()
+        order=conn.execute(
+            """SELECT o.*,p.name AS product_name,v.name AS variant_name
+               FROM orders o
+               LEFT JOIN products p ON p.id=o.product_id
+               LEFT JOIN product_variants v ON v.id=o.variant_id
+               WHERE o.id=? AND o.user_id=?""",
+            (order_id,call.from_user.id)
+        ).fetchone()
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Pesanan belum bisa dibuka. Coba lagi.",show_alert=True)
+    finally:
+        if conn is not None:
+            conn.close()
 
     if not order:
         return await call.answer("Pesanan tidak ditemukan.",show_alert=True)
@@ -17901,66 +19759,79 @@ async def user_order_detail(call: CallbackQuery):
                 show_alert=True
             )
 
-    await safe_edit_or_answer(
-        call,
-        order_detail_text(order),
-        reply_markup=order_detail_keyboard(order),
-        parse_mode="HTML"
-    )
+    try:
+        text=order_detail_text(order)
+        keyboard=order_detail_keyboard(order)
+        await shopping_navigation_exit(call.from_user.id,state)
+        await safe_edit_or_answer(call,text,reply_markup=keyboard,parse_mode="HTML")
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Pesanan belum bisa dibuka. Coba lagi.",show_alert=True)
     await safe_callback_notice(call)
+
 
 
 @router.callback_query(F.data.startswith("statuscheck:"))
 async def user_check_transaction_status(call: CallbackQuery):
-    try:
-        _,entity,raw_id=call.data.split(":")
-        entity_id=int(raw_id)
-    except Exception:
-        return await call.answer("Transaksi tidak valid.",show_alert=True)
+    target=payment_transaction_callback(call.data,"statuscheck")
+    if not target:
+        return await safe_callback_notice(call,"Transaksi tidak valid.",show_alert=True)
+    entity,entity_id=target
 
     if not recent_action_allowed(f"statuscheck:{entity}:{entity_id}:{call.from_user.id}",2):
         return await call.answer("Status baru saja dicek.",show_alert=True)
 
-    rate_ok,retry_after=persistent_rate_limit(
-        call.from_user.id,
-        "status_check",
-        limit=8,
-        window_seconds=30
-    )
+    try:
+        rate_ok,retry_after=persistent_rate_limit(
+            call.from_user.id,
+            "status_check",
+            limit=8,
+            window_seconds=30
+        )
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Transaksi belum bisa dibuka. Coba lagi.",show_alert=True)
     if not rate_ok:
         return await call.answer(
             f"Terlalu sering cek status. Coba lagi dalam {retry_after} detik.",
             show_alert=True
         )
 
-    conn=db()
-    if entity=="order":
-        row=conn.execute(
-            """SELECT o.*,p.name AS product_name,v.name AS variant_name
-               FROM orders o
-               LEFT JOIN products p ON p.id=o.product_id
-               LEFT JOIN product_variants v ON v.id=o.variant_id
-               WHERE o.id=? AND o.user_id=?""",
-            (entity_id,call.from_user.id)
-        ).fetchone()
-    elif entity=="topup":
-        row=conn.execute(
-            "SELECT * FROM topups WHERE id=? AND user_id=?",
-            (entity_id,call.from_user.id)
-        ).fetchone()
-    else:
-        row=None
-    conn.close()
+    conn=None
+    try:
+        conn=db()
+        if entity=="order":
+            row=conn.execute(
+                """SELECT o.*,p.name AS product_name,v.name AS variant_name
+                   FROM orders o
+                   LEFT JOIN products p ON p.id=o.product_id
+                   LEFT JOIN product_variants v ON v.id=o.variant_id
+                   WHERE o.id=? AND o.user_id=?""",
+                (entity_id,call.from_user.id)
+            ).fetchone()
+        elif entity=="topup":
+            row=conn.execute(
+                "SELECT * FROM topups WHERE id=? AND user_id=?",
+                (entity_id,call.from_user.id)
+            ).fetchone()
+        else:
+            row=None
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Status belum bisa dibuka. Coba lagi.",show_alert=True)
+    finally:
+        if conn is not None:
+            conn.close()
 
     if not row:
         return await call.answer("Transaksi tidak ditemukan.",show_alert=True)
 
     if entity=="order":
-        await call.message.answer(
-            order_detail_text(row),
-            reply_markup=order_detail_keyboard(row),
-            parse_mode="HTML"
-        )
+        try:
+            await safe_edit_or_answer(call,
+                order_detail_text(row),
+                reply_markup=order_detail_keyboard(row,include_history=str(row["status"] or "") in {"completed","cancelled","expired"}),
+                parse_mode="HTML"
+            )
+        except sqlite3.Error:
+            return await safe_callback_notice(call,"Status belum bisa dibuka. Coba lagi.",show_alert=True)
     else:
         status=str(row["status"] or "pending").replace("_"," ").title()
         review_status=str(row["payment_review_status"] or "")
@@ -17968,11 +19839,12 @@ async def user_check_transaction_status(call: CallbackQuery):
             status="Bukti Sedang Diperiksa"
         elif row["status"]=="completed":
             status="Selesai"
-        await call.message.answer(
+        await safe_edit_or_answer(call,
             "💰 <b>STATUS TOP UP</b>\n\n"
             f"🧾 {topup_invoice(entity_id)}\n"
             f"💵 Nominal: <b>{rupiah(row['amount'])}</b>\n"
             f"📌 Status: <b>{html.escape(status)}</b>",
+            reply_markup=payment_proof_status_keyboard(entity,entity_id),
             parse_mode="HTML"
         )
 
@@ -17981,10 +19853,10 @@ async def user_check_transaction_status(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("usercancel:"))
 async def user_cancel_order(call: CallbackQuery,bot: Bot):
-    try:
-        order_id=int(call.data.split(":")[-1])
-    except Exception:
-        return await call.answer("Invoice tidak valid.",show_alert=True)
+    numbers=callback_positive_numbers(call.data,"usercancel")
+    if not numbers:
+        return await safe_callback_notice(call,"Invoice tidak valid.",show_alert=True)
+    order_id=numbers[0]
 
     if not recent_action_allowed(f"usercancel:{order_id}:{call.from_user.id}",3):
         return await call.answer("Sedang diproses. Jangan tekan dua kali.",show_alert=True)
@@ -18083,6 +19955,37 @@ async def resend_last_delivery(call: CallbackQuery, bot: Bot):
             "Pengiriman ulang gagal. Silakan coba lagi beberapa saat.",
             show_alert=True
         )
+
+
+@router.callback_query(F.data.startswith("resendorder:"))
+async def resend_order_delivery(call: CallbackQuery, bot: Bot):
+    numbers=callback_positive_numbers(call.data,"resendorder")
+    if not numbers:
+        return await safe_callback_notice(call,"Invoice tidak valid.",show_alert=True)
+    order_id=numbers[0]
+    conn=None
+    try:
+        conn=db()
+        order=conn.execute(
+            "SELECT * FROM orders WHERE id=? AND user_id=?",
+            (order_id,call.from_user.id)).fetchone()
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Pesanan belum bisa dibuka. Coba lagi.",show_alert=True)
+    finally:
+        if conn is not None:conn.close()
+    if not order:
+        return await safe_callback_notice(call,"Pesanan tidak ditemukan.",show_alert=True)
+    if (order["status"]!="completed" or order["payment_status"]!="paid"
+            or order["fulfillment_status"]!="delivered" or not str(order["delivery_text"] or "").strip()):
+        return await safe_callback_notice(call,"Pengiriman ulang tersedia setelah akun selesai dikirim.",show_alert=True)
+    if not recent_action_allowed(f"resend:{call.from_user.id}:{order_id}",3):
+        return await safe_callback_notice(call,"Sedang diproses. Jangan tekan dua kali.",show_alert=True)
+    await safe_callback_notice(call,"Mengirim ulang akun...")
+    try:
+        await send_delivery_payload(bot,call.from_user.id,order_id,order["delivery_text"])
+    except Exception:
+        return await safe_callback_notice(call,"Pengiriman ulang gagal. Coba kembali nanti.",show_alert=True)
+    await safe_callback_notice(call,"✅ Akun dikirim ulang.")
 
 
 @router.callback_query(F.data == "stock_report")
@@ -23352,17 +25255,26 @@ async def reply_menu_flash(message: Message, bot: Bot):
 
 @router.message(F.text == "🏠 Menu Utama")
 async def reply_menu_home(message: Message, bot: Bot, state: FSMContext):
-    clear_payment_proof_session(message.from_user.id)
-    await state.clear()
+    try:
+        await shopping_navigation_exit(message.from_user.id,state)
+        await state.clear()
+    except sqlite3.Error:
+        return await message.answer("Menu belum bisa dibuka. Silakan coba lagi.")
 
     if not await is_channel_member(bot, message.from_user.id):
         return await send_join_required(message)
 
-    mark_user_verified(
-        message.from_user.id,
-        message.from_user.username or ""
-    )
+    try:
+        mark_user_verified(
+            message.from_user.id,
+            message.from_user.username or ""
+        )
+
+    except sqlite3.Error:
+        return await message.answer("Menu belum bisa dibuka. Silakan coba lagi.")
     await show_main_menu_message(message)
+
+
 
 
 @router.message(F.text == "🎁 Voucher")
@@ -23416,86 +25328,13 @@ async def reply_menu_stock(message: Message, bot: Bot):
     )
 
 
-@router.message(F.text.in_({"🧾 Riwayat","🧾 Pesanan Saya"}))
-async def reply_menu_orders(message: Message, bot: Bot):
+@router.message(F.text.in_({"🧾 Riwayat","🧾 Pesanan Saya"}),
+    lambda message, raw_state=None: raw_state is None or raw_state in shopping_navigation_states())
+async def reply_menu_orders(message: Message, bot: Bot, state: FSMContext = None):
     if not await is_channel_member(bot, message.from_user.id):
         return await send_join_required(message)
+    await render_user_history_page(message, 1, state)
 
-    conn = db()
-    cutoff=user_final_order_cutoff_iso()
-    rows = conn.execute(
-        f"""SELECT * FROM orders
-            WHERE user_id=?
-              AND ({user_order_visible_sql('')})
-            ORDER BY id DESC
-            LIMIT 10""",
-        (message.from_user.id, cutoff)
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        return await message.answer(
-            "🧾 <b>RIWAYAT TRANSAKSI</b>\n\nBelum ada transaksi.",
-            reply_markup=user_reply_menu(),
-            parse_mode="HTML"
-        )
-
-    lines = ["🧾 <b>RIWAYAT TRANSAKSI</b>", ""]
-    for row in rows:
-        display_status=order_user_status_label(row)
-
-        if row["status"]=="completed":
-            icon="✅"
-        elif row["status"] in {"cancelled","expired"} or str(row["payment_review_status"] or "")=="rejected":
-            icon="❌"
-        elif row["payment_status"]=="paid":
-            icon="💰"
-        else:
-            icon="🟡"
-
-        expiry_line = ""
-        if row["status"] == "pending" and row["reserved_until"]:
-            expiry_line = f"\n   ⏳ {format_expiry_time(row['reserved_until'])}"
-
-        lines.append(
-            f"{icon} <b>{invoice(row['id'])}</b> • "
-            f"{rupiah(row['payment_total'] or row['total'])} • "
-            f"{html.escape(display_status)}"
-            f"{expiry_line}"
-        )
-
-    kb_rows=[]
-
-    if rows:
-        kb_rows.append([
-            InlineKeyboardButton(
-                text="📄 Detail Terbaru",
-                callback_data="history:latest"
-            )
-        ])
-
-    if any(
-        row["status"]=="completed"
-        and row["fulfillment_status"]=="delivered"
-        and (row["delivery_text"] or "").strip()
-        for row in rows
-    ):
-        kb_rows.append([
-            InlineKeyboardButton(
-                text="📩 Kirim Ulang Akun Terakhir",
-                callback_data="resend:last"
-            )
-        ])
-
-    kb_rows.append([
-        InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")
-    ])
-
-    await message.answer(
-        "\n\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
-        parse_mode="HTML"
-    )
 
 
 @router.message(F.text == "💰 Isi Saldo")
@@ -24881,7 +26720,7 @@ async def owner_proof_reject(call: CallbackQuery):
         [InlineKeyboardButton(text="❌ Bukti Tidak Valid", callback_data=f"proofrejectreason:{entity}:{entity_id}:invalid")],
         [InlineKeyboardButton(text="💰 Nominal Tidak Sesuai", callback_data=f"proofrejectreason:{entity}:{entity_id}:amount")],
         [InlineKeyboardButton(text="🔎 Pembayaran Tidak Ditemukan", callback_data=f"proofrejectreason:{entity}:{entity_id}:notfound")],
-        [InlineKeyboardButton(text="↩️ Kembali", callback_data=f"proofback:{entity}:{entity_id}")],
+        [InlineKeyboardButton(text="↩️ Kembali", callback_data=f"ownerproofback:{entity}:{entity_id}")],
         [InlineKeyboardButton(text="🏠 Menu Awal", callback_data="owner:panel")]
     ])
 
@@ -24895,25 +26734,30 @@ async def owner_proof_reject(call: CallbackQuery):
 
 
 
-@router.callback_query(F.data.startswith("proofback:"))
+@router.callback_query(F.data.startswith("ownerproofback:"))
 async def owner_proof_back(call: CallbackQuery):
     """Return from reject menu without mutating payment state."""
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
+    prefix=str(call.data or "").split(":",1)[0]
+    target=payment_transaction_callback(call.data,prefix) if prefix in {"ownerproofback","proofback"} else None
+    if not target:
+        return await safe_callback_notice(call,"Data transaksi tidak valid.",show_alert=True)
+    entity,entity_id=target
+    conn=None
     try:
-        _, entity, raw_id = call.data.split(":")
-        entity_id = int(raw_id)
-    except Exception:
-        return await call.answer("Data transaksi tidak valid.", show_alert=True)
-
-    conn=db()
-    row=conn.execute(
-        "SELECT * FROM orders WHERE id=?" if entity=="order"
-        else "SELECT * FROM topups WHERE id=?",
-        (entity_id,)
-    ).fetchone()
-    conn.close()
+        conn=db()
+        row=conn.execute(
+            "SELECT * FROM orders WHERE id=?" if entity=="order"
+            else "SELECT * FROM topups WHERE id=?",
+            (entity_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Transaksi belum bisa dibuka. Coba lagi.",show_alert=True)
+    finally:
+        if conn is not None:
+            conn.close()
 
     if not row:
         return await owner_proof_result_screen(
@@ -28679,7 +30523,7 @@ async def owner_family_invited(call: CallbackQuery, bot: Bot):
     ]
     btn=owner_contact_button()
     if btn: rows.append([btn])
-    rows.append([InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")])
+    rows.append([InlineKeyboardButton(text="🧾 Detail Pesanan",callback_data=f"orderdetail:{order_id}")])
 
     try:
         await bot.send_message(
@@ -28876,7 +30720,7 @@ async def user_family_issue_reason(message: Message, state: FSMContext, bot: Bot
     rows=[]
     btn=owner_contact_button()
     if btn: rows.append([btn])
-    rows.append([InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders")])
+    rows.append([InlineKeyboardButton(text="🧾 Detail Pesanan",callback_data=f"orderdetail:{order_id}")])
     await message.answer(
         "✅ <b>KENDALA TERKIRIM KE OWNER</b>\n\n"
         f"🧾 {invoice(order_id)}\n"
@@ -29282,7 +31126,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.59"
+EXPECTED_SOURCE_VERSION = "16.63"
 
 
 def source_integrity_self_test():
