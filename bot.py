@@ -226,7 +226,7 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.70"
+BOT_VERSION = "16.71"
 SCHEMA_VERSION = 185
 
 CHECKOUT_TERMS_SHORT = (
@@ -244,6 +244,10 @@ RAILWAY_REPLICA_ID = os.getenv("RAILWAY_REPLICA_ID","").strip()
 RAILWAY_GIT_COMMIT_SHA = os.getenv("RAILWAY_GIT_COMMIT_SHA","").strip()
 RAILWAY_ENVIRONMENT_NAME = os.getenv("RAILWAY_ENVIRONMENT_NAME","").strip()
 RAILWAY_SERVICE_NAME = os.getenv("RAILWAY_SERVICE_NAME","").strip()
+
+# Owner /ping only. Railway does not inject subscription dates into service metadata.
+HOSTING_PLAN_NAME = os.getenv("HOSTING_PLAN_NAME", "").strip()
+HOSTING_PLAN_EXPIRES_AT = os.getenv("HOSTING_PLAN_EXPIRES_AT", "").strip()
 
 
 def deployment_fingerprint():
@@ -1486,6 +1490,57 @@ def jakarta_now():
 
 def bot_started_at_jakarta():
     return datetime.fromtimestamp(START_TIME, tz=JAKARTA_TZ)
+
+
+def parse_hosting_plan_expiry(value: str):
+    """Optional owner reference date; date-only values include the whole WIB day."""
+    raw=str(value or "").strip()
+    if not raw or len(raw)>128:
+        return None
+    try:
+        if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}",raw):
+            day=datetime.strptime(raw,"%Y-%m-%d").replace(tzinfo=JAKARTA_TZ)
+            return day+timedelta(days=1),day.strftime("%d/%m/%Y")+" (akhir hari WIB)"
+        if not re.match(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ]",raw):
+            return None
+        if raw.endswith(("Z","z")):
+            raw=raw[:-1]+"+00:00"
+        deadline=datetime.fromisoformat(raw)
+        if deadline.tzinfo is None:
+            deadline=deadline.replace(tzinfo=JAKARTA_TZ)
+        deadline=deadline.astimezone(JAKARTA_TZ)
+        return deadline,deadline.strftime("%d/%m/%Y • %H:%M:%S WIB")
+    except (ValueError,TypeError,OverflowError):
+        return None
+
+
+def hosting_plan_status_text(now=None) -> str:
+    """Show configured Railway dates without guessing billing or changing bot access."""
+    plan=" ".join(str(HOSTING_PLAN_NAME or "").split())[:80]
+    lines=[f"🚂 Paket Railway: <b>{html.escape(plan or 'Belum diatur')}</b>"]
+    raw=str(HOSTING_PLAN_EXPIRES_AT or "").strip()
+    parsed=parse_hosting_plan_expiry(raw)
+    if not raw:
+        lines.append("⏳ Sisa paket: <b>Belum diatur</b>")
+    elif not parsed:
+        lines.append("⏳ Sisa paket: <b>Tanggal tidak valid</b>")
+    else:
+        deadline,display=parsed
+        current=now if now is not None else datetime.now(JAKARTA_TZ)
+        if current.tzinfo is None:
+            current=current.replace(tzinfo=JAKARTA_TZ)
+        current=current.astimezone(JAKARTA_TZ)
+        remaining=(deadline-current).total_seconds()
+        lines.append(f"📆 Tanggal paket: <b>{html.escape(display)}</b>")
+        if remaining<=0:
+            lines.append("⏳ Sisa paket: <b>0 hari • tanggal acuan sudah lewat</b>")
+        else:
+            duration=format_uptime_detail(max(1,int(remaining)))
+            if remaining<86400:
+                duration="<1 hari • "+duration
+            lines.append(f"⏳ Sisa paket: <b>{html.escape(duration)}</b>")
+    lines.append("<i>Tanggal paket dicatat manual; mengikuti acuan owner.</i>")
+    return "\n".join(lines)
 
 
 def owner_access_denied_text() -> str:
@@ -19149,6 +19204,7 @@ async def ping_command(message: Message):
     now_jakarta=datetime.now(JAKARTA_TZ)
     date_text=now_jakarta.strftime("%d/%m/%Y")
     time_text=now_jakarta.strftime("%H:%M:%S WIB")
+    uptime_text=format_uptime_detail(max(0,int(time.time()-START_TIME)))
 
     await message.answer(
         "🏓 <b>MABOYY DIGITAL</b>\n"
@@ -19158,7 +19214,9 @@ async def ping_command(message: Message):
         f"🌐 IPv4: <code>{html.escape(ipv4)}</code>\n"
         f"🌐 IPv6: <code>{html.escape(ipv6)}</code>\n"
         f"🚀 Deploy: <code>{html.escape(deployment)}</code> • "
-        f"<code>{html.escape(fp['commit'])}</code>",
+        f"<code>{html.escape(fp['commit'])}</code>"
+        f"\n\n⏱️ Durasi aktif: <b>{html.escape(uptime_text)}</b>\n"
+        +hosting_plan_status_text(now_jakarta),
         parse_mode="HTML"
     )
 
@@ -32675,7 +32733,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.70"
+EXPECTED_SOURCE_VERSION = "16.71"
 
 
 def source_integrity_self_test():
