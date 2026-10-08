@@ -1908,3 +1908,22 @@ Job lama yang sudah terikat ke email tetap melanjutkan email tersebut agar Magic
 Menu tetap khusus owner; tidak ada tombol tambahan. Schema tetap `183`, tanpa variable atau dependency baru.
 Paket/durasi tetap mengikuti hasil provider; endpoint Apply tidak memiliki parameter jaminan satu tahun.
 Pengujian menggunakan API simulasi; penerimaan Alight/Apply asli belum diuji. Upload enam file v16.66 bersama.
+
+## v16.67 — Belanja ringkas dan aktivasi otomatis
+
+Awal `/start` hanya memiliki Belanja dan Rating Toko; Riwayat/Menu Utama tersedia pada daftar produk dan hasil akhir.
+Daftar memuat 10 produk per halaman, tanpa tombol nama produk panjang; nomor tetap dapat ditekan/diketik.
+Setiap invoice baru membeli 1 unit; pilihan jumlah/MAX dihapus. Jumlah invoice lama tetap dipertahankan.
+QRIS pesanan dibatalkan dihapus; jika Telegram menolak, caption dan tombol pembayaran dinonaktifkan.
+
+Aktivasi owner berjalan dari satu klik tanpa konfirmasi ulang. Callback memeriksa inbox sekali agar tidak tertahan;
+bot melanjutkan otomatis di background setiap minimal 30 detik selama 1 jam, kemudian mengirim hasil ke chat owner.
+Pemantauan dan email tetap tersimpan saat restart; lease mencegah proses paralel mengirim aksi berulang.
+Jika belum masuk setelah 1 jam, gunakan Periksa Status pada email yang sama. Jika provider tidak mengirim token
+atau hasil Apply belum pasti, bot melaporkan kondisi tersebut dan tidak mengulangi request yang sudah dikirim.
+Hasil akhir yang gagal terkirim ke Telegram dicoba lagi tanpa mengulangi Apply.
+
+`TOOLS_AUTO_AM_POLL_SECONDS` tetap diterima; pemeriksaan background minimal 30 detik.
+`TOOLS_AUTO_AM_MAIL_WAIT_SECONDS` tetap diterima untuk kompatibilitas konfigurasi lama; callback tidak lagi menunggu inbox 90 detik.
+Schema `184` menyimpan batas pemantauan, tujuan pesan, dan status notifikasi. Migrasi otomatis mempertahankan data lama.
+Tidak ada dependency baru. Upload enam file v16.67 bersama, dengan Volume/database lama tetap terpasang.

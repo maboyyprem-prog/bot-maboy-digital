@@ -1,6 +1,6 @@
 # Maboyy Digital
 
-**Versi: v16.66** — Aktivasi AM Pro 1 tahun memakai Maildrop otomatis.
+**Versi: v16.67** — Belanja satu unit dan aktivasi Maildrop otomatis.
 
 ## Upload GitHub
 
@@ -14,17 +14,17 @@ Simpan token/API key di Railway. Jangan upload `.env`, database, backup, log, ca
 2. Pasang Volume `/data`; isi `DB_PATH=/data/shop.db` dan `BACKUP_DIR=/data/backups`.
 3. Gunakan Start Command: `python main.py`.
 
-Produk: 10 per halaman dengan tombol langsung. Riwayat: menu awal/selesai → invoice → detail.
+Awal `/start`: Belanja dan Rating. Daftar produk: 10 per halaman, pilih lewat nomor.
+Tombol produk panjang dan pilihan jumlah/MAX dihapus; setiap invoice baru berisi 1 unit.
+Riwayat/Menu Utama tersedia pada daftar produk dan hasil akhir transaksi.
+Pembatalan pesanan menghapus gambar QRIS atau menonaktifkan tombol dan menandai caption jika penghapusan ditolak.
 Konfigurasi: [VARIABLE_RAILWAY.md](VARIABLE_RAILWAY.md); gunakan `main.py` dan `bot.py` dari paket yang sama.
-
-## VIP khusus /tools
 
 Owner: `/tools` → **👑 VIP /tools** → pilih ID → **✅ Jadikan VIP /tools**; **🚫 Cabut VIP /tools** menghentikan akses.
 
 VIP khusus `/tools` di chat pribadi; informasi awal menampilkan teks statis **0/15 akun/jam**. Aktivasi sekali klik tetap khusus owner.
 
-User VIP: **Magic Link** → email → kirim link → salin URL dari inbox ke bot →
-**Proses Magic Link** → verifikasi dan Apply Premium otomatis.
+User VIP: **Magic Link** → email → kirim link → salin URL dari inbox ke bot → **Proses Magic Link** → verifikasi dan Apply Premium otomatis.
 **Rating Toko** muncul setelah apply terkonfirmasi sukses, dengan pilihan 1–5 bintang.
 
 Owner memakai satu tombol **Magic Link / Verifikasi**. Isi endpoint dan API key provider di Railway.
@@ -39,12 +39,11 @@ Recovery menjaga slot Famhead/Pre-Order; slot yang sudah hilang sebelum upgrade 
 
 `/tools` → **Temp Mail** → **Buat Email** → **Received Mail** → pilih pesan.
 Email baru: [Maildrop](https://docs.maildrop.cc/) gratis; `TEMPMAIL_PROVIDER=maildrop`. Email Mail.tm lama tetap didukung; batas 5 email per provider.
-**Aktivasi AM Otomatis** → email Maildrop → Magic Link → baca inbox → verifikasi → Apply Premium; tetap memakai Maildrop apa pun pengaturan Temp Mail manual.
+**Aktivasi AM Otomatis** → email Maildrop → Magic Link → inbox → verifikasi → Apply Premium, tanpa konfirmasi tambahan.
+Jika email belum masuk, bot memeriksa otomatis setiap 30 detik sampai 1 jam; hasil akhir dikirim ke chat owner. Pemantauan tersimpan setelah restart.
 Email dan hasil aktivasi memuat link situs inbox yang dapat dibagikan; menu tetap khusus owner, tanpa tombol tambahan.
 Inbox publik; pesan dapat dihapus setelah 24 jam tanpa email baru. Pengiriman pertama kadang tertunda 15 menit–1 jam.
 **Bersihkan Log Lama** meminta konfirmasi; inbox, hasil apply, rating, dan data belanja tetap tersimpan.
 
-## Status apply
-
 Sukses mengikuti hasil apply provider; paket/masa aktif mengikuti data provider, termasuk konfirmasi 1 tahun.
-**Lanjutkan** memakai email Temp Mail yang sama dan memeriksa status tanpa mengulang apply. Pengujian memakai simulasi; apply asli belum diuji.
+**Periksa Status** memakai email yang sama setelah pemantauan berakhir; request yang sudah dikirim tidak diulang. Pengujian memakai simulasi; apply asli belum diuji.
