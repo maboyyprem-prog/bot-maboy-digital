@@ -1,6 +1,6 @@
 # Maboyy Digital
 
-**Versi: v16.67** — Belanja satu unit dan aktivasi Maildrop otomatis.
+**Versi: v16.68** — Aktivasi otomatis memakai Grabmail; fitur lama tetap tersedia.
 
 ## Upload GitHub
 
@@ -32,18 +32,18 @@ Owner memakai satu tombol **Magic Link / Verifikasi**. Isi endpoint dan API key 
 ## Famhead
 
 Owner: `/owner` → **Produk & Stok** → **Atur Produk** → pilih Famhead.
-Ubah nama, deskripsi, estimasi, arahan, varian, harga, dan slot; stok/reservasi tetap tersimpan.
-Recovery menjaga slot Famhead/Pre-Order; slot yang sudah hilang sebelum upgrade perlu diisi sesuai jumlah sebenarnya.
+Ubah nama, deskripsi, estimasi, arahan, varian, harga, dan slot; stok/reservasi tetap tersimpan. Slot yang sudah hilang sebelum upgrade perlu diisi sesuai jumlah sebenarnya.
 
 ## Temp Mail dan aktivasi AM owner
 
 `/tools` → **Temp Mail** → **Buat Email** → **Received Mail** → pilih pesan.
-Email baru: [Maildrop](https://docs.maildrop.cc/) gratis; `TEMPMAIL_PROVIDER=maildrop`. Email Mail.tm lama tetap didukung; batas 5 email per provider.
-**Aktivasi AM Otomatis** → email Maildrop → Magic Link → inbox → verifikasi → Apply Premium, tanpa konfirmasi tambahan.
+Di Railway isi `TEMPMAIL_PROVIDER=grabmail` dan `TOOLS_AUTO_AM_MAIL_PROVIDER=grabmail`.
+**Aktivasi AM Otomatis** → email Grabmail → Magic Link → inbox → verifikasi → Apply Premium, tanpa konfirmasi tambahan.
 Jika email belum masuk, bot memeriksa otomatis setiap 30 detik sampai 1 jam; hasil akhir dikirim ke chat owner. Pemantauan tersimpan setelah restart.
 Email dan hasil aktivasi memuat link situs inbox yang dapat dibagikan; menu tetap khusus owner, tanpa tombol tambahan.
-Inbox publik; pesan dapat dihapus setelah 24 jam tanpa email baru. Pengiriman pertama kadang tertunda 15 menit–1 jam.
+Grabmail gratis tanpa API key; pesan dihapus setelah 5 hari. [API dan batas layanan](https://grabmail.io/docs/api).
+Email Maildrop, Mail.tm, dan Guerrilla tetap didukung; batas 5 email per provider. Mail.tm memakai login, tanpa link inbox publik.
 **Bersihkan Log Lama** meminta konfirmasi; inbox, hasil apply, rating, dan data belanja tetap tersimpan.
-
-Sukses mengikuti hasil apply provider; paket/masa aktif mengikuti data provider, termasuk konfirmasi 1 tahun.
-**Periksa Status** memakai email yang sama setelah pemantauan berakhir; request yang sudah dikirim tidak diulang. Pengujian memakai simulasi; apply asli belum diuji.
+Sukses/masa aktif mengikuti respons provider; tanggal kedaluwarsa ditampilkan, tanpa menjanjikan satu tahun baru.
+Apply menunggu hingga 30 detik (`TOOLS_PROVIDER_APPLY_TIMEOUT_SECONDS`); request yang hasilnya belum pasti tidak diulang.
+Uji API nyata melalui alur sekali klik Grabmail berhasil: kirim → terima → verifikasi → Apply HTTP 200; klik ulang tidak mengirim ulang aksi.

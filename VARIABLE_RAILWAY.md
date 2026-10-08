@@ -1927,3 +1927,40 @@ Hasil akhir yang gagal terkirim ke Telegram dicoba lagi tanpa mengulangi Apply.
 `TOOLS_AUTO_AM_MAIL_WAIT_SECONDS` tetap diterima untuk kompatibilitas konfigurasi lama; callback tidak lagi menunggu inbox 90 detik.
 Schema `184` menyimpan batas pemantauan, tujuan pesan, dan status notifikasi. Migrasi otomatis mempertahankan data lama.
 Tidak ada dependency baru. Upload enam file v16.67 bersama, dengan Volume/database lama tetap terpasang.
+
+## v16.68 — Grabmail dan aktivasi yang diuji langsung
+
+Aktivasi owner baru memakai Grabmail. Bot membuat alamat acak, mengirim Magic Link, membaca pesan,
+memverifikasi, lalu Apply sekali tanpa konfirmasi tambahan. Link hasil membuka
+`https://grabmail.io/inbox/NAMA@grabmail.io` dan dapat dibagikan tanpa akses bot.
+
+```env
+TEMPMAIL_PROVIDER=grabmail
+TOOLS_AUTO_AM_MAIL_PROVIDER=grabmail
+TOOLS_PROVIDER_APPLY_TIMEOUT_SECONDS=30
+```
+
+Pilihan provider: `grabmail`, `guerrilla`, `mailtm`, atau `maildrop`. Variable aktivasi memilih email baru;
+email/job lama tetap terikat pada provider dan alamatnya. Jika aktivasi Maildrop lama masih menunggu email,
+klik Aktivasi baru dari /tools dapat menghentikan pemantauan lama dan memulai dengan provider baru;
+klik ulang tombol sesi lama tetap memakai email lama. Verifikasi/Apply yang sudah dikirim tidak diulang.
+
+Grabmail memakai REST API tanpa key untuk domain publik; batas gratis 60 request/menit, 1.000/hari per IP,
+dan satu baca/detik per alamat. Bot memberi jarak request serta menghormati Retry-After.
+Pesan dihapus setelah 5 hari. Guerrilla menyimpan pesan sekitar 1 jam; Mail.tm membutuhkan login situs.
+Semua email lama tetap tersimpan; batas lokal 5 per provider, dengan maksimal 20 alamat ditampilkan.
+
+Endpoint Alight yang digunakan: `/api/v1/send-magiclink`, `/api/v1/verify-account`, `/api/v1/apply-premium`.
+Alias lama `/send-magic-link` dikoreksi hanya untuk host Alight; URL provider lain tetap mengikuti konfigurasi.
+HTTP 4xx, termasuk HTML 404, menjadi kegagalan yang jelas; respons timeout/5xx tetap belum diketahui.
+Token bertingkat hasil verify dibaca; masa aktif memakai `expiryTimeMillis` dari hasil provider.
+
+Uji API nyata Mail.tm dan Guerrilla berhasil sampai Apply. Uji Grabmail melalui callback sekali klik kode bot
+berhasil dalam sekitar 16,6 detik: tiga aksi HTTP 200, hasil sukses dan link inbox tampil, klik ulang 0 request.
+Satu uji Apply dengan batas 12 detik mengalami timeout; tidak diulang. Batas Apply kini terpisah, default 30 detik.
+Hasil uji memberi kedaluwarsa 3 Juli 2027; paket satu tahun baru dari hari aktivasi tidak dijanjikan.
+Pesan Telegram pada pengujian ditangkap lokal, bukan dikirim ke pembeli/owner asli.
+
+Sumber: [API Grabmail](https://grabmail.io/docs/api), [batas Grabmail](https://grabmail.io/docs/limits),
+[API Guerrilla](https://www.guerrillamail.com/GuerrillaMailAPI.html), [API Mail.tm](https://docs.mail.tm/).
+Schema tetap `184`; tidak ada dependency atau tombol baru. Upload enam file v16.68 bersama; Volume/database lama tetap dipakai.

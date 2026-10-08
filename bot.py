@@ -72,7 +72,7 @@ def env_int(name: str, default: int, minimum: int=0, maximum=None) -> int:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 TEMPMAIL_ENABLED = os.getenv("TEMPMAIL_ENABLED", "true").strip().lower() == "true"
-TEMPMAIL_PROVIDER = os.getenv("TEMPMAIL_PROVIDER", "maildrop").strip().lower() or "maildrop"
+TEMPMAIL_PROVIDER = os.getenv("TEMPMAIL_PROVIDER", "grabmail").strip().lower() or "grabmail"
 TEMPMAIL_ENCRYPTION_KEY = os.getenv("TEMPMAIL_ENCRYPTION_KEY", "").strip()
 TEMPMAIL_TIMEOUT_SECONDS = env_int("TEMPMAIL_TIMEOUT_SECONDS", 12, 3, 30)
 ADMIN_ID = env_int("ADMIN_ID",0)
@@ -108,10 +108,38 @@ if not TOOLS_PROVIDER_APPLY_URL:
 TOOLS_PROVIDER_MAGICLINK_URL = os.getenv("TOOLS_PROVIDER_MAGICLINK_URL", "").strip()
 TOOLS_PROVIDER_VERIFY_URL = os.getenv("TOOLS_PROVIDER_VERIFY_URL", "").strip()
 TOOLS_PROVIDER_API_KEY = os.getenv("TOOLS_PROVIDER_API_KEY", "").strip()
+
+def normalize_tools_provider_endpoints(magic_url, verify_url, apply_url):
+    """Repair only the known Alight API alias; retain custom provider URLs."""
+    paths = {"send-magiclink", "send-magic-link", "verify-account", "apply-premium"}
+    def alight_action(url):
+        try:
+            parsed = urlparse(str(url or ""))
+            return (parsed.scheme == "https" and parsed.hostname == "alightfree.my.id"
+                    and parsed.port in {None, 443} and not parsed.username and not parsed.password
+                    and parsed.path.rstrip("/") in {"/api/v1/" + name for name in paths})
+        except (ValueError, TypeError):
+            return False
+    known = any(alight_action(url) for url in (magic_url, verify_url, apply_url))
+    if known:
+        magic_url = magic_url or "https://alightfree.my.id/api/v1/send-magiclink"
+        verify_url = verify_url or "https://alightfree.my.id/api/v1/verify-account"
+        apply_url = apply_url or "https://alightfree.my.id/api/v1/apply-premium"
+    if alight_action(magic_url):
+        parsed = urlparse(magic_url)
+        if parsed.path.rstrip("/") == "/api/v1/send-magic-link":
+            magic_url = parsed._replace(path="/api/v1/send-magiclink").geturl()
+    return magic_url, verify_url, apply_url
+
+
+TOOLS_PROVIDER_MAGICLINK_URL, TOOLS_PROVIDER_VERIFY_URL, TOOLS_PROVIDER_APPLY_URL = normalize_tools_provider_endpoints(
+    TOOLS_PROVIDER_MAGICLINK_URL, TOOLS_PROVIDER_VERIFY_URL, TOOLS_PROVIDER_APPLY_URL)
+
 try:
     TOOLS_PROVIDER_TIMEOUT_SECONDS = max(3, min(30, int(os.getenv("TOOLS_PROVIDER_TIMEOUT_SECONDS", "12"))))
 except Exception:
     TOOLS_PROVIDER_TIMEOUT_SECONDS = 12
+TOOLS_PROVIDER_APPLY_TIMEOUT_SECONDS = env_int("TOOLS_PROVIDER_APPLY_TIMEOUT_SECONDS", 30, TOOLS_PROVIDER_TIMEOUT_SECONDS, 60)
 try:
     TOOLS_PROVIDER_MAX_RETRIES = max(0, min(2, int(os.getenv("TOOLS_PROVIDER_MAX_RETRIES", "1"))))
 except Exception:
@@ -170,7 +198,8 @@ try:
     TOOLS_PROVIDER_TEMP_RETRIES = max(0, min(3, int(os.getenv("TOOLS_PROVIDER_TEMP_RETRIES", "2"))))
 except Exception:
     TOOLS_PROVIDER_TEMP_RETRIES = 2
-TOOLS_PROVIDER_AUTH_MODE = os.getenv("TOOLS_PROVIDER_AUTH_MODE", "bearer").strip().lower()
+TOOLS_PROVIDER_AUTH_MODE = os.getenv("TOOLS_PROVIDER_AUTH_MODE", "x-api-key" if
+    TOOLS_PROVIDER_APPLY_URL.startswith("https://alightfree.my.id/api/v1/") else "bearer").strip().lower()
 if TOOLS_PROVIDER_AUTH_MODE not in {"bearer","x-api-key"}:
     TOOLS_PROVIDER_AUTH_MODE = "bearer"
 
@@ -197,7 +226,7 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.67"
+BOT_VERSION = "16.68"
 SCHEMA_VERSION = 184
 
 CHECKOUT_TERMS_SHORT = (
@@ -12236,26 +12265,37 @@ def temp_mail_decrypt_credentials(row: dict) -> dict:
 
 
 def temp_mail_selected_provider() -> str:
-    provider = str(TEMPMAIL_PROVIDER or "maildrop").strip().lower()
+    provider = str(TEMPMAIL_PROVIDER or "grabmail").strip().lower()
     if provider == "mail.tm":
         provider = "mailtm"
-    if provider not in {"maildrop", "mailtm"}:
-        raise TempMailError("TEMPMAIL_PROVIDER harus maildrop atau mailtm.", status=503)
+    if provider in {"guerrillamail", "guerrilla-mail"}:
+        provider = "guerrilla"
+    if provider == "grabmail.io":
+        provider = "grabmail"
+    if provider not in {"grabmail", "guerrilla", "maildrop", "mailtm"}:
+        raise TempMailError("TEMPMAIL_PROVIDER harus grabmail, guerrilla, maildrop, atau mailtm.", status=503)
     return provider
+
 
 
 def temp_mail_row_provider(row) -> str:
     provider = str(dict(row).get("provider") or "mailtm").strip().lower()
-    if provider not in {"maildrop", "mailtm"}:
+    if provider not in {"grabmail", "guerrilla", "maildrop", "mailtm"}:
         raise TempMailError("Provider email tersimpan tidak dikenali. Data email tetap disimpan.", status=409)
     return provider
 
 
+
 def temp_mail_web_inbox_url(row) -> str:
-    if temp_mail_row_provider(row) != "maildrop":
-        return ""
-    localpart = temp_mail_maildrop_localpart(dict(row))
-    return "https://maildrop.cc/inbox/?mailbox=" + localpart
+    provider = temp_mail_row_provider(row)
+    if provider == "grabmail":
+        temp_mail_grabmail_localpart(dict(row))
+        return "https://grabmail.io/inbox/" + temp_mail_grabmail_address(dict(row).get("address"))
+    if provider == "guerrilla":
+        return "https://www.guerrillamail.com/inbox/" + temp_mail_guerrilla_localpart(dict(row))
+    if provider == "maildrop":
+        return "https://maildrop.cc/inbox/?mailbox=" + temp_mail_maildrop_localpart(dict(row))
+    return ""
 
 
 def temp_mail_public_mailbox(row) -> dict:
@@ -12324,14 +12364,18 @@ def temp_mail_activate_account(owner_id: int, mailbox_id: int) -> dict:
     row = temp_mail_owned_row(owner_id, mailbox_id)
     if row["state"] != "ready":
         raise TempMailError("Sesi email belum siap. Gunakan Pulihkan Sesi terlebih dahulu.", status=409)
-    if temp_mail_row_provider(row) == "maildrop":
-        temp_mail_maildrop_localpart(row)
+    provider = temp_mail_row_provider(row)
+    if provider in {"grabmail", "maildrop"}:
+        if provider == "grabmail":
+            temp_mail_grabmail_localpart(row)
+        else:
+            temp_mail_maildrop_localpart(row)
         conn = db()
         try:
             begin_immediate_retry(conn)
             conn.execute("UPDATE owner_temp_mailboxes SET active=0 WHERE owner_id=?", (int(owner_id),))
-            changed = conn.execute("UPDATE owner_temp_mailboxes SET active=1,updated_at=? WHERE id=? AND owner_id=? AND state='ready' AND provider='maildrop'",
-                                   (datetime.now(timezone.utc).isoformat(timespec="seconds"), int(row["id"]), int(owner_id))).rowcount
+            changed = conn.execute("UPDATE owner_temp_mailboxes SET active=1,updated_at=? WHERE id=? AND owner_id=? AND state='ready' AND provider=?",
+                                   (datetime.now(timezone.utc).isoformat(timespec="seconds"), int(row["id"]), int(owner_id), provider)).rowcount
             if not changed:
                 raise TempMailError("Email sudah tidak tersedia.", status=404)
             conn.commit()
@@ -12341,8 +12385,11 @@ def temp_mail_activate_account(owner_id: int, mailbox_id: int) -> dict:
         finally:
             conn.close()
         return temp_mail_public_mailbox(temp_mail_owned_row(owner_id, mailbox_id))
+    if temp_mail_row_provider(row) == "guerrilla":
+        temp_mail_guerrilla_localpart(row)
     credentials = temp_mail_decrypt_credentials(row)
     return temp_mail_public_mailbox(temp_mail_save_credentials(row, credentials, state="ready", activate=True))
+
 
 
 # Maildrop's documented GraphQL read queries. Inbox addresses are public;
@@ -12625,6 +12672,581 @@ async def temp_mail_maildrop_read_locked(row: dict, message_id: str) -> dict:
     return message
 
 
+
+TEMP_MAIL_GRABMAIL_API = "https://grabmail.io/api/v1"
+_TEMP_MAIL_GRABMAIL_LAST_REQUEST = 0.0
+_TEMP_MAIL_GRABMAIL_RATE_UNTIL = 0.0
+_TEMP_MAIL_GRABMAIL_DOMAINS = frozenset({"grabmail.io", "mixozia.com", "linqmail.com"})
+
+
+def temp_mail_grabmail_address(value) -> str:
+    if not isinstance(value, str) or len(value) > 254:
+        raise TempMailError("Alamat email Grabmail tidak valid.", status=409)
+    address = value.strip().lower()
+    match = re.fullmatch(r"([a-z0-9][a-z0-9_-]{0,63})@([a-z0-9.-]+)", address)
+    if not match or match.group(2) not in _TEMP_MAIL_GRABMAIL_DOMAINS:
+        raise TempMailError("Alamat email Grabmail tidak valid.", status=409)
+    return address
+
+
+def temp_mail_grabmail_localpart(row: dict) -> str:
+    if not isinstance(row, dict) or row.get("provider") != "grabmail":
+        raise TempMailError("Provider email tidak cocok.", status=409)
+    address = temp_mail_grabmail_address(row.get("address"))
+    localpart = address.split("@", 1)[0]
+    if row.get("provider_account_id") not in (None, "", localpart):
+        raise TempMailError("Identitas email Grabmail tidak cocok.", status=409)
+    return localpart
+
+
+async def temp_mail_grabmail_http(operation: str, address: str, *, message_id="", before="", limit=200) -> tuple:
+    """Use only the vendor's fixed read API; never follow a cursor as a URL."""
+    global _TEMP_MAIL_GRABMAIL_LAST_REQUEST, _TEMP_MAIL_GRABMAIL_RATE_UNTIL
+    if (not isinstance(operation, str) or operation not in {"mailbox", "message"}
+            or not isinstance(message_id, str) or not isinstance(before, str)):
+        raise TempMailError("Permintaan Grabmail tidak valid.", status=400)
+    address = temp_mail_grabmail_address(address)
+    if operation == "message":
+        if not temp_mail_provider_id(message_id) or before or limit != 200:
+            raise TempMailError("ID pesan Grabmail tidak valid.", status=400)
+        path = "/message/" + message_id
+        params = {"mailbox": address}
+    else:
+        if message_id or (before and not temp_mail_provider_id(before)) or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise TempMailError("Halaman Grabmail tidak valid.", status=400)
+        path = "/mailbox"
+        params = {"address": address, "limit": limit}
+        if before:
+            params["before"] = before
+    headers = {"Accept": "application/json", "User-Agent": f"MaboyyDigital/{BOT_VERSION}"}
+    async with temp_mail_async_locks():
+        now = time.monotonic()
+        if _TEMP_MAIL_GRABMAIL_RATE_UNTIL > now:
+            remaining = max(1, int(_TEMP_MAIL_GRABMAIL_RATE_UNTIL - now + 0.999))
+            raise TempMailError(f"Batas Grabmail tercapai. Coba kembali dalam {remaining} detik.", status=429)
+        delay = 1.05 - (now - _TEMP_MAIL_GRABMAIL_LAST_REQUEST)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _TEMP_MAIL_GRABMAIL_LAST_REQUEST = time.monotonic()
+        timeout = aiohttp.ClientTimeout(total=TEMPMAIL_TIMEOUT_SECONDS, connect=min(6, TEMPMAIL_TIMEOUT_SECONDS))
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.request("GET", TEMP_MAIL_GRABMAIL_API + path, headers=headers, params=params, allow_redirects=False) as response:
+                    status = int(response.status)
+                    if 300 <= status < 400:
+                        raise TempMailError("Grabmail mengirim pengalihan yang tidak didukung.", status=status)
+                    if status == 429:
+                        try:
+                            retry_after = max(1, min(3600, int(response.headers.get("Retry-After", "60"))))
+                        except (TypeError, ValueError):
+                            retry_after = 60
+                        _TEMP_MAIL_GRABMAIL_RATE_UNTIL = time.monotonic() + retry_after
+                        raise TempMailError(f"Batas Grabmail tercapai. Coba kembali dalam {retry_after} detik.", status=429)
+                    if response.content_length and response.content_length > TEMP_MAIL_RESPONSE_LIMIT:
+                        raise TempMailError("Pesan Grabmail terlalu besar untuk dibaca di bot.", status=502)
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(16384):
+                        body.extend(chunk)
+                        if len(body) > TEMP_MAIL_RESPONSE_LIMIT:
+                            raise TempMailError("Pesan Grabmail terlalu besar untuk dibaca di bot.", status=502)
+                    if not 200 <= status < 300:
+                        raise temp_mail_response_error(status)
+                    try:
+                        result = json.loads(body.decode("utf-8"))
+                    except (ValueError, UnicodeError):
+                        raise TempMailError("Respons Grabmail tidak valid.", status=502) from None
+                    if not isinstance(result, dict):
+                        raise TempMailError("Respons Grabmail tidak valid.", status=502)
+                    return status, result
+        except TempMailError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            raise TempMailError("Grabmail sedang tidak dapat dihubungi. Coba kembali nanti.") from None
+
+
+def temp_mail_grabmail_validate_inbox(result: dict, row: dict, *, limit=200) -> tuple:
+    temp_mail_grabmail_localpart(row)
+    if not isinstance(result, dict) or temp_mail_grabmail_address(result.get("address")) != temp_mail_grabmail_address(row["address"]):
+        raise TempMailError("Identitas inbox Grabmail tidak cocok. Pesan tidak dibuka.", status=409)
+    items, cursor, count = result.get("messages"), result.get("next"), result.get("count")
+    if not isinstance(items, list) or len(items) > limit or isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise TempMailError("Daftar pesan Grabmail tidak valid.", status=502)
+    if cursor not in (None, "") and not temp_mail_provider_id(cursor):
+        raise TempMailError("Halaman Grabmail tidak valid.", status=502)
+    return items, cursor or ""
+
+
+def temp_mail_grabmail_public_message(item: dict, row: dict, *, body=False) -> dict:
+    temp_mail_grabmail_localpart(row)
+    if not isinstance(item, dict) or not temp_mail_provider_id(item.get("id")):
+        raise TempMailError("ID pesan Grabmail tidak valid.", status=502)
+    if body or item.get("to") is not None:
+        recipient = item.get("to")
+        if not isinstance(recipient, str) or len(recipient) > 512:
+            raise TempMailError("Penerima pesan Grabmail tidak valid.", status=502)
+        _, recipient_address = _maildrop_parseaddr(temp_mail_maildrop_header(recipient))
+        if not valid_tools_email(recipient_address):
+            raise TempMailError("Penerima pesan Grabmail tidak valid.", status=502)
+        if recipient_address.strip().lower() != str(row["address"]).strip().lower():
+            raise TempMailError("Pesan bukan milik alamat email ini.", status=409)
+    date = item.get("date")
+    if not isinstance(date, str) or not date or len(date) > 80:
+        raise TempMailError("Tanggal pesan Grabmail tidak valid.", status=502)
+    try:
+        parsed = datetime.fromisoformat(date.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("missing timezone")
+        created_at = parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+    except (ValueError, OverflowError):
+        raise TempMailError("Tanggal pesan Grabmail tidak valid.", status=502) from None
+    sender_name, sender_address = _maildrop_parseaddr(temp_mail_maildrop_header(item.get("from") or ""))
+    if item.get("from_name") is not None:
+        sender_name = temp_mail_maildrop_header(item["from_name"])
+    attachments = item.get("attachments", [] if body else 0)
+    if isinstance(attachments, bool) or not isinstance(attachments, (int, list)) or (isinstance(attachments, int) and attachments < 0) or (isinstance(attachments, list) and len(attachments) > 1000):
+        raise TempMailError("Data lampiran Grabmail tidak valid.", status=502)
+    normalized = {"id": item["id"], "from": {"address": sender_address, "name": sender_name},
+                  "to": [{"address": row["address"], "name": ""}], "subject": temp_mail_maildrop_header(item.get("subject") or "(Tanpa subjek)"),
+                  "intro": "", "createdAt": created_at, "seen": item.get("seen") is True,
+                  "hasAttachments": bool(attachments)}
+    if body:
+        raw_text, raw_html = item.get("text"), item.get("html")
+        if raw_text is None:
+            raw_text = ""
+        if raw_html is None:
+            raw_html = ""
+        if not isinstance(raw_text, str) or not isinstance(raw_html, str):
+            raise TempMailError("Isi pesan Grabmail tidak valid.", status=502)
+        try:
+            size = len(raw_text.encode("utf-8")) + len(raw_html.encode("utf-8"))
+        except UnicodeError:
+            raise TempMailError("Isi pesan Grabmail tidak valid.", status=502) from None
+        if size > TEMP_MAIL_RESPONSE_LIMIT:
+            raise TempMailError("Isi pesan Grabmail terlalu besar untuk dibaca di bot.", status=502)
+        normalized.update(text=raw_text, html=raw_html)
+    return temp_mail_public_message(normalized, body=body)
+
+
+async def temp_mail_grabmail_create_locked(owner_id: int, *, auto_job_id=0) -> dict:
+    localpart = "mb" + secrets.token_hex(16)
+    address = localpart + "@grabmail.io"
+    probe = {"provider": "grabmail", "address": address, "provider_account_id": localpart}
+    status, result = await temp_mail_grabmail_http("mailbox", address, limit=1)
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    temp_mail_grabmail_validate_inbox(result, probe, limit=1)
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="seconds")
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        rows = conn.execute("SELECT id,state,created_at,provider FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()
+        if sum(row["state"] != "failed" and temp_mail_row_provider(row) == "grabmail" for row in rows) >= TEMP_MAIL_ACCOUNT_LIMIT:
+            raise TempMailError("Batas 5 email untuk provider ini tercapai.", status=409)
+        if rows:
+            try:
+                last = datetime.fromisoformat(str(rows[0]["created_at"]))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                raise TempMailError("Waktu sesi email tidak valid.", status=409) from None
+            if (now_dt - last).total_seconds() < TEMP_MAIL_CREATE_COOLDOWN_SECONDS:
+                raise TempMailError("Pembuatan email masih dalam cooldown 60 detik.", status=429)
+        conn.execute("UPDATE owner_temp_mailboxes SET active=0 WHERE owner_id=?", (int(owner_id),))
+        inserted = conn.execute(
+            "INSERT INTO owner_temp_mailboxes(owner_id,address,secret,state,provider_account_id,active,created_at,updated_at,provider) VALUES(?,?,?,?,?,?,?,?,?)",
+            (int(owner_id), address, "", "ready", localpart, 1, now, now, "grabmail"),
+        )
+        mailbox_id = int(inserted.lastrowid)
+        if auto_job_id:
+            bound = conn.execute("UPDATE owner_auto_am_jobs SET mailbox_id=?,email=?,updated_at=? WHERE id=? AND owner_id=? AND mailbox_id=0",
+                                 (mailbox_id, address, now, int(auto_job_id), int(owner_id))).rowcount
+            if not bound:
+                raise TempMailError("Sesi aktivasi tidak tersedia.", status=409)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return temp_mail_public_mailbox(temp_mail_owned_row(owner_id, mailbox_id))
+
+
+async def temp_mail_grabmail_inbox_locked(row: dict, page: int) -> dict:
+    temp_mail_grabmail_localpart(row)
+    address = temp_mail_grabmail_address(row["address"])
+    messages, ids, cursors = [], set(), set()
+    cursor = ""
+    # The existing Telegram pager uses 30-message provider pages. Obtain a
+    # bounded fresh snapshot so insertion/deletion cannot invalidate old cursors.
+    for _ in range(5):
+        status, result = await temp_mail_grabmail_http("mailbox", address, before=cursor)
+        if not 200 <= status < 300:
+            raise temp_mail_response_error(status)
+        items, next_cursor = temp_mail_grabmail_validate_inbox(result, row)
+        for item in items:
+            try:
+                public = temp_mail_grabmail_public_message(item, row)
+            except TempMailError as exc:
+                if exc.status in {409, 502}:
+                    continue
+                raise
+            if public["id"] not in ids:
+                ids.add(public["id"])
+                messages.append(public)
+        if not next_cursor:
+            break
+        if not items or next_cursor in cursors:
+            raise TempMailError("Halaman Grabmail berulang. Periksa inbox kembali.", status=502)
+        cursors.add(next_cursor)
+        cursor = next_cursor
+    total = len(messages)
+    total_pages = max(1, (total + 29) // 30)
+    page = min(page, total_pages)
+    return {"messages": messages[(page - 1) * 30:page * 30], "total": total,
+            "page": page, "total_pages": total_pages, "mailbox": temp_mail_public_mailbox(row), "address": address}
+
+
+async def temp_mail_grabmail_read_locked(row: dict, message_id: str) -> dict:
+    temp_mail_grabmail_localpart(row)
+    if not temp_mail_provider_id(message_id):
+        raise TempMailError("ID pesan Grabmail tidak valid.", status=400)
+    status, result = await temp_mail_grabmail_http("message", temp_mail_grabmail_address(row["address"]), message_id=message_id)
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    if not isinstance(result, dict) or result.get("id") != message_id:
+        raise TempMailError("Identitas pesan provider tidak cocok.", status=409)
+    message = temp_mail_grabmail_public_message(result, row, body=True)
+    message.update(mailbox=temp_mail_public_mailbox(row), address=row["address"])
+    return message
+
+
+TEMP_MAIL_GUERRILLA_API = "https://api.guerrillamail.com/ajax.php"
+_TEMP_MAIL_GUERRILLA_LAST_REQUEST = 0.0
+_TEMP_MAIL_GUERRILLA_RATE_UNTIL = 0.0
+_TEMP_MAIL_GUERRILLA_DOMAINS = frozenset({
+    "guerrillamailblock.com", "guerrillamail.com", "guerrillamail.net", "guerrillamail.org",
+    "guerrillamail.biz", "guerrillamail.de", "guerrillamail.info", "sharklasers.com",
+    "grr.la", "pokemail.net", "spam4.me",
+})
+
+
+def temp_mail_guerrilla_address(value) -> str:
+    if not isinstance(value, str) or len(value) > 254:
+        raise TempMailError("Alamat email Guerrilla Mail tidak valid.", status=409)
+    address = value.strip().lower()
+    match = re.fullmatch(r"([a-z0-9][a-z0-9_-]{0,63})@([a-z0-9.-]+)", address)
+    if not match or match.group(2) not in _TEMP_MAIL_GUERRILLA_DOMAINS:
+        raise TempMailError("Alamat email Guerrilla Mail tidak valid.", status=409)
+    return address
+
+
+def temp_mail_guerrilla_localpart(row: dict) -> str:
+    if not isinstance(row, dict) or row.get("provider") != "guerrilla":
+        raise TempMailError("Provider email tidak cocok.", status=409)
+    address = temp_mail_guerrilla_address(row.get("address"))
+    localpart = address.split("@", 1)[0]
+    if row.get("provider_account_id") not in (None, "", localpart):
+        raise TempMailError("Identitas email Guerrilla Mail tidak cocok.", status=409)
+    return localpart
+
+
+def temp_mail_guerrilla_token(value) -> str:
+    if not isinstance(value, str) or not value or len(value) > 2048 or any(ord(c) < 33 or ord(c) > 126 for c in value):
+        raise TempMailError("Sesi Guerrilla Mail tidak valid.", status=401)
+    return value
+
+
+async def temp_mail_guerrilla_http(operation: str, *, token="", localpart="", offset=0, message_id="") -> tuple:
+    """Only fixed vendor session and read operations; never send or delete mail."""
+    global _TEMP_MAIL_GUERRILLA_LAST_REQUEST, _TEMP_MAIL_GUERRILLA_RATE_UNTIL
+    if not isinstance(operation, str) or operation not in {"get_email_address", "set_email_user", "get_email_list", "fetch_email"}:
+        raise TempMailError("Permintaan Guerrilla Mail tidak valid.", status=400)
+    if operation != "get_email_address" and not token:
+        raise TempMailError("Sesi Guerrilla Mail belum siap.", status=401)
+    params = {"f": operation, "lang": "en"}
+    if token:
+        params["sid_token"] = temp_mail_guerrilla_token(token)
+    if operation == "set_email_user":
+        if not isinstance(localpart, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", localpart):
+            raise TempMailError("Alamat email Guerrilla Mail tidak valid.", status=400)
+        params["email_user"] = localpart
+    elif localpart:
+        raise TempMailError("Permintaan Guerrilla Mail tidak valid.", status=400)
+    if operation == "get_email_list":
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 9990 or offset % 10:
+            raise TempMailError("Halaman pesan tidak valid.", status=400)
+        params["offset"] = offset
+    elif offset:
+        raise TempMailError("Permintaan Guerrilla Mail tidak valid.", status=400)
+    if operation == "fetch_email":
+        if not isinstance(message_id, str) or not re.fullmatch(r"[0-9]{1,64}", message_id):
+            raise TempMailError("ID pesan Guerrilla Mail tidak valid.", status=400)
+        params["email_id"] = message_id
+    elif message_id:
+        raise TempMailError("Permintaan Guerrilla Mail tidak valid.", status=400)
+    headers = {"Accept": "application/json", "User-Agent": f"MaboyyDigital/{BOT_VERSION}"}
+    async with temp_mail_async_locks():
+        now = time.monotonic()
+        if _TEMP_MAIL_GUERRILLA_RATE_UNTIL > now:
+            remaining = max(1, int(_TEMP_MAIL_GUERRILLA_RATE_UNTIL - now + 0.999))
+            raise TempMailError(f"Batas Guerrilla Mail tercapai. Coba kembali dalam {remaining} detik.", status=429)
+        delay = 0.25 - (now - _TEMP_MAIL_GUERRILLA_LAST_REQUEST)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _TEMP_MAIL_GUERRILLA_LAST_REQUEST = time.monotonic()
+        timeout = aiohttp.ClientTimeout(total=TEMPMAIL_TIMEOUT_SECONDS, connect=min(6, TEMPMAIL_TIMEOUT_SECONDS))
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.request("GET", TEMP_MAIL_GUERRILLA_API, headers=headers, params=params, allow_redirects=False) as response:
+                    status = int(response.status)
+                    if 300 <= status < 400:
+                        raise TempMailError("Guerrilla Mail mengirim pengalihan yang tidak didukung.", status=status)
+                    if status == 429:
+                        try:
+                            retry_after = max(1, min(3600, int(response.headers.get("Retry-After", "5"))))
+                        except (TypeError, ValueError):
+                            retry_after = 5
+                        _TEMP_MAIL_GUERRILLA_RATE_UNTIL = time.monotonic() + retry_after
+                        raise TempMailError(f"Batas Guerrilla Mail tercapai. Coba kembali dalam {retry_after} detik.", status=429)
+                    if response.content_length and response.content_length > TEMP_MAIL_RESPONSE_LIMIT:
+                        raise TempMailError("Pesan Guerrilla Mail terlalu besar untuk dibaca di bot.", status=502)
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(16384):
+                        body.extend(chunk)
+                        if len(body) > TEMP_MAIL_RESPONSE_LIMIT:
+                            raise TempMailError("Pesan Guerrilla Mail terlalu besar untuk dibaca di bot.", status=502)
+                    try:
+                        result = json.loads(body.decode("utf-8"))
+                    except (ValueError, UnicodeError):
+                        raise TempMailError("Respons Guerrilla Mail tidak valid.", status=502) from None
+                    if not isinstance(result, dict):
+                        raise TempMailError("Respons Guerrilla Mail tidak valid.", status=502)
+                    return status, result
+        except TempMailError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            raise TempMailError("Guerrilla Mail sedang tidak dapat dihubungi. Coba kembali nanti.") from None
+
+
+
+def temp_mail_guerrilla_validate_session(result: dict, address: str, *, list_response=False) -> str:
+    if not isinstance(result, dict):
+        raise TempMailError("Respons sesi Guerrilla Mail tidak valid.", status=502)
+    if isinstance(result.get("auth"), dict) and result["auth"].get("success") is False:
+        raise TempMailError("Sesi Guerrilla Mail kedaluwarsa.", status=401)
+    actual = result.get("email") if list_response else result.get("email_addr")
+    if temp_mail_guerrilla_address(actual) != temp_mail_guerrilla_address(address):
+        raise TempMailError("Identitas email Guerrilla Mail tidak cocok. Pesan tidak dibuka.", status=409)
+    return temp_mail_guerrilla_token(result.get("sid_token"))
+
+
+def temp_mail_guerrilla_save_token(row: dict, result: dict) -> dict:
+    token = temp_mail_guerrilla_token(result.get("sid_token"))
+    credentials = temp_mail_decrypt_credentials(row)
+    if credentials.get("token") != token or row.get("state") != "ready":
+        credentials["token"] = token
+        row = temp_mail_save_credentials(row, credentials, state="ready", provider_account_id=temp_mail_guerrilla_localpart(row))
+    return row
+
+
+async def temp_mail_guerrilla_resume_locked(row: dict, *, activate=True) -> dict:
+    """Reopen the exact persisted public inbox, including after session expiry."""
+    localpart = temp_mail_guerrilla_localpart(row)
+    credentials = temp_mail_decrypt_credentials(row)
+    status, session = await temp_mail_guerrilla_http("get_email_address")
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    initial_token = temp_mail_guerrilla_token(session.get("sid_token"))
+    status, restored = await temp_mail_guerrilla_http("set_email_user", token=initial_token, localpart=localpart)
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    credentials["token"] = temp_mail_guerrilla_validate_session(restored, row["address"])
+    return temp_mail_save_credentials(row, credentials, state="ready", provider_account_id=localpart, activate=activate)
+
+
+async def temp_mail_guerrilla_create_locked(owner_id: int, *, auto_job_id=0) -> dict:
+    localpart = "mb" + secrets.token_hex(16)
+    status, session = await temp_mail_guerrilla_http("get_email_address")
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    initial_token = temp_mail_guerrilla_token(session.get("sid_token"))
+    status, created = await temp_mail_guerrilla_http("set_email_user", token=initial_token, localpart=localpart)
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    address = temp_mail_guerrilla_address(created.get("email_addr"))
+    if address.split("@", 1)[0] != localpart:
+        raise TempMailError("Identitas email baru Guerrilla Mail tidak cocok.", status=409)
+    token = temp_mail_guerrilla_validate_session(created, address)
+    credentials = {"password": secrets.token_urlsafe(24), "token": token}
+    secret = temp_mail_encrypt_credentials(owner_id, address, credentials)
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat(timespec="seconds")
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        rows = conn.execute("SELECT id,state,created_at,provider FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()
+        if sum(row["state"] != "failed" and temp_mail_row_provider(row) == "guerrilla" for row in rows) >= TEMP_MAIL_ACCOUNT_LIMIT:
+            raise TempMailError("Batas 5 email untuk provider ini tercapai.", status=409)
+        if rows:
+            try:
+                last = datetime.fromisoformat(str(rows[0]["created_at"]))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                raise TempMailError("Waktu sesi email tidak valid.", status=409) from None
+            if (now_dt - last).total_seconds() < TEMP_MAIL_CREATE_COOLDOWN_SECONDS:
+                raise TempMailError("Pembuatan email masih dalam cooldown 60 detik.", status=429)
+        conn.execute("UPDATE owner_temp_mailboxes SET active=0 WHERE owner_id=?", (int(owner_id),))
+        inserted = conn.execute(
+            "INSERT INTO owner_temp_mailboxes(owner_id,address,secret,state,provider_account_id,active,created_at,updated_at,provider) VALUES(?,?,?,?,?,?,?,?,?)",
+            (int(owner_id), address, secret, "ready", localpart, 1, now, now, "guerrilla"),
+        )
+        mailbox_id = int(inserted.lastrowid)
+        if auto_job_id:
+            bound = conn.execute("UPDATE owner_auto_am_jobs SET mailbox_id=?,email=?,updated_at=? WHERE id=? AND owner_id=? AND mailbox_id=0",
+                                 (mailbox_id, address, now, int(auto_job_id), int(owner_id))).rowcount
+            if not bound:
+                raise TempMailError("Sesi aktivasi tidak tersedia.", status=409)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return temp_mail_public_mailbox(temp_mail_owned_row(owner_id, mailbox_id))
+
+
+async def temp_mail_guerrilla_list_locked(row: dict, offset: int) -> tuple:
+    temp_mail_guerrilla_localpart(row)
+    credentials = temp_mail_decrypt_credentials(row)
+    refreshed = False
+    if row.get("state") != "ready" or not credentials.get("token"):
+        row = await temp_mail_guerrilla_resume_locked(row, activate=False)
+        credentials = temp_mail_decrypt_credentials(row)
+        refreshed = True
+    for attempt in range(2):
+        status, result = await temp_mail_guerrilla_http("get_email_list", token=credentials["token"], offset=offset)
+        try:
+            if not 200 <= status < 300:
+                raise temp_mail_response_error(status)
+            temp_mail_guerrilla_validate_session(result, row["address"], list_response=True)
+        except TempMailError as exc:
+            if not refreshed and exc.status in {401, 403, 409}:
+                row = await temp_mail_guerrilla_resume_locked(row, activate=False)
+                credentials = temp_mail_decrypt_credentials(row)
+                refreshed = True
+                continue
+            raise
+        row = temp_mail_guerrilla_save_token(row, result)
+        return row, result
+    raise TempMailError("Sesi Guerrilla Mail belum dapat dipulihkan.", status=409)
+
+
+def temp_mail_guerrilla_public_message(item: dict, row: dict, *, body=False) -> dict:
+    localpart = temp_mail_guerrilla_localpart(row)
+    if not isinstance(item, dict) or not isinstance(item.get("mail_id"), str) or not re.fullmatch(r"[0-9]{1,64}", item["mail_id"]):
+        raise TempMailError("ID pesan Guerrilla Mail tidak valid.", status=502)
+    if body:
+        recipient = item.get("mail_recipient")
+        if not isinstance(recipient, str) or recipient.strip().lower() not in {localpart, str(row["address"]).lower()}:
+            raise TempMailError("Pesan bukan milik alamat email ini.", status=409)
+    elif item.get("mail_recipient") is not None:
+        recipient = item["mail_recipient"]
+        if not isinstance(recipient, str) or recipient.strip().lower() not in {localpart, str(row["address"]).lower()}:
+            raise TempMailError("Pesan bukan milik alamat email ini.", status=409)
+    raw_timestamp = item.get("mail_timestamp")
+    if isinstance(raw_timestamp, bool) or not re.fullmatch(r"[0-9]{1,12}", str(raw_timestamp or "")):
+        raise TempMailError("Tanggal pesan Guerrilla Mail tidak valid.", status=502)
+    try:
+        created_at = datetime.fromtimestamp(int(raw_timestamp), timezone.utc).isoformat(timespec="seconds")
+    except (ValueError, OverflowError, OSError):
+        raise TempMailError("Tanggal pesan Guerrilla Mail tidak valid.", status=502) from None
+    sender_name, sender_address = _maildrop_parseaddr(temp_mail_maildrop_header(item.get("mail_from") or ""))
+    normalized = {"id": item["mail_id"], "from": {"address": sender_address, "name": sender_name},
+                  "to": [{"address": row["address"], "name": ""}], "subject": temp_mail_maildrop_header(item.get("mail_subject") or "(Tanpa subjek)"),
+                  "intro": item.get("mail_excerpt") if isinstance(item.get("mail_excerpt"), str) else "", "createdAt": created_at,
+                  "seen": str(item.get("mail_read") or "0") == "1", "hasAttachments": False}
+    if body:
+        content = item.get("mail_body")
+        if not isinstance(content, str):
+            raise TempMailError("Isi pesan Guerrilla Mail tidak valid.", status=502)
+        try:
+            content_size = len(content.encode("utf-8"))
+        except UnicodeError:
+            raise TempMailError("Isi pesan Guerrilla Mail tidak valid.", status=502) from None
+        if content_size > TEMP_MAIL_RESPONSE_LIMIT:
+            raise TempMailError("Isi pesan Guerrilla Mail terlalu besar untuk dibaca di bot.", status=502)
+        content_type = str(item.get("content_type") or "").lower()
+        html_body = "html" in content_type or bool(re.search(r"<(?:a|p|div|html|body|br)\b", content, re.I))
+        normalized.update({"text": "" if html_body else content, "html": content if html_body else ""})
+    return temp_mail_public_message(normalized, body=body)
+
+
+
+async def temp_mail_guerrilla_inbox_locked(row: dict, page: int) -> dict:
+    row, result = await temp_mail_guerrilla_list_locked(row, (page - 1) * 10)
+    items = result.get("list")
+    if not isinstance(items, list) or len(items) > 100:
+        raise TempMailError("Daftar pesan Guerrilla Mail tidak valid.", status=502)
+    count = result.get("count", len(items))
+    if isinstance(count, bool) or not re.fullmatch(r"[0-9]{1,7}", str(count)):
+        raise TempMailError("Jumlah pesan Guerrilla Mail tidak valid.", status=502)
+    total = min(1000000, int(count))
+    messages, seen = [], set()
+    for item in items:
+        try:
+            message = temp_mail_guerrilla_public_message(item, row)
+        except TempMailError as exc:
+            if exc.status in {409, 502}:
+                continue
+            raise
+        if message["id"] not in seen:
+            messages.append(message)
+            seen.add(message["id"])
+    return {"messages": messages, "total": total, "page": page, "total_pages": max(1, min(1000, (total + 9) // 10)),
+            "mailbox": temp_mail_public_mailbox(row), "address": row["address"]}
+
+
+async def temp_mail_guerrilla_read_locked(row: dict, message_id: str) -> dict:
+    if not isinstance(message_id, str) or not re.fullmatch(r"[0-9]{1,64}", message_id):
+        raise TempMailError("ID pesan Guerrilla Mail tidak valid.", status=400)
+    # Validate the session's complete email before requesting any body; recipient
+    # is a localpart in the real vendor response, so it is insufficient alone.
+    row, _ = await temp_mail_guerrilla_list_locked(row, 0)
+    credentials = temp_mail_decrypt_credentials(row)
+    status, result = await temp_mail_guerrilla_http("fetch_email", token=credentials["token"], message_id=message_id)
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    if isinstance(result.get("auth"), dict) and result["auth"].get("success") is False:
+        raise TempMailError("Sesi Guerrilla Mail kedaluwarsa. Periksa kembali inbox.", status=401)
+    if result.get("mail_id") != message_id:
+        raise TempMailError("Identitas pesan provider tidak cocok.", status=409)
+    message = temp_mail_guerrilla_public_message(result, row, body=True)
+    row = temp_mail_guerrilla_save_token(row, result)
+    message.update(mailbox=temp_mail_public_mailbox(row), address=row["address"])
+    return message
+
+
+async def temp_mail_mailtm_domains() -> list:
+    status, result = await temp_mail_http("GET", "/domains", params={"page": 1})
+    if not 200 <= status < 300:
+        raise temp_mail_response_error(status)
+    items = result.get("hydra:member", result.get("member", []))
+    if not isinstance(items, list):
+        raise TempMailError("Daftar domain provider tidak valid.", status=502)
+    domains = []
+    for row in items[:100]:
+        if not isinstance(row, dict) or row.get("isActive") is not True or row.get("isPrivate") is True:
+            continue
+        domain = str(row.get("domain") or "").strip().lower()
+        if len(domain) <= 253 and re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", domain):
+            if domain not in domains:
+                domains.append(domain)
+    if not domains:
+        raise TempMailError("Provider belum menyediakan domain publik aktif.", status=503)
+    return domains
+
 async def temp_mail_http(method: str, path: str, *, payload=None, token: str = "", params=None) -> tuple:
     global _TEMP_MAIL_LAST_REQUEST, _TEMP_MAIL_RATE_UNTIL
     method = str(method).upper()
@@ -12693,28 +13315,30 @@ def temp_mail_response_error(status: int, *, creating=False) -> TempMailError:
 
 
 async def temp_mail_domains() -> list:
-    if temp_mail_selected_provider() == "maildrop":
+    provider = temp_mail_selected_provider()
+    if provider == "grabmail":
+        return ["grabmail.io", "mixozia.com", "linqmail.com"]
+    if provider == "maildrop":
         return ["maildrop.cc"]
-    status, result = await temp_mail_http("GET", "/domains", params={"page": 1})
-    if not 200 <= status < 300:
-        raise temp_mail_response_error(status)
-    items = result.get("hydra:member", result.get("member", []))
-    if not isinstance(items, list):
-        raise TempMailError("Daftar domain provider tidak valid.", status=502)
-    domains = []
-    for row in items[:100]:
-        if not isinstance(row, dict) or row.get("isActive") is not True or row.get("isPrivate") is True:
-            continue
-        domain = str(row.get("domain") or "").strip().lower()
-        if len(domain) <= 253 and re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", domain):
-            if domain not in domains:
-                domains.append(domain)
-    if not domains:
-        raise TempMailError("Provider belum menyediakan domain publik aktif.", status=503)
-    return domains
+    if provider == "guerrilla":
+        return ["guerrillamailblock.com"]
+    return await temp_mail_mailtm_domains()
 
 
 async def temp_mail_resume_locked(row: dict, *, activate=True) -> dict:
+    if temp_mail_row_provider(row) == "grabmail":
+        temp_mail_grabmail_localpart(row)
+        if row["state"] != "ready":
+            raise TempMailError("Sesi Grabmail tersimpan belum siap.", status=409)
+        status, result = await temp_mail_grabmail_http("mailbox", row["address"], limit=1)
+        if not 200 <= status < 300:
+            raise temp_mail_response_error(status)
+        temp_mail_grabmail_validate_inbox(result, row, limit=1)
+        if activate:
+            temp_mail_activate_account(int(row["owner_id"]), int(row["id"]))
+        return temp_mail_owned_row(int(row["owner_id"]), int(row["id"]))
+    if temp_mail_row_provider(row) == "guerrilla":
+        return await temp_mail_guerrilla_resume_locked(row, activate=activate)
     if temp_mail_row_provider(row) == "maildrop":
         temp_mail_maildrop_localpart(row)
         if row["state"] != "ready":
@@ -12744,6 +13368,7 @@ async def temp_mail_resume_locked(row: dict, *, activate=True) -> dict:
     return temp_mail_save_credentials(row, credentials, state="ready", provider_account_id=account_id, activate=activate)
 
 
+
 async def temp_mail_resume_account(owner_id: int, mailbox_id: int) -> dict:
     temp_mail_assert_owner(owner_id)
     async with temp_mail_async_locks(owner_id):
@@ -12752,10 +13377,9 @@ async def temp_mail_resume_account(owner_id: int, mailbox_id: int) -> dict:
 
 async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
     temp_mail_assert_owner(owner_id)
-    # New AM activation jobs always use the shareable Maildrop inbox.
-    # Manual Temp Mail and mailboxes already bound to old jobs keep their provider.
-    provider = "maildrop" if auto_job_id else temp_mail_selected_provider()
-    if provider == "mailtm":
+    # Existing jobs retain their persisted mailbox; only new jobs choose a provider.
+    provider = auto_am_mail_provider() if auto_job_id else temp_mail_selected_provider()
+    if provider in {"mailtm", "guerrilla"}:
         temp_mail_encryption_key()
     async with temp_mail_async_locks(owner_id):
         conn = db()
@@ -12793,7 +13417,11 @@ async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
                     raise TempMailError(f"Tunggu {max(1, int(remaining + 0.999))} detik sebelum membuat email baru.", status=429)
             except ValueError:
                 raise TempMailError("Waktu sesi email tidak valid. Periksa data email tersimpan.", status=409) from None
-        domains = ["maildrop.cc"] if provider == "maildrop" else await temp_mail_domains()
+        if provider == "grabmail":
+            return await temp_mail_grabmail_create_locked(owner_id, auto_job_id=auto_job_id)
+        if provider == "guerrilla":
+            return await temp_mail_guerrilla_create_locked(owner_id, auto_job_id=auto_job_id)
+        domains = ["maildrop.cc"] if provider == "maildrop" else await (temp_mail_domains() if temp_mail_selected_provider() == "mailtm" else temp_mail_mailtm_domains())
         address = f"mb{secrets.token_hex(16 if provider == 'maildrop' else 8)}@{domains[0]}"
         credentials = {"password": secrets.token_urlsafe(24), "token": ""} if provider == "mailtm" else None
         now = now_dt.isoformat(timespec="seconds")
@@ -12849,6 +13477,7 @@ async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
             raise TempMailError("Pembuatan email belum dapat dipastikan. Gunakan Pulihkan Sesi.", status=502, outcome_unknown=True)
         row = temp_mail_save_credentials(row, credentials, state="account_created", provider_account_id=account_id)
         return temp_mail_public_mailbox(await temp_mail_resume_locked(row))
+
 
 
 async def temp_mail_authenticated_read_locked(row: dict, path: str, *, params=None) -> tuple:
@@ -12993,6 +13622,10 @@ async def temp_mail_fetch_inbox(owner_id: int, mailbox_id: int, page: int = 1) -
     page = int(page)
     async with temp_mail_async_locks(owner_id):
         row = temp_mail_owned_row(owner_id, mailbox_id)
+        if temp_mail_row_provider(row) == "grabmail":
+            return await temp_mail_grabmail_inbox_locked(row, page)
+        if temp_mail_row_provider(row) == "guerrilla":
+            return await temp_mail_guerrilla_inbox_locked(row, page)
         if temp_mail_row_provider(row) == "maildrop":
             return await temp_mail_maildrop_inbox_locked(row, page)
         row, result = await temp_mail_authenticated_read_locked(row, "/messages", params={"page": page})
@@ -13009,6 +13642,7 @@ async def temp_mail_fetch_inbox(owner_id: int, mailbox_id: int, page: int = 1) -
                 continue
             public.append(temp_mail_public_message(item))
         return {"messages": public, "total": total, "page": page, "total_pages": max(1, min(1000, (total + 29) // 30)), "mailbox": temp_mail_public_mailbox(row), "address": row["address"]}
+
 
 
 def temp_mail_account_identity(value) -> str:
@@ -13080,6 +13714,10 @@ async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str
         raise TempMailError("ID pesan tidak valid.", status=400)
     async with temp_mail_async_locks(owner_id):
         row = temp_mail_owned_row(owner_id, mailbox_id)
+        if temp_mail_row_provider(row) == "grabmail":
+            return await temp_mail_grabmail_read_locked(row, message_id)
+        if temp_mail_row_provider(row) == "guerrilla":
+            return await temp_mail_guerrilla_read_locked(row, message_id)
         if temp_mail_row_provider(row) == "maildrop":
             return await temp_mail_maildrop_read_locked(row, message_id)
         row, result = await temp_mail_authenticated_read_locked(row, "/messages/" + message_id)
@@ -13104,6 +13742,7 @@ async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str
         message["mailbox"] = temp_mail_public_mailbox(row)
         message["address"] = row["address"]
         return message
+
 
 
 
@@ -13486,10 +14125,10 @@ def classify_tools_error(http_status: int, data) -> tuple[str,str]:
         return "rate_limit","Provider sedang membatasi request."
     if status in {401,403}:
         return "auth","API key/otorisasi ditolak provider."
-    if status==400:
+    if status in {400, 422}:
         return "bad_request","Data request ditolak provider."
-    if status==404:
-        return "endpoint","Endpoint provider tidak ditemukan."
+    if status in {404, 405}:
+        return "endpoint","Endpoint/metode provider tidak sesuai."
     if status>=500:
         return "provider_server","Server provider sedang bermasalah."
     if status==0 and "timeout" in text:
@@ -13761,18 +14400,19 @@ def normalize_provider_bool(value):
 
 
 def find_provider_value(result, keys):
-    if not isinstance(result,dict):
-        return None
-    lowered={str(k).lower():v for k,v in result.items()}
-    for key in keys:
-        if key.lower() in lowered:
-            return lowered[key.lower()]
-    for nested_key in ("data","result","user","account","subscription","license","premium"):
-        nested=result.get(nested_key)
-        if isinstance(nested,dict):
-            value=find_provider_value(nested,keys)
+    stack = [(result, 0)]; seen = set()
+    wrappers = ("data", "result", "user", "account", "profile", "subscription", "license", "premium")
+    while stack and len(seen) < 500:
+        obj, depth = stack.pop()
+        if not isinstance(obj, dict) or id(obj) in seen or depth > 12:
+            continue
+        seen.add(id(obj))
+        lowered = {str(key).lower(): value for key, value in obj.items()}
+        for key in keys:
+            value = lowered.get(key.lower())
             if value is not None:
                 return value
+        stack.extend((obj[key], depth + 1) for key in reversed(wrappers) if isinstance(obj.get(key), dict))
     return None
 
 
@@ -13785,7 +14425,7 @@ def parse_provider_license_status(result) -> dict:
         (
             "premium","isPremium","is_premium","pro","isPro","is_pro",
             "active","isActive","is_active","subscriptionStatus",
-            "licenseStatus","premiumStatus"
+            "licenseStatus","premiumStatus","valid"
         )
     )
     if isinstance(raw_status,dict):
@@ -13802,7 +14442,7 @@ def parse_provider_license_status(result) -> dict:
     )
     expires=find_provider_value(
         result,
-        ("expiresAt","expires_at","expiry","expiryDate","expirationDate","validUntil","valid_until")
+        ("expiresAt","expires_at","expiry","expiryDate","expirationDate","validUntil","valid_until","expiryTimeMillis")
     )
     message=find_provider_value(
         result,
@@ -14413,28 +15053,33 @@ def tool_response_preview(data) -> str:
 
 
 def extract_verify_id_token(result) -> str:
-    """Extract an idToken from the verify response without logging it."""
+    """Read a nested verify idToken without logging it or scanning unrelated history."""
     if not isinstance(result, dict):
         return ""
-
-    candidates = [
-        result.get("idToken"),
-        result.get("id_token"),
-        result.get("token"),
-    ]
-
-    for nested_key in ("data","user","result"):
-        nested=result.get(nested_key)
-        if isinstance(nested, dict):
-            candidates.extend([
-                nested.get("idToken"),
-                nested.get("id_token"),
-                nested.get("token"),
-            ])
-
-    for value in candidates:
-        if isinstance(value, str) and len(value.strip()) >= 20 and not any(char.isspace() for char in value.strip()) and value.strip() != "idToken_dari_verifyaccount":
-            return value.strip()
+    queue = [(result, 0)]
+    seen = set()
+    legacy_tokens = []
+    while queue and len(seen) < 100:
+        item, depth = queue.pop(0)
+        if not isinstance(item, dict) or id(item) in seen or depth > 12:
+            continue
+        seen.add(id(item))
+        for key in ("idToken", "id_token"):
+            value = item.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                if 20 <= len(value) <= 32768 and not any(char.isspace() for char in value) and value != "idToken_dari_verifyaccount":
+                    return value
+        legacy_tokens.append(item.get("token"))
+        for key in ("data", "user", "result", "account", "profile"):
+            nested = item.get(key)
+            if isinstance(nested, dict):
+                queue.append((nested, depth + 1))
+    for value in legacy_tokens:
+        if isinstance(value, str):
+            value = value.strip()
+            if 20 <= len(value) <= 32768 and not any(char.isspace() for char in value) and value != "idToken_dari_verifyaccount":
+                return value
     return ""
 
 
@@ -14478,7 +15123,10 @@ async def tools_provider_request(method: str, url: str, *, payload=None,
         return False,0,{"error":"unsafe_status_url"}
     retries=TOOLS_PROVIDER_MAX_RETRIES if max_retries is None else max(0,int(max_retries))
     attempts=1+retries if safe_read else 1
-    timeout=aiohttp.ClientTimeout(total=float(TOOLS_PROVIDER_TIMEOUT_SECONDS))
+    request_timeout = TOOLS_PROVIDER_TIMEOUT_SECONDS
+    if method == "POST" and not read_only and str(url) == str(TOOLS_PROVIDER_APPLY_URL):
+        request_timeout = max(request_timeout, TOOLS_PROVIDER_APPLY_TIMEOUT_SECONDS)
+    timeout=aiohttp.ClientTimeout(total=float(request_timeout))
     headers=tools_provider_headers(payload is not None)
     owner_id=int(owner_id or ADMIN_ID)
     last=(False,0,{"error":"not_started"})
@@ -14496,10 +15144,18 @@ async def tools_provider_request(method: str, url: str, *, payload=None,
                     status=int(response.status)
                     try:data=await response.json(content_type=None)
                     except (ValueError,aiohttp.ContentTypeError):
-                        data={"error":"invalid_json_response","_outcome_unknown":not safe_read}
+                        data={"error":"invalid_json_response","_outcome_unknown":not safe_read and not 400<=status<500}
                     if not isinstance(data,(dict,list)):
-                        data={"error":"invalid_response","_outcome_unknown":not safe_read}
+                        data={"error":"invalid_response","_outcome_unknown":not safe_read and not 400<=status<500}
                     if isinstance(data,dict):
+                        # A definitive HTTP rejection cannot become an hour-long inbox wait
+                        # merely because an endpoint/CDN returned HTML instead of JSON.
+                        if 400<=status<500:
+                            data["_outcome_unknown"]=False
+                            if isinstance(data.get("error"),str) and data["error"] in {"invalid_json_response","invalid_response"}:
+                                data["error"]={400:"provider_invalid_input",401:"provider_auth_failed",
+                                    403:"provider_access_denied",404:"provider_endpoint_not_found",
+                                    405:"provider_method_not_allowed",429:"provider_rate_limited"}.get(status,"provider_http_rejected")
                         retry_after=response.headers.get("Retry-After")
                         if retry_after:data["_retry_after"]=retry_after
                         if not safe_read and (status>=500 or 300<=status<400):data["_outcome_unknown"]=True
@@ -15984,6 +16640,17 @@ def auto_am_extract_magic_link(message) -> str:
 
 
 # Automatic AM jobs keep credentials in memory and irreversible request claims in SQLite.
+TOOLS_AUTO_AM_MAIL_PROVIDER = os.getenv("TOOLS_AUTO_AM_MAIL_PROVIDER", "grabmail").strip().lower() or "grabmail"
+
+
+def auto_am_mail_provider():
+    provider = str(TOOLS_AUTO_AM_MAIL_PROVIDER or "grabmail").strip().lower()
+    provider = {"guerrillamail": "guerrilla", "guerrillamail.com": "guerrilla", "mail.tm": "mailtm"}.get(provider, provider)
+    if provider not in {"grabmail", "guerrilla", "mailtm", "maildrop"}:
+        raise TempMailError("TOOLS_AUTO_AM_MAIL_PROVIDER harus grabmail, guerrilla, mailtm, atau maildrop.", status=503)
+    return provider
+
+
 TOOLS_AUTO_AM_MAIL_WAIT_SECONDS = env_int("TOOLS_AUTO_AM_MAIL_WAIT_SECONDS", 90, 15, 180)
 TOOLS_AUTO_AM_POLL_SECONDS = env_int("TOOLS_AUTO_AM_POLL_SECONDS", 3, 1, 15)
 _AUTO_AM_SESSIONS = {}
@@ -16115,6 +16782,17 @@ def auto_am_job_for_ticket(owner_id, ticket):
             raise ValueError("Tombol aktivasi tidak valid.")
         row = conn.execute("SELECT * FROM owner_auto_am_jobs WHERE owner_id=? "
                            "AND status IN ('running','waiting') ORDER BY id DESC LIMIT 1", (int(owner_id),)).fetchone()
+        if row and row["mailbox_id"] and row["stage"] == "waiting_mail" and not row["verify_activity_id"]:
+            mailbox = conn.execute("SELECT * FROM owner_temp_mailboxes WHERE id=? AND owner_id=?",
+                                   (row["mailbox_id"], int(owner_id))).fetchone()
+            # A fresh owner click may leave a stalled old provider. Replayed tickets
+            # above and every verify/apply stage keep their original mailbox.
+            idle = not row["lease_token"] or str(row["lease_until"] or "") <= now
+            if mailbox and idle and temp_mail_row_provider(mailbox) != auto_am_mail_provider():
+                conn.execute("UPDATE owner_auto_am_jobs SET status='failed',auto_watch_until='',auto_notified_at=?,updated_at=?,detail=? WHERE id=? AND owner_id=?",
+                             (now, now, "Pemantauan email lama dihentikan saat owner memulai aktivasi dengan provider baru. Email tetap tersimpan; Apply belum dikirim.",
+                              int(row["id"]), int(owner_id)))
+                row = None
         if not row:
             cur = conn.execute("INSERT INTO owner_auto_am_jobs(owner_id,created_at,updated_at) VALUES(?,?,?)",
                                (int(owner_id), now, now))
@@ -16191,7 +16869,7 @@ def auto_am_flow_result(job):
         return None
     conn = db()
     try:
-        row = conn.execute("SELECT f.status,f.http_status,f.provider_ref,f.apply_started_at,a.status AS activity_status "
+        row = conn.execute("SELECT f.status,f.http_status,f.provider_ref,f.apply_started_at,a.status AS activity_status,a.detail AS activity_detail "
                            "FROM tool_provider_flows f LEFT JOIN tool_activity_logs a ON a.id=f.apply_activity_id "
                            "AND a.owner_id=f.owner_id AND a.target_email=f.target_email AND a.action='apply_premium' "
                            "WHERE f.correlation_id=? AND f.owner_id=? AND f.target_email=? AND f.stage='apply_premium'",
@@ -16377,9 +17055,14 @@ async def auto_am_run(call, job):
         data = await state.get_data()
         metadata = data.get("tools_apply_license_status") or {}
         status = persisted["status"]
+        try:
+            activity_result = json.loads(str(persisted.get("activity_detail") or "{}"))
+        except (ValueError, TypeError):
+            activity_result = {}
+        failure_detail = (f"Apply Premium gagal (HTTP {persisted['http_status']}). " + tools_retry_hint(persisted["http_status"], activity_result)) if status == "failed" else ""
         job = auto_am_update(owner, job_id, stage="apply_premium", status="waiting" if status == "pending" else status,
                             detail="Apply masih diproses provider." if status == "pending" else
-                            ("Status Apply belum diketahui. Periksa hasil tanpa mengulang Apply." if status == "unknown" else ""),
+                            ("Status Apply belum diketahui. Periksa hasil tanpa mengulang Apply." if status == "unknown" else failure_detail),
                             provider_plan=str(metadata.get("plan") or job["provider_plan"])[:200],
                             provider_expiry=str(metadata.get("expires_at") or job["provider_expiry"])[:100])
         if status in {"success", "failed"}: state.forget()
@@ -16388,7 +17071,7 @@ async def auto_am_run(call, job):
         state.forget()
         return auto_am_update(owner, job_id, status="unknown", detail="Verifikasi sudah dikirim, tetapi sesi token tidak tersedia. Periksa provider; verifikasi tidak diulang.")
     if not job["mailbox_id"]:
-        await auto_am_progress(call, "Membuat email Maildrop untuk aktivasi AM Pro 1 tahun...")
+        await auto_am_progress(call, "Membuat email " + {"grabmail":"Grabmail", "guerrilla":"Guerrilla Mail", "mailtm":"Mail.tm", "maildrop":"Maildrop"}[auto_am_mail_provider()] + " untuk aktivasi AM Pro...")
         mailbox = await temp_mail_create_account(owner, auto_job_id=job_id)
         job = auto_am_bind_mailbox(owner, job_id, mailbox)
     else:
@@ -16415,7 +17098,8 @@ async def auto_am_run(call, job):
             auto_am_update(owner, job_id, stage="waiting_mail", status="waiting", detail="Periksa kotak masuk; pengiriman link tidak diulang.")
             raise
         if status == "failed":
-            return auto_am_update(owner, job_id, status="failed", detail="Provider gagal mengirim Magic Link. Email tetap tersimpan.")
+            return auto_am_update(owner, job_id, stage="send_magic_link", status="failed",
+                detail=f"Kirim Magic Link gagal (HTTP {http_status}). " + tools_retry_hint(http_status, result) + " Email tetap tersimpan.")
         job = auto_am_update(owner, job_id, stage="waiting_mail", status="waiting", detail="")
     if not job["verify_activity_id"]:
         await auto_am_progress(call, "Menunggu email dan membaca Magic Link...")
@@ -16450,7 +17134,8 @@ async def auto_am_run(call, job):
             if not token:
                 state.forget()
                 return auto_am_update(owner, job_id, stage="verify_requested", status="unknown" if status in {"pending", "unknown"} else "failed",
-                    detail="Verifikasi belum menghasilkan token yang cocok. Apply belum dikirim; verifikasi tidak diulang.")
+                    detail=f"Verifikasi belum berhasil (HTTP {http_status}). " + (tools_retry_hint(http_status, result) if not ok else
+                    "Token/email hasil verifikasi belum cocok.") + " Apply belum dikirim; verifikasi tidak diulang.")
             now = datetime.now().isoformat(timespec="seconds")
             await state.update_data(tools_target_email=job["email"], tools_verify_email=job["email"],
                 tools_verify_id_token=token, tools_verify_id_token_at=now, tools_session_started_at=now,
@@ -16491,7 +17176,7 @@ async def auto_am_render(call, job, *, notice=""):
     if status == "success":
         lines.append("Email sudah melalui verifikasi dan Apply Premium sukses menurut provider.")
         if job["provider_plan"]: lines.append("Paket provider: " + html.escape(job["provider_plan"]))
-        if job["provider_expiry"]: lines.append("Berlaku sampai: " + html.escape(job["provider_expiry"]))
+        if job["provider_expiry"]: lines.append("Berlaku sampai: " + html.escape(format_wib_datetime(job["provider_expiry"], compact=True)))
         else: lines.append("Durasi belum diinformasikan provider; periksa paket pada akun.")
     elif job["detail"]:
         lines.append(html.escape(job["detail"][:500]))
@@ -16632,6 +17317,8 @@ async def owner_auto_am_callback(call: CallbackQuery):
             latest = auto_am_get_job(call.from_user.id, job["id"])
             if latest:
                 preserved = latest["status"] if latest["status"] in {"success", "failed", "unknown"} else "waiting"
+                if isinstance(exc, TempMailError) and not latest["magic_activity_id"] and not exc.outcome_unknown and exc.status in {400, 401, 403, 409, 422, 503}:
+                    preserved = "failed"
                 current_error = str(exc)[:400] if isinstance(exc, TempMailError) else "Koneksi terputus. Periksa hasil; permintaan yang telah dikirim tidak diulang."
                 detail = (latest["detail"] or current_error) if preserved in {"success","failed","unknown"} else current_error
                 job = auto_am_update(call.from_user.id, job["id"], status=preserved, detail=detail)
@@ -16685,17 +17372,26 @@ def temp_mail_body_pages(text: str, units: int = 2800) -> list:
 
 def temp_mail_provider_caption(mailbox=None) -> str:
     provider = temp_mail_row_provider(mailbox) if mailbox is not None else temp_mail_selected_provider()
+    if provider == "grabmail":
+        return 'Provider: <a href="https://grabmail.io">Grabmail</a> • Gratis tanpa API key.'
+    if provider == "guerrilla":
+        return 'Provider: <a href="https://www.guerrillamail.com">Guerrilla Mail</a> • Gratis tanpa API key.'
     if provider == "maildrop":
         return 'Provider: <a href="https://maildrop.cc">Maildrop</a> • Gratis tanpa API key.'
     return 'Provider: <a href="https://mail.tm">Mail.tm</a> • Gratis tanpa API key.'
+
 
 
 def temp_mail_inbox_link_text(mailbox) -> str:
     url = temp_mail_web_inbox_url(mailbox)
     if not url:
         return ""
+    provider = temp_mail_row_provider(mailbox)
+    expiry = ("Pesan disimpan hingga 5 hari." if provider == "grabmail" else
+              "Pesan disimpan sekitar 60 menit; alamat inbox dapat dibuka kembali." if provider == "guerrilla" else
+              "Pesan dapat dihapus setelah 24 jam tanpa email baru.")
     return ('\n\n🔗 Link inbox untuk dibagikan:\n<a href="' + html.escape(url, quote=True) + '">' + html.escape(url)
-            + '</a>\nInbox publik; siapa pun yang mengetahui alamat dapat membaca pesan. Pesan dapat dihapus setelah 24 jam tanpa email baru.')
+            + '</a>\nInbox publik; siapa pun yang mengetahui alamat dapat membaca pesan. ' + expiry)
 
 
 def temp_mail_ui_keyboard(mailbox=None):
@@ -16795,7 +17491,7 @@ async def owner_temp_mail_accounts(call: CallbackQuery):
         accounts=[mailbox for mailbox in temp_mail_list_accounts(call.from_user.id) if mailbox.get("state")!="failed"]
         lines=["🗂 <b>DAFTAR EMAIL</b>","","Pilih alamat untuk digunakan. Maksimal 5 alamat per provider; email lama tetap tersedia."]
         keyboard=[]
-        for mailbox in accounts[:TEMP_MAIL_ACCOUNT_LIMIT*2]:
+        for mailbox in accounts[:TEMP_MAIL_ACCOUNT_LIMIT*4]:
             address=str(mailbox.get("address") or "-")
             ready=mailbox.get("state")=="ready"
             icon="✅" if mailbox.get("active") else "▫️"
@@ -16807,6 +17503,7 @@ async def owner_temp_mail_accounts(call: CallbackQuery):
         keyboard.append([InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")])
         await safe_edit_or_answer(call,"\n\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
     except Exception as exc:await temp_mail_ui_error(call,exc)
+
 
 
 @router.callback_query(F.data.startswith("tm:use:"))
@@ -16863,13 +17560,14 @@ async def owner_temp_mail_help(call: CallbackQuery):
         "Daftar Email menyimpan maksimal 5 alamat per provider. Alamat dan akses email tetap tersedia setelah bot restart.\n"
         "Isi pesan ditampilkan sebagai teks. Link dibuka sendiri; bot tidak otomatis menjalankan link atau Apply Premium.\n\n"
         "Gunakan fitur dengan bijak. Hindari data penting karena provider dapat menghapus email sementara.\n"
-        "Email baru Maildrop mempunyai link inbox situs yang dapat dibagikan tanpa login bot. Inbox publik; jangan gunakan untuk data penting.\n"
-        "Pesan dapat dihapus setelah 24 jam tanpa email baru. Pengiriman pertama kadang tertunda 15 menit–1 jam.\n"
-        "Email Mail.tm lama tetap dapat dibuka melalui Received Mail.\n"
+        "Email Grabmail, Guerrilla Mail, dan Maildrop mempunyai link inbox situs yang dapat dibagikan tanpa login bot. Inbox publik; jangan gunakan untuk data penting.\n"
+        "Grabmail menyimpan pesan hingga 5 hari; Received Mail menampilkan maksimal 1.000 pesan terbaru. Guerrilla Mail sekitar 60 menit. Maildrop dapat menunda pengiriman pertama 15 menit–1 jam.\n"
+        "Email lama tetap dapat dibuka melalui Received Mail sesuai provider masing-masing.\n"
         +temp_mail_provider_caption(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")]]),
         parse_mode="HTML",
     )
+
 
 
 async def temp_mail_present(target, text, keyboard):
@@ -31654,7 +32352,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.67"
+EXPECTED_SOURCE_VERSION = "16.68"
 
 
 def source_integrity_self_test():
