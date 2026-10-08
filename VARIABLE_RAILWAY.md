@@ -1862,3 +1862,49 @@ Tidak ada dependency baru. Upload enam file v16.62 bersama.
 Layar awal VIP menampilkan teks statis `0/15 akun/jam`; bukan penghitung pemakaian.
 Aktivasi sekali klik tetap khusus owner. Tidak ada variable/dependency baru; schema tetap `182`.
 Upload enam file v16.63 bersama.
+
+## v16.64 — Pemulihan Temp Mail dan Aktivasi
+
+Format referensi akun Mail.tm yang didukung dinormalisasi; pesan/link rusak tidak menahan pesan valid berikutnya.
+Lanjutkan memakai email yang sama dan melaporkan status; Apply yang sudah dikirim tidak diulang.
+VIP tetap menampilkan teks statis `0/15 akun/jam`; aktivasi sekali klik khusus owner.
+Pengujian memakai API simulasi, bukan aktivasi premium asli. Schema tetap `182`; tidak ada variable/dependency baru.
+Upload enam file v16.64 bersama.
+
+Tambahan v16.64: menu owner memakai satu pintu masuk Magic Link / Verifikasi; callback lama tetap berfungsi.
+Tautan inbox membuka Received Mail langsung, dan tombol Salin Alamat mengikuti inbox yang sedang dibuka.
+Daftar produk, Populer, dan Flash Sale memuat10produk perhalaman dengan tombol langsung;
+nomor produk tetap konsisten, Flash kedaluwarsa disaring, dan navigasi menyesuaikan produk yang dinonaktifkan.
+
+## v16.65 — Link inbox situs untuk dibagikan
+
+`TEMPMAIL_PROVIDER=maildrop` memilih Maildrop untuk email baru (default). API GraphQL resmi gratis tanpa API key.
+Alamat baru berakhiran `@maildrop.cc`; teks email dan hasil aktivasi menyertakan link
+`https://maildrop.cc/inbox/?mailbox=NAMA_EMAIL`. Link dapat Anda bagikan ke pembeli tanpa akses Telegram bot.
+Fitur Temp Mail/aktivasi tetap khusus owner, tombol tidak ditambah. Tombol kotak masuk yang sudah ada menuju situs untuk email baru.
+`TEMPMAIL_PROVIDER=mailtm` memakai Mail.tm untuk email baru; mailbox Mail.tm lama tetap terbaca apa pun pilihan provider.
+Alamat Mail.tm lama tidak dapat dipindahkan ke Maildrop atau diberi link inbox Maildrop.
+
+Maildrop tidak memakai password: siapa pun yang mengetahui alamat dapat membaca/menghapus pesan di situs provider.
+Maksimal 10 pesan; pesan dapat dihapus setelah 24 jam tanpa email baru, atau lebih cepat ketika provider penuh.
+Pengiriman pertama kadang tertunda 15 menit–1 jam karena greylisting. Bot menunggu sebentar lalu menyediakan Lanjutkan
+pada alamat yang sama, tanpa mengirim ulang Magic Link atau Apply. Inbox sementara tidak dijamin tersimpan setahun.
+Domain tetap harus diterima oleh provider Alight; sukses/paket mengikuti respons Apply, bukan jenis email.
+
+Sumber: [API](https://docs.maildrop.cc/api-reference/overview), [schema](https://docs.maildrop.cc/api-reference/graphql-api-schema),
+[penerimaan](https://maildrop.cc/contact-us/), [batas inbox](https://maildrop.cc/how-it-works/), [privasi](https://maildrop.cc/privacy/).
+Schema `183` menandai provider per mailbox; migrasi mempertahankan email lama, job, produk, pembayaran, dan data belanja.
+Tidak ada dependency atau webserver baru. Upload enam file v16.65 bersama; jangan upload database atau secret ke GitHub.
+API/penerimaan/Apply diuji dengan simulasi; penerimaan Alight dan pembukaan situs inbox asli belum diuji langsung.
+
+Batas email: 5 per provider (maksimal 10 alamat tersimpan). Lima mailbox Mail.tm lama tidak menghalangi email baru Maildrop; daftar lama tetap dapat dipilih.
+
+## v16.66 — Aktivasi AM Pro 1 tahun khusus Maildrop
+
+Aktivasi AM otomatis baru selalu membuat alamat `@maildrop.cc`, mengirim Magic Link, membaca inbox,
+memverifikasi link, lalu mengirim Apply Premium satu kali. Hasil memuat email dan link inbox Maildrop yang bisa dibagikan.
+`TEMPMAIL_PROVIDER` hanya memilih provider untuk pembuatan Temp Mail manual; tidak mengalihkan aktivasi baru ke Mail.tm.
+Job lama yang sudah terikat ke email tetap melanjutkan email tersebut agar Magic Link/verifikasi/Apply tidak diulang.
+Menu tetap khusus owner; tidak ada tombol tambahan. Schema tetap `183`, tanpa variable atau dependency baru.
+Paket/durasi tetap mengikuti hasil provider; endpoint Apply tidak memiliki parameter jaminan satu tahun.
+Pengujian menggunakan API simulasi; penerimaan Alight/Apply asli belum diuji. Upload enam file v16.66 bersama.
