@@ -226,8 +226,8 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.68"
-SCHEMA_VERSION = 184
+BOT_VERSION = "16.70"
+SCHEMA_VERSION = 185
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -575,6 +575,30 @@ def init_db():
     """)
 
 
+
+    # Telegram message IDs are scoped to the owner chat that received each PM.
+    # A marker row (message_id=0) is committed with buyer cancellation so a
+    # notification whose send finishes later is also removed after a restart.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_order_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            owner_chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            notification_kind TEXT NOT NULL DEFAULT 'pending',
+            cleanup_state TEXT NOT NULL DEFAULT 'active',
+            cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT NOT NULL DEFAULT '',
+            cleanup_token TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(order_id,owner_chat_id,message_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_owner_order_notifications_cleanup "
+                "ON owner_order_notifications(cleanup_state,next_attempt_at)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS wallets (
@@ -1274,15 +1298,7 @@ def init_db():
     }
     for k, v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)", (k, v))
-    cur.execute(
-        "UPDATE settings SET value='1' WHERE key='unique_code_enabled'"
-    )
-    cur.execute(
-        "UPDATE settings SET value='200' WHERE key='unique_code_min'"
-    )
-    cur.execute(
-        "UPDATE settings SET value='500' WHERE key='unique_code_max'"
-    )
+    # Preserve owner settings during restart/restore; defaults only fill missing keys.
 
     count = cur.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"]
     if count == 0:
@@ -3137,6 +3153,10 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
 
     if allocated:
         items = allocated
+        # Retry already allocated credentials without holding the write lock
+        # across Telegram I/O and the payload's separate database updates.
+        conn.commit()
+        conn.close()
     else:
         variant_row=conn.execute(
             "SELECT sharing_mode FROM product_variants WHERE id=?",
@@ -7493,6 +7513,198 @@ def clear_payment_proof_session(user_id: int):
     conn.close()
 
 
+def queue_owner_order_notification_cleanup(conn, order_id: int, user_id: int):
+    """Called inside the verified buyer cancellation transaction, never for topups."""
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT OR IGNORE INTO owner_order_notifications
+           (order_id,user_id,owner_chat_id,message_id,notification_kind,cleanup_state,created_at,updated_at)
+           VALUES(?,?,0,0,'buyer_cancel','marker',?,?)""",
+        (int(order_id),int(user_id),now,now)
+    )
+    conn.execute(
+        """UPDATE owner_order_notifications
+           SET cleanup_state='pending',next_attempt_at='',updated_at=?
+           WHERE order_id=? AND user_id=? AND message_id>0 AND cleanup_state='active'""",
+        (now,int(order_id),int(user_id))
+    )
+
+
+async def track_owner_order_notification(bot: Bot, sent, order_id: int, user_id: int,
+                                         owner_chat_id: int, kind: str = "pending"):
+    """Store actual send results; cancelled sends are cleaned without re-sending."""
+    message_id = int(getattr(sent,"message_id",0) or 0)
+    if message_id <= 0 or int(owner_chat_id) <= 0:
+        return
+    conn = None
+    cancelled = False
+    try:
+        conn = db()
+        begin_immediate_retry(conn)
+        order = conn.execute(
+            "SELECT status,payment_status FROM orders WHERE id=? AND user_id=?",
+            (int(order_id),int(user_id))
+        ).fetchone()
+        if not order:
+            conn.rollback()
+            return
+        marker = conn.execute(
+            """SELECT 1 FROM owner_order_notifications
+               WHERE order_id=? AND user_id=? AND message_id=0 AND notification_kind='buyer_cancel'""",
+            (int(order_id),int(user_id))
+        ).fetchone()
+        cancelled = bool(marker and order["status"]=="cancelled"
+                         and order["payment_status"]=="cancelled")
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT OR IGNORE INTO owner_order_notifications
+               (order_id,user_id,owner_chat_id,message_id,notification_kind,cleanup_state,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (int(order_id),int(user_id),int(owner_chat_id),message_id,str(kind),
+             "pending" if cancelled else "active",now,now)
+        )
+        conn.commit()
+    except sqlite3.Error:
+        if conn is not None:
+            conn.rollback()
+        logging.exception("Owner order notification tracking failed order=%s",order_id)
+    finally:
+        if conn is not None:
+            conn.close()
+    if cancelled:
+        await cleanup_owner_order_notifications(bot,order_id=int(order_id))
+
+
+async def send_owner_order_notification(bot: Bot, order_id: int, user_id: int,
+                                         text: str, **kwargs):
+    owner_chat_id = int(ADMIN_ID)
+    sent = await bot.send_message(owner_chat_id,text,**kwargs)
+    await track_owner_order_notification(bot,sent,order_id,user_id,owner_chat_id)
+    return sent
+
+
+async def retire_owner_order_notification(bot: Bot, row):
+    """Telegram may refuse deleting old messages: replace them and retire controls."""
+    text = ("❌ <b>PESANAN DIBATALKAN PEMBELI</b>\n\n"
+            f"🧾 {invoice(int(row['order_id']))}\n"
+            "Invoice ini tidak perlu diproses.")
+    values = {"chat_id":int(row["owner_chat_id"]),"message_id":int(row["message_id"]),
+              "reply_markup":None,"parse_mode":"HTML"}
+    try:
+        if str(row["notification_kind"]) in {"proof_media","proof_photo","proof_document"}:
+            await bot.edit_message_caption(caption=text,**values)
+        else:
+            await bot.edit_message_text(text,**values)
+        return True
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+    except (TelegramNetworkError,TelegramRetryAfter,TelegramForbiddenError):
+        raise
+    # A forwarded image without a caption may reject a caption edit. Its live
+    # confirmation buttons must still be retired, and retry metadata kept if not.
+    try:
+        await bot.edit_message_reply_markup(chat_id=values["chat_id"],
+                                           message_id=values["message_id"],reply_markup=None)
+        return True
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+        raise
+
+
+async def cleanup_owner_order_notifications(bot: Bot, *, order_id: int = 0, limit: int = 20):
+    """Claim durable cleanup jobs; restrict them to buyer-cancelled unpaid orders."""
+    for _ in range(max(1,min(int(limit),50))):
+        conn = None
+        row = None
+        token = secrets.token_hex(16)
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            conn = db()
+            begin_immediate_retry(conn)
+            row = conn.execute(
+                """SELECT n.* FROM owner_order_notifications n
+                   JOIN orders o ON o.id=n.order_id AND o.user_id=n.user_id
+                   WHERE n.message_id>0 AND n.owner_chat_id>0
+                     AND n.cleanup_state IN ('pending','deleting')
+                     AND (n.next_attempt_at='' OR n.next_attempt_at<=?)
+                     AND (?=0 OR n.order_id=?)
+                     AND o.status='cancelled' AND o.payment_status='cancelled'
+                     AND EXISTS(SELECT 1 FROM owner_order_notifications c
+                         WHERE c.order_id=n.order_id AND c.user_id=n.user_id
+                           AND c.message_id=0 AND c.notification_kind='buyer_cancel')
+                   ORDER BY n.id LIMIT 1""",
+                (now,int(order_id),int(order_id))
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return
+            lease = (datetime.now()+timedelta(seconds=120)).isoformat(timespec="seconds")
+            conn.execute(
+                """UPDATE owner_order_notifications SET cleanup_state='deleting',
+                   cleanup_attempts=cleanup_attempts+1,cleanup_token=?,next_attempt_at=?,updated_at=?
+                   WHERE id=?""",(token,lease,now,int(row["id"]))
+            )
+            conn.commit()
+        except sqlite3.Error:
+            if conn is not None:
+                conn.rollback()
+            logging.exception("Owner notification cleanup claim failed")
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+
+        state = "deleted"
+        error = ""
+        retry_delay = min(3600,30 * (2 ** min(int(row["cleanup_attempts"] or 0),6)))
+        try:
+            try:
+                await bot.delete_message(chat_id=int(row["owner_chat_id"]),
+                                         message_id=int(row["message_id"]))
+            except TelegramBadRequest as exc:
+                if "message to delete not found" not in str(exc).lower():
+                    await retire_owner_order_notification(bot,row)
+                    state = "retired"
+            except TelegramForbiddenError:
+                await retire_owner_order_notification(bot,row)
+                state = "retired"
+        except Exception as exc:
+            state = "pending"
+            error = type(exc).__name__[:80]
+            if isinstance(exc,TelegramRetryAfter):
+                retry_delay = max(retry_delay,min(86400,int(exc.retry_after)+1))
+            logging.warning("Owner notification cleanup deferred order=%s kind=%s error=%s",
+                            row["order_id"],row["notification_kind"],error)
+        next_at = ((datetime.now()+timedelta(seconds=retry_delay)).isoformat(timespec="seconds")
+                   if state=="pending" else "")
+        conn = None
+        try:
+            conn = db()
+            conn.execute(
+                """UPDATE owner_order_notifications
+                   SET cleanup_state=?,next_attempt_at=?,cleanup_token='',last_error=?,updated_at=?
+                   WHERE id=? AND cleanup_token=?""",
+                (state,next_at,error,datetime.now().isoformat(timespec="seconds"),int(row["id"]),token)
+            )
+            conn.commit()
+        except sqlite3.Error:
+            logging.exception("Owner notification cleanup result persistence failed")
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+async def owner_order_notification_cleanup_loop(bot: Bot):
+    while True:
+        try:
+            await cleanup_owner_order_notifications(bot)
+        except Exception:
+            logging.exception("Owner notification cleanup worker failed")
+        await asyncio.sleep(30)
+
+
 async def forward_payment_proof_to_owner(
     bot: Bot,
     message: Message,
@@ -7508,23 +7720,30 @@ async def forward_payment_proof_to_owner(
         )
         return False, "ADMIN_ID belum dikonfigurasi."
 
+    owner_chat_id = int(ADMIN_ID)
     caption = payment_proof_caption(entity, row)
     keyboard = owner_payment_proof_keyboard(entity, entity_id)
 
     # Preferred path: copy the exact user evidence, then send action controls.
     # This is more reliable than re-sending a Telegram file_id after restarts.
     try:
-        await bot.copy_message(
-            chat_id=ADMIN_ID,
+        copied = await bot.copy_message(
+            chat_id=owner_chat_id,
             from_chat_id=message.chat.id,
             message_id=message.message_id
         )
-        await bot.send_message(
-            ADMIN_ID,
+        if entity == "order":
+            await track_owner_order_notification(bot,copied,entity_id,int(row["user_id"]),
+                                                 owner_chat_id,"proof_media")
+        header = await bot.send_message(
+            owner_chat_id,
             caption,
             reply_markup=keyboard,
             parse_mode="HTML"
         )
+        if entity == "order":
+            await track_owner_order_notification(bot,header,entity_id,int(row["user_id"]),
+                                                 owner_chat_id,"proof_header")
         return True, ""
     except Exception as copy_exc:
         logging.warning(
@@ -7537,16 +7756,16 @@ async def forward_payment_proof_to_owner(
     # Fallback: re-send by file_id.
     try:
         if message.photo:
-            await bot.send_photo(
-                ADMIN_ID,
+            sent = await bot.send_photo(
+                owner_chat_id,
                 photo=message.photo[-1].file_id,
                 caption=caption,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
         elif message.document:
-            await bot.send_document(
-                ADMIN_ID,
+            sent = await bot.send_document(
+                owner_chat_id,
                 document=message.document.file_id,
                 caption=caption,
                 reply_markup=keyboard,
@@ -7554,6 +7773,9 @@ async def forward_payment_proof_to_owner(
             )
         else:
             return False, "Bukti bukan foto/file gambar."
+        if entity == "order":
+            await track_owner_order_notification(bot,sent,entity_id,int(row["user_id"]),
+                                                 owner_chat_id,"proof_photo" if message.photo else "proof_document")
         return True, ""
     except Exception as send_exc:
         logging.exception(
@@ -8097,17 +8319,47 @@ def channel_target(value: str):
 
 
 def create_database_backup() -> Path:
+    # Never manufacture an empty database when the volume/path is missing.
+    source_path = Path(DB_PATH).resolve()
+    if not source_path.is_file():
+        raise RuntimeError("Database sumber tidak ditemukan; backup dibatalkan.")
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = Path(BACKUP_DIR) / f"maboyydigital_{stamp}.db"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = Path(BACKUP_DIR) / f"maboyydigital_{stamp}_{secrets.token_hex(4)}.db"
 
-    src = sqlite3.connect(DB_PATH)
-    dst = sqlite3.connect(str(backup_path))
+    src = None
+    dst = None
+    snapshot_created = False
     try:
+        # SQLite online backup includes committed WAL pages, unlike a file copy.
+        src = sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True, timeout=10.0)
+        if not src.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='orders'"
+        ).fetchone():
+            raise RuntimeError("Database sumber bukan database toko; backup dibatalkan.")
+        backup_path.touch(exist_ok=False)
+        snapshot_created = True
+        dst = sqlite3.connect(str(backup_path))
         src.backup(dst)
+        integrity = dst.execute("PRAGMA integrity_check").fetchall()
+        if integrity != [("ok",)]:
+            raise RuntimeError("Integritas snapshot database gagal; backup dibatalkan.")
+    except Exception:
+        if dst is not None:
+            dst.close()
+            dst = None
+        if src is not None:
+            src.close()
+            src = None
+        # Failed or partial snapshots must never appear as successful backups.
+        if snapshot_created:
+            backup_path.unlink(missing_ok=True)
+        raise
     finally:
-        dst.close()
-        src.close()
+        if dst is not None:
+            dst.close()
+        if src is not None:
+            src.close()
 
     backups = sorted(
         Path(BACKUP_DIR).glob("maboyydigital_*.db"),
@@ -8175,15 +8427,39 @@ def create_project_backup() -> tuple[Path, Path]:
     backup_dir=Path(BACKUP_DIR)
     backup_dir.mkdir(parents=True,exist_ok=True)
 
-    stamp=datetime.now(JAKARTA_TZ).strftime("%Y%m%d_%H%M%S")
-    zip_path=backup_dir / f"MaboyyDigital_Project_v{BOT_VERSION}_{stamp}.zip"
+    stamp=datetime.now(JAKARTA_TZ).strftime("%Y%m%d_%H%M%S_%f")
+    zip_path=backup_dir / f"MaboyyDigital_Project_v{BOT_VERSION}_{stamp}_{secrets.token_hex(4)}.zip"
 
+    # This checksum covers the exact standalone SQLite file stored as shop.db.
+    snapshot_hash=hashlib.sha256()
+    with db_snapshot.open("rb") as source_file:
+        for chunk in iter(lambda:source_file.read(1024*1024),b""):
+            snapshot_hash.update(chunk)
+    snapshot_conn=sqlite3.connect(db_snapshot.resolve().as_uri()+"?mode=ro",uri=True)
+    try:
+        snapshot_tables=[row[0] for row in snapshot_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )]
+        snapshot_schema=0
+        if "schema_migrations" in snapshot_tables:
+            snapshot_schema=int(snapshot_conn.execute(
+                "SELECT COALESCE(MAX(version),0) FROM schema_migrations"
+            ).fetchone()[0])
+        snapshot_rows=[
+            (name,snapshot_conn.execute('SELECT COUNT(*) FROM "'+name.replace('"','""')+'"').fetchone()[0])
+            for name in snapshot_tables
+        ]
+    finally:
+        snapshot_conn.close()
+
+    zip_created=False
     try:
         with zipfile.ZipFile(
             zip_path,
-            "w",
+            "x",
             compression=zipfile.ZIP_DEFLATED
         ) as archive:
+            zip_created=True
             for name in PROJECT_BACKUP_REQUIRED_FILES:
                 archive.write(project_root / name,arcname=name)
 
@@ -8210,19 +8486,28 @@ def create_project_backup() -> tuple[Path, Path]:
                 "",
                 "Database snapshot:",
                 "- shop.db",
+                f"Database SHA256: {snapshot_hash.hexdigest()}",
+                f"Database size_bytes: {db_snapshot.stat().st_size}",
+                "SQLite integrity_check: ok",
+                f"Database schema_version: {snapshot_schema}",
+                f"Database table_count: {len(snapshot_tables)}",
+                *[f"Database rows {name}: {count}" for name,count in snapshot_rows],
                 "",
-                "Secrets:",
-                "- .env intentionally excluded",
+                "Secrets / privacy:",
+                "- .env and Railway variable values intentionally excluded",
+                "- Database may contain customer data and stored account/mailbox credentials",
+                "- PRIVATE BACKUP: never upload shop.db or this archive to GitHub",
             ]
             archive.writestr(
                 "BACKUP_MANIFEST.txt",
                 "\n".join(manifest_lines)
             )
     except Exception:
-        try:
-            zip_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if zip_created:
+            try:
+                zip_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         raise
 
     project_backups=sorted(
@@ -9005,10 +9290,25 @@ async def safe_edit_or_answer(call: CallbackQuery, text: str, reply_markup=None,
         return False
 
 
+def product_name_az_compare(left, right) -> int:
+    """Compare names without case or surrounding whitespace; keep stored names intact."""
+    left=str(left or "").strip().casefold()
+    right=str(right or "").strip().casefold()
+    return (left>right)-(left<right)
+
+
+def product_list_order_sql(conn, *, popular: bool = False) -> str:
+    """One alphabetical order for pages, global numbers and reply shortcuts."""
+    conn.create_collation("PRODUCT_NAME_AZ",product_name_az_compare)
+    prefix="sold DESC, " if popular else ""
+    return prefix+"COALESCE(name,'') COLLATE PRODUCT_NAME_AZ, id"
+
+
 def user_reply_menu():
     conn = db()
+    order_sql=product_list_order_sql(conn)
     products = conn.execute(
-        "SELECT id, name FROM products WHERE active=1 ORDER BY id LIMIT 25"
+        f"SELECT id, name FROM products WHERE active=1 ORDER BY {order_sql} LIMIT 25"
     ).fetchall()
     conn.close()
 
@@ -9644,6 +9944,11 @@ def validate_system_schema():
         "settings": {"key","value"},
         "system_errors": {"id","error_text","created_at"},
         "payment_proof_sessions": {"user_id","entity_type","entity_id"},
+        "owner_order_notifications": {
+            "id","order_id","user_id","owner_chat_id","message_id","notification_kind",
+            "cleanup_state","cleanup_attempts","next_attempt_at","cleanup_token",
+            "last_error","created_at","updated_at"
+        },
         "reviews": {
             "id","order_id","user_id","product_id","rating","comment",
             "product_name_snapshot","variant_name_snapshot","created_at"
@@ -19064,14 +19369,17 @@ async def show_product_list(call, title, filter_sql="", *, page: int = 1, view: 
         if view=="flash":
             expire_finished_flash_sales(conn)
             conn.commit()
-        all_active=conn.execute("SELECT id FROM products WHERE active=1 ORDER BY id").fetchall()
+        alphabetical_order=product_list_order_sql(conn)
+        all_active=conn.execute(
+            f"SELECT id FROM products WHERE active=1 ORDER BY {alphabetical_order}"
+        ).fetchall()
         global_number_map={int(row["id"]):index for index,row in enumerate(all_active,start=1)}
         total=int(conn.execute(
             f"SELECT COUNT(*) AS n FROM products WHERE active=1 {filter_sql}"
         ).fetchone()["n"] or 0)
         total_pages=max(1,(total+PRODUCTS_PAGE_SIZE-1)//PRODUCTS_PAGE_SIZE)
         page=max(1,min(int(page or 1),total_pages))
-        order_sql="sold DESC, id" if view=="popular" else "id"
+        order_sql=product_list_order_sql(conn,popular=view=="popular")
         rows=conn.execute(
             f"SELECT * FROM products WHERE active=1 {filter_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
             (PRODUCTS_PAGE_SIZE,(page-1)*PRODUCTS_PAGE_SIZE)
@@ -20329,8 +20637,8 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
                     f"🎟️ Voucher: -{rupiah(discount_amount)}\n"
                     if discount_amount else ""
                 )
-                await bot.send_message(
-                    ADMIN_ID,
+                await send_owner_order_notification(
+                    bot,order_id,call.from_user.id,
                     "🏦 <b>ORDER BARU • TRANSFER REKENING</b>\n\n"
                     f"🧾 {inv}\n"
                     f"👤 {html.escape(user)}\n"
@@ -20564,8 +20872,8 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
                     f"🎟️ Voucher: {voucher_code} (-{rupiah(discount_amount)})\n"
                     if discount_amount else ""
                 )
-                await bot.send_message(
-                    ADMIN_ID,
+                await send_owner_order_notification(
+                    bot,order_id,call.from_user.id,
                     "🔔 <b>ORDER BARU / MENUNGGU BAYAR</b>\n\n"
                     f"🧾 {inv}\n"
                     f"👤 {user}\n"
@@ -21227,6 +21535,8 @@ async def user_cancel_order(call: CallbackQuery, bot: Bot, state: FSMContext = N
             verify = conn.execute("SELECT stock_reserved FROM orders WHERE id=?", (order_id,)).fetchone()
             if verify and int(verify["stock_reserved"] or 0) != 0:
                 raise sqlite3.IntegrityError("Reservation release failed")
+        if not was_cancelled:
+            queue_owner_order_notification_cleanup(conn,order_id,call.from_user.id)
         conn.execute(
             "DELETE FROM payment_proof_sessions WHERE user_id=? AND entity_type='order' AND entity_id=?",
             (call.from_user.id, order_id)
@@ -21264,6 +21574,13 @@ async def user_cancel_order(call: CallbackQuery, bot: Bot, state: FSMContext = N
         reply_markup=transaction_done_keyboard(order_id)
     )
     await safe_callback_notice(call, "Pesanan dibatalkan.", show_alert=True)
+
+    try:
+        await cleanup_owner_order_notifications(bot,order_id=order_id)
+    except Exception:
+        # The cancellation is already committed. A durable worker retries PM
+        # cleanup without reopening the payment or restoring reservations.
+        logging.exception("Cancelled order owner PM cleanup deferred order=%s",order_id)
 
 
 @router.callback_query(F.data == "resend:last")
@@ -22934,7 +23251,8 @@ async def owner_backup_project(call: CallbackQuery,bot: Bot):
                     if optional_missing else
                     "✅ Semua file opsional tersedia di container.\n"
                 )
-                + "🔐 <code>.env</code> dan secret Railway tidak disertakan."
+                + "🔐 <code>.env</code> dan nilai Variables tidak disertakan.\n"
+                + "⚠️ ZIP berisi database/data akun; simpan privat, jangan upload ke GitHub."
             ),
             parse_mode="HTML"
         )
@@ -22951,7 +23269,8 @@ async def owner_backup_project(call: CallbackQuery,bot: Bot):
                 + "\n\n"
                 if optional_missing else "\n"
             )
-            + "🔐 Token, password, dan <code>.env</code> asli tidak dimasukkan.",
+            + "🔐 <code>.env</code> dan nilai Variables tidak dimasukkan.\n"
+            + "⚠️ Database bisa berisi data akun/mailbox. ZIP backup wajib disimpan privat.",
             reply_markup=owner_system_menu(),
             parse_mode="HTML"
         )
@@ -26630,7 +26949,11 @@ async def reply_menu_product_number(message: Message, bot: Bot):
     try:
         mark_user_verified(message.from_user.id,message.from_user.username or "")
         conn=db()
-        product=conn.execute("SELECT * FROM products WHERE active=1 ORDER BY id LIMIT 1 OFFSET ?",(index-1,)).fetchone()
+        order_sql=product_list_order_sql(conn)
+        product=conn.execute(
+            f"SELECT * FROM products WHERE active=1 ORDER BY {order_sql} LIMIT 1 OFFSET ?",
+            (index-1,)
+        ).fetchone()
         if not product:return await message.answer("❌ Nomor produk tidak tersedia. Tekan 🏷️ List Produk untuk melihat daftar terbaru.")
         variants=conn.execute("SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY id",(int(product["id"]),)).fetchall()
     except sqlite3.Error:
@@ -32352,7 +32675,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.68"
+EXPECTED_SOURCE_VERSION = "16.70"
 
 
 def source_integrity_self_test():
@@ -32453,6 +32776,7 @@ async def main():
 
     background_tasks = [
         asyncio.create_task(auto_am_background_loop(bot), name="auto_am_background_loop"),
+        asyncio.create_task(owner_order_notification_cleanup_loop(bot), name="owner_order_notification_cleanup_loop"),
         asyncio.create_task(backup_loop(bot), name="backup_loop"),
         asyncio.create_task(cleanup_expired_orders(bot), name="cleanup_expired_orders"),
         asyncio.create_task(periodic_auto_recovery(bot), name="periodic_auto_recovery"),
