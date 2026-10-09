@@ -226,7 +226,7 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.73"
+BOT_VERSION = "16.74"
 SCHEMA_VERSION = 186
 
 CHECKOUT_TERMS_SHORT = (
@@ -1985,34 +1985,41 @@ async def send_join_required(target_message: Message):
 
 
 
-async def force_refresh_user_keyboard(message: Message):
-    """
-    Force Telegram clients (Android/iOS) to discard an old persistent
-    reply keyboard, then send the current keyboard again.
-    """
-    try:
-        remove_msg = await message.answer(
-            "🔄 Memperbarui keyboard...",
-            reply_markup=ReplyKeyboardRemove()
-        )
-    except Exception:
-        remove_msg = None
-
-    # Small message boundary helps Telegram clients apply removal before re-send.
-    await asyncio.sleep(0.15)
-
-    await message.answer(
-        "✅ <b>KEYBOARD DIPERBARUI</b>\n\n"
-        "Keyboard menu terbaru sudah dimuat.",
-        reply_markup=user_reply_menu(),
-        parse_mode="HTML"
-    )
-
-    if remove_msg:
+async def force_refresh_user_keyboard(target):
+    """Force a client reset while preserving the selected catalog and its digits."""
+    catalog=catalog_context(target)
+    if catalog is None:
+        return await refresh_shop_reply_keyboard(target,user_reply_menu())
+    # Use the same ordering as /start and catalog renders, avoiding resets
+    # interleaved with a Flash/Popular selection.
+    async with catalog_render_lock(catalog):
         try:
-            await remove_msg.delete()
-        except Exception:
-            pass
+            keyboard=await catalog_reply_menu(target)
+        except sqlite3.Error:
+            return False
+        context=shop_reply_keyboard_context(target)
+        async with shop_reply_keyboard_lock(context):
+            removed=await _remove_shop_reply_keyboard_locked(
+                target,"🔄 Memperbarui keyboard...",context
+            )
+            await asyncio.sleep(0.15)
+            refreshed=await _refresh_shop_reply_keyboard_locked(target,keyboard,context,force=True)
+            if removed and refreshed:
+                message=target if isinstance(target,Message) else getattr(target,"message",None)
+                sender=getattr(removed,"from_user",None)
+                if (getattr(removed,"text",None)=="🔄 Memperbarui keyboard..."
+                    and getattr(getattr(removed,"chat",None),"id",None)==context.key.chat_id
+                    and type(getattr(removed,"message_id",None)) is int
+                    and removed.message_id>0
+                    and removed.message_id!=getattr(message,"message_id",None)
+                    and removed.message_id!=getattr(refreshed,"message_id",None)
+                    and not any(getattr(removed,field,None) for field in ("photo","video","document","audio","voice"))
+                    and (sender is None or (getattr(sender,"is_bot",False) and getattr(sender,"id",None)==context.key.bot_id))):
+                    try:
+                        await target.bot.delete_message(context.key.chat_id,removed.message_id)
+                    except Exception:
+                        pass
+            return refreshed
 
 
 def start_view_keyboard():
@@ -2038,34 +2045,67 @@ def start_view_text() -> str:
 
 
 async def refresh_start_reply_keyboard(target):
-    # Updating inline markup alone does not replace Telegram's persistent keyboard.
+    # Callers reset their catalog while holding its render lock. Keep keyboard
+    # tracking independent from checkout/catalog clears and Railway restarts.
     try:
-        await reset_catalog_context(target)
         keyboard=user_reply_menu()
     except sqlite3.Error:
         keyboard=ReplyKeyboardMarkup(keyboard=[[
             KeyboardButton(text="🏷️ List Produk"),KeyboardButton(text="💬 Hubungi Owner")
         ]],resize_keyboard=True,is_persistent=True)
-    try:
-        if isinstance(target,Message):
-            return await target.answer("⌨️ Pilih menu atau ketik nomor produk.",reply_markup=keyboard)
-        message=getattr(target,"message",None)
-        if callable(getattr(message,"answer",None)):
-            return await message.answer("⌨️ Pilih menu atau ketik nomor produk.",reply_markup=keyboard)
-        chat_id=getattr(getattr(message,"chat",None),"id",None) or target.from_user.id
-        return await target.bot.send_message(chat_id,"⌨️ Pilih menu atau ketik nomor produk.",reply_markup=keyboard)
-    except Exception:
-        logging.warning("Start reply keyboard could not be refreshed",exc_info=True)
-        return False
+    return await refresh_shop_reply_keyboard(target,keyboard)
 
 
 async def show_main_menu_message(message: Message):
-    try:
-        await reset_catalog_context(message)
-    except sqlite3.Error:
-        return await message.answer("Menu belum bisa dibuka. Silakan coba lagi.")
-    await message.answer(start_view_text(),reply_markup=start_view_keyboard(),parse_mode="HTML")
-    await refresh_start_reply_keyboard(message)
+    return await render_start_view(message)
+
+
+async def render_start_view(target,text=None,*,state: FSMContext = None):
+    """Render /start and its keyboard in the same catalog scope as view changes."""
+    context=catalog_context(target,state)
+    is_message=(isinstance(target,Message) or (
+        not isinstance(target,CallbackQuery) and getattr(target,"message",None) is None
+    ))
+
+    async def failed(message):
+        if is_message:
+            try:
+                await target.answer(message)
+            except Exception:
+                logging.warning("Start navigation notice could not be delivered",exc_info=True)
+        else:
+            await safe_callback_notice(target,message,show_alert=True)
+        return False
+
+    async def present():
+        try:
+            # A failed/uncertain delivery must never rebind a displayed Flash
+            # number to an unrelated normal product.
+            await reset_catalog_context(target,state,_catalog_lock_held=True,pending=True)
+        except sqlite3.Error:
+            return await failed("Menu belum bisa dibuka. Silakan coba lagi.")
+        try:
+            intro=start_view_text() if text is None else text
+            if is_message:
+                rendered=await target.answer(intro,reply_markup=start_view_keyboard(),parse_mode="HTML")
+            else:
+                rendered=await safe_edit_or_answer(target,intro,reply_markup=start_view_keyboard(),parse_mode="HTML")
+        except Exception:
+            logging.warning("Start intro could not be delivered",exc_info=True)
+            rendered=False
+        if not rendered:
+            return await failed("Menu belum bisa ditampilkan. Coba lagi atau buka List Produk.")
+        try:
+            await reset_catalog_context(target,state,_catalog_lock_held=True)
+        except sqlite3.Error:
+            return await failed("Menu belum siap dipilih. Coba lagi atau buka List Produk.")
+        await refresh_start_reply_keyboard(target)
+        return True
+
+    if context is None:
+        return await present()
+    async with catalog_render_lock(context):
+        return await present()
 
 
 def effective_unit_price(variant, qty):
@@ -9721,11 +9761,26 @@ def catalog_render_lock(context):
     return lock
 
 
-async def reset_catalog_context(target,state: FSMContext = None):
+async def reset_catalog_context(target,state: FSMContext = None,*,_catalog_lock_held=False,pending=False):
     context=catalog_context(target,state)
-    if context is not None:
-        async with catalog_render_lock(context):
+    if context is None:
+        return
+
+    async def reset():
+        if pending:
+            previous=await context.get_data()
+            view,product_ids=catalog_selection_snapshot(previous)
+            await context.set_data({
+                "catalog_view":view,"catalog_product_ids":product_ids or [],
+                "catalog_rendered_at":int(time.time()),"catalog_ready":False
+            })
+        else:
             await context.set_data({})
+
+    if _catalog_lock_held:
+        return await reset()
+    async with catalog_render_lock(context):
+        return await reset()
 
 
 async def catalog_reply_menu(target,state: FSMContext = None):
@@ -9735,25 +9790,265 @@ async def catalog_reply_menu(target,state: FSMContext = None):
     return user_reply_menu(view,product_ids=product_ids)
 
 
-async def refresh_catalog_reply_keyboard(target,view,product_ids):
-    keyboard=user_reply_menu(view,product_ids=product_ids)
-    try:
-        if isinstance(target,Message):
-            return await target.answer(
-                "⌨️ Ketik nomor produk dari daftar yang dibuka.",reply_markup=keyboard
-            )
-        message=getattr(target,"message",None)
+def shop_reply_keyboard_context(target):
+    catalog=catalog_context(target)
+    if catalog is None:
+        return None
+    key=catalog.key
+    return FSMContext(storage=catalog.storage,key=StorageKey(
+        bot_id=key.bot_id,chat_id=key.chat_id,user_id=key.user_id,
+        thread_id=key.thread_id,business_connection_id=key.business_connection_id,
+        destiny="shop_reply_keyboard"
+    ))
+
+
+def shop_reply_keyboard_record(value,scope):
+    """Only IDs created by the shop keyboard helper may be retired."""
+    if not isinstance(value,dict):
+        return None
+    if (value.get("kind")!="shop_reply_keyboard" or value.get("scope")!=scope
+            or value.get("text")!="⌨️ Pilih menu atau ketik nomor produk."
+            or not isinstance(value.get("signature"),str)
+            or not re.fullmatch(r"[0-9a-f]{64}",value["signature"])
+            or type(value.get("message_id")) is not int
+            or not 0<value["message_id"]<=9223372036854775807):
+        return None
+    return value
+
+
+async def retire_shop_reply_keyboard_prompts(target,context,data):
+    scope=SQLiteFSMStorage._storage_key(context.key)
+    current=shop_reply_keyboard_record(data.get("current"),scope)
+    source=getattr(target,"message",None) if not isinstance(target,Message) else target
+    source_id=getattr(source,"message_id",None)
+    remaining=[]
+    attempts=0
+    queued=data.get("retire",[])
+    queued=queued[-10:] if isinstance(queued,list) else []
+    for record in queued:
+        record=shop_reply_keyboard_record(record,scope)
+        if record is None or (current and record["message_id"]==current["message_id"]):
+            continue
+        # Do not touch the callback source: it may be a menu or payment invoice.
+        if record["message_id"]==source_id:
+            continue
+        if attempts>=3:
+            remaining.append(record)
+            continue
+        attempts+=1
+        try:
+            await target.bot.delete_message(context.key.chat_id,record["message_id"])
+        except TelegramBadRequest as exc:
+            reason=str(exc).lower()
+            if not any(value in reason for value in (
+                "message to delete not found","message can't be deleted",
+                "message cannot be deleted"
+            )):
+                remaining.append(record)
+        except Exception:
+            remaining.append(record)
+    if remaining!=data.get("retire",[]):
+        data={**data,"retire":remaining}
+        try:
+            await context.set_data(data)
+        except sqlite3.Error:
+            logging.warning("Shop keyboard cleanup could not be recorded")
+    return data
+
+
+def shop_reply_keyboard_lock(context):
+    scope=SQLiteFSMStorage._storage_key(context.key)
+    lock_key="reply-keyboard:"+str(DB_PATH)+":"+scope
+    lock=_action_locks.get(lock_key)
+    if lock is None:
+        lock=asyncio.Lock()
+        _action_locks[lock_key]=lock
+    return lock
+
+
+async def refresh_shop_reply_keyboard(target,keyboard):
+    context=shop_reply_keyboard_context(target)
+    if context is None:
+        return await _refresh_shop_reply_keyboard_locked(target,keyboard,None)
+    async with shop_reply_keyboard_lock(context):
+        return await _refresh_shop_reply_keyboard_locked(target,keyboard,context)
+
+
+async def _refresh_shop_reply_keyboard_locked(target,keyboard,context,*,force=False):
+    """Replace one tracked keyboard prompt only when its actual markup changes."""
+    text="⌨️ Pilih menu atau ketik nomor produk."
+    message=target if isinstance(target,Message) else getattr(target,"message",None)
+
+    async def deliver():
+        options={"reply_markup":keyboard}
+        if context is not None:
+            if context.key.thread_id is not None:
+                options["message_thread_id"]=context.key.thread_id
+            if context.key.business_connection_id is not None:
+                options["business_connection_id"]=context.key.business_connection_id
+        if context is not None and callable(getattr(target.bot,"send_message",None)):
+            return await target.bot.send_message(context.key.chat_id,text,**options)
         if callable(getattr(message,"answer",None)):
-            return await message.answer(
-                "⌨️ Ketik nomor produk dari daftar yang dibuka.",reply_markup=keyboard
-            )
+            # aiogram's shortcut already binds thread/business fields itself.
+            options.pop("message_thread_id",None)
+            options.pop("business_connection_id",None)
+            return await message.answer(text,**options)
         chat_id=getattr(getattr(message,"chat",None),"id",None) or target.from_user.id
-        return await target.bot.send_message(
-            chat_id,"⌨️ Ketik nomor produk dari daftar yang dibuka.",reply_markup=keyboard
-        )
-    except Exception:
-        logging.warning("Catalog reply keyboard could not be refreshed",exc_info=True)
+        return await target.bot.send_message(chat_id,text,**options)
+
+    if context is None:
+        # Legacy callers without an event identity cannot own a persisted ID.
+        try:
+            return await deliver()
+        except Exception:
+            logging.warning("Shop reply keyboard could not be refreshed")
+            return False
+
+    scope=SQLiteFSMStorage._storage_key(context.key)
+    signature=hashlib.sha256(json.dumps(
+        keyboard.model_dump(mode="json",exclude_none=True),
+        sort_keys=True,separators=(",",":"),ensure_ascii=False
+    ).encode()).hexdigest()
+    lock=shop_reply_keyboard_lock(context)
+    try:
+        data=await context.get_data()
+    except sqlite3.Error:
+        logging.warning("Shop keyboard tracking could not be loaded")
         return False
+    data=data if isinstance(data,dict) else {}
+    cached=getattr(lock,"_shop_reply_data",None)
+    if (isinstance(cached,dict) and cached.get("generation")
+            and cached.get("generation")==data.get("generation") and cached!=data):
+        # A successful Telegram send followed by a failed DB write must not
+        # replay. Repair its record before retiring any earlier prompt.
+        try:
+            await context.set_data(cached)
+        except sqlite3.Error:
+            return bool(cached.get("current") or cached.get("delivered"))
+        data=cached
+    current=shop_reply_keyboard_record(data.get("current"),scope)
+    delivered=data.get("delivered")
+    delivered_matches=(isinstance(delivered,dict)
+        and delivered.get("kind")=="shop_reply_keyboard"
+        and delivered.get("scope")==scope and delivered.get("signature")==signature)
+    if not force and not data.get("hidden") and (
+        (current and current["signature"]==signature) or delivered_matches
+    ):
+        data=await retire_shop_reply_keyboard_prompts(target,context,data)
+        lock._shop_reply_data=data
+        return True
+    pending=data.get("pending")
+    if (not force and not data.get("hidden") and isinstance(pending,dict) and pending.get("scope")==scope
+            and pending.get("signature")==signature
+            and type(pending.get("started_at")) in (int,float)
+            and 0<=time.time()-pending["started_at"]<60):
+        return False
+    retire=[record for record in data.get("retire",[])
+            if shop_reply_keyboard_record(record,scope)][-10:] if isinstance(data.get("retire"),list) else []
+    generation=secrets.token_hex(12)
+    pending={"kind":"shop_reply_keyboard","scope":scope,
+             "signature":signature,"started_at":time.time()}
+    prepared={"generation":generation,"current":current,
+              "retire":retire,"pending":pending}
+    try:
+        await context.set_data(prepared)
+    except sqlite3.Error:
+        logging.warning("Shop keyboard refresh could not be prepared")
+        return False
+    lock._shop_reply_data=prepared
+    try:
+        rendered=await deliver()
+    except Exception:
+        # Delivery may have succeeded before a network timeout. Keep the
+        # persisted pending marker; rapid retries must not create more text.
+        logging.warning("Shop reply keyboard could not be refreshed")
+        return False
+    if not rendered:
+        return False
+    rendered_id=getattr(rendered,"message_id",None)
+    sender=getattr(rendered,"from_user",None)
+    valid=(type(rendered_id) is int and 0<rendered_id<=9223372036854775807
+        and getattr(getattr(rendered,"chat",None),"id",None)==context.key.chat_id
+        and getattr(rendered,"text",None)==text
+        and not any(getattr(rendered,field,None) for field in
+            ("photo","video","document","audio","voice","animation","sticker","video_note","paid_media"))
+        and (sender is None or (getattr(sender,"is_bot",False) and getattr(sender,"id",None)==context.key.bot_id)))
+    ready={"generation":generation,"current":current,"retire":retire}
+    if valid:
+        record={"kind":"shop_reply_keyboard","scope":scope,
+                "signature":signature,"text":text,"message_id":rendered_id}
+        ready["current"]=record
+        if current and current["message_id"]!=rendered_id:
+            ready["retire"]=[*retire,current][-10:]
+    else:
+        # An untrusted/malformed Telegram response cannot authorize deletion.
+        ready["delivered"]={"kind":"shop_reply_keyboard","scope":scope,
+                            "signature":signature}
+    lock._shop_reply_data=ready
+    try:
+        await context.set_data(ready)
+    except sqlite3.Error:
+        logging.warning("Shop keyboard delivery could not be recorded")
+        return rendered
+    ready=await retire_shop_reply_keyboard_prompts(target,context,ready)
+    lock._shop_reply_data=ready
+    return rendered
+
+
+async def _remove_shop_reply_keyboard_locked(target,text,context,*,parse_mode=None):
+    if context is not None:
+        try:
+            data=await context.get_data()
+            cached=getattr(shop_reply_keyboard_lock(context),"_shop_reply_data",None)
+            if (isinstance(cached,dict) and cached.get("generation")
+                    and cached.get("generation")==data.get("generation")):
+                data=cached
+            scope=SQLiteFSMStorage._storage_key(context.key)
+            current=shop_reply_keyboard_record(data.get("current"),scope)
+            retire=[record for record in data.get("retire",[])
+                if shop_reply_keyboard_record(record,scope)][-10:] if isinstance(data.get("retire"),list) else []
+            data={"generation":secrets.token_hex(12),"current":current,
+                  "retire":retire,"hidden":True}
+            await context.set_data(data)
+            shop_reply_keyboard_lock(context)._shop_reply_data=data
+        except sqlite3.Error:
+            logging.warning("Shop keyboard removal could not be prepared")
+            return False
+    message=target if isinstance(target,Message) else getattr(target,"message",None)
+    options={"reply_markup":ReplyKeyboardRemove()}
+    if context is not None:
+        if context.key.thread_id is not None:
+            options["message_thread_id"]=context.key.thread_id
+        if context.key.business_connection_id is not None:
+            options["business_connection_id"]=context.key.business_connection_id
+    if parse_mode is not None:
+        options["parse_mode"]=parse_mode
+    try:
+        if context is not None and callable(getattr(target.bot,"send_message",None)):
+            return await target.bot.send_message(context.key.chat_id,text,**options)
+        if callable(getattr(message,"answer",None)):
+            options.pop("message_thread_id",None)
+            options.pop("business_connection_id",None)
+            return await message.answer(text,**options)
+        return await target.bot.send_message(target.from_user.id,text,**options)
+    except Exception:
+        logging.warning("Shop reply keyboard could not be removed")
+        return False
+
+
+async def remove_shop_reply_keyboard(target,text,*,parse_mode=None):
+    """Invalidate persisted markup atomically with the tools keyboard removal."""
+    context=shop_reply_keyboard_context(target)
+    if context is None:
+        return await _remove_shop_reply_keyboard_locked(target,text,None,parse_mode=parse_mode)
+    async with shop_reply_keyboard_lock(context):
+        return await _remove_shop_reply_keyboard_locked(target,text,context,parse_mode=parse_mode)
+
+
+async def refresh_catalog_reply_keyboard(target,view,product_ids):
+    return await refresh_shop_reply_keyboard(
+        target,user_reply_menu(view,product_ids=product_ids)
+    )
 
 
 
@@ -16140,7 +16435,7 @@ async def require_tools_user(event, state: FSMContext) -> bool:
 async def user_tools_command(message: Message,state: FSMContext):
     if not await require_tools_user(message,state):return
     await state.set_state(None)
-    await message.answer("🧰 <b>TOOLS • MAGIC LINK</b>",reply_markup=ReplyKeyboardRemove(),parse_mode="HTML")
+    await remove_shop_reply_keyboard(message,"🧰 <b>TOOLS • MAGIC LINK</b>",parse_mode="HTML")
     await message.answer(tools_user_welcome_text(),
                          reply_markup=tools_user_menu(message.from_user.id),parse_mode="HTML")
 
@@ -19548,8 +19843,7 @@ async def verify_join(call: CallbackQuery, bot: Bot, state: FSMContext):
             pass
 
         success_text = "✅ <b>VERIFIKASI BERHASIL</b> • " + html.escape(check_time) + " WIB\n\n" + start_view_text()
-        await safe_edit_or_answer(call,success_text,reply_markup=start_view_keyboard(),parse_mode="HTML")
-        await refresh_start_reply_keyboard(call)
+        await render_start_view(call,success_text,state=state)
         return
 
     rows = []
@@ -19636,18 +19930,10 @@ async def cb_start_view(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     try:
         mark_user_verified(call.from_user.id,call.from_user.username or "")
-        await reset_catalog_context(call,state)
-
     except sqlite3.Error:
         return await safe_callback_notice(call,"Menu belum bisa dibuka. Coba lagi.",show_alert=True)
-    await safe_edit_or_answer(
-        call,
-        start_view_text(),
-        reply_markup=start_view_keyboard(),
-        parse_mode="HTML"
-    )
-    await refresh_start_reply_keyboard(call)
-    await safe_callback_notice(call)
+    if await render_start_view(call,state=state):
+        await safe_callback_notice(call)
 
 
 
@@ -29458,7 +29744,7 @@ async def refresh_keyboard_callback(call: CallbackQuery, state: FSMContext, bot:
         return await safe_callback_notice(call)
 
     await safe_callback_notice(call, "Keyboard diperbarui.")
-    await force_refresh_user_keyboard(call.message)
+    await force_refresh_user_keyboard(call)
 
 
 @router.callback_query(F.data.startswith("popular:toggle:"))
@@ -33134,7 +33420,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.73"
+EXPECTED_SOURCE_VERSION = "16.74"
 
 
 def source_integrity_self_test():

@@ -1,6 +1,6 @@
 # Maboyy Digital
 
-**Versi: v16.73** — katalog produk dirapikan: Flash Sale dan Produk Populer di bagian produk; seluruh alur Favorit dihapus.
+**Versi: v16.74** — pembaruan keyboard dan pergantian katalog dirapikan. Petunjuk lama sebelum upgrade yang ID-nya tidak tersimpan dapat dihapus manual.
 
 ## Upload GitHub
 
@@ -20,7 +20,7 @@ Paket source tidak memuat database produksi; pengujian memakai database sementar
 
 Awal `/start`: Belanja dan Rating. Produk normal A–Z: 10 per halaman. Flash Sale aktif tampil khusus menu Flash Sale; nomor pilihan mengikuti daftar yang sedang dibuka.
 Tombol produk panjang dan pilihan jumlah/MAX dihapus; setiap invoice baru berisi 1 unit.
-Daftar produk menyediakan Riwayat, tanpa Menu Utama/Favorit. Menu Utama pada hasil akhir kembali langsung ke tampilan awal `/start`.
+Daftar produk tetap menyediakan Keranjang, Paket Hemat, dan Riwayat, tanpa Menu Utama/Favorit. Menu Utama hasil akhir kembali ke `/start`.
 Pembatalan pesanan menghapus QRIS dan notifikasi pesanan di PM owner; jika Telegram menolak penghapusan, pesan ditandai batal dan tombol dinonaktifkan. Pesan lama yang ID-nya belum tersimpan perlu dihapus manual.
 Gunakan `main.py` dan `bot.py` dari paket versi yang sama. `/ping` khusus owner menampilkan uptime proses; isi `HOSTING_PLAN_NAME` dan `HOSTING_PLAN_EXPIRES_AT` di Railway untuk sisa hari paket. Tanggal paket diisi manual; [format dan contoh](VARIABLE_RAILWAY.md#ping-dan-paket-railway-v1671).
 
