@@ -226,7 +226,7 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.76"
+BOT_VERSION = "16.77"
 SCHEMA_VERSION = 188
 
 CHECKOUT_TERMS_SHORT = (
@@ -7749,7 +7749,10 @@ class OwnerOrphanPriceFilter(Filter):
             return False
         if get_owner_input_session(message.from_user.id) or await state.get_state():
             return False
-        return bool(parse_rupiah_input(text))
+        # Recovery is only for a monetary amount, never arbitrary text whose
+        # URL, email or reference happens to contain digits.
+        return bool(re.fullmatch(r"(?:rp\.?|idr)?\s*[0-9][0-9.,\s]*",text,re.I)
+                    and parse_rupiah_input(text))
 
 
 
@@ -16993,6 +16996,9 @@ async def owner_tools_command(message: Message,state: FSMContext):
         return await user_tools_command(message,state)
     if message.chat.type != "private" or message.chat.id != message.from_user.id:
         return await message.answer("Buka /tools melalui chat pribadi dengan bot.")
+    price_session=get_owner_input_session(message.from_user.id)
+    if price_session and price_session.get("flow") in {"product_custom_price","variant_custom_price"}:
+        clear_owner_input_session(message.from_user.id)
     # Preserve verified email/idToken/final metadata while reopening /tools.
     await state.set_state(None)
     await message.answer(owner_tools_home_text(message.from_user.id),
@@ -17121,6 +17127,8 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
         if activity_id:update_tool_activity(activity_id,status="unknown",detail="Request terputus; periksa inbox sebelum mengulang.")
         raise
     finally:release_tool_email_lock(email)
+    # The next text is the verification URL; no extra callback is required.
+    await state.set_state(OwnerState.tools_verify_link if status in {"success","pending","unknown"} else None)
     text=(
         "✅ <b>LINK VERIFIKASI REQUEST BERHASIL</b>" if status=="success" else
         "⏳ <b>LINK VERIFIKASI BELUM TERKONFIRMASI</b>" if status in {"pending","unknown"} else
@@ -17128,7 +17136,8 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
     )
     await safe_edit_or_answer(
         call,text+f"\n\n📧 Email Target: <b>{html.escape(email)}</b>\n🌐 HTTP: <b>{http_status or '-'}</b>\n\n"
-        +("Buka inbox, lalu pilih Verifikasi dan kirim link lengkap." if status=="success" else tools_retry_hint(http_status,result)),
+        +("Buka inbox, lalu langsung kirim URL Link Verifikasi lengkap ke bot. Verifikasi dan Apply Premium akan diproses otomatis."
+          if status in {"success","pending","unknown"} else tools_retry_hint(http_status,result)),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Verifikasi",callback_data="tools:verify")],
             [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
@@ -17206,6 +17215,63 @@ async def owner_tools_verify_link_input(message: Message,state: FSMContext):
     await state.set_state(None)
 
     await owner_tools_verify_confirm(await tools_message_action(message,'tools:verify:confirm'),state)
+
+
+async def tools_verification_link_recovery_filter(message: Message, state: FSMContext) -> bool:
+    raw=str(message.text or "").strip()
+    if (not raw.startswith(("https://","http://")) or await state.get_state()
+            or message.chat.type!="private" or message.chat.id!=message.from_user.id):
+        return False
+    data=await state.get_data()
+    owner=is_owner(message.from_user.id)
+    if not owner and not data.get("tools_user_mode"):
+        return False
+    if any(data.get(key) for key in ("tools_magiclink_sent","tools_verify_email","tools_target_email","tools_correlation_id")):
+        return True
+    # An orphaned AM link gets a relevant session message without guessing the
+    # target email or forwarding credentials to the provider.
+    try:
+        return bool(auto_am_link_action_candidates(raw))
+    except (ValueError,TypeError):
+        return False
+
+
+@router.message(tools_verification_link_recovery_filter)
+async def tools_verification_link_recovery(message: Message,state: FSMContext):
+    data=await state.get_data()
+    owner=is_owner(message.from_user.id)
+    if not owner and not await require_tools_user(message,state):return
+    email=str(data.get("tools_target_email") or data.get("tools_verify_email") or data.get("tools_magic_email") or "").strip().lower()
+    key=str(data.get("tools_correlation_id") or "")
+    conn=db()
+    try:
+        flow=conn.execute("SELECT * FROM tool_provider_flows WHERE correlation_id=? AND owner_id=? AND target_email=?",
+                          (key,message.from_user.id,email)).fetchone()
+    finally:
+        conn.close()
+    if (not flow or not valid_tools_email(email) or not data.get("tools_session_started_at")
+            or tools_session_expired(data)):
+        await state.update_data(tools_raw_link=None,tools_verify_id_token=None)
+        return await message.answer(
+            "🔗 <b>SESI LINK VERIFIKASI TIDAK AKTIF</b>\n\n"
+            "Buka /tools → Magic Link / Verifikasi, kirim email, lalu kirim link terbaru dari inbox."
+            if owner else
+            "🔗 <b>SESI MAGIC LINK TIDAK AKTIF</b>\n\n"
+            "Buka /tools → Magic Link, kirim email, lalu kirim link terbaru dari inbox.",
+            reply_markup=owner_tools_menu() if owner else tools_user_menu(message.from_user.id),parse_mode="HTML")
+    if (data.get("tools_apply_requested") or data.get("tools_user_verify_started")
+            or flow["apply_started_at"] or flow["stage"] in {"verify_account","apply_premium"}):
+        # A URL resend displays the saved result; it cannot replay a single-use
+        # verification or an Apply whose outcome is still pending/unknown.
+        if owner:
+            return await message.answer(tools_final_result_text(data),reply_markup=tools_result_keyboard(),parse_mode="HTML")
+        return await render_tools_user_result(await tools_message_action(message,f"utools:verify:{key}"),state)
+    if not data.get("tools_magiclink_sent"):
+        return await message.answer("Kirim email melalui /tools → Magic Link terlebih dahulu, lalu kirim link dari inbox.")
+    if owner:
+        await state.update_data(tools_verify_email=email)
+        return await owner_tools_verify_link_input(message,state)
+    return await user_tools_link_input(message,state)
 
 
 @router.callback_query(F.data == "tools:verify:confirm")
@@ -33711,7 +33777,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.76"
+EXPECTED_SOURCE_VERSION = "16.77"
 
 
 def source_integrity_self_test():

@@ -1,6 +1,19 @@
-# Migrasi dan Variables Railway — Maboyy Digital v16.76
+# Migrasi dan Variables Railway — Maboyy Digital v16.77
 
 Dokumen ini panduan manual, bukan skrip deploy/restore. Paket source tidak memuat database atau nilai rahasia produksi.
+
+## Perbaikan v16.77
+
+Bagian ini menjadi acuan terbaru; perbaikan v16.76 dan v16.75 di bawah tetap berlaku.
+
+1. **Link tidak dianggap nominal Harga Custom:** filter pemulihan harga hanya menerima teks berupa nominal. URL Firebase/AM, alamat email, nomor invoice, atau teks lain yang mengandung angka tidak memunculkan pesan "Sesi Harga Sudah Terputus". Parser harga dan format nominal pada wizard aktif tetap dipertahankan.
+2. **Langsung menerima URL setelah kirim email:** owner masuk ke mode menerima link setelah request email berstatus success/pending/unknown. Buka inbox dan kirim URL lengkap ke bot; verifikasi dan Apply berjalan tanpa wajib menekan tombol Verifikasi. Tombol lama tetap berfungsi. Request email yang ditolak tidak memulai verifikasi.
+3. **Melanjutkan sesi dari menu:** URL yang dikirim setelah kembali ke `/tools` atau pada state kosong dari versi sebelumnya dikenali melalui metadata sesi aktif. Owner/VIP, email, correlation ID, dan masa sesi diperiksa terhadap flow tersimpan sebelum request provider. Sesi hilang/kedaluwarsa mendapat arahan untuk membuka Tools dan memulai dengan email yang benar; bot tidak menebak email dari riwayat atau meneruskan URL tanpa sesi. Membuka `/tools` mengakhiri sesi input Harga Custom lama, sama seperti navigasi callback, tanpa mengubah produk/harga yang sudah ada.
+4. **Link berulang:** hasil verifikasi/Apply yang sudah ada ditampilkan kembali. Tidak mengulang request verifikasi/Apply sukses atau yang hasilnya belum diketahui. Kuota tetap 15 akun/jam; melanjutkan akun yang sudah mempunyai reservasi tetap dapat dilakukan meskipun kuota penuh. Batas pembuatan Temp Mail dan fitur Hapus Riwayat mengikuti v16.76.
+
+Schema tetap **188**. Tidak ada tabel, dependency, nama Variable, API key, endpoint, atau kunci enkripsi baru. Upload keenam file **v16.77** dari ZIP yang sama; Start Command tetap `python main.py`. Pertahankan Volume/database dan seluruh Variables lama.
+
+Pengujian mencakup dispatcher aiogram, urutan filter/handler, state SQLite, URL Firebase bersarang, respons provider simulasi, kelanjutan setelah navigasi/restart, sesi kedaluwarsa, pengiriman link berulang, akses VIP, kuota penuh, dan wizard Harga Custom. Telegram/API eksternal menggunakan simulasi; filter sinkron dispatcher dievaluasi langsung dalam harness pengujian. Belum menggunakan credential produksi atau melakukan deploy Railway.
 
 ## Perbaikan v16.76
 

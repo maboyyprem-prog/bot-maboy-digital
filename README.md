@@ -1,6 +1,6 @@
 # Maboyy Digital
 
-**Versi: v16.76** — halaman awal Temp Mail meminta Buat Email terlebih dahulu dan `/tools` menyediakan Hapus Riwayat. Perbaikan flash sale, kuota premium, aktivasi otomatis, pembayaran, dan fitur toko dari versi sebelumnya dipertahankan.
+**Versi: v16.77** — URL verifikasi tidak lagi terbaca sebagai nominal Harga Custom; owner langsung dapat mengirim link setelah email dikirim. Halaman awal Temp Mail, Hapus Riwayat, kuota premium, aktivasi otomatis, pembayaran, dan fitur toko dari versi sebelumnya dipertahankan.
 
 Flash Sale yang waktunya habis disembunyikan dari katalog normal, populer, keranjang, dan paket; tombol lama tidak dapat membuat pembelian baru. Timer tetap disimpan setelah restart. Owner dapat mengaktifkan durasi baru atau memilih **Matikan Flash Sale** untuk mengembalikan produk ke katalog normal. Produk, stok, dan transaksi lama tidak dihapus.
 
@@ -33,6 +33,7 @@ VIP khusus `/tools` di chat pribadi; informasi awal menampilkan pemakaian kuota 
 User VIP: **Magic Link** → email → link dikirim otomatis → salin URL dari inbox ke bot → verifikasi dan Apply Premium otomatis tanpa tombol konfirmasi tambahan.
 **Rating Toko** muncul setelah apply terkonfirmasi sukses, dengan pilihan 1–5 bintang.
 Owner memakai satu tombol **Magic Link / Verifikasi**. Pertahankan endpoint dan API key provider Railway lama.
+Setelah email dikirim, bot langsung menunggu URL verifikasi. Buka inbox lalu tempel URL lengkap ke bot; tombol Verifikasi pada pesan lama tetap dapat dipakai, tanpa wajib menekannya. Jika kembali ke `/tools`, link dari sesi aktif tetap diteruskan hanya pada flow yang cocok dengan owner/VIP dan email. Sesi yang tidak aktif atau kedaluwarsa mendapat arahan Tools, bukan pesan Harga Custom. Link yang dikirim ulang setelah diproses hanya menampilkan hasil tersimpan; verifikasi/Apply yang hasilnya belum pasti tidak diulang. Pemulihan Harga Custom hanya mengenali nominal, bukan URL, email, atau teks berangka; format harga yang sudah didukung tetap tersedia.
 
 ## Famhead
 
@@ -59,4 +60,4 @@ Isi saldo: nominal → QRIS/rekening → bukti → verifikasi owner. Caption QRI
 
 Migrasi schema 188 otomatis menambahkan penanda visibilitas riwayat; seluruh riwayat lama tetap terlihat sampai owner memilih Hapus Riwayat. Catatan kuota akun dan sesi aktivasi terenkripsi dari schema 187 tetap dipertahankan. Jika upgrade langsung dari versi lebih lama, kuota akun jam upgrade dihitung dari histori email lama sekali saja. Pertahankan database, BOT_TOKEN, kunci enkripsi, dan endpoint/API key provider yang sama. Tidak ada dependency atau nama Variable baru. Pengujian memakai database sementara dan simulasi Telegram/API, termasuk transaksi saldo normal; belum diuji dengan credential provider produksi.
 
-Jika versi lama sudah menghapus seluruh penanda/timer Flash Sale suatu produk, kategori lamanya tidak dapat ditentukan dari source ini. Produk tersebut perlu diatur kembali melalui owner. Panduan versi terbaru: [VARIABLE_RAILWAY.md](VARIABLE_RAILWAY.md#perbaikan-v1676).
+Jika versi lama sudah menghapus seluruh penanda/timer Flash Sale suatu produk, kategori lamanya tidak dapat ditentukan dari source ini. Produk tersebut perlu diatur kembali melalui owner. Panduan versi terbaru: [VARIABLE_RAILWAY.md](VARIABLE_RAILWAY.md#perbaikan-v1677).
