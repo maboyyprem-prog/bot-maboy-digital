@@ -1,3 +1,159 @@
+# Migrasi dan Variables Railway — Maboyy Digital v16.73
+
+Dokumen ini panduan manual, bukan skrip deploy/restore. Paket source tidak memuat database atau nilai rahasia produksi.
+
+## /ping dan paket Railway v16.71
+
+`/ping` tetap khusus owner. Informasi lama tetap tersedia; tambahan menampilkan durasi proses bot sejak dijalankan dan sisa hari menuju tanggal paket yang diisi owner. Restart/redeploy mengulang uptime proses. Dua Variables baru berikut opsional dan tidak mengganti Variables lama:
+
+| Variable baru | Nilai dan arti |
+| --- | --- |
+| `HOSTING_PLAN_NAME` | Nama paket, misalnya `Hobby`, `Pro`, atau `Trial`; kosong berarti belum diatur. |
+| `HOSTING_PLAN_EXPIRES_AT` | Tanggal acuan batas paket/trial yang owner lihat di dashboard Railway. Contoh `2026-11-08` berlaku sampai akhir hari tersebut dalam WIB. Bisa juga waktu ISO, misalnya `2026-11-08T18:00:00+07:00` atau `2026-11-08T11:00:00Z`; waktu tanpa offset dibaca sebagai WIB. |
+
+Isi melalui Variables service baru/lama sesuai kebutuhan, tanpa menyalin rahasia ke GitHub. Kosong/format salah menampilkan informasi belum diatur/tidak valid, tanpa membuat klaim sisa 0 hari. Jika tanggal sudah lewat, ditampilkan 0 hari dan keterangan tanggal lewat. Durasi sisa menunjukkan hari/jam/menit; kurang dari 24 jam diberi keterangan kurang dari 1 hari. Penghitungan tidak mengubah pembayaran, data, atau menghentikan bot.
+
+Railway tidak mencantumkan nama paket/tanggal berakhir dalam [metadata environment otomatis](https://docs.railway.com/variables/reference). Ini tanggal manual, bukan pembacaan billing/credit Railway. [Paket berbayar memakai tagihan bulanan](https://docs.railway.com/pricing/plans): tanggal perpanjangan bukan berarti service otomatis kedaluwarsa. Jika memakai tanggal tagihan berikutnya sebagai acuan, beri nama paket jelas dan perbarui tanggal setelah perpanjangan. [Trial dapat berakhir lebih awal saat kredit habis](https://docs.railway.com/pricing/free-trial); `/ping` tidak membaca saldo kredit atau menjamin bot aktif sampai tanggal tersebut.
+
+## Persiapan migrasi v16.70
+
+### 1. File untuk GitHub: tepat 6
+
+| File di root repository | Kegunaan |
+| --- | --- |
+| `main.py` | Launcher Railway; Start Command `python main.py`. |
+| `bot.py` | Semua fitur bot, pembayaran, database dan Full Backup lama. |
+| `requirements.txt` | Dependency Python. |
+| `.env.example` | Semua nama konfigurasi; nilai contoh bukan pengganti Variables lama. |
+| `README.md` | Panduan singkat. |
+| `VARIABLE_RAILWAY.md` | Daftar Variables dan panduan migrasi/restore ini. |
+
+Gunakan keenam file v16.71 dari paket yang sama, tanpa folder. Jangan upload `shop.db`, file `*.db-wal`/`*.db-shm`, Full Backup, ZIP, `.env` asli, token/API key, log, cache, atau kunci privat. Upload dengan daftar file di atas; hindari `git add .` dari folder kerja yang berisi data.
+
+### 2. Railway Variables yang dipindahkan secara manual
+
+Salin **nilai asli setiap Variable manual yang sudah ada** langsung dari Railway lama ke Variables Railway baru melalui akun sendiri. Nilai aslinya tidak tercantum di dokumen/paket ini dan tidak perlu dikirim ke chat. Jangan mengubah nama, nilai, status aktif, atau kondisi kosong/tidak diisi pada service lama. Jangan mengimpor `.env.example` sebagai pengganti konfigurasi produksi.
+
+Inventaris kode: **61 nama**, terdiri dari **56 konfigurasi aplikasi/port** dan **5 metadata otomatis**. Tidak semuanya wajib diisi: grup opsional mengikuti fitur yang sudah aktif pada bot lama. Dua nama baru khusus `/ping` opsional; seluruh 59 nama sebelumnya dipertahankan.
+
+| Grup | Nama yang diperiksa/disalin jika dipakai |
+| --- | --- |
+| Telegram | `BOT_TOKEN`, `ADMIN_ID`, `ADMIN_USERNAME`, `PAYMENT_NOTE` |
+| Channel | `REQUIRED_CHANNEL_ID`, `REQUIRED_CHANNEL_URL`, `REQUIRED_CHANNEL_NAME`, `STOCK_CHANNEL_ID` |
+| Database dan backup | `DB_PATH`, `BACKUP_DIR`, `BACKUP_INTERVAL_HOURS`, `BACKUP_RETENTION` |
+| Reservasi | `ORDER_RESERVATION_MINUTES` |
+| Pembayaran otomatis | `SHOPEEPAY_ENABLED`, `SHOPEEPAY_BASE_URL`, `SHOPEEPAY_CLIENT_ID`, `SHOPEEPAY_CLIENT_SECRET`, `SHOPEEPAY_MERCHANT_ID`, `SHOPEEPAY_STORE_ID`, `SHOPEEPAY_TERMINAL_ID`, `SHOPEEPAY_PRIVATE_KEY`, `SHOPEEPAY_PUBLIC_KEY`, `PUBLIC_BASE_URL` |
+| Provider /tools | `TOOLS_PROVIDER_ENABLED`, `TOOLS_PROVIDER_NAME`, `TOOLS_PROVIDER_AUTH_MODE`, `TOOLS_PROVIDER_API_KEY`, `TOOLS_PROVIDER_MAGICLINK_URL`, `TOOLS_PROVIDER_VERIFY_URL`, `TOOLS_PROVIDER_APPLY_URL`, `TOOLS_PROVIDER_APPLY_STATUS_URL`, `TOOLS_PROVIDER_STATUS_URL`, `TOOLS_PROVIDER_PROVISION_URL` |
+| Batas dan sesi /tools | `TOOLS_PROVIDER_TIMEOUT_SECONDS`, `TOOLS_PROVIDER_APPLY_TIMEOUT_SECONDS`, `TOOLS_PROVIDER_MAX_RETRIES`, `TOOLS_PROVIDER_REQUEST_COOLDOWN_SECONDS`, `TOOLS_PROVIDER_MAX_RESPONSE_CHARS`, `TOOLS_PROVIDER_HOURLY_LIMIT`, `TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT`, `TOOLS_SESSION_EXPIRY_MINUTES`, `TOOLS_EMAIL_LOCK_SECONDS`, `TOOLS_PROVIDER_STATUS_CACHE_SECONDS`, `TOOLS_PROVIDER_POLL_ATTEMPTS`, `TOOLS_PROVIDER_POLL_INTERVAL_SECONDS`, `TOOLS_PROVIDER_TEMP_RETRIES` |
+| Temp Mail dan aktivasi | `TEMPMAIL_ENABLED`, `TEMPMAIL_PROVIDER`, `TEMPMAIL_TIMEOUT_SECONDS`, `TEMPMAIL_ENCRYPTION_KEY`, `TOOLS_AUTO_AM_MAIL_PROVIDER`, `TOOLS_AUTO_AM_MAIL_WAIT_SECONDS`, `TOOLS_AUTO_AM_POLL_SECONDS` |
+| HTTP | `PORT` — cocokkan dengan target port service; pertahankan override manual jika ada, atau gunakan nilai Railway. |
+| Informasi paket di /ping (opsional) | `HOSTING_PLAN_NAME`, `HOSTING_PLAN_EXPIRES_AT` — salin jika sudah diisi manual; bukan metadata otomatis Railway. |
+
+**Wajib:** token bot yang sama, owner yang sama, `DB_PATH` ke Volume persisten. Untuk Volume `/data`: `DB_PATH=/data/shop.db` dan `BACKUP_DIR=/data/backups`. Jika lokasi lama berbeda, catat lokasi sumber lama; hanya path service baru yang disesuaikan. Pertahankan interval, retention, reservasi dan semua batas lama, meskipun berbeda dari contoh.
+
+**Kunci enkripsi inbox:** pertahankan persis `TEMPMAIL_ENCRYPTION_KEY` lama. Jika sebelumnya kosong/tidak ada, bot menggunakan `BOT_TOKEN` sebagai kunci; jangan mengganti token atau membuat kunci baru saat migrasi. Token Telegram yang sama juga diperlukan agar `file_id` QRIS, bukti dan file akun lama tetap dapat digunakan.
+
+**Pembayaran:** salin semua credential gateway yang dipakai, termasuk bentuk multiline/literal `\n` pada private/public key. Jika tetap memakai domain yang sama, pertahankan `PUBLIC_BASE_URL`; jika domain baru, isi URL baru hanya pada service baru dan ubah callback provider menjadi `https://DOMAIN-BARU/shopeepay/callback`. Nilai ini ikut dalam verifikasi tanda tangan. Bot tidak mendaftarkan callback provider secara otomatis. Pertahankan `SHOPEEPAY_ENABLED` lama; gunakan credential/akses provider yang sama. Jangan alihkan callback sebelum database baru siap.
+
+**Metadata otomatis — jangan disalin dari deployment lama:** `RAILWAY_DEPLOYMENT_ID`, `RAILWAY_REPLICA_ID`, `RAILWAY_GIT_COMMIT_SHA`, `RAILWAY_ENVIRONMENT_NAME`, `RAILWAY_SERVICE_NAME`. Railway menyediakan nilai baru. Shared/reference Variables lama perlu diarahkan ke project/service baru dan hasil nilainya diperiksa secara pribadi, bukan menyalin referensi ID lama secara buta.
+
+**Infrastruktur opsional:** jika sudah digunakan, pindahkan konfigurasi yang diperlukan untuk `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `http_proxy`, `https_proxy`, `no_proxy`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NETRC`. Ini dukungan library/jaringan, terpisah dari 61 nama aplikasi/metadata; path sertifikat/NETRC harus benar-benar tersedia pada service baru. Tidak perlu menambahkan nilai kosong. Metadata Volume, token login CLI, dan variable build Railway bukan credential bot untuk dipindahkan.
+
+### 3. Database yang di-restore: seluruh shop.db
+
+Full Backup lama adalah `/owner` → **Sistem** → **📦 Backup Project**. Fitur yang sama tetap digunakan; tidak ada fitur backup duplikat. ZIP privat berisi snapshot utuh bernama **`shop.db`**, source yang tersedia dan `BACKUP_MANIFEST.txt`. **Backup Database** dan backup otomatis juga menyimpan seluruh SQLite, bukan hanya produk.
+
+Snapshot menggunakan SQLite Backup API, sehingga transaksi yang sudah commit di WAL ikut tersalin. Semua tabel ikut: customer/user, saldo dan ledger, produk/varian/stok/reservasi/akun, order/transaksi/topup, voucher, rating, pengaturan pembayaran/QRIS, sesi/FSM, VIP /tools, Temp Mail dan job aktivasi. Pengaturan kode unik yang sudah tersimpan dipertahankan saat startup v16.70.
+
+Backup v16.70 memeriksa integritas dan mencatat SHA-256, ukuran, schema serta jumlah baris tiap tabel di manifest. Backup lama tetap bisa dipakai setelah pemeriksaan lokal. Informasi "backup terakhir" ditulis setelah snapshot dibuat, sehingga metadata laporan backup terbaru dapat berbeda tanpa kehilangan data toko.
+
+ZIP Full Backup/database **tetap mengandung data privat**, termasuk akun stok dan credential mailbox yang disimpan bot. `.env` dan Railway Secrets eksternal tidak disertakan. Jangan upload ZIP Full Backup ke GitHub. Foto Telegram dan inbox provider eksternal bukan file yang disalin oleh SQLite; database menyimpan ID/credential/link, dan aksesnya bergantung pada token serta masa simpan layanan.
+
+### 4. Langkah migrasi manual yang aman
+
+1. Catat total customer, saldo/ledger, produk, stok/reservasi, pesanan/transaksi dan pengaturan penting; simpan privat. Salin Variables. Aktifkan Maintenance lama; selesaikan/review pesanan pending tanpa menghapus histori. Simpan Full Backup awal dan Volume lama untuk rollback. **Pastikan database lama memang berada pada Volume.** Jika masih berada di disk container, jangan mengubah/redeploy deployment lama: ekspor Full Backup privat terlebih dahulu dari container yang sama melalui [SSH/SCP Railway](https://docs.railway.com/cli/ssh), hentikan penerimaan transaksi dan rekonsiliasi transaksi sejak snapshot sebelum berpindah. Metode idle berikut hanya untuk database pada Volume persisten.
+2. Hentikan **proses bot** lama sebelum snapshot final. Maintenance saja belum menghentikan callback pembayaran/background worker. Untuk database lama pada Volume, owner dapat sementara mengganti Start Command service lama menjadi `python -c "import time; time.sleep(86400)"`, menonaktifkan healthcheck sementara, lalu menjalankan deployment idle itu secara manual. Pastikan `main.py`/polling/worker lama sudah berhenti. Variables lama tidak perlu diubah. SSH hanya menjalankan fungsi backup satu kali, tanpa `bot.main()`/`init_db()`:
+
+   ```sh
+   railway login
+   railway link
+   railway status
+   railway ssh -- python -c 'import bot; print(bot.create_project_backup()[0])'
+   ```
+
+   Pilih project/service/environment **lama**. Catat nama ZIP yang dihasilkan. Bila `BACKUP_DIR=/data/backups`, unduh melalui root Volume:
+
+   ```sh
+   railway volume files list /backups
+   railway volume files download /backups/NAMA-ZIP-FINAL.zip ./FullBackup.zip
+   ```
+
+   Ganti nama contoh dengan nama asli. Jangan menyalin `shop.db` mentah dari bot yang masih berjalan, karena data commit terbaru dapat berada di WAL. Simpan backup secara privat sebelum mengubah/menghentikan container tanpa Volume.
+
+3. Di komputer pribadi, periksa ZIP, ekstrak hanya `shop.db`, validasi SQLite dan checksum jika tersedia. Jalankan dari folder privat baru yang belum berisi `shop.db`:
+
+   ```sh
+   python - <<'PY'
+   import hashlib, pathlib, sqlite3, zipfile
+   target = pathlib.Path('shop.db')
+   assert not target.exists(), 'Gunakan folder privat baru; jangan timpa database.'
+   with zipfile.ZipFile('FullBackup.zip') as archive:
+       assert archive.testzip() is None, 'ZIP rusak.'
+       raw = archive.read('shop.db')
+       manifest = archive.read('BACKUP_MANIFEST.txt').decode('utf-8')
+   digest = hashlib.sha256(raw).hexdigest()
+   expected = [line.split(': ', 1)[1] for line in manifest.splitlines()
+               if line.startswith('Database SHA256: ')]
+   assert not expected or expected == [digest], 'Checksum berbeda.'
+   with target.open('xb') as handle:
+       handle.write(raw)
+   conn = sqlite3.connect('file:shop.db?mode=ro', uri=True)
+   assert conn.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+   tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
+   for (name,) in tables:
+       quoted = '"' + name.replace('"', '""') + '"'
+       print(name, conn.execute('SELECT COUNT(*) FROM ' + quoted).fetchone()[0])
+   conn.close()
+   print('SHA256:', digest)
+   PY
+   ```
+
+   Catat checksum dan jumlah baris privat. Jika arsip bukan Backup Project tetapi file `.db` dari Backup Database, gunakan snapshot itu sebagai `shop.db` dan jalankan pemeriksaan SQLite yang sama. Jangan gabungkan tabel atau membuat database kosong.
+
+4. Buat repository GitHub baru berisi enam source; siapkan service Railway baru dan Volume kosong mount **`/data`**. Tunda start/autodeploy bot baru sampai restore selesai. Isi Variables asli melalui UI privat; belum menjalankan `python main.py`. Volume tersedia saat runtime, bukan build/pre-deploy; jangan meletakkan restore pada Build/Pre-deploy Command.
+5. Pada terminal pribadi, hubungkan CLI ke **project/service/environment baru**, lalu periksa target sebelum upload. Dengan CLI terbaru, pengelolaan file Volume mendukung upload/download; remote `/shop.db` berarti `/data/shop.db` pada Volume mount `/data`:
+
+   ```sh
+   railway link
+   railway status
+   railway volume list
+   railway volume files list /
+   railway volume files upload ./shop.db /shop.db
+   railway volume files download /shop.db ./shop-restored-check.db
+   python -c "import hashlib,pathlib; a=pathlib.Path('shop.db').read_bytes(); b=pathlib.Path('shop-restored-check.db').read_bytes(); assert hashlib.sha256(a).digest()==hashlib.sha256(b).digest(); print('Checksum restore cocok')"
+   ```
+
+   Pilih Volume baru yang benar jika CLI bertanya. Jangan memakai `--overwrite` untuk database yang sudah ada; hentikan dan periksa target terlebih dahulu. Volume lama tetap disimpan. Perintah tersedia dalam [dokumentasi resmi Railway Volume CLI](https://docs.railway.com/cli/volume); [mount Volume](https://docs.railway.com/volumes) bersifat persisten.
+6. Setelah file cocok, pastikan bot lama tetap berhenti. Owner baru menjalankan satu instance dengan Start Command `python main.py` dan healthcheck `/health`. Arahkan domain/callback gateway ke service baru bila diperlukan, lalu cek `/ping`, Diagnostik/Launch Readiness, jumlah customer/saldo/stok/transaksi/pengaturan dan menu /start, /owner, /tools. Database akan membuka data lama, bukan membuat toko kosong.
+
+Pesanan expired dapat diproses sesuai waktu reservasi lama setelah startup; jangan menyebut perubahan status yang wajar ini kehilangan data. Tinjau pesanan bayar/pending dengan provider sebelum membuka toko; callback pembayaran yang terjadi saat downtime memerlukan retry/reconciliation provider. Gunakan satu percobaan pembayaran terkontrol sesuai prosedur provider untuk memeriksa callback dan pemenuhan, bukan membuat tagihan duplikat.
+
+**Rollback:** sebelum toko baru menerima transaksi, hentikan service baru lalu kembalikan service lama dengan Start Command/healthcheck/domain lama. Setelah ada transaksi baru, jangan langsung memakai snapshot lama karena akan menghilangkan saldo/order terbaru; hentikan penulis baru, ambil snapshot final baru dan rekonsiliasi data dahulu. Jangan menghapus Volume, backup, atau deployment lama sebelum verifikasi selesai.
+
+### 5. Pengujian paket
+
+**14 uji backup/restore baru lulus** pada database sementara: snapshot penuh, data commit di WAL, integritas/checksum, restore ke lokasi Volume simulasi dan dua kali startup. Seluruh 48 tabel aplikasi, tabel ekstensi simulasi, schema/index dan data saldo/stok/transaksi/pengaturan/sesi tetap sama. Job AM dipulihkan tanpa mengulang pengiriman link/apply yang sudah dijalankan. Kredensial inbox terenkripsi terbuka dengan kunci/token lama; perubahan kunci ditolak. Instruksi ekstraksi/verifikasi pada langkah 3 juga dijalankan dengan snapshot simulasi dan menghasilkan database yang identik.
+
+Total **852 kasus unik lulus**: 825 regresi fitur lama dan 27 kasus migrasi, melalui suite lengkap 851 kasus serta satu kasus tambahan pemulihan inbox terenkripsi. **49 pemeriksaan runtime lulus**, termasuk schema, launcher/dependency, isolasi demo dan callback; tidak ada fungsi lama atau nama Variable lama yang dihapus. Bug transaksi SQLite saat retry pengiriman akun yang sudah dialokasikan juga diperbaiki; callback ulang tidak menambah debit/alokasi.
+
+Audit Variables mengecek seluruh 59 nama, kelengkapan dan kompatibilitas nilai contoh lama. Alur callback/pembayaran diuji dengan simulasi; tidak ada deploy, restore, pengiriman Telegram atau pembayaran produksi otomatis.
+
+Pembayaran otomatis dipertahankan di source; keberhasilan produksi tetap memerlukan credential lama, akses jaringan, domain/signature/callback provider dan satu instance yang benar. Panduan ini tidak menyatakan Railway/provider produksi sudah diuji langsung.
+
+## Referensi dan riwayat konfigurasi lama
+
+Bagian berikut dipertahankan sebagai referensi historis. Daftar migrasi v16.70 di atas dan `.env.example` adalah inventaris kode saat ini. Catatan versi lama tentang variable "tidak digunakan" jangan dijadikan alasan menghapus Variables lama saat migrasi: `TOOLS_PROVIDER_STATUS_URL` dan `TOOLS_PROVIDER_PROVISION_URL` tetap memiliki jalur kompatibilitas.
+
 # Panduan Lengkap Variable Railway — Maboyy Digital
 
 File ini hanya berisi dokumentasi variable. Tidak digunakan langsung oleh bot.
@@ -1964,3 +2120,19 @@ Pesan Telegram pada pengujian ditangkap lokal, bukan dikirim ke pembeli/owner as
 Sumber: [API Grabmail](https://grabmail.io/docs/api), [batas Grabmail](https://grabmail.io/docs/limits),
 [API Guerrilla](https://www.guerrillamail.com/GuerrillaMailAPI.html), [API Mail.tm](https://docs.mail.tm/).
 Schema tetap `184`; tidak ada dependency atau tombol baru. Upload enam file v16.68 bersama; Volume/database lama tetap dipakai.
+
+## v16.69 — Daftar produk A–Z dan PM owner saat pembeli membatalkan
+
+Daftar utama dan Flash Sale diurutkan berdasarkan nama A–Z, tanpa membedakan huruf besar/kecil.
+Nomor daftar, pagination 10 produk, keyboard angka, dan pilihan nomor mengikuti urutan yang sama.
+Popular tetap mengikuti jumlah terjual, dengan A–Z untuk nilai yang sama; nomor tetap merujuk daftar utama.
+ID produk/database dan callback produk tetap dipertahankan.
+
+Saat pembeli membatalkan pesanan belum dibayar, notifikasi pesanan dan bukti terkait di PM owner dihapus.
+ID pesan disimpan untuk cleanup setelah restart dan menangani pesan yang terlambat selesai dikirim.
+Jika penghapusan ditolak Telegram, pesan ditandai batal dan tombol tindakan dinonaktifkan;
+kegagalan jaringan dicoba lagi. Pesanan dibayar, pesanan milik user lain, dan notifikasi topup tetap aman.
+Notifikasi yang dikirim versi lama tanpa ID tersimpan tidak bisa ditemukan melalui Bot API; hapus manual.
+
+Schema `185` menambahkan pencatatan notifikasi owner dan pembatalan pembeli; migrasi menjaga data lama.
+Tidak ada variable, dependency, atau tombol baru. Upload enam file v16.69 bersama, tetap memakai Volume/database lama.

@@ -1,6 +1,6 @@
 # Maboyy Digital
 
-**Versi: v16.70** — Persiapan migrasi GitHub/Railway dengan seluruh data tetap utuh.
+**Versi: v16.73** — katalog produk dirapikan: Flash Sale dan Produk Populer di bagian produk; seluruh alur Favorit dihapus.
 
 ## Upload GitHub
 
@@ -18,11 +18,11 @@ Jangan upload `.env` asli, database, Full Backup, token/API key, log, cache, ata
 Panduan restore, seluruh nama Variables, pemeriksaan data dan rollback: [VARIABLE_RAILWAY.md](VARIABLE_RAILWAY.md#persiapan-migrasi-v1670).
 Paket source tidak memuat database produksi; pengujian memakai database sementara, tanpa deploy/restore produksi otomatis.
 
-Awal `/start`: Belanja dan Rating. Daftar produk A–Z: 10 per halaman, pilih lewat nomor yang mengikuti urutan nama.
+Awal `/start`: Belanja dan Rating. Produk normal A–Z: 10 per halaman. Flash Sale aktif tampil khusus menu Flash Sale; nomor pilihan mengikuti daftar yang sedang dibuka.
 Tombol produk panjang dan pilihan jumlah/MAX dihapus; setiap invoice baru berisi 1 unit.
-Riwayat/Menu Utama tersedia pada daftar produk dan hasil akhir transaksi.
+Daftar produk menyediakan Riwayat, tanpa Menu Utama/Favorit. Menu Utama pada hasil akhir kembali langsung ke tampilan awal `/start`.
 Pembatalan pesanan menghapus QRIS dan notifikasi pesanan di PM owner; jika Telegram menolak penghapusan, pesan ditandai batal dan tombol dinonaktifkan. Pesan lama yang ID-nya belum tersimpan perlu dihapus manual.
-Gunakan `main.py` dan `bot.py` dari paket versi yang sama.
+Gunakan `main.py` dan `bot.py` dari paket versi yang sama. `/ping` khusus owner menampilkan uptime proses; isi `HOSTING_PLAN_NAME` dan `HOSTING_PLAN_EXPIRES_AT` di Railway untuk sisa hari paket. Tanggal paket diisi manual; [format dan contoh](VARIABLE_RAILWAY.md#ping-dan-paket-railway-v1671).
 
 Owner: `/tools` → **👑 VIP /tools** → pilih ID → **✅ Jadikan VIP /tools**; **🚫 Cabut VIP /tools** menghentikan akses.
 VIP khusus `/tools` di chat pribadi; informasi awal menampilkan teks statis **0/15 akun/jam**. Aktivasi sekali klik tetap khusus owner.
@@ -47,4 +47,4 @@ Email Maildrop, Mail.tm, dan Guerrilla tetap didukung; batas 5 email per provide
 **Bersihkan Log Lama** meminta konfirmasi; inbox, hasil apply, rating, dan data belanja tetap tersimpan.
 Sukses/masa aktif mengikuti respons provider; tanggal kedaluwarsa ditampilkan, tanpa menjanjikan satu tahun baru.
 Apply menunggu hingga 30 detik (`TOOLS_PROVIDER_APPLY_TIMEOUT_SECONDS`); request yang hasilnya belum pasti tidak diulang.
-Fitur dan alur pembayaran lama dipertahankan; hasil aktivasi dan pembayaran langsung tetap bergantung pada provider/konfigurasi.
+Isi saldo: nominal → QRIS/rekening → bukti → verifikasi owner. Caption QRIS tetap berupa invoice; klik berulang memakai invoice aktif. Saat gambar gagal, kontrol invoice tetap tersedia. Fitur lama dipertahankan.

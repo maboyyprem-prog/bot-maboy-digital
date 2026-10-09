@@ -226,7 +226,7 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.72"
+BOT_VERSION = "16.73"
 SCHEMA_VERSION = 186
 
 CHECKOUT_TERMS_SHORT = (
@@ -2040,6 +2040,7 @@ def start_view_text() -> str:
 async def refresh_start_reply_keyboard(target):
     # Updating inline markup alone does not replace Telegram's persistent keyboard.
     try:
+        await reset_catalog_context(target)
         keyboard=user_reply_menu()
     except sqlite3.Error:
         keyboard=ReplyKeyboardMarkup(keyboard=[[
@@ -2059,6 +2060,10 @@ async def refresh_start_reply_keyboard(target):
 
 
 async def show_main_menu_message(message: Message):
+    try:
+        await reset_catalog_context(message)
+    except sqlite3.Error:
+        return await message.answer("Menu belum bisa dibuka. Silakan coba lagi.")
     await message.answer(start_view_text(),reply_markup=start_view_keyboard(),parse_mode="HTML")
     await refresh_start_reply_keyboard(message)
 
@@ -9627,69 +9632,133 @@ def product_list_order_sql(conn, *, popular: bool = False) -> str:
     return prefix+"COALESCE(name,'') COLLATE PRODUCT_NAME_AZ, id"
 
 
-def user_reply_menu():
-    conn = db()
-    order_sql=product_list_order_sql(conn)
-    products = conn.execute(
-        f"SELECT id, name FROM products WHERE active=1 ORDER BY {order_sql} LIMIT 25"
-    ).fetchall()
-    conn.close()
+def user_reply_menu(view: str = "all", *, product_ids=None):
+    view=view if view in {"all","popular","flash"} else "all"
+    if product_ids is None:
+        conn=db()
+        try:
+            order_sql=product_list_order_sql(conn,popular=view=="popular")
+            rows=conn.execute(
+                f"SELECT id FROM products WHERE active=1 {product_view_filter(view)} "
+                f"ORDER BY {order_sql} LIMIT 25"
+            ).fetchall()
+            product_ids=[int(row["id"]) for row in rows]
+        finally:
+            conn.close()
+    else:
+        product_ids=list(product_ids)[:25]
 
-    keyboard = [
-        [
-            KeyboardButton(text="🏷️ List Produk"),
-            KeyboardButton(text="🎁 Voucher"),
-            KeyboardButton(text="📁 Laporan Stok"),
-        ]
-    ]
-
-    # Product shortcuts: 1..N, five buttons per row.
-    # Number follows the same order shown in List Produk.
-    number_row = []
-    for index, _product in enumerate(products, start=1):
-        number_row.append(KeyboardButton(text=str(index)))
-        if len(number_row) == 5:
-            keyboard.append(number_row)
-            number_row = []
-
-    if number_row:
-        keyboard.append(number_row)
-
+    keyboard=[[
+        KeyboardButton(text="🏷️ List Produk"),
+        KeyboardButton(text="🎁 Voucher"),
+        KeyboardButton(text="📁 Laporan Stok"),
+    ]]
+    for offset in range(0,len(product_ids),5):
+        keyboard.append([
+            KeyboardButton(text=str(index+1))
+            for index in range(offset,min(offset+5,len(product_ids)))
+        ])
     keyboard.append([
         KeyboardButton(text="💰 Isi Saldo"),
         KeyboardButton(text="❓ Cara Order"),
     ])
-
-    keyboard.append([
-        KeyboardButton(text="💬 Hubungi Owner"),
-    ])
-
+    keyboard.append([KeyboardButton(text="💬 Hubungi Owner")])
     return ReplyKeyboardMarkup(
-        keyboard=keyboard,
-        resize_keyboard=True,
-        is_persistent=True,
+        keyboard=keyboard,resize_keyboard=True,is_persistent=True,
         input_field_placeholder="Pilih menu atau nomor produk"
     )
 
 
+def catalog_selection_snapshot(data):
+    """Keep typed numbers attached to the IDs shown in the selected catalog."""
+    data=data if isinstance(data,dict) else {}
+    view=data.get("catalog_view","all")
+    view=view if view in {"all","popular","flash"} else "all"
+    if "catalog_product_ids" not in data:
+        return view,None
+    if data.get("catalog_ready") is False:
+        return view,[]
+    product_ids=data.get("catalog_product_ids")
+    if not isinstance(product_ids,list) or any(
+        type(value) is not int or not 0<value<=9223372036854775807
+        for value in product_ids
+    ):
+        return view,[]
+    return view,product_ids
+
+
+def catalog_context(target,state: FSMContext = None) -> FSMContext:
+    """Store catalog selection separately so checkout wizard clears keep its digits valid."""
+    message=target if isinstance(target,Message) else getattr(target,"message",None)
+    previous=getattr(state,"key",None)
+    user_id=int(getattr(getattr(target,"from_user",None),"id",None)
+                or getattr(previous,"user_id",0) or 0)
+    if user_id<=0:
+        return None
+    chat_id=int(getattr(getattr(message,"chat",None),"id",None)
+                or getattr(previous,"chat_id",None) or user_id)
+    target_bot=getattr(target,"bot",None)
+    bot_id=int(getattr(target_bot,"id",None) or getattr(previous,"bot_id",0))
+    same_scope=(previous is not None and previous.bot_id==bot_id
+                and previous.chat_id==chat_id and previous.user_id==user_id)
+    key=StorageKey(
+        bot_id=bot_id,chat_id=chat_id,user_id=user_id,
+        thread_id=(previous.thread_id if same_scope else getattr(message,"message_thread_id",None)),
+        business_connection_id=(previous.business_connection_id if same_scope
+                                else getattr(message,"business_connection_id",None)),
+        destiny="product_catalog"
+    )
+    storage=state.storage if state is not None else SQLiteFSMStorage(DB_PATH)
+    return FSMContext(storage=storage,key=key)
+
+
+def catalog_render_lock(context):
+    scope="catalog:"+str(DB_PATH)+":"+SQLiteFSMStorage._storage_key(context.key)
+    lock=_action_locks.get(scope)
+    if lock is None:
+        lock=asyncio.Lock()
+        _action_locks[scope]=lock
+    return lock
+
+
+async def reset_catalog_context(target,state: FSMContext = None):
+    context=catalog_context(target,state)
+    if context is not None:
+        async with catalog_render_lock(context):
+            await context.set_data({})
+
+
+async def catalog_reply_menu(target,state: FSMContext = None):
+    context=catalog_context(target,state)
+    data=await context.get_data() if context is not None else {}
+    view,product_ids=catalog_selection_snapshot(data)
+    return user_reply_menu(view,product_ids=product_ids)
+
+
+async def refresh_catalog_reply_keyboard(target,view,product_ids):
+    keyboard=user_reply_menu(view,product_ids=product_ids)
+    try:
+        if isinstance(target,Message):
+            return await target.answer(
+                "⌨️ Ketik nomor produk dari daftar yang dibuka.",reply_markup=keyboard
+            )
+        message=getattr(target,"message",None)
+        if callable(getattr(message,"answer",None)):
+            return await message.answer(
+                "⌨️ Ketik nomor produk dari daftar yang dibuka.",reply_markup=keyboard
+            )
+        chat_id=getattr(getattr(message,"chat",None),"id",None) or target.from_user.id
+        return await target.bot.send_message(
+            chat_id,"⌨️ Ketik nomor produk dari daftar yang dibuka.",reply_markup=keyboard
+        )
+    except Exception:
+        logging.warning("Catalog reply keyboard could not be refreshed",exc_info=True)
+        return False
+
+
 
 def main_menu():
-    kb=InlineKeyboardBuilder()
-    kb.button(text="🏷️ List Produk", callback_data="products")
-    kb.button(text="🔥 Produk Populer", callback_data="popular")
-    kb.button(text="⚡ Flash Sale", callback_data="flash")
-    kb.button(text="🎁 Voucher", callback_data="voucher_info")
-    kb.button(text="💰 Isi Saldo", callback_data="wallet")
-    kb.button(text="🧾 Riwayat", callback_data="my_orders")
-
-    if ADMIN_USERNAME:
-        kb.button(
-            text="💬 Hubungi Owner",
-            url=f"https://t.me/{ADMIN_USERNAME}"
-        )
-
-    kb.adjust(2,2,2)
-    return kb.as_markup()
+    return start_view_keyboard()
 
 
 def owner_menu():
@@ -11531,38 +11600,43 @@ def flash_owner_products_keyboard():
 
 def product_view_filter(view: str) -> str:
     view=str(view or "all").lower()
-    if view=="popular":
-        return "AND is_popular=1"
+    active_flash=(
+        "COALESCE(is_flash_sale,0)=1 "
+        f"AND COALESCE(flash_sale_until_ts,0)>{int(time.time())}"
+    )
     if view=="flash":
-        return (
-            "AND is_flash_sale=1 "
-            f"AND COALESCE(flash_sale_until_ts,0)>{int(time.time())}"
-        )
-    return ""
+        return f"AND ({active_flash})"
+    normal_filter=f"AND NOT ({active_flash})"
+    if view=="popular":
+        return "AND is_popular=1 "+normal_filter
+    return normal_filter
 
 
 def products_keyboard(page: int = 1, total_pages: int = 1, view: str = "all",
                       *, products=None, stock_map=None, global_number_map=None):
-    total_pages=max(1,int(total_pages or 1))
-    page=max(1,min(int(page or 1),total_pages))
-    view=view if view in {"all","popular","flash"} else "all"
-    kb=InlineKeyboardBuilder()
-
-    nav=[]
-    if page>1:
-        nav.append(InlineKeyboardButton(text="⬅️ Halaman Sebelumnya",
-            callback_data=f"productspage:{view}:{page-1}"))
-    if page<total_pages:
-        nav.append(InlineKeyboardButton(text="Halaman Berikutnya ➡️",
-            callback_data=f"productspage:{view}:{page+1}"))
-    if nav:kb.row(*nav)
-    kb.row(
-        InlineKeyboardButton(text="🛒 Keranjang",callback_data="shop:cart"),
-        InlineKeyboardButton(text="⭐ Favorit",callback_data="shop:favorites")
-    )
-    kb.row(InlineKeyboardButton(text="🎁 Paket Hemat",callback_data="shop:bundles"))
-    kb.row(InlineKeyboardButton(text="🧾 Riwayat",callback_data="my_orders"),
-           InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home"))
+    total_pages = max(1, int(total_pages or 1))
+    page = max(1, min(int(page or 1), total_pages))
+    view = view if view in {"all", "popular", "flash"} else "all"
+    kb = InlineKeyboardBuilder()
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="⬅️ Halaman Sebelumnya", callback_data=f"productspage:{view}:{page-1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton(text="Halaman Berikutnya ➡️", callback_data=f"productspage:{view}:{page+1}"))
+    if nav:
+        kb.row(*nav)
+    if view == "all":
+        kb.row(InlineKeyboardButton(text="⚡ Flash Sale", callback_data="flash"),
+               InlineKeyboardButton(text="🔥 Produk Populer", callback_data="popular"))
+    elif view == "popular":
+        kb.row(InlineKeyboardButton(text="🏷️ List Produk", callback_data="products"),
+               InlineKeyboardButton(text="⚡ Flash Sale", callback_data="flash"))
+    else:
+        kb.row(InlineKeyboardButton(text="🏷️ List Produk", callback_data="products"),
+               InlineKeyboardButton(text="🔥 Produk Populer", callback_data="popular"))
+    kb.row(InlineKeyboardButton(text="🛒 Keranjang", callback_data="shop:cart"),
+           InlineKeyboardButton(text="🎁 Paket Hemat", callback_data="shop:bundles"))
+    kb.row(InlineKeyboardButton(text="🧾 Riwayat", callback_data="my_orders"))
     return kb.as_markup()
 
 
@@ -12061,50 +12135,19 @@ async def cart_remove(call: CallbackQuery):
     await shop_cart(call)
 
 
-@router.callback_query(F.data.startswith("favadd:"))
-async def favorite_add(call: CallbackQuery):
-    numbers=callback_positive_numbers(call.data, "favadd")
-    if not numbers:
-        return await call.answer("Variasi tidak valid.", show_alert=True)
-    variant_id=numbers[0]
-    conn=db()
-    variant=conn.execute("SELECT product_id FROM product_variants WHERE id=?",(variant_id,)).fetchone()
-    if not variant:
-        conn.close()
-        return await call.answer("Produk tidak ditemukan.",show_alert=True)
-    conn.execute(
-        """INSERT OR IGNORE INTO favorites(user_id,product_id,created_at)
-           VALUES(?,?,?)""",
-        (call.from_user.id,variant["product_id"],datetime.now().isoformat(timespec="seconds"))
-    )
-    conn.commit(); conn.close()
-    await call.answer("Produk ditambahkan ke favorit.",show_alert=True)
-
-
-@router.callback_query(F.data == "shop:favorites")
-async def shop_favorites(call: CallbackQuery):
-    conn=db()
-    rows=conn.execute(
-        """SELECT p.* FROM favorites f
-           JOIN products p ON p.id=f.product_id
-           WHERE f.user_id=? AND p.active=1
-           ORDER BY f.id DESC LIMIT 20""",
-        (call.from_user.id,)
-    ).fetchall()
-    conn.close()
-
-    kb=InlineKeyboardBuilder()
-    for row in rows:
-        kb.button(text=f"⭐ {row['name']}",callback_data=f"product:{row['id']}")
-    kb.button(text="⬅️ List Produk",callback_data="products")
-    kb.adjust(1)
-    await safe_edit_or_answer(call, 
-        "⭐ <b>PRODUK FAVORIT</b>\n\n"+(f"{len(rows)} produk tersimpan." if rows else "Belum ada favorit."),
-        reply_markup=kb.as_markup(),
+@router.callback_query((F.data == "shop:favorites") | (F.data == "favadd") | F.data.startswith("favadd:"))
+async def favorites_removed(call: CallbackQuery):
+    """Retire old favorite buttons without modifying preserved customer data."""
+    await safe_edit_or_answer(
+        call,
+        "🏷️ <b>LIST PRODUK</b>\n\n"
+        "Fitur Favorit sudah dihapus. Buka daftar produk untuk melanjutkan belanja.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ List Produk", callback_data="products")]
+        ]),
         parse_mode="HTML"
     )
-    await call.answer()
-
+    await safe_callback_notice(call, "Fitur Favorit sudah dihapus.")
 
 
 @router.callback_query(F.data == "cartcheckout:wallet")
@@ -12684,11 +12727,11 @@ async def payment_proof_exit_to_start(message: Message, state: FSMContext, bot: 
 
 
 @router.message(CheckoutState.waiting_payment_proof)
-async def payment_proof_invalid(message: Message):
+async def payment_proof_invalid(message: Message, state: FSMContext = None):
     await message.answer(
         "❌ Kirim bukti pembayaran sebagai foto/screenshot atau file gambar.\n\n"
         "Jika ingin keluar dari pengiriman bukti, tekan 🏷️ List Produk.",
-        reply_markup=user_reply_menu()
+        reply_markup=await catalog_reply_menu(message,state)
     )
 
 
@@ -19593,6 +19636,7 @@ async def cb_start_view(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     try:
         mark_user_verified(call.from_user.id,call.from_user.username or "")
+        await reset_catalog_context(call,state)
 
     except sqlite3.Error:
         return await safe_callback_notice(call,"Menu belum bisa dibuka. Coba lagi.",show_alert=True)
@@ -19610,38 +19654,7 @@ async def cb_start_view(call: CallbackQuery, state: FSMContext, bot: Bot):
 
 @router.callback_query(F.data == "home")
 async def cb_home(call: CallbackQuery, state: FSMContext, bot: Bot):
-    try:
-        await shopping_navigation_exit(call.from_user.id,state)
-        await state.clear()
-    except sqlite3.Error:
-        return await safe_callback_notice(call,"Menu belum bisa dibuka. Coba lagi.",show_alert=True)
-
-    if not await is_channel_member(bot, call.from_user.id):
-        await safe_edit_or_answer(call, 
-            "🔐 <b>VERIFIKASI CHANNEL</b>\n\n"
-            f"Silakan join <b>{REQUIRED_CHANNEL_NAME}</b> terlebih dahulu.",
-            reply_markup=join_required_keyboard(),
-            parse_mode="HTML"
-        )
-        return await call.answer()
-
-    try:
-        mark_user_verified(
-            call.from_user.id,
-            call.from_user.username or ""
-        )
-
-    except sqlite3.Error:
-        return await safe_callback_notice(call,"Menu belum bisa dibuka. Coba lagi.",show_alert=True)
-
-    await safe_edit_or_answer(call, 
-        f"🛍️ <b>{rating_html_excerpt(STORE_NAME,200)}</b>\n\n"
-        "Pilih menu yang ingin dibuka.\n\n"
-        f"<i>{rating_html_excerpt(STORE_FOOTER,200)}</i>",
-        reply_markup=main_menu(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+    return await cb_start_view(call, state, bot)
 
 
 
@@ -19678,29 +19691,45 @@ def compact_product_list_text(
 
 
 async def show_product_list(call, title, filter_sql="", *, page: int = 1, view: str = "all", state: FSMContext = None):
+    context=catalog_context(call,state)
+    async with catalog_render_lock(context):
+        return await _show_product_list_locked(
+            call,title,filter_sql,page=page,view=view,state=state
+        )
+
+
+async def _show_product_list_locked(call, title, filter_sql="", *, page: int = 1, view: str = "all", state: FSMContext = None):
     if not await is_channel_member(call.bot,call.from_user.id):
         if isinstance(call,Message):return await send_join_required(call)
         await safe_edit_or_answer(call,"🔐 Silakan join channel terlebih dahulu.",reply_markup=join_required_keyboard())
         return await safe_callback_notice(call)
     view=view if view in {"all","popular","flash"} else "all"
     conn=None
+    failed=False
+    previous_view="all"
+    previous_ids=None
     try:
         await shopping_navigation_exit(call.from_user.id,state)
+        context=catalog_context(call,state)
+        previous_view,previous_ids=catalog_selection_snapshot(await context.get_data())
+        canonical_filter=product_view_filter(view)
+        extra_filter=str(filter_sql or "").strip()
+        filter_sql=canonical_filter if not extra_filter or extra_filter==canonical_filter else (
+            canonical_filter+" "+extra_filter
+        )
         conn=db()
         if view=="flash":
             expire_finished_flash_sales(conn)
             conn.commit()
-        alphabetical_order=product_list_order_sql(conn)
-        all_active=conn.execute(
-            f"SELECT id FROM products WHERE active=1 ORDER BY {alphabetical_order}"
+        order_sql=product_list_order_sql(conn,popular=view=="popular")
+        selected=conn.execute(
+            f"SELECT id FROM products WHERE active=1 {filter_sql} ORDER BY {order_sql}"
         ).fetchall()
-        global_number_map={int(row["id"]):index for index,row in enumerate(all_active,start=1)}
-        total=int(conn.execute(
-            f"SELECT COUNT(*) AS n FROM products WHERE active=1 {filter_sql}"
-        ).fetchone()["n"] or 0)
+        product_ids=[int(row["id"]) for row in selected]
+        global_number_map={product_id:index for index,product_id in enumerate(product_ids,start=1)}
+        total=len(product_ids)
         total_pages=max(1,(total+PRODUCTS_PAGE_SIZE-1)//PRODUCTS_PAGE_SIZE)
         page=max(1,min(int(page or 1),total_pages))
-        order_sql=product_list_order_sql(conn,popular=view=="popular")
         rows=conn.execute(
             f"SELECT * FROM products WHERE active=1 {filter_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
             (PRODUCTS_PAGE_SIZE,(page-1)*PRODUCTS_PAGE_SIZE)
@@ -19708,11 +19737,13 @@ async def show_product_list(call, title, filter_sql="", *, page: int = 1, view: 
         stock_map=product_stock_map(conn,filter_sql)
     except sqlite3.Error:
         logging.exception("Product list could not be loaded")
+        failed=True
+    finally:
+        if conn is not None:conn.close()
+    if failed:
         if isinstance(call,Message):
             return await call.answer("Daftar produk belum bisa dimuat. Silakan coba lagi.")
         return await safe_callback_notice(call,"Daftar produk belum bisa dimuat. Silakan coba lagi.",show_alert=True)
-    finally:
-        if conn is not None:conn.close()
 
     clean_title=re.sub(r"<[^>]+>","",str(title or "LIST PRODUK"))
     clean_title=clean_title.replace("🏷️","").replace("🔥","").replace("⚡","").strip()
@@ -19730,10 +19761,36 @@ async def show_product_list(call, title, filter_sql="", *, page: int = 1, view: 
                   f"⏳ Terdekat berakhir: <b>{nearest_text}</b>\n\n"+text)
     keyboard=products_keyboard(page,total_pages,view,products=rows,
         stock_map=stock_map,global_number_map=global_number_map)
+    snapshot={"catalog_view":view,"catalog_product_ids":product_ids,
+              "catalog_rendered_at":int(time.time()),"catalog_ready":False}
+    try:
+        await context.set_data(snapshot)
+    except sqlite3.Error:
+        logging.exception("Catalog selection snapshot could not be prepared")
+        if isinstance(call,Message):
+            return await call.answer("Daftar produk belum bisa dimuat. Silakan coba lagi.")
+        return await safe_callback_notice(call,"Daftar produk belum bisa dimuat. Silakan coba lagi.",show_alert=True)
+    if previous_view!=view or (
+        previous_ids is not None and previous_ids[:25]!=product_ids[:25]
+    ):
+        await refresh_catalog_reply_keyboard(call,view,product_ids)
     if isinstance(call,Message):
-        return await call.answer(text,reply_markup=keyboard,parse_mode="HTML")
-    await safe_edit_or_answer(call,text,reply_markup=keyboard,parse_mode="HTML")
-    await safe_callback_notice(call)
+        rendered=await call.answer(text,reply_markup=keyboard,parse_mode="HTML")
+    else:
+        rendered=await safe_edit_or_answer(call,text,reply_markup=keyboard,parse_mode="HTML")
+    if rendered:
+        try:
+            await context.set_data({**snapshot,"catalog_ready":True})
+        except sqlite3.Error:
+            logging.exception("Catalog selection snapshot could not be confirmed")
+            if isinstance(call,Message):
+                await call.answer("Daftar belum siap dipilih. Buka daftar terbaru sekali lagi.")
+            else:
+                await safe_callback_notice(call,"Daftar belum siap dipilih. Buka daftar terbaru sekali lagi.",show_alert=True)
+            return False
+    if not isinstance(call,Message):
+        await safe_callback_notice(call)
+    return rendered
 
 
 
@@ -27208,7 +27265,7 @@ async def reply_menu_voucher(message: Message, bot: Bot):
 
 
 @router.message(F.text == "📁 Laporan Stok")
-async def reply_menu_stock(message: Message, bot: Bot):
+async def reply_menu_stock(message: Message, bot: Bot, state: FSMContext = None):
     if not await is_channel_member(bot, message.from_user.id):
         return await send_join_required(message)
 
@@ -27237,7 +27294,7 @@ async def reply_menu_stock(message: Message, bot: Bot):
 
     await message.answer(
         "\n".join(lines),
-        reply_markup=user_reply_menu(),
+        reply_markup=await catalog_reply_menu(message,state),
         parse_mode="HTML"
     )
 
@@ -27275,7 +27332,7 @@ async def reply_menu_wallet(message: Message, bot: Bot):
 
 
 @router.message(StateFilter(None), F.text.regexp(r"^[0-9]{1,6}$"))
-async def reply_menu_product_number(message: Message, bot: Bot):
+async def reply_menu_product_number(message: Message, bot: Bot, state: FSMContext = None):
     if not await is_channel_member(bot, message.from_user.id):
         return await send_join_required(message)
 
@@ -27285,26 +27342,56 @@ async def reply_menu_product_number(message: Message, bot: Bot):
         return await message.answer("❌ Nomor produk tidak valid.")
     if index<1:return await message.answer("❌ Nomor produk tidak valid.")
     conn=None
+    failed=False
+    product=None
+    variants=[]
+    view="all"
+    product_ids=None
     try:
+        context=catalog_context(message,state)
+        view,product_ids=catalog_selection_snapshot(await context.get_data())
         mark_user_verified(message.from_user.id,message.from_user.username or "")
         conn=db()
-        order_sql=product_list_order_sql(conn)
-        product=conn.execute(
-            f"SELECT * FROM products WHERE active=1 ORDER BY {order_sql} LIMIT 1 OFFSET ?",
-            (index-1,)
-        ).fetchone()
-        if not product:return await message.answer("❌ Nomor produk tidak tersedia. Tekan 🏷️ List Produk untuk melihat daftar terbaru.")
-        variants=conn.execute("SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY id",(int(product["id"]),)).fetchall()
+        filter_sql=product_view_filter(view)
+        if product_ids is not None:
+            if index<=len(product_ids):
+                product=conn.execute(
+                    f"SELECT * FROM products WHERE id=? AND active=1 {filter_sql}",
+                    (product_ids[index-1],)
+                ).fetchone()
+        else:
+            order_sql=product_list_order_sql(conn,popular=view=="popular")
+            product=conn.execute(
+                f"SELECT * FROM products WHERE active=1 {filter_sql} "
+                f"ORDER BY {order_sql} LIMIT 1 OFFSET ?",(index-1,)
+            ).fetchone()
+        if product:
+            variants=conn.execute(
+                "SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY id",
+                (int(product["id"]),)
+            ).fetchall()
     except sqlite3.Error:
-        return await message.answer("Produk belum bisa dibuka. Silakan coba lagi.")
+        failed=True
     finally:
         if conn is not None:conn.close()
+    if failed:
+        return await message.answer("Produk belum bisa dibuka. Silakan coba lagi.")
+    if not product:
+        callback={"all":"products","popular":"popular","flash":"flash"}[view]
+        return await message.answer(
+            "❌ Nomor produk tidak tersedia atau daftar sudah berubah. Buka daftar terbaru untuk memilih kembali.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔄 Buka Daftar Terbaru",callback_data=callback)
+            ]])
+        )
 
     text = (
         "╭────────────────────╮\n"
         f"• <b>Produk:</b> {html.escape(product['name'])}\n"
         f"• <b>Terjual:</b> {int(product['sold'] or 0)}\n"
         f"• <b>Deskripsi:</b> {html.escape(product['description'] or '-')}\n"
+        + (f"• <b>Flash Sale:</b> ⚡ sampai {html.escape(flash_sale_end_text(product))}\n"
+           if flash_sale_is_active(product) else "")
         + (
             f"• <b>Sistem:</b> 🕒 Pre-Order\n"
             f"• <b>Estimasi:</b> {html.escape(str(product['preorder_estimate'] or '-'))}\n"
@@ -27330,7 +27417,7 @@ async def reply_menu_product_number(message: Message, bot: Bot):
                 callback_data=f"variant:{variant['id']}"
             )
 
-    kb.button(text="⬅️ Kembali",callback_data="products")
+    kb.button(text="⬅️ Kembali",callback_data={"all":"products","popular":"popular","flash":"flash"}[view])
     kb.adjust(1)
 
     await message.answer(
@@ -27341,7 +27428,7 @@ async def reply_menu_product_number(message: Message, bot: Bot):
 
 
 @router.message(F.text == "❓ Cara Order")
-async def reply_menu_howto(message: Message):
+async def reply_menu_howto(message: Message, state: FSMContext = None):
     await message.answer(
         "❓ <b>CARA ORDER</b>\n\n"
         "1. Pilih List Produk.\n"
@@ -27352,13 +27439,13 @@ async def reply_menu_howto(message: Message):
         "6. Selesaikan pembayaran.\n"
         "7. Setelah pembayaran valid, akun premium dikirim otomatis.\n\n"
         f"<i>{STORE_FOOTER}</i>",
-        reply_markup=user_reply_menu(),
+        reply_markup=await catalog_reply_menu(message,state),
         parse_mode="HTML"
     )
 
 
 @router.message(F.text == "💬 Hubungi Owner")
-async def reply_menu_owner_contact(message: Message):
+async def reply_menu_owner_contact(message: Message, state: FSMContext = None):
     if ADMIN_USERNAME:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -27377,7 +27464,7 @@ async def reply_menu_owner_contact(message: Message):
     else:
         await message.answer(
             "💬 Username owner belum dikonfigurasi.",
-            reply_markup=user_reply_menu()
+            reply_markup=await catalog_reply_menu(message,state)
         )
 
 
@@ -33047,7 +33134,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.72"
+EXPECTED_SOURCE_VERSION = "16.73"
 
 
 def source_integrity_self_test():
