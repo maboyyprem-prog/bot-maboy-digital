@@ -226,8 +226,8 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.71"
-SCHEMA_VERSION = 185
+BOT_VERSION = "16.72"
+SCHEMA_VERSION = 186
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1214,6 +1214,7 @@ def init_db():
     add_column_if_missing(conn, "topups", "verified_by", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "topups", "expires_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "updated_at", "TEXT DEFAULT ''")
+    add_column_if_missing(conn, "topups", "payment_message_ids", "TEXT DEFAULT '[]'")
     add_column_if_missing(conn, "topups", "payment_review_status", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "payment_proof_file_id", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "payment_proof_type", "TEXT DEFAULT ''")
@@ -4355,6 +4356,10 @@ async def cleanup_expired_orders(bot: Bot):
                     )
                 except Exception:
                     pass
+                try:
+                    await retire_saved_topup_payment_messages(bot, int(row["id"]), int(row["user_id"]))
+                except Exception:
+                    logging.exception("Expired topup QRIS cleanup deferred invoice=%s", row["id"])
 
             try:
                 await purge_stale_invoice_data()
@@ -5378,89 +5383,84 @@ def record_payment_event(
 
 
 def verify_topup_atomic(topup_id: int, actor_id: int):
-    """
-    Idempotent top-up verification.
-    Only the transaction that changes pending -> processing may credit the wallet.
-    """
-    conn = db()
-    conn.execute("BEGIN IMMEDIATE")
-    row = conn.execute("SELECT * FROM topups WHERE id=?", (topup_id,)).fetchone()
-
-    if not row:
-        conn.rollback()
-        conn.close()
+    """Credit the invoice amount and its audit trail in one idempotent transaction."""
+    if not isinstance(topup_id, int) or isinstance(topup_id, bool) or not 0 < topup_id <= 9223372036854775807:
         return None, "not_found"
-
-    if row["status"] == "completed":
+    conn = None
+    try:
+        conn = db()
+        begin_immediate_retry(conn)
+        row = conn.execute("SELECT * FROM topups WHERE id=?", (topup_id,)).fetchone()
+        if not row:
+            return None, "not_found"
         wallet = conn.execute(
-            "SELECT balance FROM wallets WHERE user_id=?",
-            (row["user_id"],)
+            "SELECT balance FROM wallets WHERE user_id=?", (row["user_id"],)
         ).fetchone()
         balance = int(wallet["balance"] or 0) if wallet else 0
-        conn.rollback()
-        conn.close()
-        return (row, balance), "already_completed"
+        if row["status"] == "completed":
+            return (row, balance), "already_completed"
+        if row["status"] not in {"pending", "expired"}:
+            return None, f"invalid_status:{row['status']}"
 
-    if row["status"] not in {"pending", "expired"}:
-        conn.rollback()
-        conn.close()
-        return None, f"invalid_status:{row['status']}"
+        now = datetime.now().isoformat(timespec="seconds")
+        reference = topup_invoice(topup_id)
+        existing_credit = conn.execute(
+            "SELECT 1 FROM wallet_ledger WHERE user_id=? AND type='TOPUP' AND reference=?",
+            (row["user_id"], reference)
+        ).fetchone()
+        if existing_credit:
+            # Preserve credits from legacy/recovered invoices without adding them again.
+            conn.execute(
+                """UPDATE topups SET status='completed', updated_at=?
+                   WHERE id=? AND status IN ('pending','expired')""", (now, topup_id)
+            )
+            conn.commit()
+            return (row, balance), "already_completed"
 
-    now = datetime.now().isoformat(timespec="seconds")
-    updated = conn.execute(
-        """UPDATE topups
-           SET status='processing', verified_at=?, verified_by=?, updated_at=?
-           WHERE id=? AND status IN ('pending','expired')""",
-        (now, actor_id, now, topup_id)
-    ).rowcount
-
-    if updated != 1:
-        conn.rollback()
-        conn.close()
-        return None, "race_lost"
-
-    wallet = conn.execute(
-        "SELECT balance FROM wallets WHERE user_id=?",
-        (row["user_id"],)
-    ).fetchone()
-    balance = int(wallet["balance"] or 0) if wallet else 0
-    new_balance = balance + int(row["amount"])
-
-    conn.execute(
-        """INSERT INTO wallets(user_id,balance,updated_at)
-           VALUES(?,?,?)
-           ON CONFLICT(user_id) DO UPDATE SET
-             balance=excluded.balance,
-             updated_at=excluded.updated_at""",
-        (row["user_id"], new_balance, now)
-    )
-
-    # Unique ledger key prevents duplicate credit if code is replayed.
-    conn.execute(
-        """INSERT OR IGNORE INTO wallet_ledger
-           (user_id,type,amount,balance_after,reference,note,created_at)
-           VALUES(?,?,?,?,?,?,?)""",
-        (
-            row["user_id"], "TOPUP", int(row["amount"]), new_balance,
-            topup_invoice(topup_id), "Top up saldo terverifikasi.", now
+        amount = int(row["amount"] or 0)
+        new_balance = balance + amount
+        if amount <= 0 or not 0 <= new_balance <= 9223372036854775807:
+            return None, "invalid_amount"
+        updated = conn.execute(
+            """UPDATE topups SET status='processing', verified_at=?, verified_by=?, updated_at=?
+               WHERE id=? AND status IN ('pending','expired')""",
+            (now, actor_id, now, topup_id)
+        ).rowcount
+        if updated != 1:
+            return None, "race_lost"
+        conn.execute(
+            """INSERT INTO wallets(user_id,balance,updated_at) VALUES(?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance,updated_at=excluded.updated_at""",
+            (row["user_id"], new_balance, now)
         )
-    )
+        conn.execute(
+            """INSERT INTO wallet_ledger (user_id,type,amount,balance_after,reference,note,created_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (row["user_id"], "TOPUP", amount, new_balance, reference, "Top up saldo terverifikasi.", now)
+        )
+        completed = conn.execute(
+            "UPDATE topups SET status='completed', updated_at=? WHERE id=? AND status='processing'",
+            (now, topup_id)
+        ).rowcount
+        if completed != 1:
+            return None, "race_lost"
+        conn.execute(
+            """INSERT OR IGNORE INTO payment_events
+               (entity_type,entity_id,event_type,amount,actor_id,detail,created_at)
+               VALUES('topup',?,'verified',?,?,?,?)""",
+            (topup_id, amount, actor_id, "Topup credited atomically", now)
+        )
+        conn.commit()
+        return (row, new_balance), "completed"
+    except sqlite3.Error:
+        logging.exception("Atomic topup verification failed invoice=%s", topup_id)
+        return None, "storage_error"
+    finally:
+        if conn is not None:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
 
-    conn.execute(
-        """UPDATE topups
-           SET status='completed', updated_at=?
-           WHERE id=? AND status='processing'""",
-        (now, topup_id)
-    )
-
-    conn.commit()
-    conn.close()
-
-    record_payment_event(
-        "topup", topup_id, "verified",
-        int(row["amount"]), actor_id, "Topup credited atomically"
-    )
-    return (row, new_balance), "completed"
 
 
 def order_payment_state_ok(order) -> tuple[bool, str]:
@@ -5516,27 +5516,171 @@ def bank_order_pending_keyboard(order_id: int):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def bank_topup_pending_keyboard(topup_id: int):
-    rows=[
-        [bank_account_copy_button()],
-        [
-            InlineKeyboardButton(
-                text="📤 Kirim Bukti Pembayaran",
-                callback_data=f"proofsubmit:topup:{topup_id}"
-            )
-        ],
-    ]
-    if ADMIN_USERNAME:
-        rows.append([
-            InlineKeyboardButton(
-                text="💬 Hubungi Owner",
-                url=f"https://t.me/{ADMIN_USERNAME}"
-            )
-        ])
-    rows.append([
-        InlineKeyboardButton(text="🏠 Menu Utama",callback_data="home")
+def topup_done_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Saldo Kamu", callback_data="wallet")],
+        [InlineKeyboardButton(text="📑 Riwayat Saldo", callback_data="wallet:history")],
     ])
+
+
+def topup_pending_keyboard(topup_id: int, bank: bool = False):
+    conn = db()
+    try:
+        row = conn.execute("SELECT * FROM topups WHERE id=?", (topup_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row or str(row["status"] or "") != "pending":
+        return topup_done_keyboard()
+    expiry = parse_stored_datetime(row["expires_at"])
+    if expiry and expiry <= datetime.now(timezone.utc):
+        return topup_done_keyboard()
+    rows = []
+    if bank and bank_transfer_ready():
+        rows.append([bank_account_copy_button()])
+    if not proof_locked_status(row):
+        rows.append([InlineKeyboardButton(text="📤 Kirim Bukti Pembayaran", callback_data=f"proofsubmit:topup:{topup_id}")])
+    rows.append([InlineKeyboardButton(text="🔄 Cek Status", callback_data=f"statuscheck:topup:{topup_id}")])
+    rows.append([InlineKeyboardButton(text="❌ Batalkan Isi Saldo", callback_data=f"topupcancel:{topup_id}")])
+    if ADMIN_USERNAME:
+        rows.append([InlineKeyboardButton(text="💬 Hubungi Owner", url=f"https://t.me/{ADMIN_USERNAME}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Saldo Kamu", callback_data="wallet")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def topup_saved_payment_message_ids(value):
+    try:
+        values = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(item for item in values
+                             if isinstance(item, int) and not isinstance(item, bool)
+                             and 0 < item <= 9223372036854775807))
+
+
+def save_topup_payment_message(topup_id: int, user_id: int, message_id: int) -> bool:
+    if isinstance(message_id, bool) or not isinstance(message_id, int) or not 0 < message_id <= 9223372036854775807:
+        raise ValueError("Invalid payment message ID")
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        row = conn.execute("SELECT status,payment_message_ids FROM topups WHERE id=? AND user_id=?",
+                           (topup_id, user_id)).fetchone()
+        if not row or row["status"] != "pending":
+            conn.rollback()
+            return False
+        ids = topup_saved_payment_message_ids(row["payment_message_ids"])
+        if message_id not in ids:
+            ids.append(message_id)
+        conn.execute("UPDATE topups SET payment_message_ids=? WHERE id=? AND user_id=? AND status='pending'",
+                     (json.dumps(ids), topup_id, user_id))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+async def retire_topup_payment_message(bot: Bot, user_id: int, message_id: int) -> bool:
+    try:
+        await bot.delete_message(chat_id=user_id, message_id=message_id)
+        return True
+    except TelegramBadRequest as exc:
+        if "message to delete not found" in str(exc).lower():
+            return True
+    except Exception:
+        pass
+    try:
+        await bot.edit_message_caption(chat_id=user_id, message_id=message_id,
+            caption="⛔ QRIS isi saldo ini sudah tidak aktif. Jangan lakukan pembayaran.",
+            reply_markup=None, parse_mode="HTML")
+        return True
+    except Exception:
+        try:
+            await bot.edit_message_reply_markup(chat_id=user_id, message_id=message_id, reply_markup=None)
+        except Exception:
+            pass
+    return False
+
+
+async def retire_saved_topup_payment_messages(bot: Bot, topup_id: int, user_id: int,
+                                             handled_message_id: int = 0):
+    conn = db()
+    try:
+        row = conn.execute("SELECT status,payment_message_ids FROM topups WHERE id=? AND user_id=?",
+                           (topup_id, user_id)).fetchone()
+    finally:
+        conn.close()
+    if not row or row["status"] not in {"cancelled", "completed", "expired", "rejected"}:
+        return
+    ids = topup_saved_payment_message_ids(row["payment_message_ids"])
+    retired = set()
+    for message_id in ids:
+        if message_id == handled_message_id or await retire_topup_payment_message(bot, user_id, message_id):
+            retired.add(message_id)
+    if retired:
+        conn = db()
+        try:
+            begin_immediate_retry(conn)
+            current = conn.execute("SELECT status,payment_message_ids FROM topups WHERE id=? AND user_id=?",
+                                   (topup_id, user_id)).fetchone()
+            if current and current["status"] in {"cancelled", "completed", "expired", "rejected"}:
+                remaining = [item for item in topup_saved_payment_message_ids(current["payment_message_ids"])
+                             if item not in retired]
+                conn.execute("UPDATE topups SET payment_message_ids=? WHERE id=? AND user_id=?",
+                             (json.dumps(remaining), topup_id, user_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def cancel_topup_atomic(topup_id: int, user_id: int):
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        row = conn.execute("SELECT * FROM topups WHERE id=? AND user_id=?", (topup_id, user_id)).fetchone()
+        if not row:
+            conn.rollback()
+            return None, "not_found"
+        credited = conn.execute("SELECT 1 FROM wallet_ledger WHERE user_id=? AND type='TOPUP' AND reference=?",
+                                (user_id, topup_invoice(topup_id))).fetchone()
+        status = str(row["status"] or "")
+        if status in {"completed", "processing"} or credited:
+            conn.rollback()
+            return row, "paid_or_processing"
+        if status not in {"pending", "cancelled"}:
+            conn.rollback()
+            return row, "invalid_status"
+        now = datetime.now().isoformat(timespec="seconds")
+        if status == "pending":
+            changed = conn.execute("UPDATE topups SET status='cancelled',updated_at=? WHERE id=? AND user_id=? AND status='pending'",
+                                   (now, topup_id, user_id)).rowcount
+            if changed != 1:
+                conn.rollback()
+                return row, "race_lost"
+            conn.execute("""INSERT INTO payment_events
+                (entity_type,entity_id,event_type,amount,actor_id,detail,created_at)
+                VALUES('topup',?,'cancelled',0,?,'Cancelled by user',?)""", (topup_id, user_id, now))
+        conn.execute("DELETE FROM payment_proof_sessions WHERE user_id=? AND entity_type='topup' AND entity_id=?",
+                     (user_id, topup_id))
+        conn.commit()
+        return row, "already_cancelled" if status == "cancelled" else "cancelled"
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+
+def bank_topup_pending_keyboard(topup_id: int):
+    return topup_pending_keyboard(topup_id, bank=True)
 
 
 
@@ -7863,7 +8007,7 @@ async def process_payment_proof_message(
     )
     now = datetime.now().isoformat(timespec="seconds")
 
-    conn = db()
+    conn = db() if entity == "order" else None
     if entity == "order":
         row = conn.execute(
             "SELECT * FROM orders WHERE id=? AND user_id=?",
@@ -7903,41 +8047,15 @@ async def process_payment_proof_message(
             (file_id, proof_type, now, entity_id)
         )
     else:
-        row = conn.execute(
-            "SELECT * FROM topups WHERE id=? AND user_id=?",
-            (entity_id, message.from_user.id)
-        ).fetchone()
+        row, error = save_topup_payment_proof(message.from_user.id, entity_id, file_id, proof_type, now)
+        if error:
+            if row is not None:
+                await clear_matching_topup_proof_context(message.from_user.id, entity_id, state)
+            return False, error
 
-        if not row:
-            conn.close()
-            return False, "Invoice top up tidak ditemukan."
-
-        if proof_locked_status(row):
-            conn.close()
-            clear_payment_proof_session(message.from_user.id)
-            await state.clear()
-            return False, "Bukti top up untuk invoice ini sudah pernah dikirim."
-
-        if topup_payment_terminal(row):
-            conn.close()
-            clear_payment_proof_session(message.from_user.id)
-            await state.clear()
-            return False, "Top up ini sudah final."
-
-        conn.execute(
-            """UPDATE topups
-               SET payment_proof_file_id=?,
-                   payment_proof_type=?,
-                   payment_proof_submitted_at=?,
-                   payment_reject_reason='',
-                   payment_review_status='submitted',
-                   updated_at=?
-               WHERE id=?""",
-            (file_id, proof_type, now, now, entity_id)
-        )
-
-    conn.commit()
-    conn.close()
+    if conn is not None:
+        conn.commit()
+        conn.close()
 
     forwarded, error = await forward_payment_proof_to_owner(
         bot,
@@ -7948,8 +8066,11 @@ async def process_payment_proof_message(
     )
 
     if forwarded:
-        clear_payment_proof_session(message.from_user.id)
-        await state.clear()
+        if entity == "topup":
+            await clear_matching_topup_proof_context(message.from_user.id, entity_id, state)
+        else:
+            clear_payment_proof_session(message.from_user.id)
+            await state.clear()
         return True, ""
 
     # Proof is already stored. Do not allow a second upload.
@@ -7963,14 +8084,17 @@ async def process_payment_proof_message(
         conn.execute(
             """UPDATE topups
                SET payment_review_status='forward_failed', updated_at=?
-               WHERE id=? AND status NOT IN ('completed','expired','cancelled','rejected')""",
+               WHERE id=? AND status='pending'""",
             (datetime.now().isoformat(timespec="seconds"), entity_id)
         )
     conn.commit()
     conn.close()
 
-    clear_payment_proof_session(message.from_user.id)
-    await state.clear()
+    if entity == "topup":
+        await clear_matching_topup_proof_context(message.from_user.id, entity_id, state)
+    else:
+        clear_payment_proof_session(message.from_user.id)
+        await state.clear()
     return False, (
         "Bukti sudah tersimpan, tetapi notifikasi ke owner belum berhasil. "
         "Tidak perlu mengirim bukti lagi."
@@ -7997,6 +8121,127 @@ def order_reservation_expired(order) -> bool:
         return datetime.fromisoformat(expiry) <= datetime.now(timezone.utc).astimezone()
     except Exception:
         return False
+
+
+def topup_reservation_expired(row) -> bool:
+    if not row:
+        return True
+    keys = set(row.keys()) if hasattr(row, "keys") else set()
+    raw = str(row["expires_at"] or "").strip() if "expires_at" in keys else ""
+    if not raw:
+        return False
+    try:
+        expiry = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return expiry <= datetime.now(timezone.utc)
+    except (ValueError, TypeError):
+        return False
+
+
+def topup_payment_input_error(row) -> str:
+    if not row:
+        return "Invoice top up tidak ditemukan."
+    if topup_payment_terminal(row):
+        return "Top up ini sudah final dan tidak menerima bukti lagi."
+    if str(row["status"] or "") != "pending":
+        return "Top up sedang diproses dan tidak menerima bukti lagi."
+    if topup_reservation_expired(row):
+        return "Waktu pembayaran top up sudah habis. Buat top up baru."
+    if proof_locked_status(row):
+        return "Bukti top up untuk invoice ini sudah pernah dikirim."
+    return ""
+
+
+def save_topup_payment_proof(user_id: int, entity_id: int, file_id: str, proof_type: str, now: str):
+    """Save one proof while holding the same write lock as cancel/verify actions."""
+    if not isinstance(entity_id, int) or isinstance(entity_id, bool) or not 0 < entity_id <= 9223372036854775807:
+        return None, "Invoice top up tidak valid."
+    conn = None
+    try:
+        conn = db()
+        begin_immediate_retry(conn)
+        row = conn.execute("SELECT * FROM topups WHERE id=? AND user_id=?", (entity_id, user_id)).fetchone()
+        error = topup_payment_input_error(row)
+        if error:
+            return row, error
+        changed = conn.execute(
+            """UPDATE topups SET payment_proof_file_id=?,payment_proof_type=?,
+               payment_proof_submitted_at=?,payment_reject_reason='',
+               payment_review_status='submitted',updated_at=?
+               WHERE id=? AND user_id=? AND status='pending'
+                 AND COALESCE(payment_proof_file_id,'')=''
+                 AND COALESCE(payment_proof_submitted_at,'')=''""",
+            (file_id, proof_type, now, now, entity_id, user_id)
+        ).rowcount
+        if changed != 1:
+            return row, "Top up sudah diproses. Periksa status transaksi."
+        conn.commit()
+        return row, ""
+    except sqlite3.Error:
+        logging.exception("Topup proof save failed invoice=%s", entity_id)
+        return None, "Bukti belum bisa disimpan. Coba lagi."
+    finally:
+        if conn is not None:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
+
+async def clear_matching_topup_proof_context(user_id: int, entity_id: int, state: FSMContext):
+    conn = None
+    try:
+        conn = db()
+        conn.execute("DELETE FROM payment_proof_sessions WHERE user_id=? AND entity_type='topup' AND entity_id=?",
+                     (user_id, entity_id))
+        conn.commit()
+    except sqlite3.Error:
+        logging.exception("Topup proof session cleanup failed invoice=%s", entity_id)
+    finally:
+        if conn is not None:
+            conn.close()
+    try:
+        if await state.get_state() == CheckoutState.waiting_payment_proof.state:
+            data = await state.get_data()
+            if payment_proof_data_target(data) == ("topup", entity_id):
+                await state.set_state(None)
+                await state.set_data({key: value for key, value in data.items() if not str(key).startswith("proof_")})
+    except sqlite3.Error:
+        logging.exception("Topup upload state cleanup failed invoice=%s", entity_id)
+
+
+def topup_status_view(row):
+    entity_id = int(row["id"])
+    raw_status = str(row["status"] or "pending")
+    status = {
+        "pending": "Menunggu Pembayaran", "processing": "Sedang Diproses",
+        "completed": "Selesai", "cancelled": "Dibatalkan",
+        "expired": "Kedaluwarsa", "rejected": "Ditolak",
+    }.get(raw_status, raw_status.replace("_", " ").title())
+    pending = raw_status == "pending" and not topup_reservation_expired(row)
+    if raw_status == "pending" and not pending:
+        status = "Kedaluwarsa"
+    elif pending:
+        review = str(row["payment_review_status"] or "")
+        if review == "reviewing":
+            status = "Bukti Sedang Diperiksa"
+        elif review in {"submitted", "forward_failed"}:
+            status = "Bukti Tersimpan • Menunggu Owner"
+        elif review == "rejected":
+            status = "Bukti Ditolak • Hubungi Owner"
+    text = (
+        "💰 <b>STATUS TOP UP</b>\n\n"
+        f"🧾 {topup_invoice(entity_id)}\n"
+        f"💵 Nominal saldo: <b>{rupiah(row['amount'])}</b>\n"
+        f"💳 Total pembayaran: <b>{rupiah(row['payment_total'] or row['amount'])}</b>\n"
+        f"📌 Status: <b>{html.escape(status)}</b>\n"
+        + topup_expiry_text(row)
+    )
+    if str(row["reject_reason"] or "").strip():
+        text += f"Alasan: {html.escape(str(row['reject_reason'])[:300])}\n"
+    keyboard = (topup_pending_keyboard(entity_id, bank=str(row["payment_method"] or "") == "BANK_TRANSFER")
+                if pending else topup_done_keyboard())
+    return text, keyboard
 
 
 def topup_payment_terminal(row) -> bool:
@@ -8141,7 +8386,10 @@ def proof_rejected_keyboard(entity: str, entity_id: int):
         ])
     else:
         rows.append([
-            InlineKeyboardButton(text="🏠 Menu",callback_data="home")
+            InlineKeyboardButton(text="❌ Batalkan Isi Saldo",callback_data=f"topupcancel:{entity_id}")
+        ])
+        rows.append([
+            InlineKeyboardButton(text="⬅️ Saldo Kamu",callback_data="wallet")
         ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -8214,6 +8462,8 @@ def order_detail_keyboard(order, *, include_history: bool = True):
 
 
 def payment_proof_keyboard(entity: str, entity_id: int):
+    if entity == "topup":
+        return topup_pending_keyboard(entity_id)
     rows=[
         [
             InlineKeyboardButton(
@@ -8358,8 +8608,9 @@ def payment_proof_caption(entity: str, row) -> str:
 
 def get_min_topup() -> int:
     try:
-        return max(1000, int(get_setting("min_topup", "5000")))
-    except ValueError:
+        amount = int(get_setting("min_topup", "5000"))
+        return max(1000, amount) if amount <= 9223372036854775307 else 5000
+    except (ValueError, TypeError):
         return 5000
 
 
@@ -9284,6 +9535,21 @@ async def show_loading_from_callback(call: CallbackQuery, final_text: str, reply
         )
 
 
+def payment_media_message(message) -> bool:
+    """Keep a payment QRIS photo separate from later navigation screens."""
+    if not any(getattr(message, field, None) for field in ("photo", "document", "video", "animation")):
+        return False
+    markup = getattr(message, "reply_markup", None)
+    for row in getattr(markup, "inline_keyboard", []) or []:
+        for button in row:
+            data = str(getattr(button, "callback_data", None) or "")
+            if re.fullmatch(r"(?:proofsubmit|statuscheck):(?:topup|order):[0-9]+|(?:topupcancel|usercancel):[0-9]+", data):
+                return True
+    caption = str(getattr(message, "caption", None) or "")
+    return bool(re.search(r"\b(?:TOP|MBY)-[0-9]+\b", caption)
+                and re.search(r"qris|top.?up|isi saldo|transfer|pembayaran", caption, re.I))
+
+
 async def safe_edit_or_answer(call: CallbackQuery, text: str, reply_markup=None, parse_mode: str = "HTML"):
     """
     Reliable callback renderer:
@@ -9292,19 +9558,21 @@ async def safe_edit_or_answer(call: CallbackQuery, text: str, reply_markup=None,
     - stale/non-editable message -> send new message
     - "message is not modified" -> treat as success, not an error
     """
+    payment_media = payment_media_message(getattr(call, "message", None))
     try:
-        await call.message.edit_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
-        )
-        return True
+        if not payment_media:
+            await call.message.edit_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+            return True
     except Exception as exc:
         if "message is not modified" in str(exc).lower():
             return True
 
     try:
-        if getattr(call.message, "caption", None) is not None:
+        if not payment_media and getattr(call.message, "caption", None) is not None:
             await call.message.edit_caption(
                 caption=text,
                 reply_markup=reply_markup,
@@ -9978,7 +10246,7 @@ def validate_system_schema():
             "variant_id","qty","stock_reserved","reserved_until","created_at",
             "review_prompt_sent","family_invite_notified","family_invite_notified_at"
         },
-        "topups": {"id","user_id","status","expires_at","created_at"},
+        "topups": {"id","user_id","status","expires_at","created_at","payment_message_ids"},
         "product_variants": {"id","stock","reserved_stock","active","sharing_mode"},
         "inventory_items": {
             "id","variant_id","status","order_id",
@@ -12146,7 +12414,11 @@ async def payment_proof_back(call: CallbackQuery, state: FSMContext):
     if await state.get_state()==CheckoutState.waiting_payment_proof.state:
         data=await state.get_data()
         if payment_proof_data_target(data)==target:
-            await state.clear()
+            if entity == "topup":
+                await state.set_state(None)
+                await state.set_data({key: value for key, value in data.items() if not str(key).startswith("proof_")})
+            else:
+                await state.clear()
     if entity=="order":
         # Reuse the invoice view directly; no intermediate history page.
         conn=None
@@ -12166,11 +12438,8 @@ async def payment_proof_back(call: CallbackQuery, state: FSMContext):
             if conn is not None:
                 conn.close()
     else:
-        await safe_edit_or_answer(call,
-            "💰 <b>TOP UP</b>\n\n"+f"🧾 {topup_invoice(entity_id)}\n"
-            +f"💵 Nominal: <b>{rupiah(row['amount'])}</b>\n"
-            +"Pilih Cek Status untuk melanjutkan transaksi.",
-            reply_markup=payment_proof_status_keyboard(entity,entity_id),parse_mode="HTML")
+        text, keyboard = topup_status_view(row)
+        await safe_edit_or_answer(call, text, reply_markup=keyboard, parse_mode="HTML")
     await safe_callback_notice(call)
 
 
@@ -12229,16 +12498,9 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
             )
 
     if entity == "topup":
-        if topup_payment_terminal(row):
-            return await call.answer(
-                "Top up ini sudah final dan tidak menerima bukti lagi.",
-                show_alert=True
-            )
-        if proof_locked_status(row):
-            return await call.answer(
-                "Bukti top up hanya dapat dikirim 1 kali untuk setiap invoice.",
-                show_alert=True
-            )
+        error = topup_payment_input_error(row)
+        if error:
+            return await safe_callback_notice(call, error, show_alert=True)
 
     try:
         set_payment_proof_session(call.from_user.id,entity,entity_id)
@@ -12257,7 +12519,8 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
         "Kirim <b>foto/screenshot bukti transfer</b> ke chat ini.\n\n"
         "Bukti akan diteruskan ke owner untuk diperiksa.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Kembali ke Transaksi", callback_data=f"userproofback:{entity}:{entity_id}")]
+            [InlineKeyboardButton(text="⬅️ Kembali ke Transaksi", callback_data=f"userproofback:{entity}:{entity_id}")],
+            *([[InlineKeyboardButton(text="❌ Batalkan Top Up", callback_data=f"topupcancel:{entity_id}")]] if entity == "topup" else [])
         ]),
         parse_mode="HTML"
     )
@@ -21490,20 +21753,8 @@ async def user_check_transaction_status(call: CallbackQuery):
         except sqlite3.Error:
             return await safe_callback_notice(call,"Status belum bisa dibuka. Coba lagi.",show_alert=True)
     else:
-        status=str(row["status"] or "pending").replace("_"," ").title()
-        review_status=str(row["payment_review_status"] or "")
-        if review_status=="reviewing":
-            status="Bukti Sedang Diperiksa"
-        elif row["status"]=="completed":
-            status="Selesai"
-        await safe_edit_or_answer(call,
-            "💰 <b>STATUS TOP UP</b>\n\n"
-            f"🧾 {topup_invoice(entity_id)}\n"
-            f"💵 Nominal: <b>{rupiah(row['amount'])}</b>\n"
-            f"📌 Status: <b>{html.escape(status)}</b>",
-            reply_markup=payment_proof_status_keyboard(entity,entity_id),
-            parse_mode="HTML"
-        )
+        text, keyboard = topup_status_view(row)
+        await safe_edit_or_answer(call, text, reply_markup=keyboard, parse_mode="HTML")
 
     await call.answer("Status diperbarui.")
 
@@ -21766,6 +22017,47 @@ async def voucher_info(call: CallbackQuery):
 # =========================
 # WALLET USER
 # =========================
+@router.callback_query(F.data.startswith("topupcancel:"))
+async def user_cancel_topup(call: CallbackQuery, state: FSMContext = None):
+    numbers = callback_positive_numbers(call.data, "topupcancel")
+    if not numbers:
+        return await safe_callback_notice(call, "Invoice isi saldo tidak valid.", show_alert=True)
+    topup_id = numbers[0]
+    if not recent_action_allowed(f"topupcancel:{topup_id}:{call.from_user.id}", 3):
+        return await safe_callback_notice(call, "Sedang diproses. Jangan tekan dua kali.", show_alert=True)
+    try:
+        row, status = cancel_topup_atomic(topup_id, call.from_user.id)
+    except sqlite3.Error:
+        return await safe_callback_notice(call, "Isi saldo belum bisa dibatalkan. Silakan coba lagi.", show_alert=True)
+    if status == "not_found":
+        return await safe_callback_notice(call, "Invoice isi saldo tidak ditemukan.", show_alert=True)
+    if status == "paid_or_processing":
+        return await safe_callback_notice(call, "Isi saldo sudah diproses atau berhasil; tidak dapat dibatalkan.", show_alert=True)
+    if status not in {"cancelled", "already_cancelled"}:
+        return await safe_callback_notice(call, "Invoice isi saldo sudah tidak aktif.", show_alert=True)
+    if state is not None:
+        try:
+            if await state.get_state() == CheckoutState.waiting_payment_proof.state:
+                data = await state.get_data()
+                if payment_proof_data_target(data) == ("topup", topup_id):
+                    await state.set_data({key: value for key, value in data.items() if not str(key).startswith("proof_")})
+                    await state.set_state(None)
+        except Exception:
+            logging.exception("Cancelled topup proof input cleanup failed topup=%s", topup_id)
+    rendered = await render_cancelled_payment_message(call,
+        "❌ <b>ISI SALDO DIBATALKAN</b>\n\n"
+        f"🧾 {topup_invoice(topup_id)}\n"
+        "Saldo Anda tidak berubah.\nJangan lakukan pembayaran untuk invoice ini.",
+        reply_markup=topup_done_keyboard())
+    await safe_callback_notice(call, "Isi saldo dibatalkan.", show_alert=True)
+    try:
+        message = getattr(call, "message", None)
+        handled = getattr(message, "message_id", 0) if rendered and payment_media_message(message) else 0
+        await retire_saved_topup_payment_messages(call.bot, topup_id, call.from_user.id, handled)
+    except Exception:
+        logging.exception("Cancelled topup QRIS cleanup deferred topup=%s", topup_id)
+
+
 @router.callback_query(F.data == "wallet")
 async def wallet_home(call: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -21857,12 +22149,11 @@ async def callback_noop(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("topup:set:"))
 async def wallet_topup_set(call: CallbackQuery, state: FSMContext):
+    parts = str(call.data or "").split(":")
+    amount = parse_manual_topup_amount(parts[2]) if len(parts) == 3 and parts[:2] == ["topup", "set"] else None
+    if amount is None:
+        return await safe_callback_notice(call, "Nominal tidak valid.", show_alert=True)
     await state.clear()
-
-    try:
-        amount = int(call.data.split(":")[2])
-    except Exception:
-        return await call.answer("Nominal tidak valid.", show_alert=True)
 
     amount = max(get_min_topup(), amount)
 
@@ -21898,8 +22189,8 @@ async def wallet_topup_custom(call: CallbackQuery, state: FSMContext):
 async def wallet_topup_custom_input(message: Message, state: FSMContext):
     try:
         raw = (message.text or "").replace(".", "").replace(",", "").strip()
-        amount = int(raw)
-        if amount < get_min_topup():
+        amount = parse_manual_topup_amount(raw)
+        if amount is None or amount < get_min_topup():
             raise ValueError
     except Exception:
         return await message.answer(
@@ -21919,12 +22210,11 @@ async def wallet_topup_custom_input(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("topup:confirm:"))
 async def wallet_topup_confirm(call: CallbackQuery, state: FSMContext):
+    parts = str(call.data or "").split(":")
+    amount = parse_manual_topup_amount(parts[2]) if len(parts) == 3 and parts[:2] == ["topup", "confirm"] else None
+    if amount is None:
+        return await safe_callback_notice(call, "Nominal tidak valid.", show_alert=True)
     await state.clear()
-
-    try:
-        amount = int(call.data.split(":")[2])
-    except Exception:
-        return await call.answer("Nominal tidak valid.", show_alert=True)
 
     if amount < get_min_topup():
         return await call.answer(
@@ -21948,7 +22238,10 @@ async def wallet_topup_confirm(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("topup:pay:"))
 async def wallet_topup_pay(call: CallbackQuery):
-    amount = int(call.data.split(":")[2])
+    parts = str(call.data or "").split(":")
+    amount = parse_manual_topup_amount(parts[2]) if len(parts) == 3 and parts[:2] == ["topup", "pay"] else None
+    if amount is None:
+        return await safe_callback_notice(call, "Nominal tidak valid.", show_alert=True)
     minimum = get_min_topup()
     if amount < minimum:
         return await call.answer(
@@ -21966,265 +22259,239 @@ async def wallet_topup_pay(call: CallbackQuery):
     await call.answer()
 
 
+def parse_manual_topup_amount(raw):
+    """Validate nominal before callback generation or SQLite integer arithmetic."""
+    if not isinstance(raw, str) or not re.fullmatch(r"[0-9]{1,19}", raw):
+        return None
+    amount = int(raw)
+    # The unique transfer code can add at most 500 rupiah.
+    if not 0 < amount <= 9223372036854775307:
+        return None
+    return amount
+
+
+def manual_topup_callback_amount(data, method):
+    parts = data.split(":") if isinstance(data, str) else []
+    if len(parts) != 3 or parts[:2] != ["topupmethod", method]:
+        return None
+    return parse_manual_topup_amount(parts[2])
+
+
+def create_or_reuse_manual_topup(user_id, username, amount, method):
+    """Keep one active invoice for the same user, amount and payment method."""
+    conn = None
+    try:
+        conn = db()
+        conn.execute("BEGIN IMMEDIATE")
+        recent = conn.execute(
+            """SELECT * FROM topups
+               WHERE user_id=? AND amount=? AND payment_method=? AND status='pending'
+               ORDER BY id DESC LIMIT 1""",
+            (user_id, amount, method)
+        ).fetchone()
+        if recent:
+            expiry = parse_stored_datetime(recent["expires_at"])
+            if not expiry:
+                created = parse_stored_datetime(recent["created_at"])
+                expiry = created + timedelta(minutes=30) if created else None
+            if expiry and expiry > datetime.now(timezone.utc):
+                conn.commit()
+                return recent, False
+            conn.execute(
+                """UPDATE topups SET status='expired',updated_at=?
+                   WHERE id=? AND status='pending'""",
+                (datetime.now().isoformat(timespec="seconds"), recent["id"])
+            )
+        unique_code = unique_code_for_order(conn)
+        cur = conn.execute(
+            """INSERT INTO topups
+               (user_id,username,amount,unique_code,payment_total,
+                payment_method,status,created_at,expires_at)
+               VALUES(?,?,?,?,?,?,'pending',?,?)""",
+            (user_id, username or "", amount, unique_code, amount + unique_code,
+             method, datetime.now().isoformat(timespec="seconds"), topup_expiry_iso())
+        )
+        saved = conn.execute("SELECT * FROM topups WHERE id=?", (cur.lastrowid,)).fetchone()
+        conn.commit()
+        return saved, True
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def manual_topup_invoice_text(topup, *, bank=False):
+    unique_code = int(topup["unique_code"] or 0)
+    unique_text = f"🔢 Kode unik: <b>+{unique_code}</b>\n" if unique_code > 0 else ""
+    title = "TRANSFER REKENING" if bank else "QRIS MANUAL"
+    text = (
+        f"💰 <b>ISI SALDO • {title}</b>\n\n"
+        f"🧾 Invoice: <b>{topup_invoice(topup['id'])}</b>\n"
+        f"💵 Saldo masuk: <b>{rupiah(topup['amount'])}</b>\n"
+        f"{unique_text}"
+        f"💳 Total transfer: <b>{rupiah(topup['payment_total'])}</b>\n"
+        f"{topup_expiry_text(topup)}\n"
+    )
+    if bank:
+        text += bank_transfer_text() + "\n\n⚠️ Transfer sesuai nominal hingga kode unik.\n"
+    else:
+        note = str(get_setting("payment_note", DEFAULT_PAYMENT_NOTE) or "").strip()
+        note = note[:240]
+        while len(html.escape(note)) > 340:
+            note = note[:-1]
+        if note:
+            text += f"📝 {html.escape(note)}\n\n"
+    return text + "⏳ Setelah transfer, kirim bukti pembayaran ke bot sebelum invoice kedaluwarsa."
+
+
+async def notify_manual_topup_created(call, topup, *, bank=False):
+    if not ADMIN_ID:
+        return
+    user = f"@{call.from_user.username}" if call.from_user.username else f"ID {call.from_user.id}"
+    title = "🏦 <b>TOP UP BARU • TRANSFER REKENING</b>" if bank else "💰 <b>TOP UP BARU • QRIS</b>"
+    try:
+        await call.bot.send_message(
+            ADMIN_ID,
+            f"{title}\n\n"
+            f"🧾 {topup_invoice(topup['id'])}\n"
+            f"👤 {html.escape(user)}\n"
+            f"💰 Saldo: <b>{rupiah(topup['amount'])}</b>\n"
+            f"🔢 Kode unik: <b>+{topup['unique_code']}</b>\n"
+            f"💳 Transfer: <b>{rupiah(topup['payment_total'])}</b>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
 @router.callback_query(F.data.startswith("topupmethod:qris:"))
 async def wallet_topup_method_qris(call: CallbackQuery):
     if safe_mode_enabled() and not is_owner(call.from_user.id):
-        return await call.answer(
-            "Sistem sedang Safe Mode. Pembayaran sementara ditahan.",
-            show_alert=True
+        return await safe_callback_notice(
+            call, "Sistem sedang Safe Mode. Pembayaran sementara ditahan.", show_alert=True
         )
-    amount = int(call.data.split(":")[2])
-    rate_ok,retry_after=persistent_rate_limit(
-        call.from_user.id,
-        "topup_payment",
-        limit=4,
-        window_seconds=60
-    )
-    if not rate_ok:
-        return await call.answer(
-            f"Terlalu banyak percobaan top up. Coba lagi dalam {retry_after} detik.",
-            show_alert=True
-        )
-
+    amount = manual_topup_callback_amount(call.data, "qris")
+    if amount is None:
+        return await safe_callback_notice(call, "Nominal tidak valid.", show_alert=True)
     minimum = get_min_topup()
     if amount < minimum:
-        return await call.answer(
-            f"Minimum top up {rupiah(minimum)}.",
-            show_alert=True
+        return await safe_callback_notice(call, f"Minimum top up {rupiah(minimum)}.", show_alert=True)
+    qris_file_id = str(get_setting("qris_file_id", "") or "").strip()
+    if not qris_file_id:
+        await safe_edit_or_answer(
+            call,
+            "⚠️ <b>QRIS BELUM TERSEDIA</b>\n\n"
+            "Owner belum memasang gambar QRIS. Pilih metode pembayaran lain atau hubungi owner.\n"
+            "Invoice isi saldo belum dibuat.",
+            reply_markup=topup_payment_method_keyboard(amount), parse_mode="HTML"
         )
-
-    conn = db()
-    conn.execute("BEGIN IMMEDIATE")
-    recent = conn.execute(
-        """SELECT * FROM topups
-           WHERE user_id=? AND amount=? AND payment_method='QRIS_MANUAL'
-             AND status='pending'
-           ORDER BY id DESC LIMIT 1""",
-        (call.from_user.id, amount)
-    ).fetchone()
-
-    if recent:
-        try:
-            created = datetime.fromisoformat(recent["created_at"])
-            now = datetime.now(created.tzinfo) if created.tzinfo else datetime.now()
-            if (now - created).total_seconds() < 30:
-                conn.rollback()
-                conn.close()
-                return await call.answer(
-                    f"Top up {topup_invoice(recent['id'])} masih pending.",
-                    show_alert=True
-                )
-        except Exception:
-            pass
-
-    unique_code = unique_code_for_order(conn)
-    payment_total = amount + unique_code
-    cur = conn.execute(
-        """INSERT INTO topups
-           (user_id, username, amount, unique_code, payment_total,
-            payment_method, status, created_at, expires_at)
-           VALUES(?,?,?,?,?,'QRIS_MANUAL','pending',?,?)""",
-        (
-            call.from_user.id,
-            call.from_user.username or "",
-            amount,
-            unique_code,
-            payment_total,
-            datetime.now().isoformat(timespec="seconds"),
-            topup_expiry_iso()
+        return await safe_callback_notice(call, "QRIS belum dipasang owner.", show_alert=True)
+    try:
+        rate_ok, retry_after = persistent_rate_limit(
+            call.from_user.id, "topup_payment", limit=4, window_seconds=60
         )
-    )
-    topup_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    conn = db()
-    saved_topup = conn.execute("SELECT * FROM topups WHERE id=?", (topup_id,)).fetchone()
-    conn.close()
-    topup_expiry = topup_expiry_text(saved_topup)
-
-    qris_file_id = get_setting("qris_file_id", "")
-    payment_note = get_setting("payment_note", DEFAULT_PAYMENT_NOTE)
-    unique_text = f"🔢 Kode unik: <b>+{unique_code}</b>\n" if unique_code > 0 else ""
-
-    text = (
-        "💰 <b>ISI SALDO • QRIS MANUAL</b>\n\n"
-        f"🧾 Invoice: <b>{topup_invoice(topup_id)}</b>\n"
-        f"💵 Saldo masuk: <b>{rupiah(amount)}</b>\n"
-        f"{unique_text}"
-        f"💳 Total transfer: <b>{rupiah(payment_total)}</b>\n"
-        f"{topup_expiry}\n"
-        f"📝 {html.escape(payment_note)}\n\n"
-        "⏳ Invoice berlaku 30 menit. Setelah transfer, kirim bukti pembayaran ke bot."
-    )
-
-    if qris_file_id:
-        try:
-            await call.message.delete()
-            await call.bot.send_photo(
-                call.from_user.id,
-                photo=qris_file_id,
-                caption=text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="📤 Kirim Bukti Pembayaran", callback_data=f"proofsubmit:topup:{topup_id}")],
-                    [InlineKeyboardButton(text="💬 Hubungi Owner", url=f"https://t.me/{ADMIN_USERNAME}")]
-                ]) if ADMIN_USERNAME else payment_proof_keyboard("topup", topup_id),
-                parse_mode="HTML"
+        if not rate_ok:
+            return await safe_callback_notice(
+                call, f"Terlalu banyak percobaan top up. Coba lagi dalam {retry_after} detik.",
+                show_alert=True
             )
-        except Exception:
-            await call.bot.send_message(
-                call.from_user.id,
-                text + "\n\n⚠️ QRIS tidak dapat dimuat.",
-                parse_mode="HTML"
-            )
+        topup, created = create_or_reuse_manual_topup(
+            call.from_user.id, call.from_user.username, amount, "QRIS_MANUAL"
+        )
+    except Exception as exc:
+        logging.warning("Manual QRIS topup invoice unavailable (%s)", type(exc).__name__)
+        return await safe_callback_notice(
+            call, "Invoice belum dapat dibuat. Silakan coba lagi; saldo Anda tetap aman.", show_alert=True
+        )
+    await safe_callback_notice(
+        call, "Invoice top up QRIS dibuat." if created else "Menampilkan invoice isi saldo yang masih aktif."
+    )
+    text = manual_topup_invoice_text(topup)
+    keyboard = topup_pending_keyboard(topup["id"])
+    try:
+        sent = await call.bot.send_photo(
+            call.from_user.id, photo=qris_file_id, caption=text,
+            reply_markup=keyboard, parse_mode="HTML"
+        )
+    except Exception as exc:
+        logging.warning("Manual QRIS topup image unavailable (%s)", type(exc).__name__)
+        await safe_edit_or_answer(
+            call,
+            text + "\n\n⚠️ Gambar QRIS gagal dimuat. Jangan transfer sebelum QRIS tersedia; hubungi owner atau batalkan invoice.",
+            reply_markup=keyboard, parse_mode="HTML"
+        )
     else:
-        await safe_edit_or_answer(call, 
-            text + "\n\n⚠️ QRIS belum dipasang owner.",
-            reply_markup=wallet_menu(),
-            parse_mode="HTML"
-        )
-
-    if ADMIN_ID:
         try:
-            user = (
-                f"@{call.from_user.username}"
-                if call.from_user.username
-                else f"ID {call.from_user.id}"
+            active = save_topup_payment_message(topup["id"], call.from_user.id, sent.message_id)
+        except Exception as exc:
+            logging.warning("Manual QRIS topup message tracking unavailable (%s)", type(exc).__name__)
+            await retire_topup_payment_message(call.bot, call.from_user.id, sent.message_id)
+            await safe_edit_or_answer(
+                call, text + "\n\n⚠️ QRIS belum dapat disiapkan dengan aman. Periksa status atau batalkan invoice sebelum mencoba kembali.",
+                reply_markup=keyboard, parse_mode="HTML"
             )
-            await call.bot.send_message(
-                ADMIN_ID,
-                "💰 <b>TOP UP BARU • QRIS</b>\n\n"
-                f"🧾 {topup_invoice(topup_id)}\n"
-                f"👤 {html.escape(user)}\n"
-                f"💰 Saldo: <b>{rupiah(amount)}</b>\n"
-                f"🔢 Kode unik: <b>+{unique_code}</b>\n"
-                f"💳 Transfer: <b>{rupiah(payment_total)}</b>",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-    await call.answer("Invoice top up QRIS dibuat.")
+        else:
+            if not active:
+                # Cancellation may have committed while Telegram was sending the photo.
+                await retire_topup_payment_message(call.bot, call.from_user.id, sent.message_id)
+                return
+            # A deleted/stale menu must never prevent delivery of the payment QRIS.
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
+    if created:
+        await notify_manual_topup_created(call, topup)
 
 
 @router.callback_query(F.data.startswith("topupmethod:bank:"))
 async def wallet_topup_method_bank(call: CallbackQuery):
     if safe_mode_enabled() and not is_owner(call.from_user.id):
-        return await call.answer(
-            "Sistem sedang Safe Mode. Pembayaran sementara ditahan.",
-            show_alert=True
+        return await safe_callback_notice(
+            call, "Sistem sedang Safe Mode. Pembayaran sementara ditahan.", show_alert=True
         )
-    amount = int(call.data.split(":")[2])
-    rate_ok,retry_after=persistent_rate_limit(
-        call.from_user.id,
-        "topup_payment",
-        limit=4,
-        window_seconds=60
-    )
-    if not rate_ok:
-        return await call.answer(
-            f"Terlalu banyak percobaan top up. Coba lagi dalam {retry_after} detik.",
-            show_alert=True
-        )
-
+    amount = manual_topup_callback_amount(call.data, "bank")
+    if amount is None:
+        return await safe_callback_notice(call, "Nominal tidak valid.", show_alert=True)
     minimum = get_min_topup()
-
     if amount < minimum:
-        return await call.answer(
-            f"Minimum top up {rupiah(minimum)}.",
-            show_alert=True
-        )
-
+        return await safe_callback_notice(call, f"Minimum top up {rupiah(minimum)}.", show_alert=True)
     if not bank_transfer_ready():
-        return await call.answer(
-            "Transfer rekening belum dikonfigurasi owner.",
-            show_alert=True
+        return await safe_callback_notice(
+            call, "Transfer rekening belum dikonfigurasi owner.", show_alert=True
         )
-
-    conn = db()
-    conn.execute("BEGIN IMMEDIATE")
-    recent = conn.execute(
-        """SELECT * FROM topups
-           WHERE user_id=? AND amount=? AND payment_method='BANK_TRANSFER'
-             AND status='pending'
-           ORDER BY id DESC LIMIT 1""",
-        (call.from_user.id, amount)
-    ).fetchone()
-
-    if recent:
-        try:
-            created = datetime.fromisoformat(recent["created_at"])
-            now = datetime.now(created.tzinfo) if created.tzinfo else datetime.now()
-            if (now - created).total_seconds() < 30:
-                conn.rollback()
-                conn.close()
-                return await call.answer(
-                    f"Top up {topup_invoice(recent['id'])} masih pending.",
-                    show_alert=True
-                )
-        except Exception:
-            pass
-
-    unique_code = unique_code_for_order(conn)
-    payment_total = amount + unique_code
-
-    cur = conn.execute(
-        """INSERT INTO topups
-           (user_id, username, amount, unique_code, payment_total,
-            payment_method, status, created_at, expires_at)
-           VALUES(?,?,?,?,?,'BANK_TRANSFER','pending',?,?)""",
-        (
-            call.from_user.id,
-            call.from_user.username or "",
-            amount,
-            unique_code,
-            payment_total,
-            datetime.now().isoformat(timespec="seconds"),
-            topup_expiry_iso()
+    try:
+        rate_ok, retry_after = persistent_rate_limit(
+            call.from_user.id, "topup_payment", limit=4, window_seconds=60
         )
-    )
-    topup_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    conn = db()
-    saved_topup = conn.execute("SELECT * FROM topups WHERE id=?", (topup_id,)).fetchone()
-    conn.close()
-    topup_expiry = topup_expiry_text(saved_topup)
-
-    unique_text = f"🔢 Kode unik: <b>+{unique_code}</b>\n" if unique_code > 0 else ""
-
-    await safe_edit_or_answer(call, 
-        "💰 <b>ISI SALDO • TRANSFER REKENING</b>\n\n"
-        f"🧾 Invoice: <b>{topup_invoice(topup_id)}</b>\n"
-        f"💵 Saldo masuk: <b>{rupiah(amount)}</b>\n"
-        f"{unique_text}"
-        f"💳 Total transfer: <b>{rupiah(payment_total)}</b>\n"
-        f"{topup_expiry}\n"
-        + bank_transfer_text()
-        + "\n\n⚠️ Transfer sesuai nominal hingga kode unik.\n"
-          "⏳ Invoice berlaku 30 menit. Setelah transfer, kirim bukti pembayaran ke bot.",
-        reply_markup=bank_topup_pending_keyboard(topup_id),
-        parse_mode="HTML"
-    )
-
-    if ADMIN_ID:
-        try:
-            user = f"@{call.from_user.username}" if call.from_user.username else f"ID {call.from_user.id}"
-            await call.bot.send_message(
-                ADMIN_ID,
-                "🏦 <b>TOP UP BARU • TRANSFER REKENING</b>\n\n"
-                f"🧾 {topup_invoice(topup_id)}\n"
-                f"👤 {html.escape(user)}\n"
-                f"💰 Saldo: <b>{rupiah(amount)}</b>\n"
-                f"💳 Transfer: <b>{rupiah(payment_total)}</b>",
-                parse_mode="HTML"
+        if not rate_ok:
+            return await safe_callback_notice(
+                call, f"Terlalu banyak percobaan top up. Coba lagi dalam {retry_after} detik.",
+                show_alert=True
             )
-        except Exception:
-            pass
-
-    await call.answer("Invoice transfer rekening dibuat.")
-
+        topup, created = create_or_reuse_manual_topup(
+            call.from_user.id, call.from_user.username, amount, "BANK_TRANSFER"
+        )
+    except Exception as exc:
+        logging.warning("Manual bank topup invoice unavailable (%s)", type(exc).__name__)
+        return await safe_callback_notice(
+            call, "Invoice belum dapat dibuat. Silakan coba lagi; saldo Anda tetap aman.", show_alert=True
+        )
+    await safe_callback_notice(
+        call, "Invoice transfer rekening dibuat." if created else "Menampilkan invoice isi saldo yang masih aktif."
+    )
+    await safe_edit_or_answer(
+        call, manual_topup_invoice_text(topup, bank=True),
+        reply_markup=topup_pending_keyboard(topup["id"], bank=True), parse_mode="HTML"
+    )
+    if created:
+        await notify_manual_topup_created(call, topup, bank=True)
 
 
 @router.callback_query(F.data == "owner:wallet")
@@ -22359,10 +22626,10 @@ async def owner_wallet_verify_button(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
-    try:
-        topup_id = int(call.data.split(":")[1])
-    except Exception:
-        return await call.answer("Top up tidak valid.", show_alert=True)
+    numbers = callback_positive_numbers(call.data, "topupverify")
+    if not numbers:
+        return await safe_callback_notice(call, "Top up tidak valid.", show_alert=True)
+    topup_id = numbers[0]
 
     result, status = verify_topup_atomic(topup_id, call.from_user.id)
 
@@ -22370,10 +22637,16 @@ async def owner_wallet_verify_button(call: CallbackQuery, bot: Bot):
         return await call.answer("Top up tidak ditemukan.", show_alert=True)
     if status == "already_completed":
         row, balance = result
-        return await call.answer(
-            f"Top up sudah pernah diverifikasi. Saldo {rupiah(balance)}.",
-            show_alert=True
-        )
+        await safe_callback_notice(call, f"Top up sudah pernah diverifikasi. Saldo {rupiah(balance)}.", show_alert=True)
+        try:
+            await retire_saved_topup_payment_messages(bot, topup_id, int(row["user_id"]))
+        except Exception:
+            logging.exception("Completed topup QRIS cleanup deferred invoice=%s", topup_id)
+        return
+    if status == "storage_error":
+        return await safe_callback_notice(call, "Top up belum bisa diverifikasi. Saldo belum ditambah; coba lagi.", show_alert=True)
+    if status == "invalid_amount":
+        return await safe_callback_notice(call, "Nominal top up atau saldo tidak valid. Saldo tidak berubah.", show_alert=True)
     if status != "completed":
         return await call.answer(
             "Top up sedang/sudah diproses. Tidak ada saldo tambahan kedua.",
@@ -22389,16 +22662,24 @@ async def owner_wallet_verify_button(call: CallbackQuery, bot: Bot):
             f"🧾 {topup_invoice(topup_id)}\n"
             f"💰 Saldo masuk: <b>{rupiah(row['amount'])}</b>\n"
             f"💵 Saldo sekarang: <b>{rupiah(balance)}</b>",
+            reply_markup=topup_done_keyboard(),
             parse_mode="HTML"
         )
     except Exception:
         pass
 
-    await call.answer("Top up berhasil diverifikasi.", show_alert=True)
+    await safe_callback_notice(call, "Top up berhasil diverifikasi.", show_alert=True)
     await safe_edit_or_answer(call, 
         "✅ Top up selesai diproses.",
         reply_markup=owner_wallet_menu()
     )
+
+
+
+    try:
+        await retire_saved_topup_payment_messages(bot, topup_id, int(row["user_id"]))
+    except Exception:
+        logging.exception("Completed topup QRIS cleanup deferred invoice=%s", topup_id)
 
 
 
@@ -22425,11 +22706,11 @@ async def owner_min_topup_input(message: Message, state: FSMContext):
         return
 
     try:
-        amount = int((message.text or "").strip())
-        if amount < 1000:
+        amount = parse_manual_topup_amount((message.text or "").strip())
+        if amount is None or amount < 1000:
             raise ValueError
     except Exception:
-        return await message.answer("❌ Minimum top up paling rendah Rp1.000.")
+        return await message.answer("❌ Nominal tidak valid. Minimum top up paling rendah Rp1.000.")
 
     set_setting("min_topup", amount)
     await state.clear()
@@ -27573,7 +27854,10 @@ async def owner_wallet_reject_choose(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
-    topup_id = int(call.data.split(":")[1])
+    numbers = callback_positive_numbers(call.data, "topupreject")
+    if not numbers:
+        return await safe_callback_notice(call, "Top up tidak valid.", show_alert=True)
+    topup_id = numbers[0]
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Bukti Tidak Valid", callback_data=f"topuprejectreason:{topup_id}:invalid")],
         [InlineKeyboardButton(text="Nominal Tidak Sesuai", callback_data=f"topuprejectreason:{topup_id}:amount")],
@@ -27591,55 +27875,71 @@ async def owner_wallet_reject_choose(call: CallbackQuery):
 @router.callback_query(F.data.startswith("topuprejectreason:"))
 async def owner_wallet_reject_reason(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
-
-    _, topup_id, reason_code = call.data.split(":")
-    topup_id = int(topup_id)
+        return await safe_callback_notice(call, "Akses ditolak.", show_alert=True)
+    parts = str(call.data or "").split(":")
     reasons = {
-        "invalid": "Bukti pembayaran tidak valid",
-        "amount": "Nominal pembayaran tidak sesuai",
-        "notfound": "Pembayaran tidak ditemukan",
-        "owner": "Dibatalkan oleh owner",
+        "invalid": "Bukti pembayaran tidak valid", "amount": "Nominal pembayaran tidak sesuai",
+        "notfound": "Pembayaran tidak ditemukan", "owner": "Dibatalkan oleh owner",
     }
-    reason = reasons.get(reason_code, "Top up ditolak")
-
-    conn = db()
-    row = conn.execute(
-        "SELECT * FROM topups WHERE id=? AND status='pending'",
-        (topup_id,)
-    ).fetchone()
-    if not row:
-        conn.close()
-        return await call.answer("Top up sudah diproses / tidak ditemukan.", show_alert=True)
-
-    conn.execute(
-        """UPDATE topups
-           SET status='rejected', reject_reason=?, verified_at=?, verified_by=?
-           WHERE id=? AND status='pending'""",
-        (
-            reason,
-            datetime.now().isoformat(timespec="seconds"),
-            call.from_user.id,
-            topup_id
-        )
-    )
-    conn.commit()
-    conn.close()
-
+    numbers = callback_positive_numbers("topupreject:" + parts[1], "topupreject") if len(parts) == 3 else None
+    if not numbers or parts[2] not in reasons:
+        return await safe_callback_notice(call, "Top up tidak valid.", show_alert=True)
+    topup_id = numbers[0]
+    reason = reasons[parts[2]]
+    conn = None
+    row = None
+    accepted = False
+    storage_failed = False
+    try:
+        conn = db()
+        begin_immediate_retry(conn)
+        row = conn.execute("SELECT * FROM topups WHERE id=? AND status='pending'", (topup_id,)).fetchone()
+        if row:
+            credit = conn.execute(
+                "SELECT 1 FROM wallet_ledger WHERE user_id=? AND type='TOPUP' AND reference=?",
+                (row["user_id"], topup_invoice(topup_id))
+            ).fetchone()
+            if not credit:
+                now = datetime.now().isoformat(timespec="seconds")
+                accepted = conn.execute(
+                    """UPDATE topups SET status='rejected', reject_reason=?, verified_at=?, verified_by=?,updated_at=?
+                       WHERE id=? AND status='pending'""", (reason, now, call.from_user.id, now, topup_id)
+                ).rowcount == 1
+                if accepted:
+                    conn.execute(
+                        "DELETE FROM payment_proof_sessions WHERE user_id=? AND entity_type='topup' AND entity_id=?",
+                        (row["user_id"], topup_id)
+                    )
+                    conn.commit()
+    except sqlite3.Error:
+        storage_failed = True
+    finally:
+        if conn is not None:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+    if storage_failed:
+        return await safe_callback_notice(call, "Top up belum bisa diproses. Coba lagi.", show_alert=True)
+    if not accepted:
+        return await safe_callback_notice(call, "Top up sudah diproses / tidak ditemukan.", show_alert=True)
     try:
         await bot.send_message(
             row["user_id"],
             "❌ <b>TOP UP DITOLAK</b>\n\n"
-            f"🧾 {topup_invoice(topup_id)}\n"
-            f"Alasan: <b>{html.escape(reason)}</b>\n\n"
-            "Saldo tidak berubah.",
-            parse_mode="HTML"
+            f"🧾 {topup_invoice(topup_id)}\nAlasan: <b>{html.escape(reason)}</b>\n\nSaldo tidak berubah.",
+            reply_markup=topup_done_keyboard(), parse_mode="HTML"
         )
     except Exception:
         pass
-
-    await call.answer("Top up ditolak.", show_alert=True)
+    await safe_callback_notice(call, "Top up ditolak.", show_alert=True)
     await safe_edit_or_answer(call, "✅ Top up selesai diproses.", reply_markup=owner_wallet_menu())
+
+
+
+    try:
+        await retire_saved_topup_payment_messages(bot, topup_id, int(row["user_id"]))
+    except Exception:
+        logging.exception("Rejected topup QRIS cleanup deferred invoice=%s", topup_id)
 
 
 
@@ -28160,8 +28460,10 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
-    _, entity, raw_id = call.data.split(":")
-    entity_id = int(raw_id)
+    target = payment_transaction_callback(call.data, "proofapprove")
+    if not target:
+        return await safe_callback_notice(call, "Data transaksi tidak valid.", show_alert=True)
+    entity, entity_id = target
 
     if not recent_action_allowed(f"proofapprove:{entity}:{entity_id}", 3):
         return await call.answer("Sedang diproses. Jangan tekan dua kali.", show_alert=True)
@@ -28231,9 +28533,15 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
         return
 
     if entity == "topup":
-        conn=db()
-        topup_row=conn.execute("SELECT * FROM topups WHERE id=?", (entity_id,)).fetchone()
-        conn.close()
+        conn = None
+        try:
+            conn = db()
+            topup_row = conn.execute("SELECT * FROM topups WHERE id=?", (entity_id,)).fetchone()
+        except sqlite3.Error:
+            return await safe_callback_notice(call, "Top up belum bisa dibuka. Coba lagi.", show_alert=True)
+        finally:
+            if conn is not None:
+                conn.close()
         if not topup_row:
             return await call.answer("Top up tidak ditemukan.", show_alert=True)
         if topup_payment_terminal(topup_row):
@@ -28256,12 +28564,12 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
                 f"🧾 {topup_invoice(entity_id)}\n"
                 f"💰 Saldo masuk: <b>{rupiah(row['amount'])}</b>\n"
                 f"💵 Saldo sekarang: <b>{rupiah(balance)}</b>",
-                parse_mode="HTML"
+                reply_markup=topup_done_keyboard(), parse_mode="HTML"
             )
         except Exception:
             pass
 
-        await call.answer("Top up dikonfirmasi.", show_alert=True)
+        await safe_callback_notice(call, "Top up dikonfirmasi.", show_alert=True)
         try:
             await call.message.edit_caption(
                 caption=payment_proof_caption("topup", row) + "\n\n✅ <b>DIKONFIRMASI OWNER</b>",
@@ -28271,19 +28579,22 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
             pass
 
 
+        try:
+            await retire_saved_topup_payment_messages(bot, entity_id, int(row["user_id"]))
+        except Exception:
+            logging.exception("Completed proof topup QRIS cleanup deferred invoice=%s", entity_id)
+
+
+
 @router.callback_query(F.data.startswith("proofreject:"))
 async def owner_proof_reject(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
-    try:
-        _, entity, raw_id = call.data.split(":")
-        entity_id = int(raw_id)
-    except Exception:
-        return await call.answer("Data transaksi tidak valid.", show_alert=True)
-
-    if entity not in {"order","topup"}:
-        return await call.answer("Jenis transaksi tidak valid.", show_alert=True)
+    target = payment_transaction_callback(call.data, "proofreject")
+    if not target:
+        return await safe_callback_notice(call, "Data transaksi tidak valid.", show_alert=True)
+    entity, entity_id = target
 
     conn=db()
     row=conn.execute(
@@ -28310,6 +28621,7 @@ async def owner_proof_reject(call: CallbackQuery):
     else:
         final=(
             topup_payment_terminal(row)
+            or str(row["status"] or "") != "pending"
             or str(row["payment_review_status"] or "")=="rejected"
         )
 
@@ -28427,14 +28739,12 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
-    try:
-        _, entity, raw_id, reason_code = call.data.split(":")
-        entity_id = int(raw_id)
-    except Exception:
-        return await call.answer("Data transaksi tidak valid.", show_alert=True)
-
-    if entity not in {"order","topup"}:
-        return await call.answer("Jenis transaksi tidak valid.", show_alert=True)
+    parts = str(call.data or "").split(":")
+    target = payment_transaction_callback(":".join(parts[:3]), "proofrejectreason") if len(parts) == 4 else None
+    if not target:
+        return await safe_callback_notice(call, "Data transaksi tidak valid.", show_alert=True)
+    entity, entity_id = target
+    reason_code = parts[3]
 
     reasons = {
         "invalid": "Bukti pembayaran tidak valid.",
@@ -28468,7 +28778,7 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
             or row["status"] in {"cancelled","expired","completed"}
         )
     else:
-        is_final=topup_payment_terminal(row)
+        is_final=topup_payment_terminal(row) or str(row["status"] or "") != "pending"
 
     if is_final:
         conn.rollback()
@@ -28514,7 +28824,7 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
                    payment_review_status='rejected',
                    updated_at=?
                WHERE id=?
-                 AND status NOT IN ('completed','expired','cancelled','rejected')
+                 AND status='pending'
                  AND COALESCE(payment_review_status,'')!='rejected'""",
             (
                 reason,
@@ -28525,6 +28835,9 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
         )
 
     changed=conn.total_changes
+    if changed and entity == "topup":
+        conn.execute("DELETE FROM payment_proof_sessions WHERE user_id=? AND entity_type='topup' AND entity_id=?",
+                     (int(row["user_id"]), entity_id))
     conn.commit()
     conn.close()
 
@@ -28536,7 +28849,8 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
             alert_text="Transaksi sudah diproses."
         )
 
-    clear_payment_proof_session(int(row["user_id"]))
+    if entity == "order":
+        clear_payment_proof_session(int(row["user_id"]))
 
     try:
         inv = invoice(entity_id) if entity == "order" else topup_invoice(entity_id)
@@ -32733,7 +33047,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.71"
+EXPECTED_SOURCE_VERSION = "16.72"
 
 
 def source_integrity_self_test():
