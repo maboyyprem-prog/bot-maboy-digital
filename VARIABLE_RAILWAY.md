@@ -1,6 +1,35 @@
-# Migrasi dan Variables Railway — Maboyy Digital v16.74
+# Migrasi dan Variables Railway — Maboyy Digital v16.76
 
 Dokumen ini panduan manual, bukan skrip deploy/restore. Paket source tidak memuat database atau nilai rahasia produksi.
+
+## Perbaikan v16.76
+
+Bagian ini menjadi acuan perilaku terbaru; perbaikan v16.75 di bawah tetap berlaku.
+
+1. **Temp Mail mulai dari Buat Email:** membuka Temp Mail atau Refresh tidak menampilkan email siap pakai, tidak memilih alamat lama, dan tidak membuat inbox otomatis. Tekan Buat Email untuk alamat baru. Daftar Email tetap menyimpan seluruh alamat lama; memilih alamat atau melanjutkan pembuatan menampilkan alamat dan tombol Received Mail. Pembukaan menu tidak menonaktifkan mailbox atau mengubah job aktivasi. Tombol Alamat Email terikat ke alamat yang ditampilkan, sehingga perubahan email aktif dari proses lain tidak menampilkan alamat berbeda. Pratinjau tautan pada halaman Temp Mail dinonaktifkan agar kartu situs inbox tidak memenuhi layar.
+2. **Hapus Riwayat di /tools:** owner dapat membersihkan riwayat proses selesai, termasuk entri terbaru, dari daftar, filter, halaman lama, dan pencarian. Pratinjau menampilkan jumlah; konfirmasi berlaku 5 menit dan hanya mengubah entri yang ditinjau. Entri baru setelah pratinjau tidak ikut dibersihkan. Proses pending/unknown dan entri yang terkait job atau flow berjalan dipertahankan. Entri selesai diberi `history_hidden=1`; bukti internal untuk hasil Apply, pemeriksaan duplikasi, rating, statistik, dan kuota tidak dihapus. Kuota premium tetap 15 akun/jam dan tidak direset oleh Hapus Riwayat. Email, saldo, pesanan, produk, dan data VIP tidak berubah. Bersihkan Log Lama tetap tersedia untuk retensi log operasional 30 hari.
+
+Schema **188** menambahkan `history_hidden INTEGER NOT NULL DEFAULT 0` pada `tool_activity_logs` dan `tool_provision_logs`. Migrasi otomatis tidak menyembunyikan atau menghapus riwayat yang ada. Catatan kuota dan sesi terenkripsi tetap memakai data/kunci lama. Tidak ada dependency atau nama Variable baru.
+
+Upload tepat keenam file **v16.76** dari ZIP yang sama. Start Command tetap `python main.py`; pertahankan Volume/database, BOT_TOKEN, kunci enkripsi, endpoint/API key, dan Variables lama. Pastikan `TOOLS_PROVIDER_HOURLY_LIMIT=15`. Jangan mengganti nilai Railway dengan `.env.example`.
+
+Pengujian menggunakan database sementara serta simulasi Telegram/API, termasuk regresi fitur v16.75 dan transaksi saldo. Paket ini belum dijalankan dengan credential provider produksi atau dideploy ke Railway.
+
+## Perbaikan v16.75
+
+Bagian ini menjadi acuan perilaku terbaru. Bagian versi lama di bawah tetap tersedia sebagai catatan perubahan.
+
+1. **Flash Sale berakhir:** produk disembunyikan dari katalog normal/populer, keranjang, dan paket. Penanda waktu disimpan; membuka daftar atau restart tidak membuat produk menjadi normal. Tombol produk/varian/pembayaran lama tidak dapat membuat pesanan baru setelah timer habis. Stok, invoice, dan pengiriman transaksi yang sudah ada tetap tersimpan. Owner dapat menjadwalkan ulang atau memilih Matikan Flash Sale untuk mengembalikannya ke produk normal secara sengaja. Timer yang telah dihapus seluruhnya oleh versi lama tidak dapat dipulihkan hanya dari source; atur kembali produk itu melalui owner.
+2. **Kuota khusus aktivasi premium:** `TOOLS_PROVIDER_HOURLY_LIMIT=15` berarti **15 akun/jam**, bukan 15 request HTTP. Reset pada awal jam WIB (misalnya 21:00 → 22:00), menggunakan waktu UTC/epoch untuk penyimpanan. Semua tahap email/flow yang sama memakai satu jatah, termasuk kelanjutan yang melewati pergantian jam. Pemakaian tersimpan saat restart dan reservasi dilakukan atomik agar klik paralel tidak melewati batas. Request baca status tidak mengurangi kuota akun. `TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT=3` tetap diterima untuk kompatibilitas statistik, tanpa membagi kapasitas menjadi 5 akun.
+3. **Temp Mail bebas pembuatan:** tidak ada batas 5 alamat per provider dan tidak ada cooldown pembuatan 60 detik di bot. Menu Temp Mail tidak memakai kuota aktivasi premium, sehingga tetap dapat membuat email saat kuota premium habis. Daftar Email menampilkan semua alamat dalam halaman berisi 10 alamat. Inbox lama, pergantian alamat aktif, akses khusus owner, validasi penerima, dan enkripsi Mail.tm/Guerrilla tetap dipertahankan. Jika suatu pembuatan Mail.tm belum pasti, alamatnya tetap tersedia untuk dipulihkan; permintaan baru memakai alamat berbeda.
+4. **Tanpa konfirmasi tambahan:** email langsung mengirim Magic Link; URL yang dikirim pada alur owner/VIP langsung diverifikasi dan dilanjutkan ke Apply. Tombol konfirmasi pada pesan lama tetap ditangani untuk kompatibilitas. Aktivasi otomatis owner membaca inbox sendiri dan mengirim hasil akhir. Verifikasi yang memang diperlukan API dikerjakan otomatis; sukses mengikuti hasil Apply provider, termasuk hasil Apply eksplisit yang sudah ada pada respons verifikasi. HTTP 202/pending dan timeout tidak diubah menjadi sukses; Apply yang hasilnya belum pasti tidak dikirim ulang.
+5. **Kelanjutan setelah restart:** token sebelum Apply pada job otomatis disimpan sementara dengan AES-GCM di `owner_auto_am_jobs.session_secret`, terikat ke owner dan job. Token dihapus saat Apply dimulai, sesi habis, atau hasil final tersedia. Pertahankan `TEMPMAIL_ENCRYPTION_KEY` dan `BOT_TOKEN` lama. Link dan token tidak ditampilkan dalam hasil atau log provider.
+
+Schema **187** menambahkan tabel `tool_account_quotas` dan kolom `session_secret`. Histori aktivasi email pada jam upgrade dimigrasikan ke kuota akun sekali saja; seluruh tabel/data toko lain tetap dipertahankan. Tidak ada dependency atau nama variable baru.
+
+Upload keenam file **v16.75** dari paket yang sama, gunakan Start Command `python main.py`, dan pertahankan Volume/database serta Variables lama. Pastikan `TOOLS_PROVIDER_HOURLY_LIMIT=15`; tidak perlu mengganti API key, endpoint, provider email, atau kunci enkripsi. `.env.example` hanya contoh, bukan pengganti nilai Railway lama.
+
+Batas layanan eksternal tetap mengikuti respons server (misalnya HTTP 429/Retry-After). Perbaikan ini menghapus batas jumlah/cooldown Temp Mail yang dibuat oleh bot; tidak mengubah paket atau kuota akun di server provider. Pengujian memakai database sementara dan API/Telegram simulasi, tanpa aktivasi/deploy produksi.
 
 ## /ping dan paket Railway v16.71
 

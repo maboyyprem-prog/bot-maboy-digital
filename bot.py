@@ -41,7 +41,7 @@ from aiogram.filters import Command, Filter, StateFilter
 from aiogram.types import (
     ErrorEvent,
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton, FSInputFile,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, LinkPreviewOptions
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
@@ -226,8 +226,8 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.74"
-SCHEMA_VERSION = 186
+BOT_VERSION = "16.76"
+SCHEMA_VERSION = 188
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1016,6 +1016,9 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_tool_activity_email "
         "ON tool_activity_logs(target_email, created_at)"
     )
+    # Clearing visible history must preserve quota, Apply proof and recovery data.
+    for table in ("tool_activity_logs", "tool_provision_logs"):
+        add_column_if_missing(conn, table, "history_hidden", "INTEGER NOT NULL DEFAULT 0")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tool_email_locks (
@@ -1085,6 +1088,35 @@ def init_db():
     # Existing accounts remain Mail.tm; only new accounts use the selected provider.
     add_column_if_missing(conn, "owner_temp_mailboxes", "provider", "TEXT NOT NULL DEFAULT 'mailtm'")
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS tool_account_quotas (
+            owner_id INTEGER NOT NULL,
+            quota_key TEXT NOT NULL,
+            target_email TEXT NOT NULL,
+            created_ts INTEGER NOT NULL,
+            units INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(owner_id,quota_key)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_tool_account_quotas_hour ON tool_account_quotas(owner_id,created_ts)")
+    # Preserve the current hour's pre-upgrade account usage; requests remain an
+    # independent audit log. Future stages of the same account reuse its quota.
+    if not cur.execute("SELECT 1 FROM settings WHERE key='tools_account_quota_v1675'").fetchone():
+        _,_,_,quota_start,quota_end=tools_hour_window()
+        cur.execute("""INSERT OR IGNORE INTO tool_account_quotas(owner_id,quota_key,target_email,created_ts)
+            SELECT owner_id,'email:' || lower(trim(target_email)) || ':' || ?,
+                   lower(trim(target_email)),MIN(CAST(strftime('%s',created_at) AS INTEGER))
+            FROM (
+                SELECT owner_id,target_email,created_at FROM tool_activity_logs
+                WHERE action IN ('send_verification_link','verify_account','apply_premium')
+                UNION ALL
+                SELECT owner_id,target_email,created_at FROM tool_provision_logs
+            ) WHERE datetime(created_at)>=datetime(?) AND datetime(created_at)<datetime(?)
+                    AND trim(COALESCE(target_email,''))!=''
+            GROUP BY owner_id,lower(trim(target_email))""",
+            (int(quota_start.replace(tzinfo=timezone.utc).timestamp()),
+             quota_start.isoformat(timespec='seconds'),quota_end.isoformat(timespec='seconds')))
+        cur.execute("INSERT INTO settings(key,value) VALUES('tools_account_quota_v1675','1')")
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS owner_auto_am_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id INTEGER NOT NULL,
@@ -1111,6 +1143,7 @@ def init_db():
                                ("auto_message_id", "INTEGER NOT NULL DEFAULT 0"),
                                ("auto_notified_at", "TEXT NOT NULL DEFAULT ''")):
         add_column_if_missing(conn, "owner_auto_am_jobs", column, definition)
+    add_column_if_missing(conn, "owner_auto_am_jobs", "session_secret", "TEXT NOT NULL DEFAULT ''")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS owner_auto_am_tickets (
             token TEXT PRIMARY KEY,
@@ -1735,7 +1768,7 @@ async def notify_restock_subscribers(
     ).fetchall()
     conn.close()
 
-    if not product or not variant or stock_after <= 0:
+    if not product_is_available(product) or not variant or stock_after <= 0:
         return {"sent": 0, "failed": 0, "subscribers": 0}
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3967,6 +4000,10 @@ def checkout_duplicate_order(conn, user_id: int, variant_id: int,
 
 
 def reserve_stock_for_order(conn, variant_id: int, qty: int) -> bool:
+    product=conn.execute('SELECT p.* FROM products p JOIN product_variants v ON v.product_id=p.id WHERE v.id=?',
+                         (variant_id,)).fetchone()
+    if not product_is_available(product):
+        return False
     # Repair any stale cached reservation count first.
     sync_variant_reserved_stock(conn, variant_id)
 
@@ -9595,7 +9632,7 @@ def payment_media_message(message) -> bool:
                 and re.search(r"qris|top.?up|isi saldo|transfer|pembayaran", caption, re.I))
 
 
-async def safe_edit_or_answer(call: CallbackQuery, text: str, reply_markup=None, parse_mode: str = "HTML"):
+async def safe_edit_or_answer(call: CallbackQuery, text: str, reply_markup=None, parse_mode: str = "HTML", *, disable_web_page_preview: bool = False):
     """
     Reliable callback renderer:
     - text message -> edit_text
@@ -9603,13 +9640,15 @@ async def safe_edit_or_answer(call: CallbackQuery, text: str, reply_markup=None,
     - stale/non-editable message -> send new message
     - "message is not modified" -> treat as success, not an error
     """
+    preview_options = {"link_preview_options": LinkPreviewOptions(is_disabled=True)} if disable_web_page_preview else {}
     payment_media = payment_media_message(getattr(call, "message", None))
     try:
         if not payment_media:
             await call.message.edit_text(
                 text,
                 reply_markup=reply_markup,
-                parse_mode=parse_mode
+                parse_mode=parse_mode,
+                **preview_options
             )
             return True
     except Exception as exc:
@@ -9634,7 +9673,8 @@ async def safe_edit_or_answer(call: CallbackQuery, text: str, reply_markup=None,
             await answer(
                 text,
                 reply_markup=reply_markup,
-                parse_mode=parse_mode
+                parse_mode=parse_mode,
+                **preview_options
             )
             return True
         except Exception:
@@ -9651,7 +9691,8 @@ async def safe_edit_or_answer(call: CallbackQuery, text: str, reply_markup=None,
             chat_id,
             text,
             reply_markup=reply_markup,
-            parse_mode=parse_mode
+            parse_mode=parse_mode,
+            **preview_options
         )
         return True
     except Exception:
@@ -10617,15 +10658,16 @@ def validate_system_schema():
             "content_fingerprint","inventory_mode"
         },
         "order_login_proofs": {"id","order_id","user_id","file_id","created_at"},
-        "tool_provision_logs": {"id","owner_id","tool_name","target_email","plan","status","created_at"},
-        "tool_activity_logs": {"id","owner_id","action","target_email","status","http_status","created_at"},
+        "tool_provision_logs": {"id","owner_id","tool_name","target_email","plan","status","created_at","history_hidden"},
+        "tool_activity_logs": {"id","owner_id","action","target_email","status","http_status","created_at","history_hidden"},
         "tool_email_locks": {"email","owner_id","action","locked_until","created_at"},
+        "tool_account_quotas": {"owner_id","quota_key","target_email","created_ts","units"},
         "owner_temp_mailboxes": {"id","owner_id","address","secret","state",
                                   "provider_account_id","active","created_at","updated_at","provider"},
         "owner_auto_am_jobs": {"id","owner_id","mailbox_id","email","correlation_id","stage","status",
                                "magic_activity_id","verify_activity_id","magic_sent_at","detail","provider_plan",
                                "provider_expiry","lease_token","lease_until","created_at","updated_at",
-                               "auto_watch_until","auto_chat_id","auto_message_id","auto_notified_at"},
+                               "auto_watch_until","auto_chat_id","auto_message_id","auto_notified_at","session_secret"},
         "owner_auto_am_tickets": {"token","owner_id","job_id","created_at"},
         "tool_provider_flows": {"correlation_id","owner_id","target_email","stage","status","http_status","created_at"},
         "settings": {"key","value"},
@@ -11712,6 +11754,25 @@ def flash_sale_end_text(product) -> str:
         return "-"
 
 
+def product_is_available(product, now_ts: int | None = None) -> bool:
+    """An expired timed sale stays hidden until the owner explicitly resets it."""
+    if not product:
+        return False
+    try:
+        return bool(int(product['active'] or 0)==1 and (
+            (int(product['is_flash_sale'] or 0)==0 and int(product['flash_sale_until_ts'] or 0)<=0)
+            or flash_sale_is_active(product,now_ts)
+        ))
+    except (KeyError,IndexError,TypeError,ValueError):
+        return False
+
+
+def product_available_sql(alias: str = "") -> str:
+    prefix=(alias+'.') if alias else ''
+    return (f"((COALESCE({prefix}is_flash_sale,0)=0 AND COALESCE({prefix}flash_sale_until_ts,0)<=0) "
+            f"OR ({prefix}is_flash_sale=1 AND {prefix}flash_sale_until_ts>{int(time.time())}))")
+
+
 def expire_finished_flash_sales(conn=None) -> int:
     own_conn=conn is None
     if own_conn:
@@ -11720,9 +11781,7 @@ def expire_finished_flash_sales(conn=None) -> int:
         now_ts=int(time.time())
         cur=conn.execute(
             """UPDATE products
-               SET is_flash_sale=0,
-                   flash_sale_started_ts=0,
-                   flash_sale_until_ts=0
+               SET is_flash_sale=0
                WHERE is_flash_sale=1
                  AND COALESCE(flash_sale_until_ts,0)>0
                  AND flash_sale_until_ts<=?""",
@@ -11876,7 +11935,8 @@ def flash_owner_products_keyboard():
         active=flash_sale_is_active(row,now_ts)
         label=(
             f"⚡ {row['name']} • {flash_sale_end_text(row)}"
-            if active else f"▫️ {row['name']}"
+            if active else (f"⌛ {row['name']} • berakhir / tersembunyi"
+                           if int(row['flash_sale_until_ts'] or 0)>0 else f"▫️ {row['name']}")
         )
         buttons.append([
             InlineKeyboardButton(
@@ -11901,7 +11961,7 @@ def product_view_filter(view: str) -> str:
     )
     if view=="flash":
         return f"AND ({active_flash})"
-    normal_filter=f"AND NOT ({active_flash})"
+    normal_filter="AND COALESCE(is_flash_sale,0)=0 AND COALESCE(flash_sale_until_ts,0)<=0"
     if view=="popular":
         return "AND is_popular=1 "+normal_filter
     return normal_filter
@@ -11993,9 +12053,9 @@ def checkout_variant_is_active(variant_id: int) -> bool:
     conn = db()
     try:
         return conn.execute(
-            """SELECT 1 FROM product_variants v
+            f"""SELECT 1 FROM product_variants v
                JOIN products p ON p.id=v.product_id
-               WHERE v.id=? AND v.active=1 AND p.active=1""",
+               WHERE v.id=? AND v.active=1 AND p.active=1 AND {product_available_sql('p')}""",
             (variant_id,)
         ).fetchone() is not None
     finally:
@@ -12349,9 +12409,9 @@ async def cart_add(call: CallbackQuery):
 
     conn = db()
     variant = conn.execute(
-        """SELECT v.* FROM product_variants v
+        f"""SELECT v.* FROM product_variants v
            JOIN products p ON p.id=v.product_id
-           WHERE v.id=? AND v.active=1 AND p.active=1""",
+           WHERE v.id=? AND v.active=1 AND p.active=1 AND {product_available_sql('p')}""",
         (variant_id,)
     ).fetchone()
     if not variant:
@@ -12377,12 +12437,12 @@ async def cart_add(call: CallbackQuery):
 async def shop_cart(call: CallbackQuery):
     conn = db()
     rows = conn.execute(
-        """SELECT c.*, v.name AS variant_name, v.price, v.stock, v.reserved_stock,
+        f"""SELECT c.*, v.name AS variant_name, v.price, v.stock, v.reserved_stock,
                   p.name AS product_name
            FROM cart_items c
            JOIN product_variants v ON v.id=c.variant_id
            JOIN products p ON p.id=v.product_id
-           WHERE c.user_id=? AND p.active=1 AND v.active=1
+           WHERE c.user_id=? AND p.active=1 AND v.active=1 AND {product_available_sql('p')}
            ORDER BY c.id DESC""",
         (call.from_user.id,)
     ).fetchall()
@@ -12459,7 +12519,7 @@ async def cart_checkout_wallet(call: CallbackQuery, bot: Bot):
         conn=db()
         conn.execute("BEGIN IMMEDIATE")
         rows=conn.execute(
-            """SELECT c.id AS cart_id, c.user_id, c.variant_id, c.qty, c.created_at AS cart_created_at,
+            f"""SELECT c.id AS cart_id, c.user_id, c.variant_id, c.qty, c.created_at AS cart_created_at,
                   v.id AS vid, v.product_id, v.name AS variant_name, v.code, v.price,
                   v.stock, v.wholesale10, v.wholesale20, v.active, v.reserved_stock,
                   v.button_label, v.sharing_mode, p.id AS pid, p.name AS product_name,
@@ -12467,7 +12527,7 @@ async def cart_checkout_wallet(call: CallbackQuery, bot: Bot):
                FROM cart_items c
                JOIN product_variants v ON v.id=c.variant_id
                JOIN products p ON p.id=v.product_id
-               WHERE c.user_id=? AND p.active=1 AND v.active=1
+               WHERE c.user_id=? AND p.active=1 AND v.active=1 AND {product_available_sql('p')}
                ORDER BY c.id""",
             (call.from_user.id,)
         ).fetchall()
@@ -12635,11 +12695,12 @@ async def last_invoice_detail(call: CallbackQuery):
 async def shop_bundles(call: CallbackQuery):
     conn=db()
     rows=conn.execute(
-        """SELECT b.*, p1.name AS name_a, p2.name AS name_b
+        f"""SELECT b.*, p1.name AS name_a, p2.name AS name_b
            FROM bundle_offers b
            JOIN products p1 ON p1.id=b.product_a
            JOIN products p2 ON p2.id=b.product_b
            WHERE b.active=1 AND p1.active=1 AND p2.active=1
+             AND {product_available_sql('p1')} AND {product_available_sql('p2')}
            ORDER BY b.id DESC LIMIT 20"""
     ).fetchall()
     conn.close()
@@ -12672,6 +12733,8 @@ async def bundle_add_cart(call: CallbackQuery):
 
     added=0
     for pid in (bundle["product_a"],bundle["product_b"]):
+        product=conn.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone()
+        if not product_is_available(product):continue
         variant=conn.execute(
             """SELECT * FROM product_variants
                WHERE product_id=? AND active=1
@@ -13073,13 +13136,48 @@ def _tools_request_totals(conn, owner_id, start_utc, next_utc):
     return totals,legacy
 
 
-def _reserve_tool_provider_request(owner_id: int, method: str) -> int:
+def _tools_account_key(email: str, correlation_id: str, start_utc) -> str:
+    if correlation_id:
+        return 'flow:'+str(correlation_id)
+    if email:
+        return 'email:'+email+':'+str(int(start_utc.replace(tzinfo=timezone.utc).timestamp()))
+    return 'request:'+secrets.token_hex(16)
+
+
+def _tools_account_reservation(conn, owner_id, email, correlation_id, start_utc, next_utc):
+    key=_tools_account_key(email,correlation_id,start_utc)
+    start_ts=int(start_utc.replace(tzinfo=timezone.utc).timestamp())
+    next_ts=int(next_utc.replace(tzinfo=timezone.utc).timestamp())
+    return conn.execute("""SELECT * FROM tool_account_quotas WHERE owner_id=? AND
+        (quota_key=? OR (target_email=? AND target_email!='' AND created_ts>=? AND created_ts<?))
+        ORDER BY units DESC LIMIT 1""",(int(owner_id),key,email,start_ts,next_ts)).fetchone()
+
+
+def _tools_account_usage(conn, owner_id, start_utc, next_utc) -> int:
+    return int(conn.execute("""SELECT COALESCE(SUM(units),0) FROM tool_account_quotas
+        WHERE owner_id=? AND created_ts>=? AND created_ts<?""",
+        (int(owner_id),int(start_utc.replace(tzinfo=timezone.utc).timestamp()),
+         int(next_utc.replace(tzinfo=timezone.utc).timestamp()))).fetchone()[0])
+
+
+def _reserve_tool_provider_request(owner_id: int, method: str, *, target_email="",
+                                   correlation_id="", count_account=True) -> int:
     _,_,_,start_utc,next_utc=tools_hour_window()
     conn=db(); begin_immediate_retry(conn)
     try:
-        totals,legacy=_tools_request_totals(conn,owner_id,start_utc,next_utc)
-        if sum(totals.values())+legacy*TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT>=TOOLS_PROVIDER_HOURLY_LIMIT:
-            conn.rollback();return 0
+        email=str(target_email or '').strip().lower()
+        if count_account:
+            reserved=_tools_account_reservation(conn,owner_id,email,correlation_id,start_utc,next_utc)
+            if not reserved:
+                if _tools_account_usage(conn,owner_id,start_utc,next_utc)>=TOOLS_PROVIDER_HOURLY_LIMIT:
+                    conn.rollback();return 0
+                conn.execute("INSERT INTO tool_account_quotas(owner_id,quota_key,target_email,created_ts) VALUES(?,?,?,?)",
+                             (int(owner_id),_tools_account_key(email,correlation_id,start_utc),email,int(time.time())))
+            elif correlation_id:
+                # Link a resumed/new flow for this email to the original hour.
+                # This alias uses no additional unit and survives the hour boundary.
+                conn.execute("INSERT OR IGNORE INTO tool_account_quotas(owner_id,quota_key,target_email,created_ts,units) VALUES(?,?,?,?,0)",
+                    (int(owner_id),_tools_account_key(email,correlation_id,start_utc),email,int(reserved['created_ts'])))
         cur=conn.execute("INSERT INTO tool_provider_requests(owner_id,method,created_at) VALUES(?,?,?)",
                          (int(owner_id),method,datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")))
         conn.commit();return int(cur.lastrowid)
@@ -13125,8 +13223,7 @@ def tools_provider_status_text() -> str:
 
 # Temp Mail uses official provider APIs. Legacy Mail.tm credentials stay encrypted.
 TEMP_MAIL_API_BASE = "https://api.mail.tm"
-TEMP_MAIL_ACCOUNT_LIMIT = 5
-TEMP_MAIL_CREATE_COOLDOWN_SECONDS = 60
+TEMP_MAIL_ACCOUNTS_PAGE_SIZE = 10
 TEMP_MAIL_RESPONSE_LIMIT = 512 * 1024
 _TEMP_MAIL_LOOP = None
 _TEMP_MAIL_HTTP_GATE = None
@@ -13801,18 +13898,6 @@ async def temp_mail_grabmail_create_locked(owner_id: int, *, auto_job_id=0) -> d
     conn = db()
     try:
         begin_immediate_retry(conn)
-        rows = conn.execute("SELECT id,state,created_at,provider FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()
-        if sum(row["state"] != "failed" and temp_mail_row_provider(row) == "grabmail" for row in rows) >= TEMP_MAIL_ACCOUNT_LIMIT:
-            raise TempMailError("Batas 5 email untuk provider ini tercapai.", status=409)
-        if rows:
-            try:
-                last = datetime.fromisoformat(str(rows[0]["created_at"]))
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=timezone.utc)
-            except (TypeError, ValueError):
-                raise TempMailError("Waktu sesi email tidak valid.", status=409) from None
-            if (now_dt - last).total_seconds() < TEMP_MAIL_CREATE_COOLDOWN_SECONDS:
-                raise TempMailError("Pembuatan email masih dalam cooldown 60 detik.", status=429)
         conn.execute("UPDATE owner_temp_mailboxes SET active=0 WHERE owner_id=?", (int(owner_id),))
         inserted = conn.execute(
             "INSERT INTO owner_temp_mailboxes(owner_id,address,secret,state,provider_account_id,active,created_at,updated_at,provider) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -14046,18 +14131,6 @@ async def temp_mail_guerrilla_create_locked(owner_id: int, *, auto_job_id=0) -> 
     conn = db()
     try:
         begin_immediate_retry(conn)
-        rows = conn.execute("SELECT id,state,created_at,provider FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()
-        if sum(row["state"] != "failed" and temp_mail_row_provider(row) == "guerrilla" for row in rows) >= TEMP_MAIL_ACCOUNT_LIMIT:
-            raise TempMailError("Batas 5 email untuk provider ini tercapai.", status=409)
-        if rows:
-            try:
-                last = datetime.fromisoformat(str(rows[0]["created_at"]))
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=timezone.utc)
-            except (TypeError, ValueError):
-                raise TempMailError("Waktu sesi email tidak valid.", status=409) from None
-            if (now_dt - last).total_seconds() < TEMP_MAIL_CREATE_COOLDOWN_SECONDS:
-                raise TempMailError("Pembuatan email masih dalam cooldown 60 detik.", status=429)
         conn.execute("UPDATE owner_temp_mailboxes SET active=0 WHERE owner_id=?", (int(owner_id),))
         inserted = conn.execute(
             "INSERT INTO owner_temp_mailboxes(owner_id,address,secret,state,provider_account_id,active,created_at,updated_at,provider) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -14308,7 +14381,7 @@ async def temp_mail_resume_locked(row: dict, *, activate=True) -> dict:
             temp_mail_activate_account(int(row["owner_id"]), int(row["id"]))
         return temp_mail_owned_row(int(row["owner_id"]), int(row["id"]))
     if row["state"] == "failed":
-        raise TempMailError("Pembuatan email ini ditolak provider. Buat email baru setelah cooldown.", status=409)
+        raise TempMailError("Pembuatan email ini ditolak provider. Silakan buat email baru.", status=409)
     credentials = temp_mail_decrypt_credentials(row)
     status, result = await temp_mail_http("POST", "/token", payload={"address": row["address"], "password": credentials["password"]})
     if not 200 <= status < 300:
@@ -14343,62 +14416,31 @@ async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
     if provider in {"mailtm", "guerrilla"}:
         temp_mail_encryption_key()
     async with temp_mail_async_locks(owner_id):
-        conn = db()
-        try:
-            rows = [dict(row) for row in conn.execute("SELECT * FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()]
-        finally:
-            conn.close()
+        if auto_job_id:
+            job=auto_am_get_job(owner_id,auto_job_id)
+            if not job:
+                raise TempMailError("Sesi aktivasi tidak ditemukan.",status=404)
+            if job['mailbox_id']:
+                row=temp_mail_owned_row(owner_id,job['mailbox_id'])
+                if row['state']=='ready':
+                    return temp_mail_public_mailbox(row)
+                return temp_mail_public_mailbox(await temp_mail_resume_locked(row))
         now_dt = datetime.now(timezone.utc)
-        pending = None
-        for item in rows:
-            if item["state"] not in {"pending", "account_created"} or temp_mail_row_provider(item) != provider:
-                continue
-            try:
-                created = datetime.fromisoformat(str(item["created_at"]))
-                if created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
-            except (TypeError, ValueError):
-                raise TempMailError("Waktu sesi email tidak valid. Periksa data email tersimpan.", status=409) from None
-            if (now_dt - created).total_seconds() < TEMP_MAIL_CREATE_COOLDOWN_SECONDS:
-                pending = item
-                break
-        if pending:
-            if auto_job_id:
-                auto_am_bind_mailbox(owner_id, auto_job_id, pending)
-            return temp_mail_public_mailbox(await temp_mail_resume_locked(pending))
-        if sum(row["state"] != "failed" and temp_mail_row_provider(row) == provider for row in rows) >= TEMP_MAIL_ACCOUNT_LIMIT:
-            raise TempMailError("Batas 5 email untuk provider ini tercapai. Gunakan email yang sudah tersedia.", status=409)
-        if rows:
-            try:
-                created_at = datetime.fromisoformat(str(rows[0]["created_at"]))
-                if created_at.tzinfo is None:
-                    created_at = created_at.replace(tzinfo=timezone.utc)
-                remaining = TEMP_MAIL_CREATE_COOLDOWN_SECONDS - (now_dt - created_at).total_seconds()
-                if remaining > 0:
-                    raise TempMailError(f"Tunggu {max(1, int(remaining + 0.999))} detik sebelum membuat email baru.", status=429)
-            except ValueError:
-                raise TempMailError("Waktu sesi email tidak valid. Periksa data email tersimpan.", status=409) from None
         if provider == "grabmail":
             return await temp_mail_grabmail_create_locked(owner_id, auto_job_id=auto_job_id)
         if provider == "guerrilla":
             return await temp_mail_guerrilla_create_locked(owner_id, auto_job_id=auto_job_id)
-        domains = ["maildrop.cc"] if provider == "maildrop" else await (temp_mail_domains() if temp_mail_selected_provider() == "mailtm" else temp_mail_mailtm_domains())
+        domains = ["maildrop.cc"] if provider == "maildrop" else await temp_mail_mailtm_domains()
+        if not domains:
+            raise TempMailError("Belum ada domain email aktif. Coba kembali nanti.",status=503)
         address = f"mb{secrets.token_hex(16 if provider == 'maildrop' else 8)}@{domains[0]}"
         credentials = {"password": secrets.token_urlsafe(24), "token": ""} if provider == "mailtm" else None
         now = now_dt.isoformat(timespec="seconds")
         conn = db()
         try:
             begin_immediate_retry(conn)
-            # Recheck while holding the write lock; another worker must not create a second pending account.
-            current = conn.execute("SELECT id,state,created_at,provider FROM owner_temp_mailboxes WHERE owner_id=? ORDER BY id DESC", (int(owner_id),)).fetchall()
-            if sum(row["state"] != "failed" and temp_mail_row_provider(row) == provider for row in current) >= TEMP_MAIL_ACCOUNT_LIMIT:
-                raise TempMailError("Batas 5 email untuk provider ini tercapai.", status=409)
-            if current:
-                created = datetime.fromisoformat(str(current[0]["created_at"]))
-                if created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
-                if (datetime.now(timezone.utc) - created).total_seconds() < TEMP_MAIL_CREATE_COOLDOWN_SECONDS:
-                    raise TempMailError("Pembuatan email masih dalam cooldown 60 detik.", status=429)
+            # Each new request receives a distinct address. An automatic job's
+            # mailbox is bound in this same transaction before provider dispatch.
             if provider == "maildrop":
                 conn.execute("UPDATE owner_temp_mailboxes SET active=0 WHERE owner_id=?", (int(owner_id),))
             inserted = conn.execute(
@@ -14717,6 +14759,7 @@ def owner_tools_menu():
          InlineKeyboardButton(text="👑 VIP /tools",callback_data="tools:access")],
         [InlineKeyboardButton(text="📦 Riwayat",callback_data="tools:history"),
          InlineKeyboardButton(text="📊 Status",callback_data="tools:summary")],
+        [InlineKeyboardButton(text="🗑️ Hapus Riwayat",callback_data="tools:history_clear")],
         [InlineKeyboardButton(text="🧹 Bersihkan Log Lama",callback_data="tools:cleanup"),
          InlineKeyboardButton(text="⬅️ Owner Panel",callback_data="owner:panel")],
     ])
@@ -14730,6 +14773,7 @@ def owner_tools_more_menu():
 # Cleanup previews are short lived and contain only already eligible local IDs.
 # A restart invalidates confirmation buttons instead of deleting unreviewed data.
 _TOOLS_CLEANUP_PREVIEWS = {}
+_TOOLS_HISTORY_CLEAR_PREVIEWS = {}
 TOOLS_CLEANUP_RETENTION_DAYS = 30
 TOOLS_CLEANUP_BATCH_LIMIT = 5000
 TOOLS_CLEANUP_PREVIEW_SECONDS = 300
@@ -14737,8 +14781,8 @@ TOOLS_CLEANUP_PREVIEW_SECONDS = 300
 
 def owner_tools_home_text(owner_id: int) -> str:
     try:
-        used = tools_stats_snapshot(owner_id)["used_requests"]
-        quota = f"{used}/{TOOLS_PROVIDER_HOURLY_LIMIT}"
+        stats=tools_stats_snapshot(owner_id)
+        quota = f"{stats['used_accounts']}/{TOOLS_PROVIDER_HOURLY_LIMIT} akun/jam • reset {stats['reset_at']}"
     except sqlite3.Error:
         quota = "belum tersedia"
     return (
@@ -14746,7 +14790,8 @@ def owner_tools_home_text(owner_id: int) -> str:
         "Gunakan fitur dengan bijak.\n\n"
         f"Provider: <b>{html.escape(str(TOOLS_PROVIDER_NAME)[:120])}</b>\n"
         f"Status: <b>{html.escape(tools_provider_status_text())}</b>\n"
-        f"Kuota lokal: <b>{quota}</b>"
+        f"Aktivasi premium: <b>{quota}</b>\n"
+        "Temp Mail: <b>Tanpa batas pembuatan di bot</b>"
     )
 
 
@@ -14892,6 +14937,141 @@ async def owner_tools_cleanup_cancel(call: CallbackQuery):
     await safe_callback_notice(call)
 
 
+def tools_history_clear_predicate(table: str) -> str:
+    if table not in {"tool_activity_logs", "tool_provision_logs"}:
+        raise ValueError("Tabel riwayat tidak valid.")
+    # Hide only final entries. Raw records remain available to quota, rating,
+    # duplicate-Apply guards and the existing old-log retention feature.
+    job_match=f"(j.email!='' AND lower(j.email)=lower({table}.target_email))"
+    flow_match=f"lower(f.target_email)=lower({table}.target_email)"
+    if table=="tool_activity_logs":
+        job_match+=f" OR j.magic_activity_id={table}.id OR j.verify_activity_id={table}.id"
+        flow_match+=f" OR f.apply_activity_id={table}.id"
+    return f"""{table}.owner_id=? AND COALESCE({table}.history_hidden,0)=0
+        AND {table}.status IN ('success','failed','cancelled','rejected')
+        AND NOT EXISTS (SELECT 1 FROM owner_auto_am_jobs j
+                        WHERE j.owner_id={table}.owner_id
+                          AND j.status IN ('running','waiting','unknown') AND ({job_match}))
+        AND NOT EXISTS (SELECT 1 FROM tool_provider_flows f
+                        WHERE f.owner_id={table}.owner_id
+                          AND f.status IN ('pending','unknown') AND ({flow_match}))"""
+
+
+def tools_history_clear_preview(owner_id: int) -> dict:
+    if not is_owner(owner_id):
+        raise PermissionError("Fitur ini khusus owner.")
+    now=time.time()
+    for key,value in list(_TOOLS_HISTORY_CLEAR_PREVIEWS.items()):
+        if value["expires"]<=now:
+            _TOOLS_HISTORY_CLEAR_PREVIEWS.pop(key,None)
+    conn=db()
+    try:
+        ids={key:[int(row["id"]) for row in conn.execute(
+            "SELECT id FROM "+table+" WHERE "+tools_history_clear_predicate(table)+" ORDER BY id",(owner_id,))]
+            for table,key in (("tool_activity_logs","activities"),("tool_provision_logs","provisions"))}
+    finally:
+        conn.close()
+    token=secrets.token_hex(12)
+    _TOOLS_HISTORY_CLEAR_PREVIEWS[owner_id]={"token":token,"expires":now+TOOLS_CLEANUP_PREVIEW_SECONDS,"ids":ids}
+    return {"token":token,**{key:len(values) for key,values in ids.items()}}
+
+
+def tools_history_clear_execute(owner_id: int, token: str) -> dict:
+    if not is_owner(owner_id):
+        raise PermissionError("Fitur ini khusus owner.")
+    preview=_TOOLS_HISTORY_CLEAR_PREVIEWS.get(owner_id)
+    if (not isinstance(token,str) or not re.fullmatch(r"[0-9a-f]{24}",token)
+            or not preview or not hmac.compare_digest(preview["token"],token)
+            or preview["expires"]<=time.time()):
+        raise ValueError("Konfirmasi kedaluwarsa. Buka Hapus Riwayat kembali.")
+    _TOOLS_HISTORY_CLEAR_PREVIEWS.pop(owner_id,None)
+    conn=None
+    try:
+        conn=db()
+        begin_immediate_retry(conn)
+        removed={"activities":0,"provisions":0}
+        for table,key in (("tool_activity_logs","activities"),("tool_provision_logs","provisions")):
+            ids=preview["ids"][key]
+            for offset in range(0,len(ids),400):
+                batch=ids[offset:offset+400]
+                placeholders=",".join("?" for _ in batch)
+                cursor=conn.execute(
+                    "UPDATE "+table+" SET history_hidden=1 WHERE "+tools_history_clear_predicate(table)
+                    +" AND id IN ("+placeholders+")",(owner_id,*batch))
+                removed[key]+=cursor.rowcount
+        conn.commit()
+        return removed
+    except Exception:
+        if conn is not None:conn.rollback()
+        if preview["expires"]>time.time() and owner_id not in _TOOLS_HISTORY_CLEAR_PREVIEWS:
+            _TOOLS_HISTORY_CLEAR_PREVIEWS[owner_id]=preview
+        raise
+    finally:
+        if conn is not None:conn.close()
+
+
+def tools_history_clear_result_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Lihat Riwayat",callback_data="tools:history")],
+        [InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")],
+    ])
+
+
+@router.callback_query(F.data == "tools:history_clear")
+async def owner_tools_history_clear_preview(call: CallbackQuery):
+    if not await tools_cleanup_require_owner(call):return
+    await safe_callback_notice(call)
+    try:
+        preview=tools_history_clear_preview(call.from_user.id)
+    except sqlite3.Error:
+        await safe_edit_or_answer(call,"Riwayat belum dapat dibaca. Coba kembali sebentar lagi.",reply_markup=owner_tools_menu())
+        return
+    total=preview["activities"]+preview["provisions"]
+    text=("🗑️ <b>HAPUS RIWAYAT TOOLS</b>\n\n"
+          f"Riwayat proses selesai: <b>{total}</b>\n"
+          f"• Aktivitas: <b>{preview['activities']}</b>\n"
+          f"• Provision: <b>{preview['provisions']}</b>\n\n"
+          "Riwayat ini akan dihapus dari daftar dan pencarian.\n"
+          "Proses berjalan atau hasil belum diketahui tetap tersedia. Kuota, hasil aktivasi, inbox, dan data toko tetap tersimpan.")
+    keyboard=[]
+    if total:
+        keyboard.append([InlineKeyboardButton(text=f"🗑️ Hapus {total} riwayat",callback_data="toolshistoryclear:"+preview["token"])])
+        text+="\n\nKonfirmasi berlaku 5 menit."
+    else:
+        _TOOLS_HISTORY_CLEAR_PREVIEWS.pop(call.from_user.id,None)
+        text+="\n\nBelum ada riwayat selesai yang perlu dibersihkan."
+    keyboard.append([InlineKeyboardButton(text="❌ Batal / Kembali",callback_data="tools:history_clear_cancel")])
+    await safe_edit_or_answer(call,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+@router.callback_query(F.data.startswith("toolshistoryclear:"))
+async def owner_tools_history_clear_confirm(call: CallbackQuery):
+    if not await tools_cleanup_require_owner(call):return
+    await safe_callback_notice(call)
+    parts=str(call.data or "").split(":")
+    token=parts[1] if len(parts)==2 else ""
+    try:
+        removed=tools_history_clear_execute(call.from_user.id,token)
+    except ValueError as exc:
+        await safe_edit_or_answer(call,html.escape(str(exc)),reply_markup=owner_tools_menu())
+        return
+    except sqlite3.Error:
+        await safe_edit_or_answer(call,"Riwayat belum berhasil dibersihkan. Buka Hapus Riwayat untuk mencoba kembali.",reply_markup=owner_tools_menu())
+        return
+    await safe_edit_or_answer(call,
+        "✅ <b>RIWAYAT TOOLS DIBERSIHKAN</b>\n\n"
+        f"Aktivitas: <b>{removed['activities']}</b>\n"
+        f"Provision: <b>{removed['provisions']}</b>\n\n"
+        "Kuota dan hasil aktivasi tetap tersimpan.",reply_markup=tools_history_clear_result_keyboard())
+
+
+@router.callback_query(F.data == "tools:history_clear_cancel")
+async def owner_tools_history_clear_cancel(call: CallbackQuery):
+    if not await tools_cleanup_require_owner(call):return
+    _TOOLS_HISTORY_CLEAR_PREVIEWS.pop(call.from_user.id,None)
+    await render_tools_filtered_history(call,1,"all")
+
+
 
 def alight_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -14920,6 +15100,7 @@ def tools_stats_snapshot(owner_id: int) -> dict:
     conn=db()
     try:
         totals,legacy=_tools_request_totals(conn,owner_id,start_utc,next_utc)
+        used_accounts=_tools_account_usage(conn,owner_id,start_utc,next_utc)
         lifetime_rows=conn.execute(
             """SELECT status,COUNT(*) AS n FROM (
                 SELECT status FROM tool_provider_requests WHERE owner_id=?
@@ -14933,15 +15114,15 @@ def tools_stats_snapshot(owner_id: int) -> dict:
     success=int(lifetime.get("success",0)); failed=int(lifetime.get("failed",0))
     cost=max(1,int(TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT))
     used=sum(totals.values())+legacy*cost
-    remaining=max(0,TOOLS_PROVIDER_HOURLY_LIMIT-used)
+    remaining=max(0,TOOLS_PROVIDER_HOURLY_LIMIT-used_accounts)
     reset=max(0,int((next_wib-now_wib).total_seconds()))
     return {
         "hour_success":totals.get("success",0),
         "hour_failed":totals.get("failed",0),
         "hour_pending":totals.get("pending",0)+totals.get("unknown",0),
         "hour_attempts":sum(totals.values())+legacy,
-        "used_requests":used,"remaining_requests":remaining,
-        "remaining_accounts":remaining//cost,
+        "used_requests":used,"remaining_requests":remaining*cost,
+        "used_accounts":used_accounts,"remaining_accounts":remaining,
         "hourly_limit":int(TOOLS_PROVIDER_HOURLY_LIMIT),"request_cost":cost,
         "lifetime_total":sum(lifetime.values()),"lifetime_success":success,
         "lifetime_failed":failed,
@@ -14958,10 +15139,10 @@ def tools_stats_text(owner_id: int) -> str:
         f"🔌 Provider: <b>{html.escape(TOOLS_PROVIDER_NAME)}</b>\n"
         f"📡 Status: <b>{tools_provider_status_text()}</b>\n\n"
         "⚡ <b>KUOTA JAM INI</b>\n"
-        f"Request terpakai: <b>{s['used_requests']}/{s['hourly_limit']}</b>\n"
-        f"Sisa request: <b>{s['remaining_requests']}</b>\n"
-        f"Biaya per akun: <b>{s['request_cost']} request</b>\n"
-        f"Estimasi sisa kapasitas: <b>{s['remaining_accounts']} akun</b>\n"
+        f"Aktivasi premium: <b>{s['used_accounts']}/{s['hourly_limit']} akun</b>\n"
+        f"Sisa aktivasi: <b>{s['remaining_accounts']} akun</b>\n"
+        f"Request API tercatat: <b>{s['used_requests']}</b> (tidak mengurangi kuota per tahap)\n"
+        "Temp Mail: <b>Tanpa batas pembuatan di bot</b>\n"
         f"Reset berikutnya: <b>{s['reset_at']}</b>\n"
         f"Hitung mundur: <b>{s['reset_countdown']}</b>\n\n"
         "📦 <b>PROSES JAM INI</b>\n"
@@ -14984,19 +15165,26 @@ def tools_stats_text(owner_id: int) -> str:
     )
 
 
-def tools_quota_can_process(owner_id: int, *, requests_needed=None) -> tuple[bool,dict]:
+def tools_quota_can_process(owner_id: int, *, requests_needed=None, target_email="", correlation_id="") -> tuple[bool,dict]:
     stats=tools_stats_snapshot(owner_id)
-    needed=stats["request_cost"] if requests_needed is None else max(1,int(requests_needed))
-    return stats["remaining_requests"]>=needed,stats
+    if target_email or correlation_id:
+        _,_,_,start_utc,next_utc=tools_hour_window()
+        conn=db()
+        try:
+            if _tools_account_reservation(conn,owner_id,str(target_email or '').strip().lower(),correlation_id,start_utc,next_utc):
+                return True,stats
+        finally:
+            conn.close()
+    return stats["remaining_accounts"]>=1,stats
 
 
 TOOLS_HISTORY_PAGE_SIZE = 5
 TOOLS_HISTORY_RECORDS_SQL = """(
     SELECT id,owner_id,action,target_email,status,http_status,created_at,'activity' AS record_kind
-    FROM tool_activity_logs
+    FROM tool_activity_logs WHERE COALESCE(history_hidden,0)=0
     UNION ALL
     SELECT id,owner_id,'provision_1_year' AS action,target_email,status,http_status,created_at,'provision' AS record_kind
-    FROM tool_provision_logs
+    FROM tool_provision_logs WHERE COALESCE(history_hidden,0)=0
 )"""
 
 
@@ -15172,6 +15360,7 @@ def tools_history_filter_keyboard(page: int, total_pages: int, status_filter: st
     if page<total_pages:
         nav.append(InlineKeyboardButton(text="➡️",callback_data=f"toolsfilter:{status_filter}:{page+1}"))
     rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🗑️ Hapus Riwayat",callback_data="tools:history_clear")])
     rows.append([InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -15305,13 +15494,13 @@ def provider_result_reference(result) -> str:
     return ""
 
 
-def tools_provider_precheck(owner_id: int, email: str) -> tuple[bool,str]:
+def tools_provider_precheck(owner_id: int, email: str, *, correlation_id="") -> tuple[bool,str]:
     if not TOOLS_PROVIDER_ENABLED:return False,"Provider disabled."
     if not TOOLS_PROVIDER_API_KEY:return False,"API key provider belum tersedia."
     if not TOOLS_PROVIDER_VERIFY_URL:return False,"Endpoint verifikasi belum tersedia."
     if not valid_tools_email(email):return False,"Email target tidak valid."
     needed=2 if TOOLS_PROVIDER_APPLY_URL else 1
-    ok,quota=tools_quota_can_process(owner_id,requests_needed=needed)
+    ok,quota=tools_quota_can_process(owner_id,target_email=email,correlation_id=correlation_id)
     if not ok:return False,f"Kuota tidak cukup untuk verifikasi/apply. Reset {quota['reset_at']}."
     cleanup_expired_tool_locks()
     conn=db()
@@ -15323,11 +15512,11 @@ def tools_provider_precheck(owner_id: int, email: str) -> tuple[bool,str]:
 
 
 async def tools_provider_request_resilient(method: str, url: str, *, payload=None,
-                                            read_only=False, owner_id=0):
+                                            read_only=False, owner_id=0, correlation_id=""):
     # One retry layer. Action POSTs are always sent once, including verify/apply.
     return await tools_provider_request(
         method,url,payload=payload,read_only=read_only,owner_id=owner_id,
-        max_retries=TOOLS_PROVIDER_TEMP_RETRIES,
+        max_retries=TOOLS_PROVIDER_TEMP_RETRIES,correlation_id=correlation_id,
     )
 
 
@@ -15594,6 +15783,20 @@ async def _save_tools_apply_result(state, email, correlation_id, parsed, http_st
                              detail=tool_response_preview(parsed))
 
 
+async def accept_embedded_apply_result(state, owner_id, email, correlation_id, result, http_status):
+    """Some providers already apply premium during verification. Save that
+    explicit result without issuing a second Apply Premium request."""
+    parsed=parse_provider_apply_premium_result(result,target_email=email)
+    if not parsed.get('success') and parsed.get('status')!='pending':return False
+    if http_status==202:parsed.update(known=False,success=False,status='pending')
+    started,flow=_tools_claim_apply(owner_id,email,correlation_id)
+    if not started and flow['correlation_id']!=correlation_id:return False
+    token=str((await state.get_data()).get('tools_verify_id_token') or '')
+    await state.update_data(tools_apply_license_status=auto_am_safe_license_metadata(result,token))
+    await _save_tools_apply_result(state,email,correlation_id,parsed,http_status,tool_response_preview(auto_am_redact_token(result,token)))
+    return True
+
+
 async def run_tools_apply_once(call, state, *, user_mode=False, progress=True):
     data=await state.get_data()
     if user_mode and not tools_user_allowed(call.from_user.id):
@@ -15611,9 +15814,10 @@ async def run_tools_apply_once(call, state, *, user_mode=False, progress=True):
     token=str(data.get("tools_verify_id_token") or "").strip()
     if not token or not TOOLS_PROVIDER_ENABLED or not TOOLS_PROVIDER_API_KEY or not TOOLS_PROVIDER_APPLY_URL:
         return existing
-    quota_ok,_=tools_quota_can_process(call.from_user.id,requests_needed=1)
+    correlation_id=str(data.get("tools_correlation_id") or "")
+    quota_ok,_=tools_quota_can_process(call.from_user.id,target_email=email,correlation_id=correlation_id)
     if not quota_ok:
-        await state.update_data(tools_apply_notice="Kuota request habis. Tunggu reset, lalu pilih Apply Premium.")
+        await state.update_data(tools_apply_notice="Kuota aktivasi premium habis. Tunggu reset jam berikutnya.")
         return existing
     correlation_id=str(data.get("tools_correlation_id") or "")
     if not correlation_id:
@@ -15645,6 +15849,7 @@ async def run_tools_apply_once(call, state, *, user_mode=False, progress=True):
             return parsed
         ok,http_status,result=await tools_provider_request(
             "POST",TOOLS_PROVIDER_APPLY_URL,payload={"email":email,"idToken":token},owner_id=call.from_user.id,
+            correlation_id=correlation_id,
         )
         result=auto_am_redact_token(result,token)
         parsed=parse_provider_apply_premium_result(result,from_apply=True,target_email=email)
@@ -15777,7 +15982,7 @@ def tools_compact_summary_text(owner_id: int) -> str:
         f"Provider Config: <b>{tools_provider_status_text()}</b>",
         f"Apply URL: <b>{'READY' if TOOLS_PROVIDER_APPLY_URL else 'BELUM SIAP'}</b>",
         f"Apply Status URL: <b>{'READY' if tools_apply_status_url_allowed(TOOLS_PROVIDER_APPLY_STATUS_URL) else ('URL TIDAK VALID' if TOOLS_PROVIDER_APPLY_STATUS_URL else 'OPSIONAL')}</b>",
-        f"Kuota jam ini: <b>{stats['used_requests']}/{stats['hourly_limit']}</b>",
+        f"Aktivasi premium jam ini: <b>{stats['used_accounts']}/{stats['hourly_limit']} akun</b>",
         f"Sisa akun: <b>{stats['remaining_accounts']}</b>",
         f"Hari ini: <b>{daily['success']} sukses / {daily['failed']} gagal</b>",
         f"Auto Poll: <b>{TOOLS_PROVIDER_POLL_ATTEMPTS}× / {TOOLS_PROVIDER_POLL_INTERVAL_SECONDS}s</b>",
@@ -15798,7 +16003,7 @@ def tools_health_summary(owner_id: int) -> str:
     return (
         "❤️ <b>HEALTH SUMMARY TOOLS</b>\n\n"
         f"Provider config: <b>{'🟢 READY' if ready else '🟠 BELUM LENGKAP'}</b>\n"
-        f"Kuota jam ini: <b>{stats['used_requests']}/{stats['hourly_limit']}</b>\n"
+        f"Aktivasi premium jam ini: <b>{stats['used_accounts']}/{stats['hourly_limit']} akun</b>\n"
         f"Sisa kapasitas: <b>{stats['remaining_accounts']} akun</b>\n"
         f"Hari ini: <b>{daily['success']} sukses / {daily['failed']} gagal / {daily['pending']} pending</b>\n"
         f"Success rate hari ini: <b>{daily['rate']:.1f}%</b>\n"
@@ -15869,6 +16074,7 @@ def tools_history_keyboard(page: int, total_pages: int):
         nav.append(InlineKeyboardButton(text="➡️",callback_data=f"toolshistory:{page+1}"))
     rows.append(nav)
     rows.append([InlineKeyboardButton(text="🔄 Refresh",callback_data=f"toolshistory:{page}")])
+    rows.append([InlineKeyboardButton(text="🗑️ Hapus Riwayat",callback_data="tools:history_clear")])
     rows.append([InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -15950,7 +16156,7 @@ def tools_diagnostics_text(owner_id: int) -> str:
         f"Auth: <b>{html.escape(TOOLS_PROVIDER_AUTH_MODE)}</b>",
         f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b>",
         f"Retry: <b>{TOOLS_PROVIDER_MAX_RETRIES}</b>",
-        f"Kuota lokal: <b>{stats['used_requests']}/{stats['hourly_limit']}</b>",
+        f"Aktivasi premium: <b>{stats['used_accounts']}/{stats['hourly_limit']} akun</b>",
         f"Sisa kapasitas: <b>{stats['remaining_accounts']} akun</b>",
     ]
     if missing:
@@ -16070,7 +16276,7 @@ def tools_provider_headers(payload_present: bool=False) -> dict:
 
 
 async def tools_provider_request(method: str, url: str, *, payload=None,
-                                 read_only=False, owner_id=0, max_retries=None):
+                                 read_only=False, owner_id=0, max_retries=None, correlation_id=""):
     if not TOOLS_PROVIDER_ENABLED:return False,0,{"error":"provider_disabled"}
     if not TOOLS_PROVIDER_API_KEY:return False,0,{"error":"api_key_missing"}
     if not url:return False,0,{"error":"endpoint_not_configured"}
@@ -16092,7 +16298,9 @@ async def tools_provider_request(method: str, url: str, *, payload=None,
     owner_id=int(owner_id or ADMIN_ID)
     last=(False,0,{"error":"not_started"})
     for attempt in range(attempts):
-        request_id=_reserve_tool_provider_request(owner_id,method)
+        request_id=_reserve_tool_provider_request(owner_id,method,
+            target_email=payload.get('email','') if isinstance(payload,dict) else '',
+            correlation_id=correlation_id,count_account=not safe_read)
         if not request_id:
             return False,429,{"error":"local_quota_exhausted","_local_quota":True}
         try:
@@ -16398,9 +16606,30 @@ def tools_user_menu(user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def tools_user_welcome_text() -> str:
+class ToolsMessageAction:
+    """Reuse the existing guarded action handlers immediately after text input."""
+    def __init__(self, incoming, progress_message, data):
+        self.from_user=incoming.from_user
+        self.bot=incoming.bot
+        self.message=progress_message
+        self.data=data
+        self.id=f'tools-message-{incoming.chat.id}-{incoming.message_id}'
+
+    async def answer(self, text='', *, show_alert=False, **kwargs):
+        if text:
+            return await safe_edit_or_answer(self,html.escape(text),parse_mode='HTML')
+
+
+async def tools_message_action(message, data):
+    progress=await message.answer('⏳ Memproses aktivasi premium...')
+    return ToolsMessageAction(message,progress,data)
+
+
+def tools_user_welcome_text(user_id: int = 0) -> str:
+    stats=tools_stats_snapshot(user_id)
     return ("👑 <b>VIP KHUSUS /TOOLS</b>\n\n"
-            "📊 Info kuota: <b>0/15 akun/jam</b>\n\n"
+            f"📊 Aktivasi premium: <b>{stats['used_accounts']}/{stats['hourly_limit']} akun/jam</b>\n"
+            f"Reset: <b>{stats['reset_at']}</b>\n\n"
             "Gunakan fitur dengan bijak. Pastikan email dan link yang Anda kirim sudah benar.\n\n"
             "📧 Pilih Magic Link untuk mengirim link ke email, melakukan verifikasi, "
             "dan menerapkan premium.\n\n"
@@ -16436,7 +16665,7 @@ async def user_tools_command(message: Message,state: FSMContext):
     if not await require_tools_user(message,state):return
     await state.set_state(None)
     await remove_shop_reply_keyboard(message,"🧰 <b>TOOLS • MAGIC LINK</b>",parse_mode="HTML")
-    await message.answer(tools_user_welcome_text(),
+    await message.answer(tools_user_welcome_text(message.from_user.id),
                          reply_markup=tools_user_menu(message.from_user.id),parse_mode="HTML")
 
 
@@ -16498,7 +16727,7 @@ async def tools_user_bound_flow(call: CallbackQuery,state: FSMContext,action: st
 async def user_tools_home(call: CallbackQuery,state: FSMContext):
     if not await require_tools_user(call,state):return
     await state.set_state(None)
-    await safe_edit_or_answer(call,tools_user_welcome_text(),
+    await safe_edit_or_answer(call,tools_user_welcome_text(call.from_user.id),
         reply_markup=tools_user_menu(call.from_user.id),parse_mode="HTML")
     await safe_callback_notice(call)
 
@@ -16541,11 +16770,7 @@ async def user_tools_email_input(message: Message,state: FSMContext):
                             tools_verify_email=email,tools_correlation_id=key,tools_magiclink_sent=False,
                             tools_user_verify_started=False)
     await state.set_state(None)
-    await message.answer("📧 <b>KONFIRMASI MAGIC LINK</b>\n\nEmail: <b>"+html.escape(email)+"</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📧 Kirim Magic Link",callback_data=f"utools:send:{key}")],
-            [InlineKeyboardButton(text="❌ Batal",callback_data="utools:home")],
-        ]),parse_mode="HTML")
+    await user_tools_send(await tools_message_action(message,f'utools:send:{key}'),state)
 
 
 @router.callback_query(F.data.startswith("utools:send:"))
@@ -16559,7 +16784,7 @@ async def user_tools_send(call: CallbackQuery,state: FSMContext):
         await render_tools_user_link_prompt(call,state)
         return await safe_callback_notice(call)
     if not tools_provider_ready():return await safe_callback_notice(call,"Magic Link belum tersedia. Hubungi owner.",show_alert=True)
-    quota_ok,quota=tools_quota_can_process(call.from_user.id,requests_needed=3)
+    quota_ok,quota=tools_quota_can_process(call.from_user.id,target_email=data['tools_target_email'],correlation_id=data['tools_correlation_id'])
     if not quota_ok:return await safe_callback_notice(call,f"Kuota belum tersedia. Coba setelah {quota['reset_at']}.",show_alert=True)
     email=data["tools_target_email"]; key=data["tools_correlation_id"]
     locked,_=acquire_tool_email_lock(call.from_user.id,email,"send_verification_link")
@@ -16575,7 +16800,7 @@ async def user_tools_send(call: CallbackQuery,state: FSMContext):
             update_tool_provider_flow(key,status="failed")
             return
         ok,http_status,result=await tools_provider_request(
-            "POST",TOOLS_PROVIDER_MAGICLINK_URL,payload={"email":email},owner_id=call.from_user.id)
+            "POST",TOOLS_PROVIDER_MAGICLINK_URL,payload={"email":email},owner_id=call.from_user.id,correlation_id=key)
         status=provider_response_state(result,http_status=http_status)
         if not ok and isinstance(result,dict) and result.get("_outcome_unknown"):status="unknown"
         update_tool_activity(activity_id,status=status,http_status=http_status,detail=tool_response_preview(result))
@@ -16610,12 +16835,7 @@ async def user_tools_link_input(message: Message,state: FSMContext):
     key=str(data.get("tools_correlation_id") or "")
     await state.update_data(tools_raw_link=raw)
     await state.set_state(None)
-    await message.answer("📧 <b>PROSES MAGIC LINK</b>\n\nLink siap diproses untuk email <b>"+
-        html.escape(str(data.get("tools_target_email") or ""))+"</b>.\nVerifikasi dan Apply Premium akan dijalankan otomatis.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Proses Magic Link",callback_data=f"utools:verify:{key}")],
-            [InlineKeyboardButton(text="❌ Batal",callback_data="utools:home")],
-        ]),parse_mode="HTML")
+    await user_tools_verify(await tools_message_action(message,f'utools:verify:{key}'),state)
 
 
 @router.callback_query(F.data.startswith("utools:verify:"))
@@ -16628,7 +16848,7 @@ async def user_tools_verify(call: CallbackQuery,state: FSMContext):
     if not data.get("tools_magiclink_sent") or not raw.startswith(("https://","http://")):
         return await safe_callback_notice(call,"Kirim URL Magic Link dari email terlebih dahulu.",show_alert=True)
     if not tools_provider_ready():return await safe_callback_notice(call,"Magic Link belum tersedia. Hubungi owner.",show_alert=True)
-    quota_ok,quota=tools_quota_can_process(call.from_user.id,requests_needed=2)
+    quota_ok,quota=tools_quota_can_process(call.from_user.id,target_email=data['tools_target_email'],correlation_id=data['tools_correlation_id'])
     if not quota_ok:return await safe_callback_notice(call,f"Kuota belum tersedia. Coba setelah {quota['reset_at']}.",show_alert=True)
     email=data["tools_target_email"]; key=data["tools_correlation_id"]
     locked,_=acquire_tool_email_lock(call.from_user.id,email,"verify_account")
@@ -16645,12 +16865,12 @@ async def user_tools_verify(call: CallbackQuery,state: FSMContext):
             update_tool_provider_flow(key,status="failed")
             return
         ok,http_status,result=await tools_provider_request_resilient(
-            "POST",TOOLS_PROVIDER_VERIFY_URL,payload={"email":email,"rawLink":raw},owner_id=call.from_user.id)
+            "POST",TOOLS_PROVIDER_VERIFY_URL,payload={"email":email,"rawLink":raw},owner_id=call.from_user.id,correlation_id=key)
         status=provider_response_state(result,http_status=http_status)
         if not ok and isinstance(result,dict) and result.get("_outcome_unknown"):status="unknown"
         token=extract_verify_id_token(result) if ok and status=="success" else ""
         returned_email=find_provider_value(result,("email",))
-        if token and returned_email and str(returned_email).strip().lower()!=email:
+        if returned_email and str(returned_email).strip().lower()!=email:
             status="failed";token="";result={"error":"verified_email_mismatch"}
         await state.update_data(tools_final_status=status,tools_final_http_status=http_status,
             tools_verify_id_token=token or None,tools_verify_id_token_at=datetime.now().isoformat(timespec="seconds") if token else "")
@@ -16666,8 +16886,10 @@ async def user_tools_verify(call: CallbackQuery,state: FSMContext):
         await state.update_data(tools_raw_link=None)
         await state.set_state(None)
     if not await require_tools_user(call,state):return
-    if status=="success" and token:
-        await run_tools_apply_once(call,state,user_mode=True)
+    if status in {'success','pending'}:
+        embedded=await accept_embedded_apply_result(state,call.from_user.id,email,key,result,http_status)
+        if not embedded and status=='success' and token:
+            await run_tools_apply_once(call,state,user_mode=True)
     await render_tools_user_result(call,state)
 
 
@@ -16801,7 +17023,7 @@ async def owner_tools_alight(call: CallbackQuery,state: FSMContext):
         "4. Masukkan link ke bot\n"
         "5. Verifikasi akun\n\n"
         f"API: <b>{tools_provider_status_text()}</b>\n"
-        f"Kuota: <b>{tools_stats_snapshot(call.from_user.id)['used_requests']}/{TOOLS_PROVIDER_HOURLY_LIMIT} request</b>\n"
+        f"Aktivasi premium: <b>{tools_stats_snapshot(call.from_user.id)['used_accounts']}/{TOOLS_PROVIDER_HOURLY_LIMIT} akun/jam</b>\n"
         f"Sisa kapasitas: <b>{tools_stats_snapshot(call.from_user.id)['remaining_accounts']} akun</b>",
         reply_markup=alight_tools_menu(),parse_mode="HTML"
     )
@@ -16860,18 +17082,11 @@ async def owner_tools_magiclink_email_input(message: Message,state: FSMContext):
     if not valid_tools_email(email):
         return await message.answer("❌ Format email tidak valid. Silakan kirim ulang.")
 
-    await state.update_data(tools_magic_email=email, tools_target_email=email)
+    correlation_id=create_tool_provider_flow(message.from_user.id,email,'send_magic_link')
+    await state.update_data(tools_magic_email=email, tools_target_email=email,tools_correlation_id=correlation_id)
     await state.set_state(None)
 
-    await message.answer(
-        "⚠️ <b>KONFIRMASI KIRIM LINK VERIFIKASI</b>\n\n"
-        f"📧 Email Target: <b>{html.escape(email)}</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Kirim",callback_data="tools:magiclink:confirm")],
-            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")],
-        ]),
-        parse_mode="HTML"
-    )
+    await owner_tools_magiclink_confirm(await tools_message_action(message,'tools:magiclink:confirm'),state)
 
 
 @router.callback_query(F.data == "tools:magiclink:confirm")
@@ -16883,7 +17098,7 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
     if not valid_tools_email(email):return await call.answer("Session email tidak valid.",show_alert=True)
     if data.get("tools_magiclink_sent"):
         return await safe_callback_notice(call,"Link sudah dikirim. Lanjutkan Verifikasi.")
-    quota_ok,quota=tools_quota_can_process(call.from_user.id,requests_needed=1)
+    quota_ok,quota=tools_quota_can_process(call.from_user.id,target_email=email,correlation_id=str(data.get('tools_correlation_id') or ''))
     if not quota_ok:return await call.answer(f"Kuota habis. Reset {quota['reset_at']}.",show_alert=True)
     locked,_=acquire_tool_email_lock(call.from_user.id,email,"send_verification_link")
     if not locked:return await call.answer("Email ini sedang diproses.",show_alert=True)
@@ -16895,6 +17110,7 @@ async def owner_tools_magiclink_confirm(call: CallbackQuery,state: FSMContext):
         await safe_edit_or_answer(call,"⏳ <b>MENGIRIM LINK VERIFIKASI...</b>\n\n"+html.escape(email),parse_mode="HTML")
         ok,http_status,result=await tools_provider_request(
             "POST",TOOLS_PROVIDER_MAGICLINK_URL,payload={"email":email},owner_id=call.from_user.id,
+            correlation_id=str(data.get('tools_correlation_id') or ''),
         )
         status=provider_response_state(result,http_status=http_status)
         if not ok and isinstance(result,dict) and result.get("_outcome_unknown"):status="unknown"
@@ -16989,17 +17205,7 @@ async def owner_tools_verify_link_input(message: Message,state: FSMContext):
     await state.update_data(tools_raw_link=raw_link)
     await state.set_state(None)
 
-    await message.answer(
-        "⚠️ <b>KONFIRMASI VERIFIKASI</b>\n\n"
-        f"📧 Email Target: <b>{html.escape(email)}</b>\n"
-        "🔗 Link Verifikasi: <b>TERSIMPAN SEMENTARA</b>\n\n"
-        "Link verifikasi tidak akan ditampilkan kembali.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Verifikasi Sekarang",callback_data="tools:verify:confirm")],
-            [InlineKeyboardButton(text="❌ Batal",callback_data="tools:alight")],
-        ]),
-        parse_mode="HTML"
-    )
+    await owner_tools_verify_confirm(await tools_message_action(message,'tools:verify:confirm'),state)
 
 
 @router.callback_query(F.data == "tools:verify:confirm")
@@ -17011,14 +17217,21 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
     if tools_session_expired(data):return await call.answer("Session kedaluwarsa. Kirim link verifikasi baru.",show_alert=True)
     if not valid_tools_email(email) or not raw_link.startswith(("https://","http://")):
         return await call.answer("Link sudah dipakai/session tidak lengkap. Periksa Hasil Provider.",show_alert=True)
-    precheck_ok,reason=tools_provider_precheck(call.from_user.id,email)
+    precheck_ok,reason=tools_provider_precheck(call.from_user.id,email,correlation_id=str(data.get('tools_correlation_id') or ''))
     if not precheck_ok:return await call.answer(reason[:190],show_alert=True)
     locked,_=acquire_tool_email_lock(call.from_user.id,email,"verify_account")
     if not locked:return await call.answer("Email ini sedang diproses.",show_alert=True)
     await safe_callback_notice(call,"Memverifikasi akun...")
     activity_id=0; correlation_id=""
     try:
-        correlation_id=create_tool_provider_flow(call.from_user.id,email,"verify_account")
+        correlation_id=str(data.get('tools_correlation_id') or '')
+        conn=db()
+        try:
+            matching=conn.execute('SELECT 1 FROM tool_provider_flows WHERE correlation_id=? AND owner_id=? AND target_email=?',
+                                 (correlation_id,call.from_user.id,email)).fetchone()
+        finally:
+            conn.close()
+        if not matching:correlation_id=create_tool_provider_flow(call.from_user.id,email,"verify_account")
         activity_id=create_tool_activity(call.from_user.id,"verify_account",email)
         await state.update_data(
             tools_correlation_id=correlation_id,tools_verify_id_token=None,
@@ -17028,11 +17241,12 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         await safe_edit_or_answer(call,"⏳ <b>MEMVERIFIKASI AKUN...</b>\n\n"+html.escape(email),parse_mode="HTML")
         ok,http_status,result=await tools_provider_request_resilient(
             "POST",TOOLS_PROVIDER_VERIFY_URL,payload={"email":email,"rawLink":raw_link},owner_id=call.from_user.id,
+            correlation_id=correlation_id,
         )
         status=provider_response_state(result,http_status=http_status)
         token=extract_verify_id_token(result) if ok and status=="success" else ""
         returned_email=find_provider_value(result,("email",))
-        if token and returned_email and str(returned_email).strip().lower()!=email:
+        if returned_email and str(returned_email).strip().lower()!=email:
             ok=False;status="failed";token="";result={"error":"verified_email_mismatch"}
         preview=tool_response_preview(result)
         parsed=parse_provider_apply_premium_result(result,target_email=email) if ok and status=="success" else parse_provider_apply_premium_result({})
@@ -17043,7 +17257,7 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
             tools_final_status=status,tools_final_http_status=int(http_status or 0),
             tools_final_at=datetime.now().isoformat(timespec="seconds"),tools_final_preview=preview[:900],
             tools_provider_license_status=parse_provider_license_status(result),
-            tools_provider_apply_premium_result=parsed,
+            tools_provider_apply_premium_result={},
             tools_provider_reference=provider_result_reference(result),
         )
         update_tool_provider_flow(correlation_id,stage="verify_account",status=status,
@@ -17057,10 +17271,11 @@ async def owner_tools_verify_confirm(call: CallbackQuery,state: FSMContext):
         release_tool_email_lock(email)
         await state.update_data(tools_raw_link=None)
         await state.set_state(None)
-    if status=="success":
-        if token or parsed.get("known"):
+    if status in {'success','pending'}:
+        embedded=await accept_embedded_apply_result(state,call.from_user.id,email,correlation_id,result,http_status)
+        if not embedded and status=='success' and token:
             await run_tools_apply_once(call,state)
-        elif TOOLS_PROVIDER_STATUS_URL:
+        elif not embedded and TOOLS_PROVIDER_STATUS_URL:
             # Preserve optional legacy status lookup; it cannot grant premium.
             await poll_provider_status(email,correlation_id)
     await safe_edit_or_answer(
@@ -17121,15 +17336,14 @@ async def owner_tools_alight_confirm(call: CallbackQuery,state: FSMContext):
         await state.clear()
         return await call.answer("Session email tidak valid. Ulangi dari /tools.",show_alert=True)
 
-    quota_ok,quota=tools_quota_can_process(call.from_user.id)
+    quota_ok,quota=tools_quota_can_process(call.from_user.id,target_email=email)
     if not quota_ok:
         await state.clear()
         await safe_edit_or_answer(
             call,
             "⏳ <b>KUOTA API JAM INI HABIS</b>\n\n"
-            f"Request: <b>{quota['used_requests']}/{quota['hourly_limit']}</b>\n"
-            f"Sisa: <b>{quota['remaining_requests']}</b>\n"
-            f"Kebutuhan per akun: <b>{quota['request_cost']} request</b>\n"
+            f"Aktivasi premium: <b>{quota['used_accounts']}/{quota['hourly_limit']} akun</b>\n"
+            f"Sisa: <b>{quota['remaining_accounts']} akun</b>\n"
             f"Reset: <b>{quota['reset_at']}</b>\n"
             f"Hitung mundur: <b>{quota['reset_countdown']}</b>\n\n"
             "Bot tidak mengirim request baru agar provider tidak terkena limit.",
@@ -17291,8 +17505,8 @@ async def owner_tools_provider_info(call: CallbackQuery):
         f"Provision endpoint: <b>{'SET' if TOOLS_PROVIDER_PROVISION_URL else 'BELUM'}</b>\n"
         f"API key: <b>{'SET' if TOOLS_PROVIDER_API_KEY else 'BELUM'}</b>\n"
         f"Timeout: <b>{TOOLS_PROVIDER_TIMEOUT_SECONDS}s</b>\n"
-        f"Limit lokal: <b>{TOOLS_PROVIDER_HOURLY_LIMIT} request/jam</b>\n"
-        f"Biaya estimasi: <b>{TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT} request/akun</b>\n\n"
+        f"Kuota aktivasi premium: <b>{TOOLS_PROVIDER_HOURLY_LIMIT} akun/jam</b>\n"
+        "Temp Mail: <b>Tanpa batas pembuatan di bot</b>\n\n"
         "Secret/API key tidak pernah ditampilkan di Telegram.",
         reply_markup=owner_tools_menu(),parse_mode="HTML"
     )
@@ -17617,19 +17831,65 @@ TOOLS_AUTO_AM_POLL_SECONDS = env_int("TOOLS_AUTO_AM_POLL_SECONDS", 3, 1, 15)
 _AUTO_AM_SESSIONS = {}
 
 
+def auto_am_store_session(owner_id, job_id, values):
+    secret=''
+    if values.get('tools_verify_id_token') and not values.get('tools_apply_requested'):
+        fields=('tools_verify_id_token','tools_verify_id_token_at','tools_session_started_at',
+                'tools_target_email','tools_verify_email','tools_correlation_id','tools_final_status')
+        saved={field:values.get(field) for field in fields}
+        cipher=AES.new(temp_mail_encryption_key(),AES.MODE_GCM)
+        cipher.update(f'MaboyyDigital/AutoAM/v1:{int(owner_id)}:{int(job_id)}'.encode())
+        encrypted,tag=cipher.encrypt_and_digest(json.dumps(saved,separators=(',',':')).encode())
+        secret='v1:'+base64.urlsafe_b64encode(cipher.nonce+tag+encrypted).decode('ascii')
+    conn=db()
+    try:
+        conn.execute('UPDATE owner_auto_am_jobs SET session_secret=? WHERE owner_id=? AND id=?',
+                     (secret,int(owner_id),int(job_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def auto_am_load_session(owner_id, job_id):
+    job=auto_am_get_job(owner_id,job_id)
+    secret=str((job or {}).get('session_secret') or '')
+    if not secret:return {}
+    try:
+        if not secret.startswith('v1:') or len(secret)>65536:raise ValueError('invalid session')
+        raw=base64.b64decode(secret[3:],altchars=b'-_',validate=True)
+        cipher=AES.new(temp_mail_encryption_key(),AES.MODE_GCM,nonce=raw[:16])
+        cipher.update(f'MaboyyDigital/AutoAM/v1:{int(owner_id)}:{int(job_id)}'.encode())
+        values=json.loads(cipher.decrypt_and_verify(raw[32:],raw[16:32]))
+        if (not isinstance(values,dict) or not isinstance(values.get('tools_verify_id_token'),str)
+                or values.get('tools_target_email')!=job['email']
+                or values.get('tools_verify_email')!=job['email']
+                or values.get('tools_correlation_id')!=job['correlation_id']):
+            raise ValueError('session identity mismatch')
+    except (ValueError,TypeError,KeyError):
+        raise TempMailError('Sesi aktivasi tersimpan tidak dapat dibuka. Pertahankan BOT_TOKEN/kunci enkripsi sebelumnya.',status=409) from None
+    if tools_session_expired(values):
+        auto_am_store_session(owner_id,job_id,{})
+        return {}
+    return values
+
+
 class AutoAMJobState:
     def __init__(self, owner_id, job_id):
         self.key = (str(DB_PATH), int(owner_id), int(job_id))
 
     async def get_data(self):
-        values = _AUTO_AM_SESSIONS.get(self.key, {})
+        if self.key not in _AUTO_AM_SESSIONS:
+            _AUTO_AM_SESSIONS[self.key]=auto_am_load_session(self.key[1],self.key[2])
+        values = _AUTO_AM_SESSIONS[self.key]
         if values and tools_session_expired(values):
             values.pop("tools_verify_id_token", None)
             values.pop("tools_raw_link", None)
+            auto_am_store_session(self.key[1],self.key[2],{})
         return dict(values)
 
     async def update_data(self, data=None, **kwargs):
-        values = _AUTO_AM_SESSIONS.setdefault(self.key, {})
+        await self.get_data()
+        values = _AUTO_AM_SESSIONS[self.key]
         values.update(data or {})
         values.update(kwargs)
         metadata = kwargs.get("tools_apply_license_status")
@@ -17639,10 +17899,12 @@ class AutoAMJobState:
         if values.get("tools_apply_requested"):
             values.pop("tools_verify_id_token", None)
             values.pop("tools_raw_link", None)
+        auto_am_store_session(self.key[1],self.key[2],values)
         return dict(values)
 
     def forget(self):
         _AUTO_AM_SESSIONS.pop(self.key, None)
+        auto_am_store_session(self.key[1],self.key[2],{})
 
 
 def auto_am_redact_token(value, token, depth=0):
@@ -17907,7 +18169,7 @@ async def auto_am_background_tick(bot):
     try:
         rows=conn.execute("SELECT * FROM owner_auto_am_jobs WHERE owner_id=? AND auto_chat_id=owner_id "
             "AND auto_watch_until<>'' AND auto_notified_at='' "
-            "ORDER BY id LIMIT 5", (ADMIN_ID,)).fetchall()
+            "ORDER BY updated_at,id LIMIT 15", (ADMIN_ID,)).fetchall()
     finally:
         conn.close()
     processed=0
@@ -18049,7 +18311,7 @@ async def auto_am_run(call, job):
             return auto_am_get_job(owner, job_id)
         try:
             ok, http_status, result = await tools_provider_request("POST", TOOLS_PROVIDER_MAGICLINK_URL,
-                payload={"email": job["email"]}, owner_id=owner)
+                payload={"email": job["email"]}, owner_id=owner,correlation_id=job['correlation_id'])
             status = provider_response_state(result, http_status=http_status)
             unknown = bool(isinstance(result, dict) and result.get("_outcome_unknown"))
             if not ok: status = "unknown" if unknown else "failed"
@@ -18080,7 +18342,7 @@ async def auto_am_run(call, job):
             if not activity:
                 return auto_am_get_job(owner, job_id)
             ok, http_status, result = await tools_provider_request("POST", TOOLS_PROVIDER_VERIFY_URL,
-                payload={"email": job["email"], "rawLink": link}, owner_id=owner)
+                payload={"email": job["email"], "rawLink": link}, owner_id=owner,correlation_id=job['correlation_id'])
             status = provider_response_state(result, http_status=http_status)
             token = extract_verify_id_token(result) if ok and status == "success" else ""
             returned_email = find_provider_value(result, ("email",))
@@ -18089,9 +18351,17 @@ async def auto_am_run(call, job):
                 status = "failed"
             if not ok:
                 status = "unknown" if isinstance(result, dict) and result.get("_outcome_unknown") else "failed"
-            if status == "success" and not token: status = "failed"
+            embedded_result=parse_provider_apply_premium_result(result,target_email=job['email']) if ok and status in {'success','pending'} else {}
+            if status == "success" and not token and not embedded_result.get('success') and embedded_result.get('status')!='pending': status = "failed"
             update_tool_activity(activity, status=status, http_status=http_status, detail="Verifikasi akun: " + status)
             update_tool_provider_flow(job["correlation_id"], stage="verify_account", status=status, http_status=http_status)
+            if status in {'success','pending'} and (embedded_result.get('success') or embedded_result.get('status')=='pending'):
+                now=datetime.now().isoformat(timespec='seconds')
+                await state.update_data(tools_target_email=job['email'],tools_verify_email=job['email'],
+                    tools_correlation_id=job['correlation_id'],tools_final_status=status,
+                    tools_verify_id_token=token or None,tools_verify_id_token_at=now if token else '',tools_session_started_at=now)
+                if await accept_embedded_apply_result(state,owner,job['email'],job['correlation_id'],result,http_status):
+                    return await auto_am_run(call,auto_am_get_job(owner,job_id))
             if not token:
                 state.forget()
                 return auto_am_update(owner, job_id, stage="verify_requested", status="unknown" if status in {"pending", "unknown"} else "failed",
@@ -18257,7 +18527,7 @@ async def owner_auto_am_callback(call: CallbackQuery):
             if not ticket:
                 quota_ok, quota = tools_quota_can_process(call.from_user.id, requests_needed=3)
                 if not quota_ok:
-                    return await safe_edit_or_answer(call, "⚠️ Kuota tidak cukup untuk Kirim Link → Verifikasi → Apply (3 request). Reset " + html.escape(quota["reset_at"]),
+                    return await safe_edit_or_answer(call, "⚠️ Kuota aktivasi premium 15 akun/jam habis. Reset " + html.escape(quota["reset_at"]),
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Owner Tools", callback_data="tools:home")]]), parse_mode="HTML")
             job = auto_am_job_for_ticket(call.from_user.id, parts[2])
         else:
@@ -18361,7 +18631,7 @@ def temp_mail_ui_keyboard(mailbox=None):
         if str(mailbox.get("state") or "")=="ready":
             keyboard.append([
                 InlineKeyboardButton(text="📥 Received Mail",callback_data=f"tm:inbox:{mailbox['id']}:1"),
-                InlineKeyboardButton(text="📋 Alamat Email",callback_data="tm:address"),
+                InlineKeyboardButton(text="📋 Alamat Email",callback_data=f"tm:address:{mailbox['id']}"),
             ])
         else:
             keyboard.append([InlineKeyboardButton(text="♻️ Lanjutkan Pembuatan",callback_data=f"tm:resume:{mailbox['id']}")])
@@ -18373,19 +18643,21 @@ def temp_mail_ui_keyboard(mailbox=None):
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-async def temp_mail_render_home(call: CallbackQuery, *, notice=""):
-    mailbox=temp_mail_get_active(call.from_user.id)
+async def temp_mail_render_home(call: CallbackQuery, *, notice="", mailbox=None):
+    # Opening the menu never selects or creates an inbox implicitly. A mailbox
+    # is displayed only after Create, Resume or an explicit saved-email choice.
     text="📬 <b>TEMP MAIL — KHUSUS OWNER</b>\n\n"
     if notice:text+=html.escape(notice)+"\n\n"
     if mailbox:
         text+=f"📧 Email aktif:\n<code>{html.escape(str(mailbox.get('address') or '-'))}</code>\n"
         text+=("Status: <b>Siap menerima pesan</b>\n" if mailbox.get("state")=="ready" else "Status: <b>Pembuatan belum selesai</b>\n")
-    else:text+="Belum ada email aktif. Pilih Buat Email untuk memulai.\n"
+    else:text+=("Pilih <b>Buat Email</b> untuk membuat alamat baru.\n"
+                "Email yang pernah dibuat dapat dipilih melalui <b>Daftar Email</b>.\n")
     if mailbox and mailbox.get("state")=="ready":text+=temp_mail_inbox_link_text(mailbox)
-    text+=("\nGunakan fitur dengan bijak. Alamat ini untuk kebutuhan sementara.\n"
-           "Pesan masuk dibuka melalui Received Mail.\n"
-           +temp_mail_provider_caption(mailbox))
-    await safe_edit_or_answer(call,text,reply_markup=temp_mail_ui_keyboard(mailbox),parse_mode="HTML")
+    text+="\nGunakan fitur dengan bijak. Alamat ini untuk kebutuhan sementara.\n"
+    if mailbox:text+="Pesan masuk dibuka melalui Received Mail.\n"
+    text+=temp_mail_provider_caption(mailbox)
+    await safe_edit_or_answer(call,text,reply_markup=temp_mail_ui_keyboard(mailbox),parse_mode="HTML",disable_web_page_preview=True)
 
 
 async def temp_mail_ui_error(call: CallbackQuery, exc):
@@ -18413,8 +18685,8 @@ async def owner_temp_mail_create(call: CallbackQuery):
     if not await temp_mail_require_owner(call):return
     await safe_callback_notice(call,"Membuat email...")
     try:
-        await temp_mail_create_account(call.from_user.id)
-        await temp_mail_render_home(call,notice="✅ Email berhasil dibuat.")
+        mailbox=await temp_mail_create_account(call.from_user.id)
+        await temp_mail_render_home(call,notice="✅ Email berhasil dibuat.",mailbox=mailbox)
     except Exception as exc:await temp_mail_ui_error(call,exc)
 
 
@@ -18444,15 +18716,28 @@ async def owner_temp_mail_address(call: CallbackQuery):
     except Exception as exc:await temp_mail_ui_error(call,exc)
 
 
-@router.callback_query(F.data == "tm:accounts")
+@router.callback_query((F.data == "tm:accounts") | F.data.startswith("tm:accounts:"))
 async def owner_temp_mail_accounts(call: CallbackQuery):
     if not await temp_mail_require_owner(call):return
     await safe_callback_notice(call)
     try:
-        accounts=[mailbox for mailbox in temp_mail_list_accounts(call.from_user.id) if mailbox.get("state")!="failed"]
-        lines=["🗂 <b>DAFTAR EMAIL</b>","","Pilih alamat untuk digunakan. Maksimal 5 alamat per provider; email lama tetap tersedia."]
+        values=temp_mail_parse_callback(call.data,'accounts',1) if call.data!='tm:accounts' else (1,)
+        if not values:
+            raise TempMailError('Halaman daftar email tidak valid.',status=400)
+        conn=db()
+        try:
+            total=int(conn.execute("SELECT COUNT(*) FROM owner_temp_mailboxes WHERE owner_id=? AND state!='failed'",(call.from_user.id,)).fetchone()[0])
+            pages=max(1,(total+TEMP_MAIL_ACCOUNTS_PAGE_SIZE-1)//TEMP_MAIL_ACCOUNTS_PAGE_SIZE)
+            page=min(values[0],pages)
+            accounts=[temp_mail_public_mailbox(row) for row in conn.execute(
+                "SELECT * FROM owner_temp_mailboxes WHERE owner_id=? AND state!='failed' ORDER BY id DESC LIMIT ? OFFSET ?",
+                (call.from_user.id,TEMP_MAIL_ACCOUNTS_PAGE_SIZE,(page-1)*TEMP_MAIL_ACCOUNTS_PAGE_SIZE)).fetchall()]
+        finally:
+            conn.close()
+        lines=["🗂 <b>DAFTAR EMAIL</b>",f"Total: {total} • Halaman {page}/{pages}",
+               "Pilih alamat untuk digunakan. Pembuatan email tanpa batas jumlah di bot; email lama tetap tersedia."]
         keyboard=[]
-        for mailbox in accounts[:TEMP_MAIL_ACCOUNT_LIMIT*4]:
+        for mailbox in accounts:
             address=str(mailbox.get("address") or "-")
             ready=mailbox.get("state")=="ready"
             icon="✅" if mailbox.get("active") else "▫️"
@@ -18460,7 +18745,11 @@ async def owner_temp_mail_accounts(call: CallbackQuery):
             action="use" if ready else "resume"
             keyboard.append([InlineKeyboardButton(text=("📧 " if ready else "♻️ ")+address[:55],callback_data=f"tm:{action}:{mailbox['id']}")])
         if not accounts:lines.append("Belum ada alamat. Buat email baru untuk memulai.")
-        if sum(temp_mail_row_provider(mailbox)==temp_mail_selected_provider() for mailbox in accounts)<TEMP_MAIL_ACCOUNT_LIMIT:keyboard.append([InlineKeyboardButton(text="📧 Buat Email",callback_data="tm:create")])
+        navigation=[]
+        if page>1:navigation.append(InlineKeyboardButton(text='⬅️ Sebelumnya',callback_data=f'tm:accounts:{page-1}'))
+        if page<pages:navigation.append(InlineKeyboardButton(text='Berikutnya ➡️',callback_data=f'tm:accounts:{page+1}'))
+        if navigation:keyboard.append(navigation)
+        keyboard.append([InlineKeyboardButton(text="📧 Buat Email",callback_data="tm:create")])
         keyboard.append([InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")])
         await safe_edit_or_answer(call,"\n\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),parse_mode="HTML")
     except Exception as exc:await temp_mail_ui_error(call,exc)
@@ -18474,8 +18763,8 @@ async def owner_temp_mail_activate(call: CallbackQuery):
     values=temp_mail_parse_callback(call.data,"use",1)
     if not values:return await temp_mail_ui_error(call,TempMailError("Alamat email tidak valid. Pilih kembali dari Daftar Email."))
     try:
-        temp_mail_activate_account(call.from_user.id,values[0])
-        await temp_mail_render_home(call,notice="✅ Alamat email aktif diperbarui.")
+        mailbox=temp_mail_activate_account(call.from_user.id,values[0])
+        await temp_mail_render_home(call,notice="✅ Alamat email aktif diperbarui.",mailbox=mailbox)
     except Exception as exc:await temp_mail_ui_error(call,exc)
 
 
@@ -18486,8 +18775,8 @@ async def owner_temp_mail_resume(call: CallbackQuery):
     values=temp_mail_parse_callback(call.data,"resume",1)
     if not values:return await temp_mail_ui_error(call,TempMailError("Alamat email tidak valid. Pilih kembali dari Daftar Email."))
     try:
-        await temp_mail_resume_account(call.from_user.id,values[0])
-        await temp_mail_render_home(call,notice="✅ Email siap digunakan.")
+        mailbox=await temp_mail_resume_account(call.from_user.id,values[0])
+        await temp_mail_render_home(call,notice="✅ Email siap digunakan.",mailbox=mailbox)
     except Exception as exc:await temp_mail_ui_error(call,exc)
 
 
@@ -18518,7 +18807,8 @@ async def owner_temp_mail_help(call: CallbackQuery):
         "2. Gunakan alamat untuk menerima email sementara.\n"
         "3. Buka Received Mail dan tekan Refresh.\n"
         "4. Pilih pesan untuk membaca isi lengkapnya.\n\n"
-        "Daftar Email menyimpan maksimal 5 alamat per provider. Alamat dan akses email tetap tersedia setelah bot restart.\n"
+        "Halaman awal tidak memilih email otomatis. Buat alamat baru atau pilih email lama dari Daftar Email.\n"
+        "Pembuatan email tanpa batas jumlah dan tanpa cooldown lokal. Daftar Email mempunyai halaman; alamat dan akses email tetap tersedia setelah bot restart.\n"
         "Isi pesan ditampilkan sebagai teks. Link dibuka sendiri; bot tidak otomatis menjalankan link atau Apply Premium.\n\n"
         "Gunakan fitur dengan bijak. Hindari data penting karena provider dapat menghapus email sementara.\n"
         "Email Grabmail, Guerrilla Mail, dan Maildrop mempunyai link inbox situs yang dapat dibagikan tanpa login bot. Inbox publik; jangan gunakan untuk data penting.\n"
@@ -20176,7 +20466,7 @@ async def product_detail(call: CallbackQuery):
     try:
         conn=db()
         product=conn.execute("SELECT * FROM products WHERE id=? AND active=1",(product_id,)).fetchone()
-        if not product:return await safe_callback_notice(call,"Produk tidak ditemukan / sudah tidak aktif.",show_alert=True)
+        if not product_is_available(product):return await safe_callback_notice(call,"Produk tidak tersedia / masa Flash Sale telah berakhir.",show_alert=True)
         variants=conn.execute("SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY id",(product_id,)).fetchall()
         sold=sync_product_sold_from_history(conn,product_id)
         conn.commit()
@@ -20250,7 +20540,7 @@ async def back_product(call: CallbackQuery):
     variant = conn.execute("SELECT * FROM product_variants WHERE id=? AND active=1", (variant_id,)).fetchone()
     product = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (variant["product_id"],)).fetchone() if variant else None
     conn.close()
-    if not product:
+    if not product_is_available(product):
         return await call.answer("Produk tidak ditemukan.", show_alert=True)
 
     await safe_edit_or_answer(
@@ -20273,7 +20563,7 @@ async def variant_detail(call: CallbackQuery):
     product = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (variant["product_id"],)).fetchone() if variant else None
     conn.close()
 
-    if not variant or not product:
+    if not variant or not product_is_available(product):
         return await call.answer("Variasi tidak ditemukan.", show_alert=True)
 
     await safe_edit_or_answer(
@@ -20298,7 +20588,7 @@ async def change_qty(call: CallbackQuery):
     product = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (variant["product_id"],)).fetchone() if variant else None
     conn.close()
 
-    if not variant or not product:
+    if not variant or not product_is_available(product):
         return await call.answer("Variasi tidak ditemukan.", show_alert=True)
 
     if requested_qty != 1:
@@ -20487,7 +20777,7 @@ async def checkout_go_payment(call: CallbackQuery, state: FSMContext):
     variant=conn.execute("SELECT * FROM product_variants WHERE id=? AND active=1",(variant_id,)).fetchone()
     product=conn.execute("SELECT * FROM products WHERE id=? AND active=1",(int(variant["product_id"]),)).fetchone() if variant else None
     conn.close()
-    if not variant or not product:
+    if not variant or not product_is_available(product):
         return await call.answer("Produk tidak ditemukan.",show_alert=True)
     if available_stock(variant) < 1:
         return await call.answer("Stok tidak tersedia.", show_alert=True)
@@ -27557,11 +27847,11 @@ async def reply_menu_stock(message: Message, bot: Bot, state: FSMContext = None)
 
     conn = db()
     rows = conn.execute(
-        """SELECT p.name AS product_name, v.name AS variant_name,
+        f"""SELECT p.name AS product_name, v.name AS variant_name,
                   v.stock, v.reserved_stock
            FROM product_variants v
            JOIN products p ON p.id=v.product_id
-           WHERE p.active=1 AND v.active=1
+           WHERE p.active=1 AND v.active=1 AND {product_available_sql('p')}
            ORDER BY p.id, v.id"""
     ).fetchall()
     conn.close()
@@ -29821,7 +30111,8 @@ async def owner_flash_toggle(call: CallbackQuery, state: FSMContext):
         active=flash_sale_is_active(row)
         status_text=(
             f"⚡ Aktif sampai <b>{flash_sale_end_text(row)}</b>"
-            if active else "▫️ Tidak aktif"
+            if active else ('⌛ Berakhir • disembunyikan dari katalog'
+                           if int(row['flash_sale_until_ts'] or 0)>0 else '▫️ Tidak aktif')
         )
 
         await state.clear()
@@ -29874,7 +30165,7 @@ async def owner_flash_duration_set(call: CallbackQuery, state: FSMContext):
             f"📦 Produk: <b>{html.escape(str(row['name']))}</b>\n"
             f"⏱ Durasi: <b>{minutes} menit</b>\n"
             f"🏁 Berakhir: <b>{end_text}</b>\n\n"
-            "Setelah waktu habis, produk otomatis keluar dari menu Flash Sale.",
+            "Setelah waktu habis, produk disembunyikan dari katalog dan tidak masuk ke produk normal.",
             reply_markup=flash_duration_keyboard(product_id),
             parse_mode="HTML"
         )
@@ -33420,7 +33711,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.74"
+EXPECTED_SOURCE_VERSION = "16.76"
 
 
 def source_integrity_self_test():
