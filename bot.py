@@ -229,7 +229,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deployment ZIP contains only main.py, bot.py, otp_smscode.py, requirements.txt,
 # project_backup.py and .gitignore. Keep tests, fixtures and reports in full backups.
-BOT_VERSION = "16.87"
+BOT_VERSION = "16.88"
 SCHEMA_VERSION = 190
 
 CHECKOUT_TERMS_SHORT = (
@@ -17086,11 +17086,28 @@ def tools_user_success_flow(user_id: int, correlation_id: str=""):
 
 
 def tools_user_menu(user_id: int):
-    rows=[[InlineKeyboardButton(text="📧 Magic Link",callback_data="utools:magic")]]
+    rows=[
+        [InlineKeyboardButton(text="📧 Magic Link",callback_data="utools:magic")],
+        [InlineKeyboardButton(text="📖 Panduan Login AM via Email",callback_data="utools:login_guide")],
+    ]
     success=tools_user_success_flow(user_id)
     if success:
         rows.append([InlineKeyboardButton(text="⭐ Rating Toko",callback_data=f"utools:rating:{success['correlation_id']}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def tools_user_login_guide_text() -> str:
+    return (
+        "📖 <b>PANDUAN LOGIN AM VIA EMAIL</b>\n\n"
+        "1. Buka aplikasi <b>Alight Motion</b>, lalu masuk ke menu akun/profil.\n\n"
+        "2. Pilih <b>Masuk/Login</b> dan metode email yang tersedia.\n\n"
+        "3. Masukkan <b>email yang sama</b> dengan email aktivasi premium di /tools.\n\n"
+        "4. Ikuti instruksi login dari aplikasi. Jika ada email login, cek <b>Inbox/Spam</b> "
+        "lalu buka <b>link terbaru</b> pada perangkat yang dipakai untuk Alight Motion.\n\n"
+        "5. Setelah masuk, periksa alamat email akun dan status premium/keanggotaan.\n\n"
+        "Jika premium belum tampil setelah aktivasi berhasil di bot, buka ulang aplikasi "
+        "dengan email yang sama atau hubungi owner."
+    )
 
 
 class ToolsMessageAction:
@@ -17213,6 +17230,24 @@ async def tools_user_bound_flow(call: CallbackQuery,state: FSMContext,action: st
 async def user_tools_home(call: CallbackQuery,state: FSMContext):
     if not await require_tools_user(call,state):return
     await state.set_state(None)
+    await safe_edit_or_answer(call,tools_user_welcome_text(call.from_user.id),
+        reply_markup=tools_user_menu(call.from_user.id),parse_mode="HTML")
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "utools:login_guide")
+async def user_tools_login_guide(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
+    await safe_edit_or_answer(call,tools_user_login_guide_text(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Kembali",callback_data="utools:login_guide_back")]
+        ]),parse_mode="HTML")
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "utools:login_guide_back")
+async def user_tools_login_guide_back(call: CallbackQuery,state: FSMContext):
+    if not await require_tools_user(call,state):return
     await safe_edit_or_answer(call,tools_user_welcome_text(call.from_user.id),
         reply_markup=tools_user_menu(call.from_user.id),parse_mode="HTML")
     await safe_callback_notice(call)
@@ -34611,7 +34646,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.87"
+EXPECTED_SOURCE_VERSION = "16.88"
 
 
 def source_integrity_self_test():
