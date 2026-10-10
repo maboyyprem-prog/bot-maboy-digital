@@ -229,8 +229,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deployment ZIP contains only main.py, bot.py, otp_smscode.py, requirements.txt,
 # project_backup.py and .gitignore. Keep tests, fixtures and reports in full backups.
-BOT_VERSION = "16.82"
-SCHEMA_VERSION = 189
+BOT_VERSION = "16.84"
+SCHEMA_VERSION = 190
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -649,6 +649,31 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
+    # Keep owner PMs for topups separate from product-order notifications.
+    # Cancellation markers and cleanup leases survive process restarts.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_topup_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            topup_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            owner_chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            notification_kind TEXT NOT NULL DEFAULT 'pending',
+            cleanup_state TEXT NOT NULL DEFAULT 'active',
+            cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT NOT NULL DEFAULT '',
+            cleanup_token TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(topup_id,owner_chat_id,message_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_owner_topup_notifications_cleanup "
+                "ON owner_topup_notifications(cleanup_state,next_attempt_at)")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_owner_topup_notifications_message "
+                "ON owner_topup_notifications(owner_chat_id,message_id) WHERE message_id>0")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
@@ -5772,6 +5797,7 @@ def cancel_topup_atomic(topup_id: int, user_id: int):
                 VALUES('topup',?,'cancelled',0,?,'Cancelled by user',?)""", (topup_id, user_id, now))
         conn.execute("DELETE FROM payment_proof_sessions WHERE user_id=? AND entity_type='topup' AND entity_id=?",
                      (user_id, topup_id))
+        queue_owner_topup_notification_cleanup(conn,topup_id,user_id)
         conn.commit()
         return row, "already_cancelled" if status == "cancelled" else "cancelled"
     except Exception:
@@ -8007,7 +8033,202 @@ async def owner_order_notification_cleanup_loop(bot: Bot):
             await cleanup_owner_order_notifications(bot)
         except Exception:
             logging.exception("Owner notification cleanup worker failed")
+        try:
+            await cleanup_owner_topup_notifications(bot)
+        except Exception:
+            logging.exception("Owner topup notification cleanup worker failed")
         await asyncio.sleep(30)
+
+
+def queue_owner_topup_notification_cleanup(conn, topup_id: int, user_id: int):
+    """Commit with a verified unpaid buyer cancellation, including late sends."""
+    now=datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT OR IGNORE INTO owner_topup_notifications
+           (topup_id,user_id,owner_chat_id,message_id,notification_kind,cleanup_state,created_at,updated_at)
+           VALUES(?,?,0,0,'buyer_cancel','marker',?,?)""",
+        (int(topup_id),int(user_id),now,now)
+    )
+    conn.execute(
+        """UPDATE owner_topup_notifications
+           SET cleanup_state='pending',next_attempt_at='',updated_at=?
+           WHERE topup_id=? AND user_id=? AND message_id>0 AND cleanup_state='active'""",
+        (now,int(topup_id),int(user_id))
+    )
+
+
+async def track_owner_topup_notification(bot: Bot, sent, topup_id: int, user_id: int,
+                                        owner_chat_id: int, kind: str = "pending"):
+    """Track only actual owner send/copy IDs; never infer IDs from user invoices."""
+    message_id=getattr(sent,"message_id",None)
+    chat=getattr(sent,"chat",None)
+    sender=getattr(sent,"from_user",None)
+    if (type(message_id) is not int or not 0<message_id<=9223372036854775807
+            or int(owner_chat_id)<=0
+            or (chat is not None and getattr(chat,"id",None)!=int(owner_chat_id))
+            or (sender is not None and hasattr(sender,"is_bot") and not sender.is_bot)):
+        return False
+    conn=None
+    cancelled=False
+    try:
+        conn=db()
+        begin_immediate_retry(conn)
+        topup=conn.execute("SELECT status FROM topups WHERE id=? AND user_id=?",
+                           (int(topup_id),int(user_id))).fetchone()
+        if not topup:
+            conn.rollback()
+            return False
+        marker=conn.execute(
+            """SELECT 1 FROM owner_topup_notifications WHERE topup_id=? AND user_id=?
+               AND message_id=0 AND notification_kind='buyer_cancel'""",
+            (int(topup_id),int(user_id))
+        ).fetchone()
+        cancelled=bool(marker and topup["status"]=="cancelled")
+        now=datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT OR IGNORE INTO owner_topup_notifications
+               (topup_id,user_id,owner_chat_id,message_id,notification_kind,cleanup_state,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (int(topup_id),int(user_id),int(owner_chat_id),message_id,str(kind),
+             "pending" if cancelled else "active",now,now)
+        )
+        conn.commit()
+    except sqlite3.Error:
+        if conn is not None:
+            conn.rollback()
+        logging.exception("Owner topup notification tracking failed topup=%s",topup_id)
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+    if cancelled:
+        await cleanup_owner_topup_notifications(bot,topup_id=int(topup_id))
+    return True
+
+
+async def send_owner_topup_notification(bot: Bot, topup_id: int, user_id: int,
+                                       text: str, **kwargs):
+    owner_chat_id=int(ADMIN_ID)
+    sent=await bot.send_message(owner_chat_id,text,**kwargs)
+    await track_owner_topup_notification(bot,sent,topup_id,user_id,owner_chat_id)
+    return sent
+
+
+async def retire_owner_topup_notification(bot: Bot, row):
+    """Retire old undeletable PMs and their approval controls safely."""
+    text=("❌ <b>ISI SALDO DIBATALKAN</b>\n\n"
+          f"🧾 {topup_invoice(int(row['topup_id']))}\n"
+          "Invoice ini tidak perlu diproses. Saldo user tidak berubah.")
+    values={"chat_id":int(row["owner_chat_id"]),"message_id":int(row["message_id"]),
+            "reply_markup":None,"parse_mode":"HTML"}
+    try:
+        if str(row["notification_kind"]) in {"proof_media","proof_photo","proof_document"}:
+            await bot.edit_message_caption(caption=text,**values)
+        else:
+            await bot.edit_message_text(text,**values)
+        return True
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+    except (TelegramNetworkError,TelegramRetryAfter,TelegramForbiddenError):
+        raise
+    try:
+        await bot.edit_message_reply_markup(chat_id=values["chat_id"],
+                                           message_id=values["message_id"],reply_markup=None)
+        return True
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+        raise
+
+
+async def cleanup_owner_topup_notifications(bot: Bot, *, topup_id: int = 0, limit: int = 20):
+    """Delete only tracked owner messages for buyer-cancelled, uncredited topups."""
+    for _ in range(max(1,min(int(limit),50))):
+        conn=None
+        row=None
+        token=secrets.token_hex(16)
+        now=datetime.now().isoformat(timespec="seconds")
+        try:
+            conn=db()
+            begin_immediate_retry(conn)
+            row=conn.execute(
+                """SELECT n.* FROM owner_topup_notifications n
+                   JOIN topups t ON t.id=n.topup_id AND t.user_id=n.user_id
+                   WHERE n.message_id>0 AND n.owner_chat_id>0
+                     AND n.cleanup_state IN ('pending','deleting')
+                     AND (n.next_attempt_at='' OR n.next_attempt_at<=?)
+                     AND (?=0 OR n.topup_id=?) AND t.status='cancelled'
+                     AND EXISTS(SELECT 1 FROM owner_topup_notifications c
+                         WHERE c.topup_id=n.topup_id AND c.user_id=n.user_id
+                           AND c.message_id=0 AND c.notification_kind='buyer_cancel')
+                     AND NOT EXISTS(SELECT 1 FROM wallet_ledger w
+                         WHERE w.user_id=t.user_id AND w.type='TOPUP'
+                           AND w.reference=printf('TOP-%06d',t.id))
+                   ORDER BY n.id LIMIT 1""",
+                (now,int(topup_id),int(topup_id))
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return
+            lease=(datetime.now()+timedelta(seconds=120)).isoformat(timespec="seconds")
+            conn.execute(
+                """UPDATE owner_topup_notifications SET cleanup_state='deleting',
+                   cleanup_attempts=cleanup_attempts+1,cleanup_token=?,next_attempt_at=?,updated_at=?
+                   WHERE id=?""",(token,lease,now,int(row["id"]))
+            )
+            conn.commit()
+        except sqlite3.Error:
+            if conn is not None:
+                conn.rollback()
+            logging.exception("Owner topup cleanup claim failed")
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+
+        state="deleted"
+        error=""
+        retry_delay=min(3600,30*(2**min(int(row["cleanup_attempts"] or 0),6)))
+        rate_limited=False
+        try:
+            try:
+                await bot.delete_message(chat_id=int(row["owner_chat_id"]),
+                                         message_id=int(row["message_id"]))
+            except TelegramBadRequest as exc:
+                if "message to delete not found" not in str(exc).lower():
+                    await retire_owner_topup_notification(bot,row)
+                    state="retired"
+            except TelegramForbiddenError:
+                await retire_owner_topup_notification(bot,row)
+                state="retired"
+        except Exception as exc:
+            state="pending"
+            error=type(exc).__name__[:80]
+            if isinstance(exc,TelegramRetryAfter):
+                retry_delay=max(retry_delay,min(86400,int(exc.retry_after)+1))
+                rate_limited=True
+            logging.warning("Owner topup PM cleanup deferred topup=%s kind=%s error=%s",
+                            row["topup_id"],row["notification_kind"],error)
+        next_at=((datetime.now()+timedelta(seconds=retry_delay)).isoformat(timespec="seconds")
+                 if state=="pending" else "")
+        conn=None
+        try:
+            conn=db()
+            conn.execute(
+                """UPDATE owner_topup_notifications
+                   SET cleanup_state=?,next_attempt_at=?,cleanup_token='',last_error=?,updated_at=?
+                   WHERE id=? AND cleanup_token=?""",
+                (state,next_at,error,datetime.now().isoformat(timespec="seconds"),int(row["id"]),token)
+            )
+            conn.commit()
+        except sqlite3.Error:
+            logging.exception("Owner topup cleanup result persistence failed")
+        finally:
+            if conn is not None:
+                conn.close()
+        if rate_limited:
+            return
 
 
 async def forward_payment_proof_to_owner(
@@ -8040,6 +8261,9 @@ async def forward_payment_proof_to_owner(
         if entity == "order":
             await track_owner_order_notification(bot,copied,entity_id,int(row["user_id"]),
                                                  owner_chat_id,"proof_media")
+        elif entity == "topup":
+            await track_owner_topup_notification(bot,copied,entity_id,int(row["user_id"]),
+                                                 owner_chat_id,"proof_media")
         header = await bot.send_message(
             owner_chat_id,
             caption,
@@ -8048,6 +8272,9 @@ async def forward_payment_proof_to_owner(
         )
         if entity == "order":
             await track_owner_order_notification(bot,header,entity_id,int(row["user_id"]),
+                                                 owner_chat_id,"proof_header")
+        elif entity == "topup":
+            await track_owner_topup_notification(bot,header,entity_id,int(row["user_id"]),
                                                  owner_chat_id,"proof_header")
         return True, ""
     except Exception as copy_exc:
@@ -8080,6 +8307,9 @@ async def forward_payment_proof_to_owner(
             return False, "Bukti bukan foto/file gambar."
         if entity == "order":
             await track_owner_order_notification(bot,sent,entity_id,int(row["user_id"]),
+                                                 owner_chat_id,"proof_photo" if message.photo else "proof_document")
+        elif entity == "topup":
+            await track_owner_topup_notification(bot,sent,entity_id,int(row["user_id"]),
                                                  owner_chat_id,"proof_photo" if message.photo else "proof_document")
         return True, ""
     except Exception as send_exc:
@@ -10837,6 +11067,11 @@ def validate_system_schema():
         "payment_proof_sessions": {"user_id","entity_type","entity_id"},
         "owner_order_notifications": {
             "id","order_id","user_id","owner_chat_id","message_id","notification_kind",
+            "cleanup_state","cleanup_attempts","next_attempt_at","cleanup_token",
+            "last_error","created_at","updated_at"
+        },
+        "owner_topup_notifications": {
+            "id","topup_id","user_id","owner_chat_id","message_id","notification_kind",
             "cleanup_state","cleanup_attempts","next_attempt_at","cleanup_token",
             "last_error","created_at","updated_at"
         },
@@ -22893,6 +23128,12 @@ async def user_cancel_topup(call: CallbackQuery, state: FSMContext = None):
         return await safe_callback_notice(call, "Isi saldo sudah diproses atau berhasil; tidak dapat dibatalkan.", show_alert=True)
     if status not in {"cancelled", "already_cancelled"}:
         return await safe_callback_notice(call, "Invoice isi saldo sudah tidak aktif.", show_alert=True)
+    # The cancellation and owner cleanup jobs have committed together. A PM
+    # failure never reopens the invoice; the existing worker retries the job.
+    try:
+        await cleanup_owner_topup_notifications(call.bot,topup_id=topup_id)
+    except Exception:
+        logging.exception("Cancelled topup owner PM cleanup deferred topup=%s",topup_id)
     if state is not None:
         try:
             if await state.get_state() == CheckoutState.waiting_payment_proof.state:
@@ -23215,8 +23456,8 @@ async def notify_manual_topup_created(call, topup, *, bank=False):
     user = f"@{call.from_user.username}" if call.from_user.username else f"ID {call.from_user.id}"
     title = "🏦 <b>TOP UP BARU • TRANSFER REKENING</b>" if bank else "💰 <b>TOP UP BARU • QRIS</b>"
     try:
-        await call.bot.send_message(
-            ADMIN_ID,
+        await send_owner_topup_notification(
+            call.bot,int(topup['id']),int(topup['user_id']),
             f"{title}\n\n"
             f"🧾 {topup_invoice(topup['id'])}\n"
             f"👤 {html.escape(user)}\n"
@@ -23226,7 +23467,7 @@ async def notify_manual_topup_created(call, topup, *, bank=False):
             parse_mode="HTML"
         )
     except Exception:
-        pass
+        logging.warning("Owner topup creation notification failed topup=%s",topup['id'])
 
 
 @router.callback_query(F.data.startswith("topupmethod:qris:"))
@@ -23353,6 +23594,168 @@ async def wallet_topup_method_bank(call: CallbackQuery):
         await notify_manual_topup_created(call, topup, bank=True)
 
 
+def parse_owner_wallet_adjustment(text: str):
+    """Accept username/ID, whole IDR and an optional note; keep legacy input."""
+    raw=(text or "").strip()
+    if not raw:
+        raise ValueError("Kirim username atau ID, lalu nominal. Contoh: @c4nt5 1000 isi saldo")
+    money=r"(?:[0-9]{1,3}(?:\.[0-9]{3})+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
+    if "|" in raw and re.fullmatch(r"@?[A-Za-z0-9_]{1,32}",raw.split("|",1)[0].strip()):
+        parts=[part.strip() for part in raw.split("|",2)]
+        if len(parts)<2:
+            raise ValueError("Kirim username atau ID, lalu nominal.")
+        target,nominal=parts[:2]
+        note=parts[2] if len(parts)>2 else ""
+        match=re.fullmatch(rf"(?:Rp\s*|IDR\s*)?({money})(?:\s+IDR)?",nominal,re.IGNORECASE)
+    else:
+        parts=raw.split(None,1)
+        if len(parts)!=2:
+            raise ValueError("Nominal belum diisi. Contoh: @c4nt5 1000 isi saldo")
+        target,rest=parts
+        match=re.match(rf"(?:Rp\s*|IDR\s*)?({money})(?:\s+IDR)?(?=\s|$)",rest,re.IGNORECASE)
+        note=rest[match.end():].strip() if match else ""
+        if match and re.match(r"[0-9]{3}(?:\s|$)",note):
+            raise ValueError("Tulis nominal tanpa spasi: 50000 atau 50.000.")
+    if not re.fullmatch(r"@?[A-Za-z0-9_]{1,32}",target):
+        raise ValueError("Gunakan username Telegram atau ID angka yang valid.")
+    if not match:
+        raise ValueError("Nominal harus bilangan rupiah positif. Contoh: 1000 atau Rp50.000.")
+    digits=re.sub(r"[.,]","",match.group(1))
+    if len(digits.lstrip("0"))>19:
+        raise ValueError("Nominal terlalu besar.")
+    amount=int(digits)
+    if not 0<amount<=9223372036854775807:
+        raise ValueError("Nominal harus positif dan tidak melebihi kapasitas saldo.")
+    if len(note)>500:
+        raise ValueError("Catatan maksimal 500 karakter.")
+    return target,amount,note or "Penyesuaian saldo oleh owner."
+
+
+def resolve_owner_wallet_user(conn, target: str):
+    if re.fullmatch(r"[0-9]+",target):
+        if len(target.lstrip("0"))>19 or not 0<int(target)<=9223372036854775807:
+            raise ValueError("ID Telegram harus angka positif yang valid.")
+        uid=int(target)
+        profile=conn.execute("SELECT username FROM verified_users WHERE user_id=?",(uid,)).fetchone()
+        return uid,str(profile["username"] or "").lstrip("@") if profile else ""
+    username=target.lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,32}",username):
+        raise ValueError("Username Telegram tidak valid.")
+    rows=conn.execute(
+        "SELECT user_id,username FROM verified_users WHERE LOWER(LTRIM(username,'@'))=LOWER(?) LIMIT 2",
+        (username,)
+    ).fetchall()
+    if not rows:
+        raise ValueError("Username belum terdaftar di bot. Minta user buka /start, atau gunakan ID Telegram.")
+    if len(rows)!=1:
+        raise ValueError("Username tercatat pada lebih dari satu user. Gunakan ID Telegram agar saldo tepat sasaran.")
+    uid=int(rows[0]["user_id"])
+    if not 0<uid<=9223372036854775807:
+        raise ValueError("ID user tidak valid. Gunakan ID Telegram yang benar.")
+    return uid,str(rows[0]["username"] or "").lstrip("@")
+
+
+def apply_owner_wallet_adjustment(actor_id: int, target: str, amount: int,
+                                  reference: str, note: str, *, subtract: bool = False):
+    """Adjust the shared wallet and ledger atomically, once per owner message."""
+    if not is_owner(actor_id):
+        raise PermissionError("Akses ditolak.")
+    if type(amount) is not int or not 0<amount<=9223372036854775807:
+        raise ValueError("Nominal harus bilangan rupiah positif.")
+    if (not re.fullmatch(r"ADMINADJ-[1-9][0-9]*-[1-9][0-9]*-[1-9][0-9]*",reference)
+            or reference.split("-")[2]!=str(actor_id) or len(reference)>120):
+        raise ValueError("Referensi pesan tidak valid. Buka manajemen saldo kembali.")
+    conn=db()
+    try:
+        begin_immediate_retry(conn)
+        uid,username=resolve_owner_wallet_user(conn,target)
+        delta=-amount if subtract else amount
+        previous=conn.execute(
+            "SELECT user_id,amount,note FROM wallet_ledger WHERE type='ADMIN_ADJUST' AND reference=?",
+            (reference,)
+        ).fetchone()
+        wallet=conn.execute("SELECT balance FROM wallets WHERE user_id=?",(uid,)).fetchone()
+        balance=int(wallet["balance"]) if wallet else 0
+        if previous:
+            if previous["user_id"]!=uid or int(previous["amount"])!=delta or str(previous["note"] or "")!=note:
+                raise ValueError("Pesan ini sudah diproses dengan data lain. Gunakan pesan baru untuk transaksi berbeda.")
+            conn.rollback()
+            return {"user_id":uid,"username":username,"balance":balance,"changed":False}
+        new_balance=balance+delta
+        if new_balance<0:
+            raise ValueError(f"Saldo user tidak mencukupi. Saldo saat ini {rupiah(balance)}.")
+        if new_balance>9223372036854775807:
+            raise ValueError("Penambahan melebihi kapasitas saldo. Gunakan nominal lebih kecil.")
+        now=datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            """INSERT INTO wallets(user_id,balance,updated_at) VALUES(?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance,updated_at=excluded.updated_at""",
+            (uid,new_balance,now)
+        )
+        conn.execute(
+            """INSERT INTO wallet_ledger(user_id,type,amount,balance_after,reference,note,created_at)
+               VALUES(?,'ADMIN_ADJUST',?,?,?,?,?)""",
+            (uid,delta,new_balance,reference,note,now)
+        )
+        conn.commit()
+        return {"user_id":uid,"username":username,"balance":new_balance,"changed":True}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def owner_wallet_input_prompt(*, subtract: bool = False):
+    title="➖ KURANGI SALDO USER" if subtract else "➕ TAMBAH SALDO USER"
+    return (f"<b>{title}</b>\n\n"
+            "Kirim username atau ID, nominal, lalu catatan (opsional).\n\n"
+            "Contoh:\n<code>@c4nt5 1000 isi saldo</code>\n"
+            "<code>123456789 50000</code>\n\n"
+            "Username boleh tanpa @. Nominal boleh 50000 atau Rp50.000.\n"
+            "Saldo user berlaku untuk belanja produk dan /otp.")
+
+
+async def handle_owner_wallet_adjustment(message: Message, state: FSMContext, *, subtract: bool = False):
+    if not is_owner(message.from_user.id):
+        return
+    if str(message.chat.type)!="private" or message.chat.id!=message.from_user.id:
+        return await message.answer("Gunakan manajemen saldo melalui chat privat bot.")
+    expected=OwnerState.owner_wallet_subtract.state if subtract else OwnerState.owner_wallet_add.state
+    if await state.get_state()!=expected:
+        return
+    try:
+        target,amount,note=parse_owner_wallet_adjustment(message.text)
+        reference=f"ADMINADJ-{message.bot.id}-{message.from_user.id}-{message.message_id}"
+        result=await asyncio.to_thread(apply_owner_wallet_adjustment,message.from_user.id,
+                                      target,amount,reference,note,subtract=subtract)
+    except ValueError as exc:
+        return await message.answer("❌ "+html.escape(str(exc)),
+                                    reply_markup=back_owner("owner:wallet"),parse_mode="HTML")
+    except PermissionError:
+        return await message.answer("Akses ditolak.")
+    except sqlite3.Error:
+        logging.exception("Owner wallet adjustment database failed")
+        return await message.answer("⚠️ Penyesuaian saldo belum bisa diproses. Coba lagi nanti.",
+                                    reply_markup=back_owner("owner:wallet"))
+    if result["changed"]:
+        owner_audit(message.from_user.id,"WALLET_SUBTRACT" if subtract else "WALLET_ADD","ok",
+                    f"user={result['user_id']} amount={-amount if subtract else amount} ref={reference}")
+    try:
+        await state.clear()
+    except sqlite3.Error:
+        logging.warning("Owner wallet input state could not be cleared after commit")
+    title=("✅ Saldo dikurangi." if subtract else "✅ Saldo ditambahkan.") if result["changed"] else "✅ Transaksi ini sudah diproses."
+    label=(f"@{html.escape(result['username'])} " if result["username"] else "")+f"<code>{result['user_id']}</code>"
+    await message.answer(
+        f"{title}\n\n👤 User: {label}\n"
+        f"💵 Nominal: <b>{rupiah(amount)}</b>\n"
+        f"💰 Saldo sekarang: <b>{rupiah(result['balance'])}</b>\n"
+        f"📝 {html.escape(note)}\n\nSaldo yang sama berlaku untuk produk dan /otp.",
+        reply_markup=owner_wallet_menu(),parse_mode="HTML"
+    )
+
+
 @router.callback_query(F.data == "owner:wallet")
 async def owner_wallet(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
@@ -23381,71 +23784,42 @@ async def owner_wallet(call: CallbackQuery, state: FSMContext):
 async def owner_wallet_add(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
+    if not call.message or str(call.message.chat.type)!="private" or call.message.chat.id!=call.from_user.id:
+        return await call.answer("Gunakan chat privat bot.",show_alert=True)
+    await state.clear()
     await state.set_state(OwnerState.owner_wallet_add)
     await safe_edit_or_answer(call, 
-        "➕ <b>TAMBAH SALDO USER</b>\n\n"
-        "Kirim:\n<code>USER_ID | NOMINAL | CATATAN</code>\n\n"
-        "Contoh:\n<code>123456789 | 50000 | Bonus saldo</code>",
-        reply_markup=back_owner(),
+        owner_wallet_input_prompt(),
+        reply_markup=back_owner("owner:wallet"),
         parse_mode="HTML"
     )
     await call.answer()
 
 
-@router.message(OwnerState.owner_wallet_add)
+@router.message(OwnerState.owner_wallet_add, F.text & ~F.text.startswith("/"))
 async def owner_wallet_add_input(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-    try:
-        uid, amount, note = [x.strip() for x in message.text.split("|", 2)]
-        uid, amount = int(uid), int(amount)
-        if amount <= 0:
-            raise ValueError
-        ref = f"ADMINADD-{int(time.time())}"
-        balance = wallet_change(uid, amount, "ADMIN_ADJUST", ref, note)
-        await state.clear()
-        await message.answer(
-            f"✅ Saldo ditambahkan.\nSaldo user sekarang: {rupiah(balance)}",
-            reply_markup=owner_wallet_menu()
-        )
-    except Exception:
-        await message.answer("❌ Format salah. Contoh: 123456789 | 50000 | Bonus saldo")
+    await handle_owner_wallet_adjustment(message,state)
 
 
 @router.callback_query(F.data == "owner:wallet_sub")
 async def owner_wallet_sub(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
+    if not call.message or str(call.message.chat.type)!="private" or call.message.chat.id!=call.from_user.id:
+        return await call.answer("Gunakan chat privat bot.",show_alert=True)
+    await state.clear()
     await state.set_state(OwnerState.owner_wallet_subtract)
     await safe_edit_or_answer(call, 
-        "➖ <b>KURANGI SALDO USER</b>\n\n"
-        "Kirim:\n<code>USER_ID | NOMINAL | CATATAN</code>",
-        reply_markup=back_owner(),
+        owner_wallet_input_prompt(subtract=True),
+        reply_markup=back_owner("owner:wallet"),
         parse_mode="HTML"
     )
     await call.answer()
 
 
-@router.message(OwnerState.owner_wallet_subtract)
+@router.message(OwnerState.owner_wallet_subtract, F.text & ~F.text.startswith("/"))
 async def owner_wallet_sub_input(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-    try:
-        uid, amount, note = [x.strip() for x in message.text.split("|", 2)]
-        uid, amount = int(uid), int(amount)
-        if amount <= 0:
-            raise ValueError
-        ref = f"ADMINSUB-{int(time.time())}"
-        balance = wallet_change(uid, -amount, "ADMIN_ADJUST", ref, note)
-        await state.clear()
-        await message.answer(
-            f"✅ Saldo dikurangi.\nSaldo user sekarang: {rupiah(balance)}",
-            reply_markup=owner_wallet_menu()
-        )
-    except ValueError as e:
-        await message.answer(f"❌ {str(e) or 'Saldo tidak mencukupi.'}")
-    except Exception:
-        await message.answer("❌ Format salah.")
+    await handle_owner_wallet_adjustment(message,state,subtract=True)
 
 
 @router.callback_query(F.data == "owner:wallet_verify")
@@ -33950,7 +34324,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.82"
+EXPECTED_SOURCE_VERSION = "16.84"
 
 
 def source_integrity_self_test():
