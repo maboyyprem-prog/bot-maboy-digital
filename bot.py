@@ -226,8 +226,8 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.77"
-SCHEMA_VERSION = 188
+BOT_VERSION = "16.78"
+SCHEMA_VERSION = 189
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -299,6 +299,12 @@ STORE_FOOTER = "Aplikasi Premium • Since 2020"
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
+
+# Isolated exact /otp command and smscode_otp: callbacks are registered before
+# state inputs and final fallbacks. Existing commands retain their handlers.
+import sys as _otp_sys
+import otp_smscode
+OTP_STORE = otp_smscode.register(router, otp_smscode.Store(_otp_sys.modules[__name__]))
 START_TIME = time.time()
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
@@ -1485,6 +1491,7 @@ def init_db():
         )
     )
 
+    otp_smscode.init_schema(conn)
     reconcile_all_inventory_stock(conn)
     sync_all_product_sold_from_history(conn)
     conn.commit()
@@ -8769,6 +8776,7 @@ def create_database_backup() -> Path:
 PROJECT_BACKUP_REQUIRED_FILES = (
     "main.py",
     "bot.py",
+    "otp_smscode.py",
 )
 
 PROJECT_BACKUP_OPTIONAL_FILES = (
@@ -8776,6 +8784,8 @@ PROJECT_BACKUP_OPTIONAL_FILES = (
     ".env.example",
     "README.md",
     "VARIABLE_RAILWAY.md",
+    "project_backup.py",
+    "OTP_OPERATIONS.md",
 )
 
 
@@ -33725,6 +33735,7 @@ async def start_web_server(bot: Bot):
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_post("/shopeepay/callback", shopeepay_callback)
+    app.router.add_post("/webhooks/smscode/otp", OTP_STORE.webhook.handle)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -33777,7 +33788,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.77"
+EXPECTED_SOURCE_VERSION = "16.78"
 
 
 def source_integrity_self_test():
@@ -33887,6 +33898,11 @@ async def main():
         asyncio.create_task(periodic_safe_cleanup_loop(), name="periodic_safe_cleanup_loop"),
         asyncio.create_task(smart_owner_alert_loop(bot), name="smart_owner_alert_loop"),
     ]
+    try:
+        background_tasks.extend(await OTP_STORE.start(bot))
+    except Exception as exc:
+        # Integration startup failure must not stop existing shop commands.
+        logging.warning("OTP worker startup failed: %s", type(exc).__name__)
 
     try:
         await bot.delete_webhook(drop_pending_updates=False)
@@ -33923,6 +33939,10 @@ async def main():
         for task in background_tasks:
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
+        try:
+            await OTP_STORE.close()
+        except Exception:
+            logging.warning("OTP client cleanup failed.")
 
         try:
             await runner.cleanup()

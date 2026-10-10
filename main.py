@@ -2,7 +2,7 @@ import asyncio
 import os
 import sys
 
-EXPECTED_VERSION = "16.77"
+EXPECTED_VERSION = "16.78"
 
 import bot
 
@@ -17,7 +17,7 @@ def launcher_self_test():
     if version != EXPECTED_VERSION:
         _fail(
             f"bot.py version mismatch: got={version or '-'} expected={EXPECTED_VERSION}. "
-            "Pastikan main.py DAN bot.py terbaru di-upload ke root repository."
+            "Pastikan main.py, bot.py dan otp_smscode.py dari paket versi yang sama di-upload ke root repository."
         )
 
     if not callable(getattr(bot, "main", None)):
