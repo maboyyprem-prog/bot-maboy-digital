@@ -30,6 +30,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 PREFIX = "smscode_otp:"
+USER_BRAND = "MABOYY OTP STORE"
+ADMIN_BRAND = "MABOYY OTP ADMIN"
 TERMINAL = {"COMPLETED", "CANCELED", "EXPIRED", "FAILED"}
 ACTIVE = {"ACTIVE", "OTP_RECEIVED"}
 DEFINITIVE = {"UNAUTHORIZED", "FORBIDDEN", "VALIDATION_ERROR", "NO_OFFER_AVAILABLE",
@@ -769,7 +771,7 @@ class NotificationQueue:
                 elif job["kind"] == "REFUND":
                     texts = [f"✅ Refund OTP #{order['id']} berhasil: <b>{money(order['refund_idr'])}</b> masuk ke saldo kamu."]
                 else:
-                    texts = ["✅ <b>PEMBELIAN BERHASIL</b>\n"+self.store.ui.order_text(order)+"\n📩 SMS akan dikirim otomatis saat diterima provider."]
+                    texts = ["✅ <b>PEMBELIAN BERHASIL</b>\n"+self.store.ui.order_text(order)+"\n📩 SMS akan dikirim otomatis saat masuk."]
                 for index in range(job["part_index"], len(texts)):
                     if not self.store.repo.execute("UPDATE otp_notifications SET lease_until=? WHERE notification_id=? AND lease_owner=?",
                             (time.time()+120, job["notification_id"], owner)):
@@ -1077,18 +1079,123 @@ class OTPState(StatesGroup):
     admin_value = State()
 
 
+class UserFormatter:
+    """Public shop text; never format internal pricing, API or refund evidence."""
+
+    @staticmethod
+    def label(value):
+        # Catalog labels can contain upstream branding/URLs. SMS bodies and OTP
+        # codes never use this function: their original contents are preserved.
+        text = re.sub(r"https?://[^\s<>]+", "", str(value or ""), flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:[a-z0-9_-]+\.)*smscode\.gg(?:/[^\s<>]*)?", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bsmscode\b(?:\s*\.\s*gg\b)?", "", text, flags=re.IGNORECASE)
+        return " ".join(text.split()).strip(" •|·-/") or "-"
+
+    @staticmethod
+    def status(value):
+        return {"ACTIVE": "Menunggu SMS", "OTP_RECEIVED": "SMS diterima", "COMPLETED": "Selesai",
+                "CANCELED": "Dibatalkan", "EXPIRED": "Kedaluwarsa", "FAILED": "Gagal",
+                "RESERVED": "Sedang diproses", "REQUESTING": "Sedang diproses",
+                "PENDING_RECONCILIATION": "Menunggu kepastian transaksi"}.get(value, "Sedang diperiksa")
+
+    @staticmethod
+    def refund_status(value):
+        return {"NONE": "Belum ada refund", "REFUNDED": "Sudah masuk ke saldo",
+                "AWAITING_PROVIDER_PROOF": "Menunggu konfirmasi pengembalian dana",
+                "PARTIAL_RECONCILIATION": "Pengembalian dana sedang diperiksa",
+                "REVIEW_REQUIRED": "Pengembalian dana sedang diperiksa"}.get(value, "Sedang diperiksa")
+
+    @staticmethod
+    def error(exc):
+        # Select by code, rather than exposing API/config details or arbitrary
+        # exception messages. Admin errors are handled in their own context.
+        if getattr(exc, "code", "") == "FORBIDDEN" and getattr(exc, "public", "") in {
+                "Menu ini hanya untuk owner.", "Akun kamu dibatasi owner."}:
+            return exc.public
+        return {
+            "PRIVATE": "Gunakan /otp melalui chat privat bot.",
+            "CHANNEL": "Akses mengikuti verifikasi channel bot. Buka /start dan ikuti petunjuk bergabung dahulu.",
+            "FORBIDDEN": "Layanan OTP sementara belum tersedia. Hubungi owner.",
+            "NOT_FOUND": "Pesanan atau produk tidak ditemukan.",
+            "USER_BALANCE": "Saldo kamu tidak cukup. Isi saldo melalui menu deposit bot.",
+            "UNAUTHORIZED": "Pembelian OTP sementara belum tersedia. Hubungi owner.",
+            "NOT_CONFIGURED": "Pembelian OTP sementara belum tersedia. Hubungi owner.",
+            "CONFIG": "Pembelian OTP sementara belum tersedia. Hubungi owner.",
+            "ENCRYPTION": "Data SMS sementara tidak tersedia. Hubungi owner.",
+            "INSUFFICIENT_BALANCE": "Nomor sementara tidak dapat dibeli. Saldo yang ditahan untuk pembelian gagal akan dilepas.",
+            "CANCEL_TOO_EARLY": "Nomor belum boleh dibatalkan. Tunggu sampai pembatalan tersedia.",
+            "NO_OFFER_AVAILABLE": "Stok nomor habis atau harga berubah. Pilih produk kembali.",
+            "PRICE_CHANGED": "Harga berubah. Pilih kembali produk untuk menyetujui harga terbaru.",
+            "PRICE_LIMIT": "Produk ini belum tersedia untuk dibeli di toko.",
+            "BELOW_COST": "Harga produk perlu diperbarui. Pilih produk lain atau hubungi owner.",
+            "QUOTE_EXPIRED": "Konfirmasi harga kedaluwarsa. Pilih produk lagi.",
+            "DISABLED": "Pembelian baru sedang ditutup. Pesanan lama tetap dipantau.",
+            "ORDER_LIMIT": "Batas pesanan aktif tercapai. Selesaikan pesanan sebelumnya.",
+            "COOLDOWN": "Batas atau jeda permintaan tercapai. Tunggu sebelum mencoba kembali.",
+            "RATE_LIMIT_EXCEEDED": "Terlalu banyak permintaan. Coba kembali setelah jeda.",
+            "TEMP_BANNED_ABUSE_GUARD": "Layanan meminta jeda penggunaan. Coba kembali nanti.",
+            "REQUEST_IN_PROGRESS": "Transaksi sedang diproses; jangan membeli ulang.",
+            "IDEMPOTENCY_KEY_REUSED": "Transaksi sedang diperiksa; jangan membeli ulang.",
+            "NETWORK": "Hasil permintaan belum pasti. Periksa pesanan dan jangan membeli ulang.",
+            "LOCAL_DATABASE": "Hasil tindakan sedang diperiksa; jangan mengulang.",
+            "CONFLICT": "Tindakan belum tersedia untuk pesanan ini. Cek status pesanan.",
+            "TOKEN": "Tombol kedaluwarsa atau bukan milik kamu. Buka /otp lagi.",
+            "INPUT": "Perintah tidak valid. Gunakan /otp bantuan untuk format yang benar.",
+            "RETENTION": "SMS sudah melewati masa penyimpanan.",
+        }.get(getattr(exc, "code", ""), "Layanan OTP mengalami gangguan sementara. Coba kembali nanti.")
+
+
+class OwnerFormatter:
+    """Private dashboard text; balance is supplied by GET /balance only."""
+
+    @staticmethod
+    def dashboard(*, stats, settings, balance, api_status, attempts, notifications, worker_errors, config_error):
+        return (f"👑 <b>{ADMIN_BRAND}</b>\n📱 Provider: SMSCode.gg (v1 IDR)\n"
+            f"🔌 Status API: {escape(api_status)}\n"
+            f"💰 Saldo provider: {escape(balance)}\n🛒 Total penjualan: {stats['total']}\n"
+            f"✅ Selesai: {stats['completed']} • ⏳ Aktif: {stats['pending']} • ❌ Terminal lain: {stats['canceled']}\n"
+            f"💵 Omzet setelah refund: {money(stats['revenue'])}\n📈 Profit kotor sementara: {money(stats['profit'])}\n"
+            f"📈 Markup: {escape(settings['percent'])}% • Tambahan: {money(settings['fixed'])}\n"
+            f"⚙️ Mode harga: {escape(settings['mode'])}\n"
+            f"⚠️ Refund perlu rekonsiliasi: {stats['refund_review']}\n⏳ Pembelian belum pasti: {attempts}\n"
+            f"📩 Notifikasi pending/gagal: {notifications}\n🛍 Toko: {'ON' if settings['enabled'] else 'OFF'}\n"
+            f"📦 Limit aktif: {settings['max_active']}/user\n🕒 Poll terakhir: {settings['last_poll_at'] or 'belum'}\n"
+            f"Webhook terakhir: {settings['last_webhook_at'] or 'belum'}\n"
+            f"Worker: {escape(worker_errors or settings['last_worker_error']) or 'Tidak ada error tercatat'}\n"
+            f"Config: {escape(config_error) or 'valid'}\n"
+            "OTP dan isi SMS user tidak ditampilkan di dashboard.")
+
+    @staticmethod
+    def dashboard_rows():
+        return [
+            [("💰 SALDO PROVIDER", "admin_balance", {}), ("📊 STATISTIK", "admin_stats", {})],
+            [("💵 HARGA PROVIDER", "admin_prices", {"kind": "provider"}), ("🏷️ HARGA JUAL", "admin_prices", {"kind": "jual"})],
+            [("📈 MARKUP & PROFIT", "admin_profit", {}), ("⚙️ PENGATURAN HARGA", "admin_prices_menu", {})],
+            [("📦 SEMUA ORDER", "admin_orders", {}), ("⏳ PEMBELIAN PENDING", "admin_pending", {})],
+            [("📩 STATUS AUTO SMS", "admin_status", {}), ("📩 WEBHOOK", "admin_webhook", {})],
+            [("🟢 TOKO ON/OFF", "admin_toggle", {}), ("🔄 RETRY NOTIFIKASI GAGAL", "admin_retry", {})],
+            [("🏠 MABOYY OTP", "home", {})]]
+
+
 class UIBuilder:
     def __init__(self, store):
         self.store = store
 
     def keyboard(self, user, rows):
+        if any(action.startswith("admin") for row in rows for _, action, _ in row) and not self.store.host.is_owner(user):
+            raise StoreError("FORBIDDEN", "Menu ini hanya untuk owner.")
         return InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=label[:64], callback_data=self.store.token(user, action, payload))
             for label, action, payload in row] for row in rows])
 
+    def admin_keyboard(self, user, rows):
+        if not self.store.host.is_owner(user):
+            raise StoreError("FORBIDDEN", "Menu ini hanya untuk owner.")
+        return self.keyboard(user, rows)
+
     def home_keyboard(self, user):
-        rows = [[("📱 BELI OTP", "countries", {})], [("🌍 PILIH NEGARA", "countries", {})],
-                [("📦 PESANAN SAYA", "orders", {}), ("🔐 CEK OTP", "orders", {})],
+        rows = [[("📱 BELI NOMOR OTP", "countries", {})], [("🌍 PILIH NEGARA", "countries", {})],
+                [("📦 PESANAN SAYA", "orders", {}), ("🔐 CEK KODE OTP", "orders", {})],
                 [("💰 SALDO SAYA", "balance", {}), ("📜 RIWAYAT", "history", {})],
                 [("❓ BANTUAN", "help", {})]]
         if self.store.host.is_owner(user):
@@ -1097,14 +1204,14 @@ class UIBuilder:
 
     @staticmethod
     def order_text(order):
-        return (f"🆔 Order bot: <b>#{order['id']}</b> • Provider: {order['provider_order_id']}\n"
-                f"🌍 Negara: {escape(order['country_name'])}\n📱 Layanan: {escape(order['platform_name'])}\n"
-                f"📶 Operator: {escape(order['operator_name'])}\n📞 Nomor: <code>{escape(order['phone_number'])}</code>\n"
-                f"💰 Harga: {money(order['selling_price_idr'])}\n⏳ Status: {escape(order['status'])}\n"
+        return (f"🛍️ <b>{USER_BRAND}</b>\n🆔 Order: <b>#{order['id']}</b>\n"
+                f"🌍 Negara: {escape(UserFormatter.label(order['country_name']))}\n📱 Layanan: {escape(UserFormatter.label(order['platform_name']))}\n"
+                f"📶 Operator: {escape(UserFormatter.label(order['operator_name']))}\n📞 Nomor: <code>{escape(order['phone_number'])}</code>\n"
+                f"💰 Harga: {money(order['selling_price_idr'])}\n⏳ Status: {UserFormatter.status(order['status'])}\n"
                 f"🕒 Beli: {datetime.fromtimestamp(order['created_at'],timezone.utc).isoformat(timespec='seconds')}\n"
-                f"⌛ Kedaluwarsa: {escape(order['expires_at']) or '-'}\n"
+                f"⌛ Kedaluwarsa: {escape(UserFormatter.label(order['expires_at']))}\n"
                 + (f"✅ Selesai: {datetime.fromtimestamp(order['completed_at'],timezone.utc).isoformat(timespec='seconds')}\n" if order.get('completed_at') else "")
-                + f"↩️ Refund: {money(order['refund_idr'])} • {escape(order['refund_state'])}")
+                + f"↩️ Refund: {money(order['refund_idr'])} • {UserFormatter.refund_status(order['refund_state'])}")
 
     def order_keyboard(self, order, user):
         oid = {"id": order["id"]}
@@ -1119,14 +1226,14 @@ class UIBuilder:
                 rows.append([("✅ SELESAI", "confirm_finish", oid)])
         elif caps.get("can_reactivate"):
             rows.append([("♻️ AKTIFKAN LAGI", "reactivate", oid)])
-        rows.append([("📦 PESANAN", "orders", {}), ("🏠 TOKO OTP", "home", {})])
+        rows.append([("📦 PESANAN", "orders", {}), ("🏠 MABOYY OTP", "home", {})])
         return self.keyboard(user, rows)
 
     @staticmethod
     def sms_texts(order, payload, revision):
-        header = ("📩 <b>SMS OTP MASUK!</b>\n"
-                  f"📱 {escape(order['platform_name'])} • 🌍 {escape(order['country_name'])}\n"
-                  f"📞 <code>{escape(order['phone_number'])}</code>\n🆔 #{order['id']} • SMS revision {revision}\n")
+        header = (f"🛍️ <b>{USER_BRAND}</b>\n📩 <b>SMS OTP MASUK!</b>\n"
+                  f"📱 {escape(UserFormatter.label(order['platform_name']))} • 🌍 {escape(UserFormatter.label(order['country_name']))}\n"
+                  f"📞 <code>{escape(order['phone_number'])}</code>\n🆔 #{order['id']} • SMS ke-{revision}\n")
         code_parts = []
         if payload.get("otp_code"):
             code = escape(payload["otp_code"])
@@ -1144,8 +1251,8 @@ class UIBuilder:
                 code_parts.append("🔐 KODE VERIFIKASI • #"+str(order["id"])+"\n<pre>"+part+"</pre>")
                 header += "🔐 Kode panjang dikirim lengkap pada pesan berikutnya.\n"
         else:
-            header += "📩 SMS diterima tanpa kode yang dikenali provider.\n"
-        message = payload.get("otp_message") or "Provider belum mengirim isi SMS."
+            header += "📩 SMS diterima tanpa kode verifikasi.\n"
+        message = payload.get("otp_message") or "Isi SMS belum tersedia."
         # Small escaped chunks also handle non-numeric SMS and Telegram's limit.
         chunks, part = [], ""
         for character in message:
@@ -1163,19 +1270,24 @@ class UIBuilder:
 
     async def home(self, message, user):
         settings, api = self.store.settings(), self.store.api
-        if not self.store.config.token:
-            status = "Belum dikonfigurasi"
+        if not self.store.config.token or self.store.config.error:
+            status = "Pembelian belum tersedia"
         elif not settings["enabled"]:
             status = "Pembelian ditutup"
         elif api.last_error:
-            status = "Gangguan: "+api.last_error
+            status = "Gangguan sementara"
         elif time.time()-api.last_ok <= 120:
-            status = "API terhubung (pemeriksaan terakhir)"
+            status = "Siap menerima pesanan (pemeriksaan terakhir)"
         else:
-            status = "Belum diperiksa / pemeriksaan kedaluwarsa"
-        await self.send(message, "<b>TOKO OTP • SMSCode.gg</b>\n\n"
+            status = "Status belum tersedia"
+        profile = self.store.repo.one("SELECT username FROM verified_users WHERE user_id=?", (user,))
+        username = profile["username"] if profile else ""
+        if message.from_user and message.from_user.id == user:
+            username = getattr(message.from_user, "username", "") or username
+        identity = "@"+username.lstrip("@") if username else f"User {user}"
+        await self.send(message, f"🛍️ <b>{USER_BRAND}</b>\n👤 User: {escape(identity)}\n\n"
             f"💰 Saldo Kamu: <b>{money(self.store.host.get_balance(user))}</b>\n"
-            f"📱 Provider: SMSCode.gg\n⚙️ Status: {escape(status)}\n\nSilakan pilih menu:", self.home_keyboard(user))
+            f"🛍️ Status toko: {escape(status)}\n\nSilakan pilih menu:", self.home_keyboard(user))
 
     async def selection(self, message, user, kind, payload=None, query=""):
         self.store.require_ready()
@@ -1185,19 +1297,19 @@ class UIBuilder:
             rows = await self.store.catalog.listing("/catalog/countries")
             rows = [row for row in rows if row.get("active") is True]
             rows = [row for row in rows if query.casefold() in (str(row.get("name"))+str(row.get("code"))).casefold()]
-            buttons = [(str(row.get("emoji") or "🌍")+" "+str(row["name"]), "services",
+            buttons = [(UserFormatter.label(row.get("emoji") or "🌍")+" "+UserFormatter.label(row["name"]), "services",
                         {"country": row["id"], "country_name": row["name"]}) for row in rows]
             title = "🌍 PILIH NEGARA"
         elif kind == "services":
             rows = await self.store.catalog.listing("/catalog/services", {"country_id": payload["country"]})
             rows = [row for row in rows if row.get("active") is True and query.casefold() in str(row.get("name", "")).casefold()]
-            buttons = [(str(row["name"]), "operators", {**payload, "platform": row["id"], "platform_name": row["name"], "page": 0}) for row in rows]
-            title = "📱 PILIH LAYANAN • "+escape(payload.get("country_name"))
+            buttons = [(UserFormatter.label(row["name"]), "operators", {**payload, "platform": row["id"], "platform_name": row["name"], "page": 0}) for row in rows]
+            title = "📱 PILIH LAYANAN • "+escape(UserFormatter.label(payload.get("country_name")))
         elif kind == "operators":
             rows = await self.store.catalog.listing("/catalog/operators", {"country_id": payload["country"], "platform_id": payload["platform"]})
             if not rows:
                 rows = [{"operator_id": None, "name": "Any"}]
-            buttons = [(str(row.get("name") or "Any"), "products", {**payload, "operator": row["operator_id"], "operator_name": row.get("name") or "Any", "page": 0}) for row in rows]
+            buttons = [(UserFormatter.label(row.get("name") or "Any"), "products", {**payload, "operator": row["operator_id"], "operator_name": row.get("name") or "Any", "page": 0}) for row in rows]
             title = "📶 PILIH OPERATOR"
         else:
             rows, more = await self.store.catalog.products(payload["country"], payload["platform"], payload.get("operator"), page+1)
@@ -1211,7 +1323,7 @@ class UIBuilder:
                     buttons.append((f"{money(sale)} • Stok {row['available']}", "quote", {"product": product}))
                 except StoreError:
                     continue
-            title = "🛒 PRODUK TERSEDIA • "+escape(payload["platform_name"])+" / "+escape(payload["country_name"])
+            title = "🛒 PRODUK TERSEDIA • "+escape(UserFormatter.label(payload["platform_name"]))+" / "+escape(UserFormatter.label(payload["country_name"]))
             keyboard_rows = [[button] for button in buttons]
             nav = []
             if page:
@@ -1220,7 +1332,7 @@ class UIBuilder:
                 nav.append(("➡️", kind, {**payload, "page": page+1}))
             if nav:
                 keyboard_rows.append(nav)
-            keyboard_rows.append([("🏠 TOKO OTP", "home", {})])
+            keyboard_rows.append([("🏠 MABOYY OTP", "home", {})])
             return await self.send(message, title+"\n\n"+("Pilih harga nomor:" if buttons else "Belum ada stok pada halaman ini."), self.keyboard(user, keyboard_rows))
         subset = buttons[page*8:(page+1)*8]
         keyboard_rows = [[button] for button in subset]
@@ -1233,15 +1345,15 @@ class UIBuilder:
             keyboard_rows.append(nav)
         if kind in {"countries", "services"}:
             keyboard_rows.append([("🔎 CARI", "search", {"kind": kind, "context": {**payload, "page": 0}})])
-        keyboard_rows.append([("🏠 TOKO OTP", "home", {})])
+        keyboard_rows.append([("🏠 MABOYY OTP", "home", {})])
         await self.send(message, title+f"\nHalaman {page+1} • {len(buttons)} pilihan\n"+("Pilih menu:" if subset else "Tidak ada hasil."), self.keyboard(user, keyboard_rows))
 
     async def quote(self, message, user, quote):
         product = json.loads(quote["product"])
         balance = self.store.host.get_balance(user)
         await self.send(message, "🛒 <b>KONFIRMASI "+("REAKTIVASI" if quote["parent_order_id"] else "PEMBELIAN")+"</b>\n\n"
-            f"🌍 Negara: {escape(product['country_name'])}\n📱 Layanan: {escape(product['platform_name'])}\n"
-            f"📶 Operator: {escape(product.get('operator_name') or 'Any')}\n"
+            f"🌍 Negara: {escape(UserFormatter.label(product['country_name']))}\n📱 Layanan: {escape(UserFormatter.label(product['platform_name']))}\n"
+            f"📶 Operator: {escape(UserFormatter.label(product.get('operator_name') or 'Any'))}\n"
             f"💰 Harga: <b>{money(quote['selling_price_idr'])}</b>\n💳 Saldo: {money(balance)}\n"
             f"Saldo setelah beli: {money(balance-quote['selling_price_idr'])}\n"
             f"⏳ Berlaku {self.store.config.quote_ttl} detik. Pembelian memakai saldo kamu.",
@@ -1254,7 +1366,7 @@ class UIBuilder:
         if not history and not admin:
             clause += " AND status IN ('ACTIVE','OTP_RECEIVED')"
         rows = self.store.repo.rows("SELECT * FROM otp_orders WHERE "+clause+" ORDER BY id DESC LIMIT 6 OFFSET ?", (*args, max(0, page)*5))
-        text, buttons = ["📜 <b>RIWAYAT OTP</b>" if history else "📦 <b>PESANAN OTP</b>"], []
+        text, buttons = [f"👑 <b>{ADMIN_BRAND}</b>\n📦 SEMUA ORDER" if admin else "📜 <b>RIWAYAT OTP</b>" if history else "📦 <b>PESANAN OTP</b>"], []
         for order in rows[:5]:
             if admin:
                 text.append(f"#{order['id']} • Buyer {order['buyer_user_id']} • {escape(order['platform_name'])} • {escape(order['status'])} • {money(order['selling_price_idr'])} • Modal {money(order['provider_cost_idr'])} • Refund {money(order['refund_idr'])}")
@@ -1266,7 +1378,7 @@ class UIBuilder:
         pending = self.store.repo.rows("SELECT attempt_id,state,hold_idr FROM otp_purchase_attempts WHERE user_id=? AND state IN ('RESERVED','REQUESTING','PENDING_RECONCILIATION')", (user,))
         if not admin:
             for item in pending:
-                text.append(f"⏳ {escape(item['state'])} • Saldo ditahan {money(item['hold_idr'])}; jangan membeli ulang.")
+                text.append(f"⏳ {UserFormatter.status(item['state'])} • Saldo ditahan {money(item['hold_idr'])}; jangan membeli ulang.")
         nav, action = [], "admin_orders" if admin else "history" if history else "orders"
         if page:
             nav.append(("⬅️", action, {"page": page-1}))
@@ -1274,8 +1386,8 @@ class UIBuilder:
             nav.append(("➡️", action, {"page": page+1}))
         if nav:
             buttons.append(nav)
-        buttons.append([("🏠 TOKO OTP", "home", {})])
-        await self.send(message, "\n\n".join(text), self.keyboard(user, buttons))
+        buttons.append([("⬅️ ADMIN", "admin", {})] if admin else [("🏠 MABOYY OTP", "home", {})])
+        await self.send(message, "\n\n".join(text), self.admin_keyboard(user, buttons) if admin else self.keyboard(user, buttons))
 
     async def check(self, message, user, order_id):
         order = self.store.repo.owned(user, order_id)
@@ -1294,15 +1406,16 @@ class UIBuilder:
             await self.send(message, "📩 SMS belum diterima atau sudah melewati masa retensi.")
 
 
-HELP = ("❓ <b>PANDUAN TOKO OTP</b>\n\n"
+HELP = (f"🛍️ <b>{USER_BRAND}</b>\n❓ PANDUAN TOKO OTP\n\n"
     "/otp — menu toko\n/otp beli • /otp negara — pilih negara\n/otp layanan — pilih layanan\n"
     "/otp saldo — saldo bot kamu\n/otp pesanan — pesanan aktif\n/otp cek &lt;id&gt; — nomor dan SMS\n"
-    "/otp ulang &lt;id&gt; — resend sesuai aturan provider\n/otp batal &lt;id&gt; — konfirmasi pembatalan\n"
+    "/otp ulang &lt;id&gt; — minta SMS baru jika tersedia\n/otp batal &lt;id&gt; — konfirmasi pembatalan\n"
     "/otp selesai &lt;id&gt; — konfirmasi selesai\n/otp riwayat — riwayat pribadi\n"
     "/otp aktifkan &lt;id&gt; — reaktivasi berbayar jika didukung\n/otp bantuan — panduan\n\n"
     "Gunakan ID order bot (#), bukan ID order orang lain. SMS dikirim otomatis ke chat privat ini. "
     "Saldo ditahan saat pemesanan dan ditagihkan setelah nomor terkonfirmasi. "
-    "Refund penuh hanya setelah refund modal penuh dari provider terbukti. Refund parsial/hasil timeout ditinjau owner.")
+    "Refund masuk ke saldo setelah pembatalan dan pengembalian dana terkonfirmasi. "
+    "Pengembalian dana yang belum pasti ditinjau owner.")
 
 
 class AdminHandler:
@@ -1451,7 +1564,7 @@ class AdminHandler:
                     f"Nonaktif otomatis: {'ya' if data.get('webhook_disabled_at') else 'tidak'}\n"
                     f"Gagal beruntun: {data.get('webhook_consecutive_failures',0)}\n"
                     "Tombol Hubungkan hanya mengatur URL ini jika webhook kosong atau sudah memakai URL bot. Secret tidak ditampilkan.")
-            return await self.store.ui.send(message, text, self.store.ui.keyboard(user, [[("🔗 HUBUNGKAN WEBHOOK", "admin_webhook_connect", {})], [("🧪 TEST WEBHOOK", "admin_webhook_test", {})], [("⬅️ ADMIN", "admin", {})]]))
+            return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [[("🔗 HUBUNGKAN WEBHOOK", "admin_webhook_connect", {})], [("🧪 TEST WEBHOOK", "admin_webhook_test", {})], [("⬅️ ADMIN", "admin", {})]]))
         if section == "harga":
             example = {"id": -1, "price": 8000}
             sale, _ = self.store.pricing.calculate(example)
@@ -1463,7 +1576,7 @@ class AdminHandler:
                 "/otp admin harga set &lt;product_id&gt; &lt;harga&gt;\n/otp admin harga reset &lt;product_id&gt;\n"
                 "/otp admin harga round 100\n/otp admin harga allow-loss on|off\n"
                 "/otp admin harga rule country_service 7:3 kombinasi 25 2000")
-            return await self.store.ui.send(message, text, self.store.ui.keyboard(user, [
+            return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [
                 [("📈 ATUR PERSENTASE", "admin_input", {"setting": "percent"}), ("💵 ATUR NOMINAL", "admin_input", {"setting": "fixed"})],
                 [("⚙️ PILIH MODE", "admin_modes", {})], [("📋 HARGA PROVIDER", "admin_prices", {"kind": "provider"}), ("🛒 HARGA JUAL", "admin_prices", {"kind": "jual"})], [("⬅️ ADMIN", "admin", {})]]))
         stats = self.store.repo.one("""SELECT count(*) total,COALESCE(sum(selling_price_idr-refund_idr),0) revenue,
@@ -1471,37 +1584,24 @@ class AdminHandler:
             COALESCE(sum(status='COMPLETED'),0) completed,COALESCE(sum(status IN ('ACTIVE','OTP_RECEIVED')),0) pending,
             COALESCE(sum(status IN ('CANCELED','EXPIRED','FAILED')),0) canceled,
             COALESCE(sum(refund_state IN ('AWAITING_PROVIDER_PROOF','PARTIAL_RECONCILIATION','REVIEW_REQUIRED')),0) refund_review FROM otp_orders""")
-        balance, connected = "Belum diperiksa", False
+        balance, api_status = "Belum diperiksa", "Belum diperiksa"
         if section in {"dashboard", "saldo", "status"}:
             try:
                 response = await self.store.api.request("GET", "/balance")
-                if response.get("currency") != "IDR":
+                if not isinstance(response, dict) or response.get("currency") != "IDR":
                     raise StoreError("INVALID_RESPONSE")
-                balance, connected = money(integer(response.get("balance"))), True
+                balance, api_status = money(integer(response.get("balance"))), "Terhubung"
             except StoreError as exc:
-                balance = exc.public
+                balance, api_status = "Tidak tersedia", "Tidak terhubung • "+exc.public
+            except Exception as exc:
+                logging.warning("OTP provider balance: %s", type(exc).__name__)
+                balance, api_status = "Tidak tersedia", "Tidak terhubung"
         attempts = self.store.repo.one("SELECT count(*) n FROM otp_purchase_attempts WHERE state IN ('RESERVED','REQUESTING','PENDING_RECONCILIATION')")["n"]
         notifications = self.store.repo.one("SELECT count(*) n FROM otp_notifications WHERE status IN ('PENDING','SENDING','FAILED')")["n"]
         settings = self.store.settings()
-        text = ("⚙️ <b>OTP ADMIN PANEL</b>\n📱 Provider: SMSCode.gg (v1 IDR)\n"
-            f"🔌 API: {'Terhubung' if connected else escape(self.store.api.last_error or 'Belum diperiksa')}\n"
-            f"💰 Saldo provider: {escape(balance)}\n🛒 Total penjualan: {stats['total']}\n"
-            f"✅ Selesai: {stats['completed']} • ⏳ Aktif: {stats['pending']} • ❌ Terminal lain: {stats['canceled']}\n"
-            f"💵 Omzet setelah refund: {money(stats['revenue'])}\n📈 Profit kotor sementara: {money(stats['profit'])}\n"
-            f"⚠️ Refund perlu rekonsiliasi: {stats['refund_review']}\n⏳ Pembelian belum pasti: {attempts}\n"
-            f"📩 Notifikasi pending/gagal: {notifications}\n🛍 Toko: {'ON' if settings['enabled'] else 'OFF'}\n"
-            f"📦 Limit aktif: {settings['max_active']}/user\n🕒 Poll terakhir: {settings['last_poll_at'] or 'belum'}\n"
-            f"Webhook terakhir: {settings['last_webhook_at'] or 'belum'}\n"
-            f"Worker: {escape(worker_errors or settings['last_worker_error']) or 'Tidak ada error tercatat'}\n"
-            f"Config: {escape(self.store.config.error) or 'valid'}\n"
-            "OTP dan isi SMS user tidak ditampilkan di dashboard.")
-        await self.store.ui.send(message, text, self.store.ui.keyboard(user, [
-            [("⚙️ HARGA", "admin_prices_menu", {}), ("💰 SALDO PROVIDER", "admin_balance", {})],
-            [("📊 STATISTIK", "admin_stats", {}), ("📦 SEMUA ORDER", "admin_orders", {})],
-            [("📈 PROFIT", "admin_profit", {}), ("🔌 STATUS API", "admin_status", {})],
-            [("⏳ PEMBELIAN PENDING", "admin_pending", {})],
-            [("📩 WEBHOOK", "admin_webhook", {}), ("🟢 TOKO ON/OFF", "admin_toggle", {})],
-            [("🔄 RETRY NOTIFIKASI GAGAL", "admin_retry", {})], [("🏠 TOKO OTP", "home", {})]]))
+        text = OwnerFormatter.dashboard(stats=stats, settings=settings, balance=balance, api_status=api_status,
+            attempts=attempts, notifications=notifications, worker_errors=worker_errors, config_error=self.store.config.error)
+        await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, OwnerFormatter.dashboard_rows()))
 
     @staticmethod
     def number(value, low, high):
@@ -1530,13 +1630,18 @@ def register(router, store):
             username = getattr(message.from_user, "username", "") or username
         store.host.mark_user_verified(user, username)
 
-    async def failure(message, exc):
-        text = exc.public if isinstance(exc, StoreError) else "Layanan OTP mengalami gangguan sementara. Command lain tetap tersedia."
+    async def failure(message, exc, *, user=None, admin_context=False):
+        text = (exc.public if admin_context and store.host.is_owner(user) and isinstance(exc, StoreError)
+                else UserFormatter.error(exc))
         if not isinstance(exc, StoreError):
             logging.warning("OTP handler: %s", type(exc).__name__)
         await store.ui.send(message, "⚠️ "+escape(text))
 
     async def dispatch(message, user, action, payload, state):
+        # Apply this before every admin action, including history pagination and
+        # previously issued callbacks whose owner's role may have been revoked.
+        if action.startswith("admin"):
+            admin.authorize(user)
         if action in {"home", "help", "balance", "countries", "orders", "history"}:
             await state.clear()
         if action == "home":
@@ -1565,7 +1670,7 @@ def register(router, store):
                 order = store.repo.one("SELECT * FROM otp_orders WHERE attempt_id=?", (attempt["attempt_id"],))
                 await store.ui.send(message, "✅ Nomor berhasil dibeli. Detail akan dikirim otomatis. Order #"+str(order["id"])+".", store.ui.order_keyboard(order, user))
             elif attempt["state"] == "FAILED":
-                await store.ui.send(message, "❌ Pembelian gagal. Saldo yang ditahan telah dilepas. "+escape(StoreError(attempt["error_code"]).public))
+                await store.ui.send(message, "❌ Pembelian gagal. Saldo yang ditahan telah dilepas. "+escape(UserFormatter.error(StoreError(attempt["error_code"]))))
             else:
                 await store.ui.send(message, "⏳ Pembelian sedang direkonsiliasi. Saldo ditahan untuk transaksi ini. Jangan membeli ulang; hasil akan dikirim otomatis.")
         elif action == "check":
@@ -1574,11 +1679,11 @@ def register(router, store):
             order = store.repo.owned(user, payload["id"])
             kind = action.removeprefix("confirm_")
             await store.ui.send(message, "Konfirmasi "+("pembatalan" if kind == "cancel" else "penyelesaian")+f" order #{order['id']}?\n"
-                + ("Refund diproses hanya setelah provider mengonfirmasi refund modal penuh." if kind == "cancel" else "Order selesai tidak mendapat refund."),
+                + ("Refund diproses setelah pembatalan dan pengembalian dana terkonfirmasi." if kind == "cancel" else "Order selesai tidak mendapat refund."),
                 store.ui.keyboard(user, [[("✅ KONFIRMASI", kind, {"id": order["id"]})], [("⬅️ KEMBALI", "check", {"id": order["id"]})]]))
         elif action in {"cancel", "finish", "resend"}:
             await store.orders.action(user, payload["id"], action)
-            await store.ui.send(message, "✅ "+{"cancel": "Provider menerima pembatalan. Status refund tersedia di pesanan.", "finish": "Order selesai.", "resend": "Resend diterima. Tunggu SMS revision baru; SMS lama tidak dikirim ulang."}[action])
+            await store.ui.send(message, "✅ "+{"cancel": "Pembatalan diterima. Status refund tersedia di pesanan.", "finish": "Order selesai.", "resend": "Permintaan SMS baru diterima. Tunggu SMS berikutnya; SMS lama tidak dikirim ulang."}[action])
         elif action == "reactivate":
             parent = store.repo.owned(user, payload["id"])
             product = {"id": parent["product_id"], "catalog_product_id": parent["catalog_product_id"], "country_id": parent["country_id"], "platform_id": parent["platform_id"],
@@ -1594,7 +1699,7 @@ def register(router, store):
             elif action == "admin_toggle":
                 await admin.handle(message, user, ["off" if store.settings()["enabled"] else "on"])
             elif action == "admin_modes":
-                await store.ui.send(message, "Pilih mode harga:", store.ui.keyboard(user, [[(name, "admin_set_mode", {"mode": mode})] for name, mode in [("Persentase", "persen"), ("Nominal", "nominal"), ("Kombinasi", "kombinasi")]]))
+                await store.ui.send(message, "Pilih mode harga:", store.ui.admin_keyboard(user, [[(name, "admin_set_mode", {"mode": mode})] for name, mode in [("Persentase", "persen"), ("Nominal", "nominal"), ("Kombinasi", "kombinasi")]]))
             elif action == "admin_set_mode":
                 await admin.handle(message, user, ["markup", "mode", payload["mode"]])
             elif action == "admin_input":
@@ -1613,6 +1718,7 @@ def register(router, store):
 
     @router.message(Command("otp"))
     async def otp_command(message, state):
+        user, admin_context = None, False
         try:
             user = message.from_user.id
             await guard(message, user)
@@ -1621,7 +1727,8 @@ def register(router, store):
             args = text.split()[1:]
             if len(text) > 1024 or len(args) > 10:
                 raise StoreError("INPUT", "Command terlalu panjang.")
-            if args and args[0].lower() == "admin":
+            admin_context = bool(args and args[0].lower() == "admin")
+            if admin_context:
                 await admin.handle(message, user, args[1:])
                 return
             name = args[0].lower() if args else ""
@@ -1635,10 +1742,11 @@ def register(router, store):
                 payload["id"] = admin.number(args[1], 1, 2**31-1)
             await dispatch(message, user, action, payload, state)
         except Exception as exc:
-            await failure(message, exc)
+            await failure(message, exc, user=user, admin_context=admin_context)
 
     @router.callback_query(F.data.startswith(PREFIX))
     async def otp_callback(call, state):
+        action = ""
         try:
             user = call.from_user.id
             await guard(call.message, user)
@@ -1649,7 +1757,7 @@ def register(router, store):
         except Exception as exc:
             await call.answer("Permintaan OTP belum berhasil.", show_alert=True)
             if call.message and str(call.message.chat.type) == "private" and call.message.chat.id == call.from_user.id:
-                await failure(call.message, exc)
+                await failure(call.message, exc, user=call.from_user.id, admin_context=action.startswith("admin"))
 
     @router.message(OTPState.search, F.text & ~F.text.startswith("/"))
     async def otp_search(message, state):
@@ -1660,7 +1768,7 @@ def register(router, store):
             await state.clear()
             await store.ui.selection(message, message.from_user.id, data["kind"], data["context"], (message.text or "")[:80])
         except Exception as exc:
-            await failure(message, exc)
+            await failure(message, exc, user=message.from_user.id)
 
     @router.message(OTPState.admin_value, F.text & ~F.text.startswith("/"))
     async def otp_admin_input(message, state):
@@ -1671,6 +1779,6 @@ def register(router, store):
             await admin.handle(message, message.from_user.id, ["markup", "persen" if key == "percent" else "nominal", (message.text or "").strip()])
             await state.clear()
         except Exception as exc:
-            await failure(message, exc)
+            await failure(message, exc, user=message.from_user.id, admin_context=True)
 
     return store
