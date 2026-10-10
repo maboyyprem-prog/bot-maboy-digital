@@ -25,9 +25,10 @@ import aiohttp
 from aiohttp import web
 from Crypto.Cipher import AES
 from aiogram import F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 PREFIX = "smscode_otp:"
 USER_BRAND = "MABOYY OTP STORE"
@@ -54,6 +55,15 @@ def money(value):
 
 def escape(value):
     return html.escape(str(value or ""))
+
+
+def qr_image(content):
+    """Render the actual gateway QR content locally, without a third-party URL."""
+    from io import BytesIO
+    import qrcode
+    output = BytesIO()
+    qrcode.make(content).save(output, format="PNG")
+    return output.getvalue()
 
 
 def timestamp(value):
@@ -178,6 +188,13 @@ def init_schema(conn):
            state TEXT NOT NULL,provider_order_id INTEGER UNIQUE,hold_idr INTEGER NOT NULL CHECK(hold_idr>=0),
            created_at REAL NOT NULL,updated_at REAL NOT NULL,next_retry_at REAL NOT NULL DEFAULT 0,
            retries INTEGER NOT NULL DEFAULT 0,lease_owner TEXT,lease_until REAL NOT NULL DEFAULT 0,error_code TEXT)""",
+        """CREATE TABLE IF NOT EXISTS otp_payments(payment_id TEXT PRIMARY KEY,quote_id TEXT NOT NULL UNIQUE,
+           user_id INTEGER NOT NULL,method TEXT NOT NULL,state TEXT NOT NULL,amount_idr INTEGER NOT NULL CHECK(amount_idr>0),
+           payment_total_idr INTEGER NOT NULL CHECK(payment_total_idr>=amount_idr),topup_id INTEGER UNIQUE,
+           partner_reference TEXT NOT NULL UNIQUE,qr_url TEXT NOT NULL DEFAULT '',qr_payload TEXT NOT NULL DEFAULT '',qr_message_id INTEGER,
+           qr_delivery_state TEXT NOT NULL DEFAULT 'PENDING',attempt_id TEXT UNIQUE,created_at REAL NOT NULL,
+           expires_at REAL NOT NULL,paid_at REAL,updated_at REAL NOT NULL,next_retry_at REAL NOT NULL DEFAULT 0,
+           retries INTEGER NOT NULL DEFAULT 0,error_code TEXT,lease_owner TEXT,lease_until REAL NOT NULL DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS otp_orders(id INTEGER PRIMARY KEY AUTOINCREMENT,buyer_user_id INTEGER NOT NULL,
            provider_order_id INTEGER NOT NULL UNIQUE,parent_order_id INTEGER,attempt_id TEXT NOT NULL UNIQUE,
            country_id INTEGER,platform_id INTEGER,operator_id INTEGER,product_id INTEGER,catalog_product_id INTEGER,
@@ -209,6 +226,8 @@ def init_schema(conn):
         """CREATE TABLE IF NOT EXISTS otp_worker_leases(name TEXT PRIMARY KEY,owner TEXT NOT NULL,until_ts REAL NOT NULL)""",
         "CREATE INDEX IF NOT EXISTS idx_otp_user_orders ON otp_orders(buyer_user_id,status,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_otp_attempt_due ON otp_purchase_attempts(state,next_retry_at,lease_until)",
+        "CREATE INDEX IF NOT EXISTS idx_otp_payment_due ON otp_payments(state,next_retry_at,lease_until)",
+        "CREATE INDEX IF NOT EXISTS idx_otp_user_payments ON otp_payments(user_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_otp_notification_due ON otp_notifications(status,next_retry_at,lease_until)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_otp_action_pending ON otp_actions(order_id) WHERE state IN ('REQUESTING','PENDING_RECONCILIATION')",
     ]
@@ -217,6 +236,8 @@ def init_schema(conn):
     # A restart after a partially deployed 16.78 remains additive/idempotent.
     if "provider_refund_idr" not in {row[1] for row in conn.execute("PRAGMA table_info(otp_orders)")}:
         conn.execute("ALTER TABLE otp_orders ADD COLUMN provider_refund_idr INTEGER NOT NULL DEFAULT 0")
+    if "qr_payload" not in {row[1] for row in conn.execute("PRAGMA table_info(otp_payments)")}:
+        conn.execute("ALTER TABLE otp_payments ADD COLUMN qr_payload TEXT NOT NULL DEFAULT ''")
 
 
 class APIClient:
@@ -402,8 +423,8 @@ class CatalogService:
             raise StoreError("INVALID_RESPONSE")
         return rows
 
-    async def products(self, country, platform, operator=None, page=1):
-        params = {"country_id": country, "platform_id": platform, "page": page, "limit": 50, "sort": "price_asc"}
+    async def products(self, country, platform, operator=None, page=1, *, limit=50):
+        params = {"country_id": country, "platform_id": platform, "page": page, "limit": limit, "sort": "price_asc"}
         if operator is not None:
             params["operator_id"] = operator
         raw = await self.listing("/catalog/products", params)
@@ -411,7 +432,7 @@ class CatalogService:
                 and row["available"] > 0 and row.get("country_id") == country
                 and row.get("platform_id") == platform and row.get("operator_id") == operator
                 and isinstance(row.get("catalog_product_id"), int)]
-        return rows, len(raw) == 50
+        return rows, len(raw) >= limit
 
     async def live_product(self, product):
         for page in range(1, 201):
@@ -449,16 +470,8 @@ class PurchaseService:
                 time.time()+self.store.config.quote_ttl))
         return self.store.repo.one("SELECT * FROM otp_quotes WHERE quote_id=?", (quote_id,))
 
-    async def buy(self, user, quote_id):
-        self.store.require_ready()
-        quote = self.store.repo.one("SELECT * FROM otp_quotes WHERE quote_id=? AND buyer_user_id=?", (quote_id, user))
-        if not quote:
-            raise StoreError("NOT_FOUND")
-        existing = self.store.repo.one("SELECT * FROM otp_purchase_attempts WHERE quote_id=?", (quote_id,))
-        if existing:
-            return existing
-        if quote["status"] != "OPEN" or quote["expires_at"] <= time.time():
-            raise StoreError("QUOTE_EXPIRED", "Konfirmasi harga kedaluwarsa. Pilih produk lagi.")
+    async def revalidate(self, user, quote):
+        quote_id = quote["quote_id"]
         product = json.loads(quote["product"])
         parent = self.store.repo.owned(user, quote["parent_order_id"]) if quote["parent_order_id"] else None
         if parent:
@@ -471,13 +484,35 @@ class PurchaseService:
             fresh = await self.store.catalog.live_product(product)
             cost = integer(fresh["price"])
         sale, rule = self.store.pricing.calculate(product, cost)
+        if cost > self.store.config.max_cost:
+            raise StoreError("PRICE_LIMIT")
         if cost != quote["provider_price_idr"] or sale != quote["selling_price_idr"] or rule != quote["pricing_rule_snapshot"]:
-            self.store.repo.execute("UPDATE otp_quotes SET status='PRICE_CHANGED' WHERE quote_id=?", (quote_id,))
+            self.store.repo.execute("UPDATE otp_quotes SET status='PRICE_CHANGED' WHERE quote_id=? AND status IN ('OPEN','PAYMENT_PENDING')", (quote_id,))
             raise StoreError("PRICE_CHANGED", "Harga berubah. Pilih kembali produk untuk menyetujui harga terbaru.")
         body = {"id": parent["provider_order_id"], "max_price": cost} if parent else {
             "catalog_product_id": product["catalog_product_id"], "quantity": 1, "max_price": cost}
         if not parent and product.get("operator_id") is not None:
             body["operator_id"] = product["operator_id"]
+        return body
+
+    async def buy(self, user, quote_id, *, payment_id=None):
+        self.store.payments.require_checkout(user)
+        quote = self.store.repo.one("SELECT * FROM otp_quotes WHERE quote_id=? AND buyer_user_id=?", (quote_id, user))
+        if not quote:
+            raise StoreError("NOT_FOUND")
+        existing = self.store.repo.one("SELECT * FROM otp_purchase_attempts WHERE quote_id=?", (quote_id,))
+        if existing:
+            return existing
+        funded = self.store.payments.owned(user, payment_id) if payment_id else None
+        if funded:
+            if funded["quote_id"] != quote_id or funded["state"] != "PAID" or quote["status"] != "PAYMENT_PENDING":
+                raise StoreError("PAYMENT_PENDING")
+        elif quote["status"] == "PAYMENT_PENDING":
+            raise StoreError("PAYMENT_PENDING")
+        elif quote["status"] != "OPEN" or quote["expires_at"] <= time.time():
+            raise StoreError("QUOTE_EXPIRED", "Konfirmasi harga kedaluwarsa. Pilih produk lagi.")
+        body = await self.revalidate(user, quote)
+        sale = quote["selling_price_idr"]
         attempt_id, key, now = secrets.token_urlsafe(18), secrets.token_hex(24), time.time()
         with self.store.repo.connection(True) as conn:
             duplicate = conn.execute("SELECT * FROM otp_purchase_attempts WHERE quote_id=?", (quote_id,)).fetchone()
@@ -487,7 +522,14 @@ class PurchaseService:
             if not settings["enabled"]:
                 raise StoreError("DISABLED", "Pembelian baru sedang ditutup owner.")
             live_quote = conn.execute("SELECT * FROM otp_quotes WHERE quote_id=?", (quote_id,)).fetchone()
-            if live_quote["status"] != "OPEN" or live_quote["expires_at"] <= now:
+            if funded:
+                payment = conn.execute("SELECT * FROM otp_payments WHERE payment_id=? AND user_id=? AND quote_id=?",
+                                       (payment_id, user, quote_id)).fetchone()
+                if not payment or payment["state"] != "PAID" or payment["amount_idr"] != sale or live_quote["status"] != "PAYMENT_PENDING":
+                    raise StoreError("PAYMENT_PENDING")
+            elif live_quote["status"] == "PAYMENT_PENDING":
+                raise StoreError("PAYMENT_PENDING")
+            elif live_quote["status"] != "OPEN" or live_quote["expires_at"] <= now:
                 raise StoreError("QUOTE_EXPIRED", "Konfirmasi kedaluwarsa. Pilih produk lagi.")
             active = conn.execute("SELECT count(*) FROM otp_orders WHERE buyer_user_id=? AND status IN ('ACTIVE','OTP_RECEIVED')", (user,)).fetchone()[0]
             pending = conn.execute("SELECT count(*) FROM otp_purchase_attempts WHERE user_id=? AND state IN ('RESERVED','REQUESTING','PENDING_RECONCILIATION')", (user,)).fetchone()[0]
@@ -497,11 +539,18 @@ class PurchaseService:
             latest = conn.execute("SELECT max(created_at) FROM otp_purchase_attempts WHERE user_id=?", (user,)).fetchone()[0]
             if recent >= settings["hourly_limit"] or latest and now-latest < settings["purchase_cooldown"]:
                 raise StoreError("COOLDOWN", "Batas/jeda pembelian tercapai. Tunggu sebelum membeli lagi.")
+            if funded:
+                # Move the payment hold to the existing purchase hold in the
+                # same transaction. No available-wallet window or second debit.
+                WalletAdapter.change(conn, user, "OTP_QRIS_RESERVE_RELEASE", sale, "OTPQRIS:"+payment_id)
             WalletAdapter.change(conn, user, "OTP_HOLD", -sale, "OTP:"+attempt_id)
             conn.execute("""INSERT INTO otp_purchase_attempts(attempt_id,quote_id,user_id,idempotency_key,request_body,
                  request_hash,state,hold_idr,created_at,updated_at) VALUES(?,?,?,?,?,?,'RESERVED',?,?,?)""",
                  (attempt_id, quote_id, user, key, encoded(body), hashlib.sha256(encoded(body).encode()).hexdigest(), sale, now, now))
             conn.execute("UPDATE otp_quotes SET status='RESERVED' WHERE quote_id=?", (quote_id,))
+            if funded:
+                conn.execute("UPDATE otp_payments SET state='BUYING',attempt_id=?,updated_at=? WHERE payment_id=?",
+                             (attempt_id, now, payment_id))
         await self.process(attempt_id)
         return self.store.repo.one("SELECT * FROM otp_purchase_attempts WHERE attempt_id=?", (attempt_id,))
 
@@ -587,6 +636,234 @@ class PurchaseService:
         self.store.repo.execute("""UPDATE otp_purchase_attempts SET state='PENDING_RECONCILIATION',error_code=?,
             retries=retries+1,next_retry_at=?,lease_owner=NULL,lease_until=0,updated_at=? WHERE attempt_id=? AND lease_owner=?""",
             (code, time.time()+delay, time.time(), attempt["attempt_id"], owner))
+
+
+class PaymentService:
+    """Bind existing QRIS verification to a durable OTP quote and wallet hold."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def owned(self, user, payment_id):
+        row = self.store.repo.one("SELECT * FROM otp_payments WHERE payment_id=? AND user_id=?", (payment_id, user))
+        if not row:
+            raise StoreError("NOT_FOUND")
+        return row
+
+    @staticmethod
+    def queue_notice(conn, payment):
+        conn.execute("""INSERT OR IGNORE INTO otp_notifications(dedup_key,order_id,provider_order_id,sms_revision,user_id,kind)
+            VALUES(?,0,0,0,?,'PAYMENT')""", ("PAYMENT:"+payment["payment_id"], payment["user_id"]))
+
+    def require_checkout(self, user):
+        self.store.require_ready()
+        if not self.store.host.is_owner(user) and (self.store.host.safe_mode_enabled() or self.store.host.maintenance_enabled()):
+            raise StoreError("PAYMENT_UNAVAILABLE", "Pembayaran sementara ditahan. Coba kembali nanti.")
+
+    async def create(self, user, quote_id):
+        self.require_checkout(user)
+        quote = self.store.repo.one("SELECT * FROM otp_quotes WHERE quote_id=? AND buyer_user_id=?", (quote_id, user))
+        if not quote:
+            raise StoreError("NOT_FOUND")
+        existing = self.store.repo.one("SELECT * FROM otp_payments WHERE quote_id=? AND user_id=?", (quote_id, user))
+        if existing:
+            return existing
+        if quote["status"] != "OPEN" or quote["expires_at"] <= time.time():
+            raise StoreError("QUOTE_EXPIRED")
+        await self.store.purchase.revalidate(user, quote)
+        amount = integer(quote["selling_price_idr"], 1)
+        auto = self.store.host.shopeepay_ready()
+        if not auto and not self.store.host.get_setting("qris_file_id", ""):
+            raise StoreError("PAYMENT_UNAVAILABLE", "QRIS belum tersedia. Gunakan Buy Saldo atau hubungi owner.")
+        payment_id, reference, now = secrets.token_urlsafe(18), "OTP-"+secrets.token_hex(12), time.time()
+        with self.store.repo.connection(True) as conn:
+            previous = conn.execute("SELECT * FROM otp_payments WHERE quote_id=?", (quote_id,)).fetchone()
+            if previous:
+                return dict(previous)
+            live = conn.execute("SELECT * FROM otp_quotes WHERE quote_id=? AND buyer_user_id=?", (quote_id, user)).fetchone()
+            if not live or live["status"] != "OPEN" or live["expires_at"] <= now:
+                raise StoreError("QUOTE_EXPIRED")
+            settings = self.store.settings(conn)
+            if not settings["enabled"]:
+                raise StoreError("DISABLED")
+            active = conn.execute("SELECT count(*) FROM otp_orders WHERE buyer_user_id=? AND status IN ('ACTIVE','OTP_RECEIVED')", (user,)).fetchone()[0]
+            attempts = conn.execute("SELECT count(*) FROM otp_purchase_attempts WHERE user_id=? AND state IN ('RESERVED','REQUESTING','PENDING_RECONCILIATION')", (user,)).fetchone()[0]
+            waiting = conn.execute("SELECT count(*) FROM otp_payments WHERE user_id=? AND state IN ('CREATING','CREATE_UNKNOWN','PENDING','PAID')", (user,)).fetchone()[0]
+            if active+attempts+waiting >= settings["max_active"]:
+                raise StoreError("ORDER_LIMIT")
+            topup_id, total, expires = None, amount, now+900
+            if not auto:
+                code = self.store.host.unique_code_for_order(conn)
+                profile = conn.execute("SELECT username FROM verified_users WHERE user_id=?", (user,)).fetchone()
+                expiry = self.store.host.topup_expiry_iso()
+                topup = conn.execute("""INSERT INTO topups(user_id,username,amount,unique_code,payment_total,
+                    payment_method,status,created_at,expires_at) VALUES(?,?,?,?,?,'QRIS_MANUAL','pending',?,?)""",
+                    (user, profile["username"] if profile else "", amount, code, amount+code,
+                     datetime.now().isoformat(timespec='seconds'), expiry))
+                topup_id, total = topup.lastrowid, amount+code
+                expires = self.store.host.parse_stored_datetime(expiry).timestamp()
+                reference = self.store.host.topup_invoice(topup_id)
+            conn.execute("""INSERT INTO otp_payments(payment_id,quote_id,user_id,method,state,amount_idr,payment_total_idr,
+                topup_id,partner_reference,created_at,expires_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (payment_id, quote_id, user, "AUTO_QRIS" if auto else "QRIS_MANUAL", "CREATING" if auto else "PENDING",
+                 amount, total, topup_id, reference, now, expires, now))
+            conn.execute("UPDATE otp_quotes SET status='PAYMENT_PENDING' WHERE quote_id=?", (quote_id,))
+        if auto:
+            try:
+                result = await self.store.host.shopeepay_generate_qr(0, amount, partner_reference=reference)
+                if not isinstance(result, dict) or result.get("partner_reference") != reference:
+                    raise StoreError("INVALID_RESPONSE", uncertain=True)
+                url = str(result.get("qr_url") or "")
+                content = result.get("qr_content") or ""
+                if url and (urlparse(url).scheme != "https" or not urlparse(url).netloc):
+                    raise StoreError("INVALID_RESPONSE", uncertain=True)
+                if not isinstance(content, str) or len(content.encode()) > 2048 or not (url or content):
+                    raise StoreError("INVALID_RESPONSE", uncertain=True)
+                encrypted = self.store.encrypt({"qr_content": content}) if content else ""
+                # Commit only the original request's result; a callback can have
+                # settled the payment while the generate response was in flight.
+                self.store.repo.execute("UPDATE otp_payments SET qr_url=?,qr_payload=?,state=CASE WHEN state='CREATING' THEN 'PENDING' ELSE state END,updated_at=? WHERE payment_id=?",
+                    (url, encrypted, time.time(), payment_id))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The gateway has no verified idempotent retry adapter here.
+                # Never create a second invoice after a timeout/lost response.
+                self.store.repo.execute("UPDATE otp_payments SET state='CREATE_UNKNOWN',error_code=?,updated_at=? WHERE payment_id=? AND state='CREATING'",
+                    (type(exc).__name__, time.time(), payment_id))
+        return self.owned(user, payment_id)
+
+    def settle(self, conn, payment, *, already_credited=False):
+        if payment["paid_at"] is not None:
+            return
+        reference, amount, now = "OTPQRIS:"+payment["payment_id"], payment["amount_idr"], time.time()
+        if not already_credited:
+            WalletAdapter.change(conn, payment["user_id"], "TOPUP", amount, reference)
+        eligible = payment["state"] in {"PENDING", "CREATING", "CREATE_UNKNOWN"} and now <= payment["expires_at"]
+        if eligible:
+            WalletAdapter.change(conn, payment["user_id"], "OTP_QRIS_HOLD", -amount, reference)
+        state = "PAID" if eligible else "WALLET_CREDITED"
+        conn.execute("UPDATE otp_payments SET state=?,paid_at=?,updated_at=?,error_code=?,next_retry_at=0 WHERE payment_id=?",
+                     (state, now, now, "" if eligible else "LATE_PAYMENT", payment["payment_id"]))
+        if not eligible:
+            self.queue_notice(conn, payment)
+
+    def accept_topup(self, conn, topup):
+        """Called inside the host's successful TOPUP credit transaction only."""
+        payment = conn.execute("SELECT * FROM otp_payments WHERE topup_id=?", (topup["id"],)).fetchone()
+        if not payment:
+            return False
+        if payment["method"] != "QRIS_MANUAL" or payment["user_id"] != topup["user_id"] or payment["amount_idr"] != topup["amount"] or payment["payment_total_idr"] != topup["payment_total"]:
+            raise sqlite3.IntegrityError("OTP payment mapping mismatch")
+        self.settle(conn, dict(payment), already_credited=True)
+        return True
+
+    async def notify_topup_receipt(self, bot, topup_id):
+        payment = self.store.repo.one("SELECT * FROM otp_payments WHERE topup_id=?", (topup_id,))
+        if not payment:
+            return False
+        if payment["state"] != "PAID":
+            # Late payment outcomes already have a durable wallet notification.
+            return True
+        await bot.send_message(payment["user_id"], f"🛍️ <b>{USER_BRAND}</b>\n✅ Pembayaran QRIS terkonfirmasi\n"
+            f"🧾 {escape(payment['partner_reference'])} • {money(payment['amount_idr'])}\nNomor sedang diproses; hasil dikirim otomatis.",
+            parse_mode="HTML", reply_markup=self.store.ui.keyboard(payment["user_id"], [[("📦 PESANAN OTP", "orders", {})]]))
+        return True
+
+    def gateway_callback(self, payload):
+        """The host verifies the existing gateway RSA signature before routing."""
+        try:
+            reference = payload.get("originalPartnerReferenceNo")
+            amount = payload.get("amount")
+            if not isinstance(amount, dict) or amount.get("currency") != "IDR":
+                raise ValueError
+            value = Decimal(str(amount.get("value")))
+            if not value.is_finite() or value != value.to_integral_value() or not 0 < value <= 10**12:
+                raise ValueError
+            with self.store.repo.connection(True) as conn:
+                row = conn.execute("SELECT * FROM otp_payments WHERE partner_reference=? AND method='AUTO_QRIS'", (reference,)).fetchone()
+                if not row:
+                    return web.json_response({"responseCode":"4045600","responseMessage":"Invoice Not Found"}, status=404)
+                if int(value) != row["payment_total_idr"]:
+                    raise ValueError
+                if payload.get("latestTransactionStatus") == "00":
+                    self.settle(conn, dict(row))
+            return web.json_response({"responseCode":"2005600","responseMessage":"Successful"})
+        except (InvalidOperation, ValueError, TypeError):
+            return web.json_response({"responseCode":"4005600","responseMessage":"Reference/Amount Mismatch"}, status=400)
+        except sqlite3.Error:
+            return web.json_response({"responseCode":"5035600","responseMessage":"Retry Later"}, status=503)
+
+    def release_to_wallet(self, payment_id, code):
+        with self.store.repo.connection(True) as conn:
+            row = conn.execute("SELECT * FROM otp_payments WHERE payment_id=?", (payment_id,)).fetchone()
+            if not row or row["state"] != "PAID":
+                return
+            WalletAdapter.change(conn, row["user_id"], "OTP_QRIS_RELEASE", row["amount_idr"], "OTPQRIS:"+payment_id)
+            conn.execute("UPDATE otp_payments SET state='WALLET_CREDITED',error_code=?,updated_at=?,lease_owner=NULL,lease_until=0 WHERE payment_id=?",
+                         (code, time.time(), payment_id))
+            conn.execute("UPDATE otp_quotes SET status='PAYMENT_CLOSED' WHERE quote_id=? AND status='PAYMENT_PENDING'", (row["quote_id"],))
+            self.queue_notice(conn, dict(row))
+
+    async def reconcile(self):
+        if not self.store.lease("payments", max(60, self.store.config.timeout+30)):
+            return
+        now = time.time()
+        waiting = self.store.repo.rows("SELECT * FROM otp_payments WHERE state IN ('CREATING','CREATE_UNKNOWN','PENDING') ORDER BY created_at LIMIT 100")
+        for row in waiting:
+            topup = self.store.repo.one("SELECT * FROM topups WHERE id=?", (row["topup_id"],)) if row["topup_id"] else None
+            if topup and topup["status"] == "completed":
+                # Compatibility with a host deployed without the atomic bridge:
+                # money is already available in its wallet, so do not debit it.
+                with self.store.repo.connection(True) as conn:
+                    changed = conn.execute("UPDATE otp_payments SET state='WALLET_CREDITED',paid_at=?,updated_at=?,error_code='CREDIT_ALREADY_AVAILABLE' WHERE payment_id=? AND paid_at IS NULL",
+                                           (now, now, row["payment_id"])).rowcount
+                    if changed:
+                        self.queue_notice(conn, row)
+                continue
+            closed = topup and topup["status"] in {"cancelled", "rejected", "expired"}
+            if closed or row["expires_at"] <= now:
+                state = "CANCELLED" if topup and topup["status"] in {"cancelled", "rejected"} else "EXPIRED"
+                self.store.repo.execute("UPDATE otp_payments SET state=?,updated_at=? WHERE payment_id=? AND paid_at IS NULL AND state IN ('CREATING','CREATE_UNKNOWN','PENDING')",
+                                        (state, now, row["payment_id"]))
+        for payment in self.store.repo.rows("SELECT * FROM otp_payments WHERE state='PAID' AND next_retry_at<=? ORDER BY paid_at LIMIT 20", (now,)):
+            try:
+                await self.store.purchase.buy(payment["user_id"], payment["quote_id"], payment_id=payment["payment_id"])
+            except StoreError as exc:
+                # No provider POST has happened until the existing purchase
+                # attempt commits. A temporary catalog error keeps funds held.
+                if exc.code in {"PRICE_CHANGED", "NO_OFFER_AVAILABLE", "NOT_FOUND", "DISABLED", "ORDER_LIMIT", "PRICE_LIMIT", "CONFLICT", "BELOW_COST", "CONFIG", "NOT_CONFIGURED", "UNAUTHORIZED", "ENCRYPTION", "PAYMENT_UNAVAILABLE"}:
+                    self.release_to_wallet(payment["payment_id"], exc.code)
+                elif exc.code == "PAYMENT_PENDING":
+                    pass
+                else:
+                    delay = max(getattr(exc, "retry_after", 0) or 0, min(900, 10*2**min(payment["retries"], 6)))
+                    self.store.repo.execute("UPDATE otp_payments SET next_retry_at=?,retries=retries+1,error_code=? WHERE payment_id=? AND state='PAID'",
+                                            (now+delay, exc.code, payment["payment_id"]))
+        for payment in self.store.repo.rows("SELECT p.*,a.state attempt_state FROM otp_payments p JOIN otp_purchase_attempts a ON a.attempt_id=p.attempt_id WHERE p.state='BUYING'"):
+            if payment["attempt_state"] in {"CAPTURED", "FAILED"}:
+                state = "COMPLETED" if payment["attempt_state"] == "CAPTURED" else "WALLET_CREDITED"
+                with self.store.repo.connection(True) as conn:
+                    updated = conn.execute("UPDATE otp_payments SET state=?,updated_at=? WHERE payment_id=? AND state='BUYING'", (state, now, payment["payment_id"])).rowcount
+                    if updated and state == "WALLET_CREDITED":
+                        self.queue_notice(conn, payment)
+
+    def cancel(self, user, payment_id):
+        payment = self.owned(user, payment_id)
+        if payment["paid_at"] is not None or payment["state"] == "BUYING":
+            raise StoreError("PAYMENT_PAID")
+        if payment["topup_id"]:
+            _, status = self.store.host.cancel_topup_atomic(payment["topup_id"], user)
+            if status not in {"cancelled", "already_cancelled", "invalid_status"}:
+                raise StoreError("PAYMENT_PAID")
+        self.store.repo.execute("UPDATE otp_payments SET state='CANCELLED',updated_at=? WHERE payment_id=? AND user_id=? AND paid_at IS NULL AND state IN ('CREATING','CREATE_UNKNOWN','PENDING')",
+                                (time.time(), payment_id, user))
+        return self.owned(user, payment_id)
+
+    async def retire_qr(self, bot):
+        for row in self.store.repo.rows("SELECT * FROM otp_payments WHERE qr_message_id IS NOT NULL AND qr_delivery_state='SENT' AND state IN ('PAID','BUYING','COMPLETED','WALLET_CREDITED','CANCELLED','EXPIRED') LIMIT 20"):
+            if await self.store.host.retire_topup_payment_message(bot, row["user_id"], row["qr_message_id"]):
+                self.store.repo.execute("UPDATE otp_payments SET qr_delivery_state='RETIRED' WHERE payment_id=?", (row["payment_id"],))
 
 
 class SMSEventProcessor:
@@ -760,9 +1037,15 @@ class NotificationQueue:
                 continue
             order = self.store.repo.one("SELECT * FROM otp_orders WHERE id=?", (job["order_id"],))
             try:
-                if not order or order["buyer_user_id"] != job["user_id"]:
+                payment = None
+                if job["kind"] == "PAYMENT":
+                    payment = self.store.payments.owned(job["user_id"], job["dedup_key"].removeprefix("PAYMENT:"))
+                    texts = [f"🛍️ <b>{USER_BRAND}</b>\n💰 Pembayaran QRIS {money(payment['amount_idr'])} tersedia di saldo kamu.\n"
+                             "Nomor belum dibeli. Pembayaran terlambat, harga/stok berubah, atau pembelian tidak dapat diselesaikan. "
+                             "Gunakan Buy Saldo untuk memilih nomor kembali; tidak perlu membayar QRIS lagi."]
+                elif not order or order["buyer_user_id"] != job["user_id"]:
                     raise StoreError("NOT_FOUND")
-                if job["kind"] == "SMS":
+                elif job["kind"] == "SMS":
                     event = self.store.repo.one("SELECT * FROM otp_sms_events WHERE provider_order_id=? AND sms_revision=?", (job["provider_order_id"], job["sms_revision"]))
                     if not event or not event["encrypted_payload"]:
                         raise StoreError("RETENTION", "SMS melewati masa retensi.")
@@ -777,7 +1060,7 @@ class NotificationQueue:
                             (time.time()+120, job["notification_id"], owner)):
                         raise StoreError("LEASE_LOST")
                     sent = await bot.send_message(job["user_id"], texts[index], parse_mode="HTML",
-                         reply_markup=self.store.ui.order_keyboard(order, job["user_id"]) if index == len(texts)-1 else None,
+                         reply_markup=(self.store.ui.home_keyboard(job["user_id"]) if payment else self.store.ui.order_keyboard(order, job["user_id"])) if index == len(texts)-1 else None,
                          link_preview_options=LinkPreviewOptions(is_disabled=True))
                     self.store.repo.execute("UPDATE otp_notifications SET part_index=?,telegram_message_id=? WHERE notification_id=? AND lease_owner=?",
                            (index+1, getattr(sent, "message_id", None), job["notification_id"], owner))
@@ -865,6 +1148,7 @@ class Store:
         self.host, self.config = host, config or Config.environment()
         self.repo, self.api = Repository(host), APIClient(self.config)
         self.pricing, self.catalog, self.purchase = PricingService(self), CatalogService(self), PurchaseService(self)
+        self.payments = PaymentService(self)
         self.sms, self.refund, self.orders = SMSEventProcessor(self), RefundService(self), OrderService(self)
         self.notifications, self.webhook, self.ui = NotificationQueue(self), WebhookController(self), UIBuilder(self)
         self.worker_id = secrets.token_hex(16)
@@ -1031,16 +1315,19 @@ class Store:
                 if kind == "notifications":
                     if self.has_encryption():
                         await self.notifications.deliver(bot)
+                        await self.payments.retire_qr(bot)
                         self.set_setting("last_delivery_at", time.time())
                 elif kind == "polling":
                     if self.has_encryption():
                         await self.webhook.drain()
                     if self.config.token and not self.config.error:
                         await self.polling_cycle()
-                elif self.config.token and not self.config.error:
-                    for row in self.repo.rows("SELECT attempt_id FROM otp_purchase_attempts WHERE state IN ('RESERVED','REQUESTING','PENDING_RECONCILIATION') AND next_retry_at<=? AND lease_until<? LIMIT 10", (time.time(), time.time())):
-                        await self.purchase.process(row["attempt_id"])
-                    await self.orders.reconcile_actions()
+                elif kind == "reconciliation":
+                    await self.payments.reconcile()
+                    if self.config.token and not self.config.error:
+                        for row in self.repo.rows("SELECT attempt_id FROM otp_purchase_attempts WHERE state IN ('RESERVED','REQUESTING','PENDING_RECONCILIATION') AND next_retry_at<=? AND lease_until<? LIMIT 10", (time.time(), time.time())):
+                            await self.purchase.process(row["attempt_id"])
+                        await self.orders.reconcile_actions()
                 if kind == "reconciliation" and time.time()-last_cleanup > 300:
                     self.cleanup()
                     last_cleanup = time.time()
@@ -1142,6 +1429,9 @@ class UserFormatter:
             "TOKEN": "Tombol kedaluwarsa atau bukan milik kamu. Buka /otp lagi.",
             "INPUT": "Perintah tidak valid. Gunakan /otp bantuan untuk format yang benar.",
             "RETENTION": "SMS sudah melewati masa penyimpanan.",
+            "PAYMENT_PENDING": "QRIS untuk pembelian ini sudah dibuat. Periksa invoice di Pesanan Saya sebelum memilih pembayaran lain.",
+            "PAYMENT_PAID": "Pembayaran sudah diterima atau sedang diproses. Periksa Pesanan Saya; jangan membayar ulang.",
+            "PAYMENT_UNAVAILABLE": "QRIS belum tersedia atau pembayaran sementara ditahan. Gunakan Buy Saldo atau hubungi owner.",
         }.get(getattr(exc, "code", ""), "Layanan OTP mengalami gangguan sementara. Coba kembali nanti.")
 
 
@@ -1149,7 +1439,16 @@ class OwnerFormatter:
     """Private dashboard text; balance is supplied by GET /balance only."""
 
     @staticmethod
-    def dashboard(*, stats, settings, balance, api_status, attempts, notifications, worker_errors, config_error):
+    def dashboard(*, stats, settings, balance, api_status, attempts, notifications, worker_errors, config_error, details=False):
+        if not details:
+            attention = attempts+stats['refund_review']
+            return (f"👑 <b>{ADMIN_BRAND}</b>\n📱 SMSCode.gg • Status API: {escape(api_status)}\n\n"
+                    f"💰 Saldo provider: {escape(balance)}\n"
+                    f"🛍️ Toko: {'ON' if settings['enabled'] else 'OFF'} • 📦 Aktif: {stats['pending']}\n"
+                    f"🛒 Total penjualan: {stats['total']} • ✅ Selesai: {stats['completed']}\n"
+                    f"💵 Omzet: {money(stats['revenue'])}\n📈 Profit kotor sementara: {money(stats['profit'])}\n"
+                    f"📩 Notifikasi menunggu/gagal: {notifications} • ⚠️ Perlu diperiksa: {attention}\n\n"
+                    "Pilih menu untuk melihat rincian dan pengaturan.")
         return (f"👑 <b>{ADMIN_BRAND}</b>\n📱 Provider: SMSCode.gg (v1 IDR)\n"
             f"🔌 Status API: {escape(api_status)}\n"
             f"💰 Saldo provider: {escape(balance)}\n🛒 Total penjualan: {stats['total']}\n"
@@ -1169,12 +1468,40 @@ class OwnerFormatter:
     def dashboard_rows():
         return [
             [("💰 SALDO PROVIDER", "admin_balance", {}), ("📊 STATISTIK", "admin_stats", {})],
-            [("💵 HARGA PROVIDER", "admin_prices", {"kind": "provider"}), ("🏷️ HARGA JUAL", "admin_prices", {"kind": "jual"})],
-            [("📈 MARKUP & PROFIT", "admin_profit", {}), ("⚙️ PENGATURAN HARGA", "admin_prices_menu", {})],
+            [("⚙️ PENGATURAN HARGA", "admin_prices_menu", {}), ("📈 MARKUP & PROFIT", "admin_profit", {})],
             [("📦 SEMUA ORDER", "admin_orders", {}), ("⏳ PEMBELIAN PENDING", "admin_pending", {})],
             [("📩 STATUS AUTO SMS", "admin_status", {}), ("📩 WEBHOOK", "admin_webhook", {})],
-            [("🟢 TOKO ON/OFF", "admin_toggle", {}), ("🔄 RETRY NOTIFIKASI GAGAL", "admin_retry", {})],
-            [("🏠 MABOYY OTP", "home", {})]]
+            [("🟢 TOKO ON/OFF", "admin_toggle", {}), ("🛍️ TOKO PEMBELI", "shop", {})]]
+
+
+class MenuMessage:
+    """Edit the callback's menu; delivery notifications keep using send_message."""
+
+    def __init__(self, message, *, message_id=None):
+        self.message = message
+        self.target_id = message_id if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0 else None
+
+    def __getattr__(self, name):
+        return getattr(self.message, name)
+
+    async def answer(self, text, **kwargs):
+        try:
+            if self.target_id:
+                return await self.message.bot.edit_message_text(text, chat_id=self.message.chat.id, message_id=self.target_id, **kwargs)
+            if getattr(self.message, "text", None) is not None:
+                return await self.message.edit_text(text, **kwargs)
+        except TelegramBadRequest as exc:
+            reason = exc.message.lower()
+            if "message is not modified" in reason:
+                return self.message
+            if not any(value in reason for value in ("message to edit not found", "message can't be edited",
+                                                     "message can not be edited", "there is no text")):
+                raise
+        # A missing menu or a payment photo cannot be edited as a text menu.
+        # Network timeouts never reach this fallback: an edit may already exist.
+        self.message = await self.message.bot.send_message(self.message.chat.id, text, **kwargs)
+        self.target_id = None
+        return self.message
 
 
 class UIBuilder:
@@ -1194,7 +1521,7 @@ class UIBuilder:
         return self.keyboard(user, rows)
 
     def home_keyboard(self, user):
-        rows = [[("📱 BELI NOMOR OTP", "countries", {})], [("🌍 PILIH NEGARA", "countries", {})],
+        rows = [[("📱 BELI NOMOR OTP", "countries", {})],
                 [("📦 PESANAN SAYA", "orders", {}), ("🔐 CEK KODE OTP", "orders", {})],
                 [("💰 SALDO SAYA", "balance", {}), ("📜 RIWAYAT", "history", {})],
                 [("❓ BANTUAN", "help", {})]]
@@ -1265,8 +1592,15 @@ class UIBuilder:
         return [(header if index == 0 else f"📩 SMS #{order['id']} • lanjutan {index+1}\n")+
                 "📨 ISI SMS:\n<pre>"+chunk+"</pre>\n✅ OTP DITERIMA" for index, chunk in enumerate(chunks)] + code_parts
 
-    async def send(self, message, text, keyboard=None):
-        return await message.answer(text, reply_markup=keyboard, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+    async def send(self, message, text, keyboard=None, *, fresh=False):
+        if keyboard is None and isinstance(message, MenuMessage) and not fresh:
+            user = message.chat.id
+            keyboard = self.keyboard(user, [[("⬅️ ADMIN", "admin", {})]] if self.store.host.is_owner(user)
+                                     else [[("🏠 MABOYY OTP", "home", {})]])
+        options = {"reply_markup": keyboard, "parse_mode": "HTML", "link_preview_options": LinkPreviewOptions(is_disabled=True)}
+        if fresh:
+            return await message.bot.send_message(message.chat.id, text, **options)
+        return await message.answer(text, **options)
 
     async def home(self, message, user):
         settings, api = self.store.settings(), self.store.api
@@ -1285,9 +1619,11 @@ class UIBuilder:
         if message.from_user and message.from_user.id == user:
             username = getattr(message.from_user, "username", "") or username
         identity = "@"+username.lstrip("@") if username else f"User {user}"
+        mode = "🛍️ Mode pembeli • saldo wallet pribadi\n" if self.store.host.is_owner(user) else ""
         await self.send(message, f"🛍️ <b>{USER_BRAND}</b>\n👤 User: {escape(identity)}\n\n"
+            + mode +
             f"💰 Saldo Kamu: <b>{money(self.store.host.get_balance(user))}</b>\n"
-            f"🛍️ Status toko: {escape(status)}\n\nSilakan pilih menu:", self.home_keyboard(user))
+            f"🛍️ Status toko: {escape(status)}\n\nPilih menu di bawah:", self.home_keyboard(user))
 
     async def selection(self, message, user, kind, payload=None, query=""):
         self.store.require_ready()
@@ -1312,9 +1648,9 @@ class UIBuilder:
             buttons = [(UserFormatter.label(row.get("name") or "Any"), "products", {**payload, "operator": row["operator_id"], "operator_name": row.get("name") or "Any", "page": 0}) for row in rows]
             title = "📶 PILIH OPERATOR"
         else:
-            rows, more = await self.store.catalog.products(payload["country"], payload["platform"], payload.get("operator"), page+1)
+            rows, more = await self.store.catalog.products(payload["country"], payload["platform"], payload.get("operator"), page+1, limit=8)
             buttons = []
-            for row in rows[:50]:
+            for row in rows[:8]:
                 try:
                     sale, _ = self.store.pricing.calculate(row)
                     if integer(row["price"]) > self.store.config.max_cost:
@@ -1333,7 +1669,7 @@ class UIBuilder:
             if nav:
                 keyboard_rows.append(nav)
             keyboard_rows.append([("🏠 MABOYY OTP", "home", {})])
-            return await self.send(message, title+"\n\n"+("Pilih harga nomor:" if buttons else "Belum ada stok pada halaman ini."), self.keyboard(user, keyboard_rows))
+            return await self.send(message, title+f"\nHalaman {page+1}\n\n"+("Pilih harga nomor:" if buttons else "Belum ada stok pada halaman ini."), self.keyboard(user, keyboard_rows))
         subset = buttons[page*8:(page+1)*8]
         keyboard_rows = [[button] for button in subset]
         nav = []
@@ -1351,13 +1687,85 @@ class UIBuilder:
     async def quote(self, message, user, quote):
         product = json.loads(quote["product"])
         balance = self.store.host.get_balance(user)
+        after = ("Saldo setelah Buy Saldo: "+money(balance-quote["selling_price_idr"]) if balance >= quote["selling_price_idr"]
+                 else "Saldo belum cukup untuk Buy Saldo. Kamu dapat memilih Buy Now (QRIS).")
         await self.send(message, "🛒 <b>KONFIRMASI "+("REAKTIVASI" if quote["parent_order_id"] else "PEMBELIAN")+"</b>\n\n"
             f"🌍 Negara: {escape(UserFormatter.label(product['country_name']))}\n📱 Layanan: {escape(UserFormatter.label(product['platform_name']))}\n"
             f"📶 Operator: {escape(UserFormatter.label(product.get('operator_name') or 'Any'))}\n"
             f"💰 Harga: <b>{money(quote['selling_price_idr'])}</b>\n💳 Saldo: {money(balance)}\n"
-            f"Saldo setelah beli: {money(balance-quote['selling_price_idr'])}\n"
-            f"⏳ Berlaku {self.store.config.quote_ttl} detik. Pembelian memakai saldo kamu.",
-            self.keyboard(user, [[("✅ BELI SEKARANG", "buy", {"quote": quote["quote_id"]})], [("❌ BATAL", "home", {})]]))
+            f"{after}\n"
+            f"⏳ Harga berlaku {self.store.config.quote_ttl} detik sebelum memilih pembayaran.\n"
+            "Pilih metode pembayaran. Refund yang terkonfirmasi masuk ke saldo bot.",
+            self.keyboard(user, [[("⚡ BUY NOW (QRIS)", "pay_qris", {"quote": quote["quote_id"]})],
+                                 [("💰 BUY SALDO", "buy", {"quote": quote["quote_id"]})], [("❌ BATAL", "home", {})]]))
+
+    async def payment(self, message, user, payment_id):
+        payment = self.store.payments.owned(user, payment_id)
+        if payment["attempt_id"]:
+            order = self.store.repo.one("SELECT * FROM otp_orders WHERE attempt_id=? AND buyer_user_id=?", (payment["attempt_id"], user))
+            if order:
+                return await self.send(message, self.order_text(order), self.order_keyboard(order, user))
+        state, active = payment["state"], payment["state"] in {"PENDING", "CREATING", "CREATE_UNKNOWN"} and payment["expires_at"] > time.time()
+        if active and state == "PENDING":
+            claimed = self.store.repo.execute("UPDATE otp_payments SET qr_delivery_state='SENDING' WHERE payment_id=? AND qr_delivery_state='PENDING'", (payment_id,))
+            if claimed:
+                try:
+                    image = payment["qr_url"] if payment["method"] == "AUTO_QRIS" else self.store.host.get_setting("qris_file_id", "")
+                    if not image and payment["qr_payload"]:
+                        content = self.store.decrypt(payment["qr_payload"])["qr_content"]
+                        image = BufferedInputFile(await asyncio.to_thread(qr_image, content), filename="MaboyyOTPQRIS.png")
+                    if not image:
+                        raise StoreError("PAYMENT_UNAVAILABLE")
+                    sent = await message.bot.send_photo(user, photo=image,
+                        caption=f"🛍️ {USER_BRAND}\n🧾 {payment['partner_reference']}\n💳 Total: {money(payment['payment_total_idr'])}\nBayar satu kali sesuai total invoice sebelum kedaluwarsa.")
+                    self.store.repo.execute("UPDATE otp_payments SET qr_message_id=?,qr_delivery_state='SENT' WHERE payment_id=?", (sent.message_id, payment_id))
+                    if payment["topup_id"]:
+                        self.store.host.save_topup_payment_message(payment["topup_id"], user, sent.message_id)
+                except (TelegramBadRequest, StoreError):
+                    self.store.repo.execute("UPDATE otp_payments SET qr_delivery_state='PENDING' WHERE payment_id=?", (payment_id,))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.store.repo.execute("UPDATE otp_payments SET qr_delivery_state='UNKNOWN' WHERE payment_id=?", (payment_id,))
+        payment = self.store.payments.owned(user, payment_id)
+        state = payment["state"]
+        active = state in {"PENDING", "CREATING", "CREATE_UNKNOWN"} and payment["expires_at"] > time.time()
+        label = {"CREATING":"QRIS sedang disiapkan", "CREATE_UNKNOWN":"Hasil pembuatan QRIS sedang diperiksa",
+                 "PENDING":"Menunggu pembayaran", "PAID":"Pembayaran diterima, nomor sedang diproses",
+                 "BUYING":"Pembelian nomor sedang diproses", "COMPLETED":"Nomor berhasil dibeli",
+                 "WALLET_CREDITED":"Dana tersedia di saldo bot", "CANCELLED":"Invoice dibatalkan",
+                 "EXPIRED":"Invoice kedaluwarsa"}.get(state, "Sedang diperiksa")
+        rows = []
+        if active and payment["topup_id"]:
+            rows.append([InlineKeyboardButton(text="📤 KIRIM BUKTI PEMBAYARAN", callback_data=f"proofsubmit:topup:{payment['topup_id']}")])
+        ttl = max(300, min(3600, int(payment["expires_at"]-time.time())+300))
+        token = lambda action: self.store.token(user, action, {"payment": payment_id}, ttl=ttl)
+        rows.append([InlineKeyboardButton(text="🔄 CEK PEMBAYARAN", callback_data=token("payment_status"))])
+        if active:
+            rows.append([InlineKeyboardButton(text="❌ BATALKAN INVOICE", callback_data=token("payment_cancel"))])
+        rows.append([InlineKeyboardButton(text="📦 PESANAN SAYA", callback_data=self.store.token(user, "orders")),
+                     InlineKeyboardButton(text="🏠 MABOYY OTP", callback_data=self.store.token(user, "home"))])
+        text = (f"🛍️ <b>{USER_BRAND}</b>\n💳 <b>BUY NOW • QRIS</b>\n\n"
+                f"🧾 Invoice: <b>{escape(payment['partner_reference'])}</b>\n"
+                f"💰 Harga nomor: {money(payment['amount_idr'])}\n"
+                f"🔢 Kode unik: {money(payment['payment_total_idr']-payment['amount_idr'])}\n"
+                f"💳 Total bayar: <b>{money(payment['payment_total_idr'])}</b>\n"
+                f"⌛ Berlaku sampai: {datetime.fromtimestamp(payment['expires_at'], timezone.utc).isoformat(timespec='seconds')}\n"
+                f"⏳ Status: {label}\n\n")
+        if active:
+            text += ("Pembayaran QRIS diperiksa otomatis. " if payment["method"] == "AUTO_QRIS"
+                     else "Kirim bukti pembayaran untuk verifikasi owner. ")
+            text += "Nomor diproses otomatis setelah pembayaran terkonfirmasi. Bayar satu kali sesuai total invoice.\n"
+            if payment["qr_delivery_state"] != "SENT":
+                text += "⚠️ Gambar QRIS belum berhasil ditampilkan. Jangan membayar sebelum QRIS tersedia; hubungi owner.\n"
+        elif state in {"CANCELLED", "EXPIRED"}:
+            text += "Jangan bayar invoice ini. Jika pembayaran terlambat terkonfirmasi, dana masuk ke saldo bot.\n"
+        elif state == "WALLET_CREDITED":
+            text += "Nomor belum dibeli. Gunakan Buy Saldo untuk membeli kembali; tidak perlu membayar QRIS lagi.\n"
+        text += "Refund OTP yang terkonfirmasi masuk ke saldo bot."
+        if payment['payment_total_idr'] > payment['amount_idr']:
+            text += " Kode unik tidak dikembalikan sebagai saldo."
+        return await self.send(message, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def history(self, message, user, history=False, page=0, admin=False):
         if admin and not self.store.host.is_owner(user):
@@ -1371,7 +1779,12 @@ class UIBuilder:
             if admin:
                 text.append(f"#{order['id']} • Buyer {order['buyer_user_id']} • {escape(order['platform_name'])} • {escape(order['status'])} • {money(order['selling_price_idr'])} • Modal {money(order['provider_cost_idr'])} • Refund {money(order['refund_idr'])}")
             else:
-                text.append(self.order_text(order))
+                summary = (f"🆔 <b>#{order['id']}</b> • {escape(UserFormatter.label(order['platform_name']))} / {escape(UserFormatter.label(order['country_name']))}\n"
+                           f"📞 <code>{escape(order['phone_number'])}</code> • 💰 {money(order['selling_price_idr'])}\n"
+                           f"⏳ {UserFormatter.status(order['status'])}")
+                if order['refund_state'] != 'NONE':
+                    summary += f"\n↩️ {money(order['refund_idr'])} • {UserFormatter.refund_status(order['refund_state'])}"
+                text.append(summary)
                 buttons.append([(f"🔎 #{order['id']}", "check", {"id": order["id"]})])
         if not rows:
             text.append("Belum ada pesanan.")
@@ -1379,6 +1792,11 @@ class UIBuilder:
         if not admin:
             for item in pending:
                 text.append(f"⏳ {UserFormatter.status(item['state'])} • Saldo ditahan {money(item['hold_idr'])}; jangan membeli ulang.")
+            payments = self.store.repo.rows("SELECT * FROM otp_payments WHERE user_id=? AND state IN ('CREATING','CREATE_UNKNOWN','PENDING','PAID') ORDER BY created_at DESC LIMIT 5", (user,))
+            for payment in payments:
+                text.append(f"💳 QRIS {escape(payment['partner_reference'])} • {money(payment['payment_total_idr'])}\n"
+                            + ("Pembayaran diterima, nomor sedang diproses." if payment['state'] == 'PAID' else "Periksa invoice pembayaran."))
+                buttons.append([("💳 "+payment['partner_reference'], "payment_status", {"payment": payment['payment_id']})])
         nav, action = [], "admin_orders" if admin else "history" if history else "orders"
         if page:
             nav.append(("⬅️", action, {"page": page-1}))
@@ -1397,16 +1815,28 @@ class UIBuilder:
         except StoreError:
             pass
         order = self.store.repo.owned(user, order_id)
-        await self.send(message, self.order_text(order), self.order_keyboard(order, user))
+        text = self.order_text(order)
         event = self.store.repo.one("SELECT * FROM otp_sms_events WHERE provider_order_id=? ORDER BY sms_revision DESC LIMIT 1", (order["provider_order_id"],))
         if event and event["encrypted_payload"]:
-            for text in self.sms_texts(order, self.store.decrypt(event["encrypted_payload"]), event["sms_revision"]):
-                await self.send(message, text)
+            parts = self.sms_texts(order, self.store.decrypt(event["encrypted_payload"]), event["sms_revision"])
+            if len(text)+len(parts[0]) <= 3900:
+                text += "\n\n"+parts.pop(0)
+            await self.send(message, text, self.order_keyboard(order, user))
+            for part in parts:
+                await self.send(message, part, fresh=True)
         else:
-            await self.send(message, "📩 SMS belum diterima atau sudah melewati masa retensi.")
+            await self.send(message, text+"\n\n📩 SMS belum diterima atau sudah melewati masa retensi.", self.order_keyboard(order, user))
 
 
-HELP = (f"🛍️ <b>{USER_BRAND}</b>\n❓ PANDUAN TOKO OTP\n\n"
+HELP = (f"🛍️ <b>{USER_BRAND}</b>\n❓ CARA BELI OTP\n\n"
+        "1. Pilih negara, layanan, dan nomor.\n"
+        "2. Pilih <b>Buy Now (QRIS)</b> atau <b>Buy Saldo</b>.\n"
+        "3. Nomor dikirim setelah pembayaran terkonfirmasi.\n"
+        "4. SMS dan kode OTP masuk otomatis ke chat ini.\n\n"
+        "Cek, resend, selesai, dan batal tersedia di Pesanan Saya sesuai status nomor. "
+        "Refund yang terkonfirmasi masuk ke saldo bot. Buka /otp untuk kembali.")
+
+COMMAND_HELP = (f"🛍️ <b>{USER_BRAND}</b>\n❓ PANDUAN TOKO OTP\n\n"
     "/otp — menu toko\n/otp beli • /otp negara — pilih negara\n/otp layanan — pilih layanan\n"
     "/otp saldo — saldo bot kamu\n/otp pesanan — pesanan aktif\n/otp cek &lt;id&gt; — nomor dan SMS\n"
     "/otp ulang &lt;id&gt; — minta SMS baru jika tersedia\n/otp batal &lt;id&gt; — konfirmasi pembatalan\n"
@@ -1571,11 +2001,7 @@ class AdminHandler:
             text = ("⚙️ <b>PENGATURAN HARGA OTP</b>\n"
                 f"Mode: {escape(settings['mode'])}\nMarkup: {escape(settings['percent'])}%\nTambahan: {money(settings['fixed'])}\n"
                 f"Pembulatan: {settings['rounding']}\nContoh modal {money(8000)} → jual {money(sale)}\n"
-                "Prioritas: produk → negara+layanan → layanan → negara → global.\n\n"
-                "/otp admin markup persen 25\n/otp admin markup nominal 2000\n/otp admin markup mode kombinasi\n"
-                "/otp admin harga set &lt;product_id&gt; &lt;harga&gt;\n/otp admin harga reset &lt;product_id&gt;\n"
-                "/otp admin harga round 100\n/otp admin harga allow-loss on|off\n"
-                "/otp admin harga rule country_service 7:3 kombinasi 25 2000")
+                "Prioritas: produk → negara+layanan → layanan → negara → global.")
             return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [
                 [("📈 ATUR PERSENTASE", "admin_input", {"setting": "percent"}), ("💵 ATUR NOMINAL", "admin_input", {"setting": "fixed"})],
                 [("⚙️ PILIH MODE", "admin_modes", {})], [("📋 HARGA PROVIDER", "admin_prices", {"kind": "provider"}), ("🛒 HARGA JUAL", "admin_prices", {"kind": "jual"})], [("⬅️ ADMIN", "admin", {})]]))
@@ -1600,8 +2026,12 @@ class AdminHandler:
         notifications = self.store.repo.one("SELECT count(*) n FROM otp_notifications WHERE status IN ('PENDING','SENDING','FAILED')")["n"]
         settings = self.store.settings()
         text = OwnerFormatter.dashboard(stats=stats, settings=settings, balance=balance, api_status=api_status,
-            attempts=attempts, notifications=notifications, worker_errors=worker_errors, config_error=self.store.config.error)
-        await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, OwnerFormatter.dashboard_rows()))
+            attempts=attempts, notifications=notifications, worker_errors=worker_errors, config_error=self.store.config.error,
+            details=section == "status")
+        rows = OwnerFormatter.dashboard_rows()
+        if section == "status":
+            rows = [[("🔄 RETRY NOTIFIKASI GAGAL", "admin_retry", {})], [("⬅️ ADMIN", "admin", {})]]
+        await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, rows))
 
     @staticmethod
     def number(value, low, high):
@@ -1642,12 +2072,19 @@ def register(router, store):
         # previously issued callbacks whose owner's role may have been revoked.
         if action.startswith("admin"):
             admin.authorize(user)
-        if action in {"home", "help", "balance", "countries", "orders", "history"}:
+        if action in {"home", "shop", "help", "balance", "countries", "orders", "history"} or action.startswith("admin") and action != "admin_input":
             await state.clear()
         if action == "home":
+            if store.host.is_owner(user):
+                await admin.handle(message, user, [])
+            else:
+                await store.ui.home(message, user)
+        elif action == "shop":
             await store.ui.home(message, user)
         elif action == "help":
-            await store.ui.send(message, HELP, store.ui.home_keyboard(user))
+            await store.ui.send(message, HELP, store.ui.keyboard(user, [[("📋 DAFTAR COMMAND", "help_commands", {})], [("🏠 MABOYY OTP", "home", {})]]))
+        elif action == "help_commands":
+            await store.ui.send(message, COMMAND_HELP, store.ui.keyboard(user, [[("⬅️ BANTUAN", "help", {})], [("🏠 MABOYY OTP", "home", {})]]))
         elif action == "balance":
             await store.ui.send(message, "💰 Saldo kamu: <b>"+money(store.host.get_balance(user))+"</b>\nGunakan menu deposit bot untuk mengisi saldo.", store.ui.home_keyboard(user))
         elif action in {"countries", "services", "operators", "products"}:
@@ -1661,9 +2098,20 @@ def register(router, store):
             await state.set_state(OTPState.search)
             await state.update_data(otp_search=payload)
             await store.ui.send(message, "🔎 Kirim nama negara/layanan untuk dicari. /otp untuk kembali.")
+            await state.update_data(otp_menu_message_id=message.message_id)
         elif action == "quote":
             quote = await store.purchase.quote(user, payload["product"])
             await store.ui.quote(message, user, quote)
+        elif action == "pay_qris":
+            payment = await store.payments.create(user, payload["quote"])
+            await store.ui.payment(message, user, payment["payment_id"])
+        elif action in {"payment_status", "payment_cancel"}:
+            store.payments.owned(user, payload["payment"])
+            if action == "payment_cancel":
+                store.payments.cancel(user, payload["payment"])
+            else:
+                await store.payments.reconcile()
+            await store.ui.payment(message, user, payload["payment"])
         elif action == "buy":
             attempt = await store.purchase.buy(user, payload["quote"])
             if attempt["state"] == "CAPTURED":
@@ -1672,7 +2120,7 @@ def register(router, store):
             elif attempt["state"] == "FAILED":
                 await store.ui.send(message, "❌ Pembelian gagal. Saldo yang ditahan telah dilepas. "+escape(UserFormatter.error(StoreError(attempt["error_code"]))))
             else:
-                await store.ui.send(message, "⏳ Pembelian sedang direkonsiliasi. Saldo ditahan untuk transaksi ini. Jangan membeli ulang; hasil akan dikirim otomatis.")
+                await store.ui.send(message, "⏳ Pembelian belum terkonfirmasi. Dana untuk transaksi ini ditahan. Jangan membeli ulang; hasil dikirim otomatis.")
         elif action == "check":
             await store.ui.check(message, user, payload["id"])
         elif action in {"confirm_cancel", "confirm_finish"}:
@@ -1706,6 +2154,7 @@ def register(router, store):
                 await state.set_state(OTPState.admin_value)
                 await state.update_data(otp_admin_setting=payload["setting"])
                 await store.ui.send(message, "Kirim nilai "+("persentase" if payload["setting"] == "percent" else "tambahan nominal rupiah (angka bulat)")+". /otp untuk kembali.")
+                await state.update_data(otp_menu_message_id=message.message_id)
             elif action == "admin_webhook_connect":
                 await store.configure_webhook(user)
                 await store.ui.send(message, "✅ Webhook resmi terhubung. Secret diselaraskan dalam memori; polling tetap aktif.")
@@ -1736,6 +2185,7 @@ def register(router, store):
             if name not in mapping:
                 raise StoreError("INPUT", "Command belum dikenal. Gunakan /otp bantuan.")
             action, payload = mapping[name], {}
+            admin_context = action == "home" and store.host.is_owner(user)
             if action in {"check", "resend", "confirm_cancel", "confirm_finish", "reactivate"}:
                 if len(args) != 2:
                     raise StoreError("INPUT", "Gunakan /otp "+name+" <id order bot>.")
@@ -1746,39 +2196,53 @@ def register(router, store):
 
     @router.callback_query(F.data.startswith(PREFIX))
     async def otp_callback(call, state):
-        action = ""
+        action, menu, answered = "", None, False
         try:
             user = call.from_user.id
             await guard(call.message, user)
             store.repo.rate(user, "callback", 40, 60)
             action, payload = store.read_token(user, (call.data or "")[len(PREFIX):])
             await call.answer()
-            await dispatch(call.message, user, action, payload, state)
+            answered = True
+            menu = MenuMessage(call.message)
+            await dispatch(menu, user, action, payload, state)
         except Exception as exc:
-            await call.answer("Permintaan OTP belum berhasil.", show_alert=True)
+            if not answered:
+                try:
+                    await call.answer("Permintaan OTP belum berhasil.", show_alert=True)
+                except Exception:
+                    pass
             if call.message and str(call.message.chat.type) == "private" and call.message.chat.id == call.from_user.id:
-                await failure(call.message, exc, user=call.from_user.id, admin_context=action.startswith("admin"))
+                await failure(menu or MenuMessage(call.message), exc, user=call.from_user.id, admin_context=action.startswith("admin") or action == "home")
 
     @router.message(OTPState.search, F.text & ~F.text.startswith("/"))
     async def otp_search(message, state):
+        menu = message
         try:
             await guard(message, message.from_user.id)
             store.repo.rate(message.from_user.id, "search", 10, 60)
-            data = (await state.get_data()).get("otp_search", {})
+            values = await state.get_data()
+            data = values.get("otp_search", {})
+            if values.get("otp_menu_message_id"):
+                menu = MenuMessage(message, message_id=values["otp_menu_message_id"])
             await state.clear()
-            await store.ui.selection(message, message.from_user.id, data["kind"], data["context"], (message.text or "")[:80])
+            await store.ui.selection(menu, message.from_user.id, data["kind"], data["context"], (message.text or "")[:80])
         except Exception as exc:
-            await failure(message, exc, user=message.from_user.id)
+            await failure(menu, exc, user=message.from_user.id)
 
     @router.message(OTPState.admin_value, F.text & ~F.text.startswith("/"))
     async def otp_admin_input(message, state):
+        menu = message
         try:
             await guard(message, message.from_user.id)
             admin.authorize(message.from_user.id)
-            key = (await state.get_data()).get("otp_admin_setting")
-            await admin.handle(message, message.from_user.id, ["markup", "persen" if key == "percent" else "nominal", (message.text or "").strip()])
+            values = await state.get_data()
+            key = values.get("otp_admin_setting")
+            if values.get("otp_menu_message_id"):
+                menu = MenuMessage(message, message_id=values["otp_menu_message_id"])
+            await admin.handle(menu, message.from_user.id, ["markup", "persen" if key == "percent" else "nominal", (message.text or "").strip()])
             await state.clear()
         except Exception as exc:
-            await failure(message, exc, user=message.from_user.id, admin_context=True)
+            await failure(menu, exc, user=message.from_user.id, admin_context=True)
 
     return store

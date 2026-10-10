@@ -226,7 +226,10 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
-BOT_VERSION = "16.78"
+# Release policy: increment published releases; synchronize source, launcher and ZIP.
+# Deployment ZIP contains only main.py, bot.py, otp_smscode.py, requirements.txt,
+# project_backup.py and .gitignore. Keep tests, fixtures and reports in full backups.
+BOT_VERSION = "16.80"
 SCHEMA_VERSION = 189
 
 CHECKOUT_TERMS_SHORT = (
@@ -5539,6 +5542,10 @@ def verify_topup_atomic(topup_id: int, actor_id: int):
                VALUES('topup',?,'verified',?,?,?,?)""",
             (topup_id, amount, actor_id, "Topup credited atomically", now)
         )
+        # OTP QRIS invoices use the same topup and ledger. Reserve their credit
+        # before commit so it cannot be spent by another concurrent checkout.
+        if OTP_STORE.payments.accept_topup(conn, row):
+            new_balance = int(conn.execute("SELECT balance FROM wallets WHERE user_id=?", (row["user_id"],)).fetchone()[0])
         conn.commit()
         return (row, new_balance), "completed"
     except sqlite3.Error:
@@ -9230,11 +9237,11 @@ async def shopeepay_access_token():
             return data["accessToken"]
 
 
-async def shopeepay_generate_qr(order_id: int, amount: int):
+async def shopeepay_generate_qr(order_id: int, amount: int, *, partner_reference: str = ""):
     token = await shopeepay_access_token()
     path = "/v1.0/qr/qr-mpm-generate"
     timestamp = iso_timestamp()
-    partner_ref = invoice(order_id)
+    partner_ref = partner_reference or invoice(order_id)
 
     body = {
         "partnerReferenceNo": partner_ref,
@@ -23365,15 +23372,16 @@ async def owner_wallet_verify_button(call: CallbackQuery, bot: Bot):
     row, balance = result
 
     try:
-        await bot.send_message(
-            row["user_id"],
-            "✅ <b>TOP UP BERHASIL</b>\n\n"
-            f"🧾 {topup_invoice(topup_id)}\n"
-            f"💰 Saldo masuk: <b>{rupiah(row['amount'])}</b>\n"
-            f"💵 Saldo sekarang: <b>{rupiah(balance)}</b>",
-            reply_markup=topup_done_keyboard(),
-            parse_mode="HTML"
-        )
+        if not await OTP_STORE.payments.notify_topup_receipt(bot, topup_id):
+            await bot.send_message(
+                row["user_id"],
+                "✅ <b>TOP UP BERHASIL</b>\n\n"
+                f"🧾 {topup_invoice(topup_id)}\n"
+                f"💰 Saldo masuk: <b>{rupiah(row['amount'])}</b>\n"
+                f"💵 Saldo sekarang: <b>{rupiah(balance)}</b>",
+                reply_markup=topup_done_keyboard(),
+                parse_mode="HTML"
+            )
     except Exception:
         pass
 
@@ -29297,14 +29305,15 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
 
         row, balance = result
         try:
-            await bot.send_message(
-                row["user_id"],
-                "✅ <b>TOP UP DIKONFIRMASI</b>\n\n"
-                f"🧾 {topup_invoice(entity_id)}\n"
-                f"💰 Saldo masuk: <b>{rupiah(row['amount'])}</b>\n"
-                f"💵 Saldo sekarang: <b>{rupiah(balance)}</b>",
-                reply_markup=topup_done_keyboard(), parse_mode="HTML"
-            )
+            if not await OTP_STORE.payments.notify_topup_receipt(bot, entity_id):
+                await bot.send_message(
+                    row["user_id"],
+                    "✅ <b>TOP UP DIKONFIRMASI</b>\n\n"
+                    f"🧾 {topup_invoice(entity_id)}\n"
+                    f"💰 Saldo masuk: <b>{rupiah(row['amount'])}</b>\n"
+                    f"💵 Saldo sekarang: <b>{rupiah(balance)}</b>",
+                    reply_markup=topup_done_keyboard(), parse_mode="HTML"
+                )
         except Exception:
             pass
 
@@ -33660,8 +33669,18 @@ async def shopeepay_callback(request: web.Request):
             status=400
         )
 
+    if not isinstance(payload, dict):
+        return web.json_response(
+            {"responseCode": "4005600", "responseMessage": "Invalid Body"},
+            status=400
+        )
+
     partner_ref = payload.get("originalPartnerReferenceNo", "")
     latest_status = payload.get("latestTransactionStatus", "")
+    # Existing signature verification also protects OTP payments. The original
+    # MBY order route below is unchanged; OTP references have their own mapping.
+    if isinstance(partner_ref, str) and partner_ref.startswith("OTP-"):
+        return OTP_STORE.payments.gateway_callback(payload)
     amount_obj = payload.get("amount") or {}
     amount_value = amount_obj.get("value", "0")
 
@@ -33788,7 +33807,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.78"
+EXPECTED_SOURCE_VERSION = "16.80"
 
 
 def source_integrity_self_test():
