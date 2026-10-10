@@ -35,6 +35,16 @@ USER_BRAND = "MABOYY OTP STORE"
 ADMIN_BRAND = "MABOYY OTP ADMIN"
 TERMINAL = {"COMPLETED", "CANCELED", "EXPIRED", "FAILED"}
 ACTIVE = {"ACTIVE", "OTP_RECEIVED"}
+# Browsing is not a purchase authorization. Keep navigation usable for a day;
+# quotes and all financial actions still validate their own expiry and owner.
+NAVIGATION_ACTIONS = {"home", "shop", "main_menu", "balance", "help", "help_commands", "countries", "services",
+                      "operators", "products", "orders", "history", "search", "admin", "admin_balance",
+                      "admin_stats", "admin_profit", "admin_status", "admin_webhook", "admin_pending",
+                      "admin_orders", "admin_prices_menu", "admin_prices", "admin_modes", "topup",
+                      "topup_set", "topup_custom", "topup_confirm", "topup_pay", "topup_history",
+                      "topup_status", "topup_back", "topup_noop"}
+TEXT_MENU_ACTIONS = {"🏷️ List Produk", "🔥 Produk Populer", "⚡ Flash Sale", "🏠 Menu Utama", "🎁 Voucher",
+                     "📁 Laporan Stok", "💰 Isi Saldo", "❓ Cara Order", "💬 Hubungi Owner"}
 DEFINITIVE = {"UNAUTHORIZED", "FORBIDDEN", "VALIDATION_ERROR", "NO_OFFER_AVAILABLE",
               "INSUFFICIENT_BALANCE", "PROVIDER_ERROR", "NOT_FOUND"}
 
@@ -69,6 +79,11 @@ def qr_image(content):
 def timestamp(value):
     if not value:
         return 0
+    try:
+        instant = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return instant.replace(tzinfo=timezone.utc).timestamp() if instant.tzinfo is None else instant.timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return 0
 
 
 async def bounded_body(stream, limit):
@@ -79,10 +94,6 @@ async def bounded_body(stream, limit):
             raise StoreError("BODY_TOO_LARGE")
         parts.append(part)
     return b"".join(parts)
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-    except (ValueError, TypeError):
-        return 0
 
 
 class StoreError(Exception):
@@ -1151,6 +1162,7 @@ class Store:
         self.payments = PaymentService(self)
         self.sms, self.refund, self.orders = SMSEventProcessor(self), RefundService(self), OrderService(self)
         self.notifications, self.webhook, self.ui = NotificationQueue(self), WebhookController(self), UIBuilder(self)
+        self.topups = TopupBridge(self)
         self.worker_id = secrets.token_hex(16)
         self._tasks = []
 
@@ -1364,6 +1376,8 @@ class Store:
 class OTPState(StatesGroup):
     search = State()
     admin_value = State()
+    topup_amount = State()
+    topup_proof = State()
 
 
 class UserFormatter:
@@ -1404,7 +1418,7 @@ class UserFormatter:
             "CHANNEL": "Akses mengikuti verifikasi channel bot. Buka /start dan ikuti petunjuk bergabung dahulu.",
             "FORBIDDEN": "Layanan OTP sementara belum tersedia. Hubungi owner.",
             "NOT_FOUND": "Pesanan atau produk tidak ditemukan.",
-            "USER_BALANCE": "Saldo kamu tidak cukup. Isi saldo melalui menu deposit bot.",
+            "USER_BALANCE": "Saldo kamu tidak cukup. Gunakan tombol Isi Saldo di menu OTP.",
             "UNAUTHORIZED": "Pembelian OTP sementara belum tersedia. Hubungi owner.",
             "NOT_CONFIGURED": "Pembelian OTP sementara belum tersedia. Hubungi owner.",
             "CONFIG": "Pembelian OTP sementara belum tersedia. Hubungi owner.",
@@ -1504,15 +1518,201 @@ class MenuMessage:
         return self.message
 
 
+class TopupState:
+    """Use the existing proof handlers with a state isolated to the OTP menu."""
+
+    def __init__(self, state, host):
+        self.state, self.host = state, host
+
+    def __getattr__(self, name):
+        return getattr(self.state, name)
+
+    async def get_state(self):
+        current = await self.state.get_state()
+        return self.host.CheckoutState.waiting_payment_proof.state if current == OTPState.topup_proof.state else current
+
+    async def set_state(self, state):
+        if state == self.host.CheckoutState.waiting_payment_proof or state == self.host.CheckoutState.waiting_payment_proof.state:
+            state = OTPState.topup_proof
+        await self.state.set_state(state)
+
+
+class TopupBot:
+    def __init__(self, bot, bridge, user):
+        self.bot, self.bridge, self.user = bot, bridge, user
+
+    def __getattr__(self, name):
+        return getattr(self.bot, name)
+
+    async def send_photo(self, chat_id, **kwargs):
+        if chat_id == self.user and kwargs.get("reply_markup"):
+            kwargs["reply_markup"] = self.bridge.keyboard(self.user, kwargs["reply_markup"])
+        return await self.bot.send_photo(chat_id, **kwargs)
+
+
+class TopupMessage(MenuMessage):
+    def __init__(self, message, bridge, user, *, message_id=None):
+        super().__init__(message, message_id=message_id)
+        self.bridge, self.user = bridge, user
+
+    @property
+    def bot(self):
+        return TopupBot(self.message.bot, self.bridge, self.user)
+
+    async def answer(self, text, **kwargs):
+        kwargs["reply_markup"] = self.bridge.keyboard(self.user, kwargs.get("reply_markup"))
+        # Keep the original photo available to the host's cancellation cleanup.
+        if self.target_id or getattr(self.message.from_user, "is_bot", False):
+            result = await MenuMessage(self.message, message_id=self.target_id).answer(text, **kwargs)
+        else:
+            result = await self.message.answer(text, **kwargs)
+        self.target_id = result.message_id
+        return result
+
+    async def edit_text(self, text, **kwargs):
+        return await self.answer(text, **kwargs)
+
+    async def edit_caption(self, **kwargs):
+        kwargs["reply_markup"] = self.bridge.keyboard(self.user, kwargs.get("reply_markup"))
+        return await self.message.edit_caption(**kwargs)
+
+
+class TopupCall:
+    def __init__(self, call, message, data, bridge, user):
+        self.call, self.message, self.data = call, message, data
+        self.bot = message.bot
+        self.from_user = call.from_user if call else message.from_user
+
+    def __getattr__(self, name):
+        return getattr(self.call, name)
+
+    async def answer(self, text=None, **kwargs):
+        # The OTP router already acknowledged the callback before rendering.
+        if text and self.call:
+            try:
+                return await self.call.answer(text, **kwargs)
+            except Exception:
+                return None
+        if text:
+            return await self.message.answer("⚠️ "+escape(text), parse_mode="HTML")
+
+
+class TopupBridge:
+    """Navigation adapter only: all invoices, proof checks and credits stay in the host."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def keyboard(self, user, keyboard=None):
+        rows, mapped = [], keyboard is None
+        for row in getattr(keyboard, "inline_keyboard", []) or []:
+            buttons = []
+            for button in row:
+                data, action, payload = button.callback_data or "", None, {}
+                fixed = {"wallet": "balance", "wallet:topup": "topup", "wallet:history": "topup_history",
+                         "home": "home", "products": "countries", "noop": "topup_noop", "topup:custom": "topup_custom"}
+                action = fixed.get(data)
+                match = re.fullmatch(r"topup:(set|confirm|pay):([0-9]{1,19})", data)
+                method = re.fullmatch(r"topupmethod:(qris|bank):([0-9]{1,19})", data)
+                invoice = re.fullmatch(r"(proofsubmit|statuscheck|userproofback|proofback):topup:([0-9]{1,19})", data)
+                cancel = re.fullmatch(r"topupcancel:([0-9]{1,19})", data)
+                if match:
+                    action, payload = "topup_"+match[1], {"amount": match[2]}
+                elif method:
+                    action, payload = "topup_"+method[1], {"amount": method[2]}
+                elif invoice:
+                    action = {"proofsubmit": "topup_proof", "statuscheck": "topup_status",
+                              "userproofback": "topup_back", "proofback": "topup_back"}[invoice[1]]
+                    payload = {"id": invoice[2]}
+                elif cancel:
+                    action, payload = "topup_cancel", {"id": cancel[1]}
+                if action:
+                    label = "🏠 Menu Awal" if action == "home" else "⬅️ Kembali" if button.text.startswith("⬅️") else button.text
+                    # Proof/cancel buttons must remain usable throughout a deposit
+                    # invoice, just like the host's original ownership-checked buttons.
+                    token = (self.store.token(user, action, payload, ttl=86400) if action in {"topup_proof", "topup_cancel"}
+                             else self.store.ui.callback(user, action, payload))
+                    button = button.model_copy(update={"text": label, "callback_data": token})
+                    mapped = True
+                buttons.append(button)
+            rows.append(buttons)
+        if not mapped:
+            return keyboard  # In particular, never change owner proof-review buttons.
+        if not any(button.text == "⬅️ Kembali" for row in rows for button in row):
+            rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=self.store.ui.callback(user, "balance"))])
+        if not any(button.text == "🏠 Menu Awal" for row in rows for button in row):
+            rows.append([InlineKeyboardButton(text="🏠 Menu Awal", callback_data=self.store.ui.callback(user, "home"))])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def exit(self, user, state):
+        values = await state.get_data()
+        current = await state.get_state()
+        if current in {OTPState.topup_proof.state, self.store.host.CheckoutState.waiting_payment_proof.state}:
+            entity, entity_id = self.store.host.payment_proof_data_target(values)
+            if entity == "topup" and entity_id:
+                await self.store.host.clear_matching_topup_proof_context(user, entity_id, TopupState(state, self.store.host))
+
+    async def handle(self, message, user, action, payload, state, call=None):
+        host = self.store.host
+        native = message.message if isinstance(message, MenuMessage) else message
+        menu = TopupMessage(native, self, user)
+        proxy_state = TopupState(state, host)
+        targets = {
+            "topup": ("wallet:topup", host.wallet_topup, True),
+            "topup_custom": ("topup:custom", host.wallet_topup_custom, True),
+            "topup_history": ("wallet:history", host.wallet_history, False),
+        }
+        if action == "topup_noop":
+            return
+        if action in {"topup_set", "topup_confirm", "topup_pay", "topup_qris", "topup_bank"}:
+            amount = host.parse_manual_topup_amount(str(payload.get("amount", "")))
+            if amount is None:
+                raise StoreError("INPUT", "Nominal isi saldo tidak valid.")
+            verb = action.removeprefix("topup_")
+            data = f"topupmethod:{verb}:{amount}" if verb in {"qris", "bank"} else f"topup:{verb}:{amount}"
+            targets[action] = (data, getattr(host, "wallet_topup_method_"+verb if verb in {"qris", "bank"} else "wallet_topup_"+verb), verb in {"set", "confirm"})
+        elif action in {"topup_status", "topup_proof", "topup_back", "topup_cancel"}:
+            numbers = host.callback_positive_numbers("invoice:"+str(payload.get("id", "")), "invoice")
+            if not numbers:
+                raise StoreError("INPUT", "Invoice tidak valid.")
+            entity_id = numbers[0]
+            if not self.store.repo.one("SELECT id FROM topups WHERE id=? AND user_id=?", (entity_id, user)):
+                raise StoreError("NOT_FOUND")
+            prefix, handler, with_state = {
+                "topup_status": ("statuscheck:topup", host.user_check_transaction_status, False),
+                "topup_proof": ("proofsubmit:topup", host.payment_proof_start, True),
+                "topup_back": ("userproofback:topup", host.payment_proof_back, True),
+                "topup_cancel": ("topupcancel", host.user_cancel_topup, True),
+            }[action]
+            targets[action] = (f"{prefix}:{entity_id}", handler, with_state)
+        if action not in targets:
+            raise StoreError("INPUT")
+        data, handler, with_state = targets[action]
+        proxy = TopupCall(call, menu, data, self, user)
+        await handler(proxy, proxy_state) if with_state else await handler(proxy)
+        if action == "topup_proof" and await state.get_state() == OTPState.topup_proof.state:
+            # SQLite FSM already persists this isolated upload. Do not arm the
+            # host's generic media recovery after a user switches to another command.
+            self.store.repo.execute("DELETE FROM payment_proof_sessions WHERE user_id=? AND entity_type='topup' AND entity_id=?",
+                                    (user, entity_id))
+        if action == "topup_custom" and await state.get_state() == host.OwnerState.topup_amount.state:
+            await state.set_state(OTPState.topup_amount)
+        if await state.get_state() in {OTPState.topup_amount.state, OTPState.topup_proof.state}:
+            await state.update_data(otp_menu_message_id=menu.target_id or native.message_id)
+
+
 class UIBuilder:
     def __init__(self, store):
         self.store = store
+
+    def callback(self, user, action, payload=None):
+        return self.store.token(user, action, payload, ttl=86400 if action in NAVIGATION_ACTIONS else 300)
 
     def keyboard(self, user, rows):
         if any(action.startswith("admin") for row in rows for _, action, _ in row) and not self.store.host.is_owner(user):
             raise StoreError("FORBIDDEN", "Menu ini hanya untuk owner.")
         return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=label[:64], callback_data=self.store.token(user, action, payload))
+            InlineKeyboardButton(text=label[:64], callback_data=self.callback(user, action, payload))
             for label, action, payload in row] for row in rows])
 
     def admin_keyboard(self, user, rows):
@@ -1523,11 +1723,29 @@ class UIBuilder:
     def home_keyboard(self, user):
         rows = [[("📱 BELI NOMOR OTP", "countries", {})],
                 [("📦 PESANAN SAYA", "orders", {}), ("🔐 CEK KODE OTP", "orders", {})],
-                [("💰 SALDO SAYA", "balance", {}), ("📜 RIWAYAT", "history", {})],
-                [("❓ BANTUAN", "help", {})]]
+                [("➕ Isi Saldo", "topup", {}), ("💰 SALDO SAYA", "balance", {})],
+                [("📜 RIWAYAT", "history", {}), ("❓ BANTUAN", "help", {})]]
         if self.store.host.is_owner(user):
             rows.append([("⚙️ OTP ADMIN", "admin", {})])
-        return self.keyboard(user, rows)
+        keyboard = self.keyboard(user, rows)
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=self.callback(user, "main_menu"))])
+        return keyboard
+
+    def navigation(self, user, back="home", payload=None):
+        return self.keyboard(user, [[("⬅️ Kembali", back, payload or {}), ("🏠 Menu Awal", "home", {})]])
+
+    async def balance(self, message, user):
+        rows = [[("➕ Isi Saldo", "topup", {}), ("📑 Riwayat Saldo", "topup_history", {})]]
+        # Unfinished deposits remain reachable when the user leaves the invoice.
+        invoices = self.store.repo.rows("""SELECT t.id,t.amount FROM topups t
+            WHERE t.user_id=? AND t.status IN ('pending','processing')
+              AND NOT EXISTS (SELECT 1 FROM otp_payments p WHERE p.topup_id=t.id)
+            ORDER BY t.id DESC LIMIT 5""", (user,))
+        for row in invoices:
+            rows.append([(f"🧾 Isi Saldo #{row['id']} • {money(row['amount'])}", "topup_status", {"id": row["id"]})])
+        rows.append([("⬅️ Kembali", "shop" if self.store.host.is_owner(user) else "home", {}), ("🏠 Menu Awal", "home", {})])
+        await self.send(message, f"💰 <b>SALDO SAYA</b>\n\nSaldo kamu: <b>{money(self.store.host.get_balance(user))}</b>\n\n"
+                        "Pilih Isi Saldo untuk menambah saldo melalui pembayaran bot. Saldo bertambah setelah pembayaran terkonfirmasi.", self.keyboard(user, rows))
 
     @staticmethod
     def order_text(order):
@@ -1553,7 +1771,7 @@ class UIBuilder:
                 rows.append([("✅ SELESAI", "confirm_finish", oid)])
         elif caps.get("can_reactivate"):
             rows.append([("♻️ AKTIFKAN LAGI", "reactivate", oid)])
-        rows.append([("📦 PESANAN", "orders", {}), ("🏠 MABOYY OTP", "home", {})])
+        rows.append([("⬅️ Kembali", "orders", {}), ("🏠 Menu Awal", "home", {})])
         return self.keyboard(user, rows)
 
     @staticmethod
@@ -1595,8 +1813,7 @@ class UIBuilder:
     async def send(self, message, text, keyboard=None, *, fresh=False):
         if keyboard is None and isinstance(message, MenuMessage) and not fresh:
             user = message.chat.id
-            keyboard = self.keyboard(user, [[("⬅️ ADMIN", "admin", {})]] if self.store.host.is_owner(user)
-                                     else [[("🏠 MABOYY OTP", "home", {})]])
+            keyboard = self.navigation(user)
         options = {"reply_markup": keyboard, "parse_mode": "HTML", "link_preview_options": LinkPreviewOptions(is_disabled=True)}
         if fresh:
             return await message.bot.send_message(message.chat.id, text, **options)
@@ -1620,7 +1837,7 @@ class UIBuilder:
             username = getattr(message.from_user, "username", "") or username
         identity = "@"+username.lstrip("@") if username else f"User {user}"
         mode = "🛍️ Mode pembeli • saldo wallet pribadi\n" if self.store.host.is_owner(user) else ""
-        await self.send(message, f"🛍️ <b>{USER_BRAND}</b>\n👤 User: {escape(identity)}\n\n"
+        await self.send(message, f"🛍️ <b>{USER_BRAND}</b>\n🏠 <b>Menu Awal</b>\n👤 User: {escape(identity)}\n\n"
             + mode +
             f"💰 Saldo Kamu: <b>{money(self.store.host.get_balance(user))}</b>\n"
             f"🛍️ Status toko: {escape(status)}\n\nPilih menu di bawah:", self.home_keyboard(user))
@@ -1668,7 +1885,7 @@ class UIBuilder:
                 nav.append(("➡️", kind, {**payload, "page": page+1}))
             if nav:
                 keyboard_rows.append(nav)
-            keyboard_rows.append([("🏠 MABOYY OTP", "home", {})])
+            keyboard_rows.append([("⬅️ Kembali", "operators", {**payload, "page": 0}), ("🏠 Menu Awal", "home", {})])
             return await self.send(message, title+f"\nHalaman {page+1}\n\n"+("Pilih harga nomor:" if buttons else "Belum ada stok pada halaman ini."), self.keyboard(user, keyboard_rows))
         subset = buttons[page*8:(page+1)*8]
         keyboard_rows = [[button] for button in subset]
@@ -1681,7 +1898,8 @@ class UIBuilder:
             keyboard_rows.append(nav)
         if kind in {"countries", "services"}:
             keyboard_rows.append([("🔎 CARI", "search", {"kind": kind, "context": {**payload, "page": 0}})])
-        keyboard_rows.append([("🏠 MABOYY OTP", "home", {})])
+        back = {"countries": "home", "services": "countries", "operators": "services"}[kind]
+        keyboard_rows.append([("⬅️ Kembali", back, {**payload, "page": 0, "query": ""}), ("🏠 Menu Awal", "home", {})])
         await self.send(message, title+f"\nHalaman {page+1} • {len(buttons)} pilihan\n"+("Pilih menu:" if subset else "Tidak ada hasil."), self.keyboard(user, keyboard_rows))
 
     async def quote(self, message, user, quote):
@@ -1697,7 +1915,12 @@ class UIBuilder:
             f"⏳ Harga berlaku {self.store.config.quote_ttl} detik sebelum memilih pembayaran.\n"
             "Pilih metode pembayaran. Refund yang terkonfirmasi masuk ke saldo bot.",
             self.keyboard(user, [[("⚡ BUY NOW (QRIS)", "pay_qris", {"quote": quote["quote_id"]})],
-                                 [("💰 BUY SALDO", "buy", {"quote": quote["quote_id"]})], [("❌ BATAL", "home", {})]]))
+                                 [("💰 BUY SALDO", "buy", {"quote": quote["quote_id"]})],
+                                 [("➕ Isi Saldo", "topup", {})],
+                                 [("⬅️ Kembali", "products", {"country": product['country_id'], "platform": product['platform_id'],
+                                     "country_name": product['country_name'], "platform_name": product['platform_name'],
+                                     "operator": product.get('operator_id'), "operator_name": product.get('operator_name')})] if not quote["parent_order_id"] else [("⬅️ Kembali", "check", {"id": quote["parent_order_id"]})],
+                                 [("🏠 Menu Awal", "home", {})]]))
 
     async def payment(self, message, user, payment_id):
         payment = self.store.payments.owned(user, payment_id)
@@ -1743,8 +1966,8 @@ class UIBuilder:
         rows.append([InlineKeyboardButton(text="🔄 CEK PEMBAYARAN", callback_data=token("payment_status"))])
         if active:
             rows.append([InlineKeyboardButton(text="❌ BATALKAN INVOICE", callback_data=token("payment_cancel"))])
-        rows.append([InlineKeyboardButton(text="📦 PESANAN SAYA", callback_data=self.store.token(user, "orders")),
-                     InlineKeyboardButton(text="🏠 MABOYY OTP", callback_data=self.store.token(user, "home"))])
+        rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=self.callback(user, "orders")),
+                     InlineKeyboardButton(text="🏠 Menu Awal", callback_data=self.callback(user, "home"))])
         text = (f"🛍️ <b>{USER_BRAND}</b>\n💳 <b>BUY NOW • QRIS</b>\n\n"
                 f"🧾 Invoice: <b>{escape(payment['partner_reference'])}</b>\n"
                 f"💰 Harga nomor: {money(payment['amount_idr'])}\n"
@@ -1804,7 +2027,7 @@ class UIBuilder:
             nav.append(("➡️", action, {"page": page+1}))
         if nav:
             buttons.append(nav)
-        buttons.append([("⬅️ ADMIN", "admin", {})] if admin else [("🏠 MABOYY OTP", "home", {})])
+        buttons.append([("⬅️ Kembali", "home", {}), ("🏠 Menu Awal", "home", {})])
         await self.send(message, "\n\n".join(text), self.admin_keyboard(user, buttons) if admin else self.keyboard(user, buttons))
 
     async def check(self, message, user, order_id):
@@ -1838,7 +2061,7 @@ HELP = (f"🛍️ <b>{USER_BRAND}</b>\n❓ CARA BELI OTP\n\n"
 
 COMMAND_HELP = (f"🛍️ <b>{USER_BRAND}</b>\n❓ PANDUAN TOKO OTP\n\n"
     "/otp — menu toko\n/otp beli • /otp negara — pilih negara\n/otp layanan — pilih layanan\n"
-    "/otp saldo — saldo bot kamu\n/otp pesanan — pesanan aktif\n/otp cek &lt;id&gt; — nomor dan SMS\n"
+    "/otp saldo — saldo bot kamu\n/otp isi — isi saldo\n/otp pesanan — pesanan aktif\n/otp cek &lt;id&gt; — nomor dan SMS\n"
     "/otp ulang &lt;id&gt; — minta SMS baru jika tersedia\n/otp batal &lt;id&gt; — konfirmasi pembatalan\n"
     "/otp selesai &lt;id&gt; — konfirmasi selesai\n/otp riwayat — riwayat pribadi\n"
     "/otp aktifkan &lt;id&gt; — reaktivasi berbayar jika didukung\n/otp bantuan — panduan\n\n"
@@ -1855,6 +2078,66 @@ class AdminHandler:
     def authorize(self, user):
         if not self.store.host.is_owner(user):
             raise StoreError("FORBIDDEN", "Menu ini hanya untuk owner.")
+
+    async def prices(self, message, user, kind, *, page=1, country=None, platform=None):
+        self.authorize(user)
+        if kind not in {"provider", "jual"}:
+            raise StoreError("INPUT", "Pilih Harga Provider atau Harga Jual.")
+        page = self.number(page, 1, 10000)
+        params = {"page": page, "limit": 8, "sort": "price_asc"}
+        if country is not None:
+            params["country_id"] = self.number(country, 1, 2**31-1)
+        if platform is not None:
+            params["platform_id"] = self.number(platform, 1, 2**31-1)
+        context = {"kind": kind, "country": country, "platform": platform}
+        title = "📋 HARGA PROVIDER" if kind == "provider" else "🏷️ HARGA JUAL"
+        buttons = []
+        try:
+            rows = await self.store.catalog.listing("/catalog/products", params)
+        except StoreError as exc:
+            text = title+"\n\n⚠️ Daftar harga belum dapat diambil. "+escape(exc.public)
+            buttons.append([("🔄 Coba Lagi", "admin_prices", {**context, "page": page})])
+        else:
+            text, shown, invalid = [f"{title} • halaman {page}"], 0, 0
+            for row in rows[:8]:
+                if row.get("active") is not True:
+                    continue
+                try:
+                    stock, cost, ident = integer(row.get("available")), integer(row.get("price")), integer(row.get("id"), 1)
+                except StoreError:
+                    invalid += 1
+                    continue
+                if not stock:
+                    continue
+                try:
+                    sale, _ = self.store.pricing.calculate(row)
+                    selling = money(sale)
+                except (StoreError, InvalidOperation, KeyError, TypeError, ValueError):
+                    # A stale override must not hide a valid provider price.
+                    selling = "Perlu memperbarui aturan harga"
+                name = str(row.get("name") or f"Negara #{row.get('country_id')} • Layanan #{row.get('platform_id')}")
+                label = ""
+                for char in name[:180]:
+                    escaped = escape(char)
+                    if len(label)+len(escaped) > 180:
+                        break
+                    label += escaped
+                text.append(f"Produk {ident} • {label}\nModal {money(cost)} • Jual {selling} • Stok {stock}")
+                shown += 1
+            if not shown:
+                text.append("Belum ada produk aktif dan tersedia pada halaman ini.")
+            if invalid:
+                text.append(f"⚠️ {invalid} data produk belum valid; tidak ditampilkan.")
+            text = "\n\n".join(text)
+            navigation = []
+            if page > 1:
+                navigation.append(("◀️ Sebelumnya", "admin_prices", {**context, "page": page-1}))
+            if len(rows) >= 8:
+                navigation.append(("Berikutnya ▶️", "admin_prices", {**context, "page": page+1}))
+            if navigation:
+                buttons.append(navigation)
+        buttons.append([("⬅️ Kembali", "admin_prices_menu", {}), ("🏠 Menu Awal", "home", {})])
+        return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, buttons))
 
     async def handle(self, message, user, args):
         self.authorize(user)
@@ -1971,18 +2254,7 @@ class AdminHandler:
                 country = self.number(args[2], 1, 2**31-1) if len(args) >= 4 else None
                 platform = self.number(args[3], 1, 2**31-1) if len(args) >= 4 else None
                 page = self.number(args[4], 1, 10000) if len(args) >= 5 else 1
-                params = {"limit": 10, "page": page, "sort": "price_asc"}
-                if country and platform:
-                    params.update(country_id=country, platform_id=platform)
-                rows = await self.store.catalog.listing("/catalog/products", params)
-                text = [f"📋 HARGA {sub.upper()} • halaman {page}"]
-                for row in rows:
-                    if row.get("active") is not True or row.get("available", 0) <= 0:
-                        continue
-                    sale, _ = self.store.pricing.calculate(row)
-                    text.append(f"Produk {row['id']} • {escape(row.get('name'))}\nModal {money(row['price'])} • Jual {money(sale)} • Stok {row['available']}")
-                text.append("Halaman berikut: /otp admin harga "+sub+" <negara_id> <layanan_id> <halaman>")
-                return await self.store.ui.send(message, "\n\n".join(text))
+                return await self.prices(message, user, sub, page=page, country=country, platform=platform)
         if section == "orders":
             return await self.store.ui.history(message, user, page=int(args[1]) if len(args) > 1 else 0, admin=True)
         if section in {"limit", "markup"}:
@@ -1994,7 +2266,7 @@ class AdminHandler:
                     f"Nonaktif otomatis: {'ya' if data.get('webhook_disabled_at') else 'tidak'}\n"
                     f"Gagal beruntun: {data.get('webhook_consecutive_failures',0)}\n"
                     "Tombol Hubungkan hanya mengatur URL ini jika webhook kosong atau sudah memakai URL bot. Secret tidak ditampilkan.")
-            return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [[("🔗 HUBUNGKAN WEBHOOK", "admin_webhook_connect", {})], [("🧪 TEST WEBHOOK", "admin_webhook_test", {})], [("⬅️ ADMIN", "admin", {})]]))
+            return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [[("🔗 HUBUNGKAN WEBHOOK", "admin_webhook_connect", {})], [("🧪 TEST WEBHOOK", "admin_webhook_test", {})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]))
         if section == "harga":
             example = {"id": -1, "price": 8000}
             sale, _ = self.store.pricing.calculate(example)
@@ -2004,7 +2276,7 @@ class AdminHandler:
                 "Prioritas: produk → negara+layanan → layanan → negara → global.")
             return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [
                 [("📈 ATUR PERSENTASE", "admin_input", {"setting": "percent"}), ("💵 ATUR NOMINAL", "admin_input", {"setting": "fixed"})],
-                [("⚙️ PILIH MODE", "admin_modes", {})], [("📋 HARGA PROVIDER", "admin_prices", {"kind": "provider"}), ("🛒 HARGA JUAL", "admin_prices", {"kind": "jual"})], [("⬅️ ADMIN", "admin", {})]]))
+                [("⚙️ PILIH MODE", "admin_modes", {})], [("📋 HARGA PROVIDER", "admin_prices", {"kind": "provider"}), ("🛒 HARGA JUAL", "admin_prices", {"kind": "jual"})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]))
         stats = self.store.repo.one("""SELECT count(*) total,COALESCE(sum(selling_price_idr-refund_idr),0) revenue,
             COALESCE(sum(selling_price_idr-refund_idr-provider_cost_idr+provider_refund_idr),0) profit,
             COALESCE(sum(status='COMPLETED'),0) completed,COALESCE(sum(status IN ('ACTIVE','OTP_RECEIVED')),0) pending,
@@ -2030,8 +2302,13 @@ class AdminHandler:
             details=section == "status")
         rows = OwnerFormatter.dashboard_rows()
         if section == "status":
-            rows = [[("🔄 RETRY NOTIFIKASI GAGAL", "admin_retry", {})], [("⬅️ ADMIN", "admin", {})]]
-        await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, rows))
+            rows = [[("🔄 RETRY NOTIFIKASI GAGAL", "admin_retry", {})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]
+        elif section != "dashboard":
+            rows = [[("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]
+        keyboard = self.store.ui.admin_keyboard(user, rows)
+        if section == "dashboard":
+            keyboard.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=self.store.ui.callback(user, "main_menu"))])
+        await self.store.ui.send(message, text, keyboard)
 
     @staticmethod
     def number(value, low, high):
@@ -2067,14 +2344,24 @@ def register(router, store):
             logging.warning("OTP handler: %s", type(exc).__name__)
         await store.ui.send(message, "⚠️ "+escape(text))
 
-    async def dispatch(message, user, action, payload, state):
+    async def dispatch(message, user, action, payload, state, call=None):
         # Apply this before every admin action, including history pagination and
         # previously issued callbacks whose owner's role may have been revoked.
         if action.startswith("admin"):
             admin.authorize(user)
+        if action.startswith("topup"):
+            if action not in {"topup_back", "topup_cancel", "topup_noop"}:
+                await store.topups.exit(user, state)
+                await state.clear()
+            return await store.topups.handle(message, user, action, payload, state, call)
+        await store.topups.exit(user, state)
         if action in {"home", "shop", "help", "balance", "countries", "orders", "history"} or action.startswith("admin") and action != "admin_input":
             await state.clear()
-        if action == "home":
+        if action == "main_menu":
+            await state.clear()
+            if call:
+                await store.host.cb_home(TopupCall(call, message, "home", store.topups, user), state, message.bot)
+        elif action == "home":
             if store.host.is_owner(user):
                 await admin.handle(message, user, [])
             else:
@@ -2082,11 +2369,11 @@ def register(router, store):
         elif action == "shop":
             await store.ui.home(message, user)
         elif action == "help":
-            await store.ui.send(message, HELP, store.ui.keyboard(user, [[("📋 DAFTAR COMMAND", "help_commands", {})], [("🏠 MABOYY OTP", "home", {})]]))
+            await store.ui.send(message, HELP, store.ui.keyboard(user, [[("📋 DAFTAR COMMAND", "help_commands", {})], [("⬅️ Kembali", "home", {}), ("🏠 Menu Awal", "home", {})]]))
         elif action == "help_commands":
-            await store.ui.send(message, COMMAND_HELP, store.ui.keyboard(user, [[("⬅️ BANTUAN", "help", {})], [("🏠 MABOYY OTP", "home", {})]]))
+            await store.ui.send(message, COMMAND_HELP, store.ui.keyboard(user, [[("⬅️ Kembali", "help", {})], [("🏠 Menu Awal", "home", {})]]))
         elif action == "balance":
-            await store.ui.send(message, "💰 Saldo kamu: <b>"+money(store.host.get_balance(user))+"</b>\nGunakan menu deposit bot untuk mengisi saldo.", store.ui.home_keyboard(user))
+            await store.ui.balance(message, user)
         elif action in {"countries", "services", "operators", "products"}:
             if action == "services" and "country" not in payload:
                 await store.ui.selection(message, user, "countries")
@@ -2097,7 +2384,7 @@ def register(router, store):
         elif action == "search":
             await state.set_state(OTPState.search)
             await state.update_data(otp_search=payload)
-            await store.ui.send(message, "🔎 Kirim nama negara/layanan untuk dicari. /otp untuk kembali.")
+            await store.ui.send(message, "🔎 Kirim nama negara/layanan untuk dicari.", store.ui.navigation(user, payload['kind'], payload['context']))
             await state.update_data(otp_menu_message_id=message.message_id)
         elif action == "quote":
             quote = await store.purchase.quote(user, payload["product"])
@@ -2128,7 +2415,7 @@ def register(router, store):
             kind = action.removeprefix("confirm_")
             await store.ui.send(message, "Konfirmasi "+("pembatalan" if kind == "cancel" else "penyelesaian")+f" order #{order['id']}?\n"
                 + ("Refund diproses setelah pembatalan dan pengembalian dana terkonfirmasi." if kind == "cancel" else "Order selesai tidak mendapat refund."),
-                store.ui.keyboard(user, [[("✅ KONFIRMASI", kind, {"id": order["id"]})], [("⬅️ KEMBALI", "check", {"id": order["id"]})]]))
+                store.ui.keyboard(user, [[("✅ KONFIRMASI", kind, {"id": order["id"]})], [("⬅️ Kembali", "check", {"id": order["id"]}), ("🏠 Menu Awal", "home", {})]]))
         elif action in {"cancel", "finish", "resend"}:
             await store.orders.action(user, payload["id"], action)
             await store.ui.send(message, "✅ "+{"cancel": "Pembatalan diterima. Status refund tersedia di pesanan.", "finish": "Order selesai.", "resend": "Permintaan SMS baru diterima. Tunggu SMS berikutnya; SMS lama tidak dikirim ulang."}[action])
@@ -2143,17 +2430,20 @@ def register(router, store):
             if action in sections:
                 await admin.handle(message, user, sections[action])
             elif action == "admin_prices":
-                await admin.handle(message, user, ["harga", payload["kind"]])
+                await admin.prices(message, user, payload.get("kind"), page=payload.get("page", 1),
+                                   country=payload.get("country"), platform=payload.get("platform"))
             elif action == "admin_toggle":
                 await admin.handle(message, user, ["off" if store.settings()["enabled"] else "on"])
             elif action == "admin_modes":
-                await store.ui.send(message, "Pilih mode harga:", store.ui.admin_keyboard(user, [[(name, "admin_set_mode", {"mode": mode})] for name, mode in [("Persentase", "persen"), ("Nominal", "nominal"), ("Kombinasi", "kombinasi")]]))
+                rows = [[(name, "admin_set_mode", {"mode": mode})] for name, mode in [("Persentase", "persen"), ("Nominal", "nominal"), ("Kombinasi", "kombinasi")]]
+                rows.append([("⬅️ Kembali", "admin_prices_menu", {}), ("🏠 Menu Awal", "home", {})])
+                await store.ui.send(message, "Pilih mode harga:", store.ui.admin_keyboard(user, rows))
             elif action == "admin_set_mode":
                 await admin.handle(message, user, ["markup", "mode", payload["mode"]])
             elif action == "admin_input":
                 await state.set_state(OTPState.admin_value)
                 await state.update_data(otp_admin_setting=payload["setting"])
-                await store.ui.send(message, "Kirim nilai "+("persentase" if payload["setting"] == "percent" else "tambahan nominal rupiah (angka bulat)")+". /otp untuk kembali.")
+                await store.ui.send(message, "Kirim nilai "+("persentase" if payload["setting"] == "percent" else "tambahan nominal rupiah (angka bulat)")+".", store.ui.navigation(user, "admin_prices_menu"))
                 await state.update_data(otp_menu_message_id=message.message_id)
             elif action == "admin_webhook_connect":
                 await store.configure_webhook(user)
@@ -2178,10 +2468,12 @@ def register(router, store):
                 raise StoreError("INPUT", "Command terlalu panjang.")
             admin_context = bool(args and args[0].lower() == "admin")
             if admin_context:
+                await store.topups.exit(user, state)
+                await state.clear()
                 await admin.handle(message, user, args[1:])
                 return
             name = args[0].lower() if args else ""
-            mapping = {"": "home", "beli": "countries", "negara": "countries", "layanan": "services", "saldo": "balance", "pesanan": "orders", "cek": "check", "ulang": "resend", "batal": "confirm_cancel", "selesai": "confirm_finish", "riwayat": "history", "aktifkan": "reactivate", "bantuan": "help"}
+            mapping = {"": "home", "beli": "countries", "negara": "countries", "layanan": "services", "saldo": "balance", "isi": "topup", "topup": "topup", "pesanan": "orders", "cek": "check", "ulang": "resend", "batal": "confirm_cancel", "selesai": "confirm_finish", "riwayat": "history", "aktifkan": "reactivate", "bantuan": "help"}
             if name not in mapping:
                 raise StoreError("INPUT", "Command belum dikenal. Gunakan /otp bantuan.")
             action, payload = mapping[name], {}
@@ -2205,7 +2497,7 @@ def register(router, store):
             await call.answer()
             answered = True
             menu = MenuMessage(call.message)
-            await dispatch(menu, user, action, payload, state)
+            await dispatch(menu, user, action, payload, state, call)
         except Exception as exc:
             if not answered:
                 try:
@@ -2244,5 +2536,43 @@ def register(router, store):
             await state.clear()
         except Exception as exc:
             await failure(menu, exc, user=message.from_user.id, admin_context=True)
+
+    @router.message(OTPState.topup_amount, F.text & ~F.text.startswith("/") & ~F.text.in_(TEXT_MENU_ACTIONS))
+    async def otp_topup_amount(message, state):
+        menu = message
+        try:
+            await guard(message, message.from_user.id)
+            store.repo.rate(message.from_user.id, "topup_amount", 10, 60)
+            values = await state.get_data()
+            menu = TopupMessage(message, store.topups, message.from_user.id, message_id=values.get("otp_menu_message_id"))
+            await store.host.wallet_topup_custom_input(menu, state)
+            if await state.get_state() == OTPState.topup_amount.state:
+                await state.update_data(otp_menu_message_id=menu.target_id or message.message_id)
+        except Exception as exc:
+            await failure(menu, exc, user=message.from_user.id)
+
+    @router.message(OTPState.topup_proof, ~F.text.startswith("/") & ~F.text.in_(TEXT_MENU_ACTIONS))
+    async def otp_topup_proof(message, state, bot):
+        menu = message
+        try:
+            await guard(message, message.from_user.id)
+            store.repo.rate(message.from_user.id, "topup_proof_upload", 6, 60)
+            values = await state.get_data()
+            entity, entity_id = store.host.payment_proof_data_target(values)
+            if entity != "topup" or not store.repo.one("SELECT id FROM topups WHERE id=? AND user_id=?", (entity_id, message.from_user.id)):
+                raise StoreError("NOT_FOUND")
+            menu = TopupMessage(message, store.topups, message.from_user.id, message_id=values.get("otp_menu_message_id"))
+            proxy_state = TopupState(state, store.host)
+            if message.photo:
+                await store.host.payment_proof_photo(menu, proxy_state, bot)
+            elif message.document:
+                await store.host.payment_proof_document(menu, proxy_state, bot)
+            else:
+                await menu.answer("❌ Kirim bukti sebagai foto/screenshot atau file gambar.",
+                    reply_markup=store.host.payment_proof_status_keyboard(entity, entity_id), parse_mode="HTML")
+            if await state.get_state() == OTPState.topup_proof.state:
+                await state.update_data(otp_menu_message_id=menu.target_id or message.message_id)
+        except Exception as exc:
+            await failure(menu, exc, user=message.from_user.id)
 
     return store

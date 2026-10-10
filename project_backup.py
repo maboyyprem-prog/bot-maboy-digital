@@ -248,6 +248,13 @@ def create(root,folder,key_path,label,databases=(),external=()):
             snapshots.append({'source':str(source),'archive_path':f'database-{label}/database-{index}.sqlite',
                               'type':'file','mode':0o600,'mtime_ns':info.st_mtime_ns,'atime_ns':info.st_atime_ns,
                               'size':info.st_size,'sha256':checksum,'staging_path':str(destination)})
+        # Reading an idle WAL database can create and retire SQLite sidecars,
+        # changing its directory's mtime. Record the filesystem after all
+        # consistent snapshots are closed. Every file is still inventoried;
+        # later changes during archiving still fail the stable-view check.
+        entries=inventory(root)
+        for storage in external_storages:
+            storage['entries']=inventory(storage['source'])
         manifest={'format':1,'created_at':datetime.now(timezone.utc).isoformat(),'source_root':str(root),
                   'archive':f'project-{label}-full.tar.gz.enc','entries':entries,
                   'databases':[{key:value for key,value in item.items() if key!='staging_path'} for item in snapshots],
