@@ -229,7 +229,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deployment ZIP contains only main.py, bot.py, otp_smscode.py, requirements.txt,
 # project_backup.py and .gitignore. Keep tests, fixtures and reports in full backups.
-BOT_VERSION = "16.84"
+BOT_VERSION = "16.87"
 SCHEMA_VERSION = 190
 
 CHECKOUT_TERMS_SHORT = (
@@ -8849,11 +8849,13 @@ async def owner_proof_result_screen(
     text: str,
     *,
     alert_text: str = "",
+    reply_markup=None,
 ):
     """
     Always leave a visible owner result after a proof action.
     Handles both media/caption messages and normal text messages.
     """
+    keyboard=reply_markup if reply_markup is not None else owner_proof_home_keyboard()
     try:
         await call.answer(alert_text or "Selesai.", show_alert=bool(alert_text))
     except Exception:
@@ -8863,7 +8865,7 @@ async def owner_proof_result_screen(
         if getattr(call.message, "caption", None) is not None:
             await call.message.edit_caption(
                 caption=text,
-                reply_markup=owner_proof_home_keyboard(),
+                reply_markup=keyboard,
                 parse_mode="HTML"
             )
             return
@@ -8873,7 +8875,7 @@ async def owner_proof_result_screen(
     try:
         await call.message.edit_text(
             text,
-            reply_markup=owner_proof_home_keyboard(),
+            reply_markup=keyboard,
             parse_mode="HTML"
         )
         return
@@ -8883,7 +8885,7 @@ async def owner_proof_result_screen(
     try:
         await call.message.answer(
             text,
-            reply_markup=owner_proof_home_keyboard(),
+            reply_markup=keyboard,
             parse_mode="HTML"
         )
     except Exception:
@@ -8891,7 +8893,7 @@ async def owner_proof_result_screen(
 
 
 def owner_payment_proof_keyboard(entity: str, entity_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows=[
         [
             InlineKeyboardButton(
                 text="✅ Konfirmasi",
@@ -8914,7 +8916,10 @@ def owner_payment_proof_keyboard(entity: str, entity_id: int):
                 callback_data="owner:panel"
             )
         ]
-    ])
+    ]
+    if entity=="topup":
+        rows.insert(2,[InlineKeyboardButton(text="📝 Kirim Catatan",callback_data=f"proofnote:topup:{entity_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def payment_proof_caption(entity: str, row) -> str:
@@ -8938,7 +8943,9 @@ def payment_proof_caption(entity: str, row) -> str:
         f"Saldo masuk: <b>{rupiah(row['amount'])}</b>\n"
         f"Total transfer: <b>{rupiah(row['payment_total'])}</b>\n"
         f"Kode unik: <b>+{int(row['unique_code'] or 0)}</b>\n\n"
-        "Periksa bukti sebelum konfirmasi."
+        "Periksa bukti sebelum konfirmasi.\n"
+        "Nominal bukti harus sesuai Total transfer, termasuk kode unik. "
+        "Jika berbeda, gunakan Kirim Catatan untuk memberi tahu user."
     )
 
 
@@ -9776,6 +9783,7 @@ class OwnerState(StatesGroup):
     topup_amount = State()
     owner_wallet_add = State()
     owner_wallet_subtract = State()
+    topup_proof_note = State()
     owner_min_topup = State()
     variant_button_name = State()
     low_stock_threshold = State()
@@ -10119,6 +10127,56 @@ def shop_reply_keyboard_record(value,scope):
     return value
 
 
+def shop_reply_keyboard_removal_record(value,scope):
+    """Cleanup IDs belong only to confirmed bot keyboard-removal notices."""
+    if (not isinstance(value,dict) or value.get("kind")!="shop_reply_keyboard_removal"
+            or value.get("scope")!=scope or value.get("text")!="⌨️ Keyboard mengetik aktif."
+            or type(value.get("message_id")) is not int
+            or not 0<value["message_id"]<=9223372036854775807
+            or type(value.get("next_retry_at",0)) not in (int,float)
+            or not 0<=value.get("next_retry_at",0)<=2**53):
+        return None
+    signature=hashlib.sha256(f"shop-removal:{scope}:{value['message_id']}".encode()).hexdigest()
+    return value if value.get("signature")==signature else None
+
+
+async def retire_shop_reply_keyboard_removals(target,context,data):
+    """Retry only saved removal notices, without touching menus or invoices."""
+    scope=SQLiteFSMStorage._storage_key(context.key)
+    source=target if isinstance(target,Message) else getattr(target,"message",None)
+    source_id=getattr(source,"message_id",None)
+    queued=data.get("removals",[])
+    queued=queued if isinstance(queued,list) else []
+    remaining=[]
+    attempts=0
+    for value in queued:
+        record=shop_reply_keyboard_removal_record(value,scope)
+        if record is None:
+            continue
+        if record["message_id"]==source_id or record.get("next_retry_at",0)>time.time() or attempts>=3:
+            remaining.append(record)
+            continue
+        attempts+=1
+        try:
+            if await target.bot.delete_message(context.key.chat_id,record["message_id"]) is not True:
+                remaining.append(record)
+        except TelegramBadRequest as exc:
+            if not any(reason in exc.message.lower() for reason in (
+                    "message to delete not found","message can't be deleted","message cannot be deleted")):
+                remaining.append(record)
+        except TelegramRetryAfter as exc:
+            remaining.append({**record,"next_retry_at":time.time()+max(1,exc.retry_after)})
+        except Exception:
+            remaining.append(record)
+    if remaining!=data.get("removals",[]):
+        data={**data,"removals":remaining}
+        try:
+            await context.set_data(data)
+        except sqlite3.Error:
+            logging.warning("Shop keyboard notice cleanup could not be recorded")
+    return data
+
+
 async def retire_shop_reply_keyboard_prompts(target,context,data):
     scope=SQLiteFSMStorage._storage_key(context.key)
     current=shop_reply_keyboard_record(data.get("current"),scope)
@@ -10229,6 +10287,8 @@ async def _refresh_shop_reply_keyboard_locked(target,keyboard,context,*,force=Fa
         except sqlite3.Error:
             return bool(cached.get("current") or cached.get("delivered"))
         data=cached
+    data=await retire_shop_reply_keyboard_removals(target,context,data)
+    lock._shop_reply_data=data
     if data.get("mode")=="command" and not activate_start:
         return False
     current=shop_reply_keyboard_record(data.get("current"),scope)
@@ -10253,7 +10313,7 @@ async def _refresh_shop_reply_keyboard_locked(target,keyboard,context,*,force=Fa
     generation=secrets.token_hex(12)
     pending={"kind":"shop_reply_keyboard","scope":scope,
              "signature":signature,"started_at":time.time()}
-    prepared={"generation":generation,"mode":"start","current":current,
+    prepared={"generation":generation,"mode":"start","current":current,"removals":data.get("removals",[]),
               "retire":retire,"pending":pending}
     try:
         await context.set_data(prepared)
@@ -10278,7 +10338,8 @@ async def _refresh_shop_reply_keyboard_locked(target,keyboard,context,*,force=Fa
         and not any(getattr(rendered,field,None) for field in
             ("photo","video","document","audio","voice","animation","sticker","video_note","paid_media"))
         and (sender is None or (getattr(sender,"is_bot",False) and getattr(sender,"id",None)==context.key.bot_id)))
-    ready={"generation":generation,"mode":"start","current":current,"retire":retire}
+    ready={"generation":generation,"mode":"start","current":current,"retire":retire,
+           "removals":data.get("removals",[])}
     if valid:
         record={"kind":"shop_reply_keyboard","scope":scope,
                 "signature":signature,"text":text,"message_id":rendered_id}
@@ -10314,13 +10375,21 @@ async def _remove_shop_reply_keyboard_locked(target,text,context,*,parse_mode=No
             current=shop_reply_keyboard_record(data.get("current"),scope)
             retire=[record for record in data.get("retire",[])
                 if shop_reply_keyboard_record(record,scope)][-10:] if isinstance(data.get("retire"),list) else []
+            removals=[record for record in data.get("removals",[])
+                if shop_reply_keyboard_removal_record(record,scope)] if isinstance(data.get("removals"),list) else []
             data={"generation":secrets.token_hex(12),"current":current,
-                  "retire":retire,"hidden":True,"hidden_confirmed":False,
+                  "retire":retire,"removals":removals,"hidden":True,"hidden_confirmed":False,
                   "mode":"command" if command_mode else data.get("mode","start")}
             await context.set_data(data)
             shop_reply_keyboard_lock(context)._shop_reply_data=data
         except sqlite3.Error:
             logging.warning("Shop keyboard removal could not be prepared")
+            if data is None:
+                cached=getattr(shop_reply_keyboard_lock(context),"_shop_reply_data",None)
+                data={**(cached if isinstance(cached,dict) else {}),
+                      "generation":secrets.token_hex(12),"hidden":True,"hidden_confirmed":False,
+                      "mode":"command" if command_mode else "start"}
+            shop_reply_keyboard_lock(context)._shop_reply_data=data
     message=target if isinstance(target,Message) else getattr(target,"message",None)
     options={**(send_options or {}),"reply_markup":ReplyKeyboardRemove()}
     if context is not None:
@@ -10346,6 +10415,24 @@ async def _remove_shop_reply_keyboard_locked(target,text,context,*,parse_mode=No
         return False
     if rendered and context is not None and data is not None:
         data={**data,"hidden_confirmed":True}
+        sender=getattr(rendered,"from_user",None)
+        rendered_id=getattr(rendered,"message_id",None)
+        if (text=="⌨️ Keyboard mengetik aktif." and isinstance(rendered,Message)
+                and rendered.text==text and rendered.chat.type=="private"
+                and rendered.chat.id==context.key.chat_id==context.key.user_id
+                and type(rendered_id) is int and 0<rendered_id<=9223372036854775807
+                and rendered_id!=getattr(message,"message_id",None)
+                and rendered.message_thread_id==context.key.thread_id
+                and rendered.business_connection_id==context.key.business_connection_id
+                and sender is not None and sender.is_bot and sender.id==context.key.bot_id
+                and rendered.reply_markup is None
+                and not any(getattr(rendered,field,None) for field in (
+                    "photo","video","document","audio","voice","animation","sticker","video_note","paid_media"))):
+            scope=SQLiteFSMStorage._storage_key(context.key)
+            record={"kind":"shop_reply_keyboard_removal","scope":scope,"message_id":rendered_id,
+                    "text":text,"next_retry_at":0,
+                    "signature":hashlib.sha256(f"shop-removal:{scope}:{rendered_id}".encode()).hexdigest()}
+            data["removals"]=[entry for entry in data.get("removals",[]) if entry["message_id"]!=rendered_id]+[record]
         shop_reply_keyboard_lock(context)._shop_reply_data=data
         try:
             await context.set_data(data)
@@ -10364,35 +10451,42 @@ async def remove_shop_reply_keyboard(target,text,*,parse_mode=None):
 
 
 async def answer_command_without_shop_keyboard(message,text,**options):
-    """Remove the /start keyboard using the command's own first response."""
+    """Send inline menus with their buttons, after removing the /start keyboard."""
     context=shop_reply_keyboard_context(message)
     if context is None:
         return await message.answer(text,**options)
     keyboard=options.get("reply_markup")
-    async with shop_reply_keyboard_lock(context):
+    menu_options=dict(options)
+    if context.key.thread_id is not None:
+        menu_options.setdefault("message_thread_id",context.key.thread_id)
+    if context.key.business_connection_id is not None:
+        menu_options.setdefault("business_connection_id",context.key.business_connection_id)
+    lock=shop_reply_keyboard_lock(context)
+    async with lock:
         try:
             data=await context.get_data()
         except sqlite3.Error:
             data={}
-        if data.get("mode")=="command" and data.get("hidden_confirmed"):
-            return await message.answer(text,**options)
-        rendered=await _remove_shop_reply_keyboard_locked(
-            message,text,context,command_mode=True,send_options=options,raise_on_error=True
-        )
-        if rendered and isinstance(keyboard,InlineKeyboardMarkup):
-            # ReplyKeyboardRemove and an inline menu cannot share SendMessage.
-            # Attach the inline buttons to the same delivered message instead.
-            try:
-                updated=await message.bot.edit_message_reply_markup(
-                    chat_id=message.chat.id,message_id=rendered.message_id,reply_markup=keyboard,
-                    **({"business_connection_id":context.key.business_connection_id}
-                       if context.key.business_connection_id is not None else {})
-                )
-                if isinstance(updated,Message):
-                    return updated
-            except Exception:
-                logging.warning("Command menu buttons could not be attached")
-        return rendered
+        cached=getattr(lock,"_shop_reply_data",None)
+        if isinstance(cached,dict) and cached.get("generation")==data.get("generation"):
+            data=cached
+        lock._shop_reply_data=data
+        try:
+            if data.get("mode")=="command" and data.get("hidden_confirmed"):
+                return await message.bot.send_message(context.key.chat_id,text,**menu_options)
+            if isinstance(keyboard,InlineKeyboardMarkup):
+                # Telegram accepts only one reply_markup per SendMessage and
+                # cannot reliably edit a message sent with ReplyKeyboardRemove.
+                # Use a disposable removal notice, then send the actual menu
+                # with its inline keyboard in the same API request.
+                await _remove_shop_reply_keyboard_locked(
+                    message,"⌨️ Keyboard mengetik aktif.",context,command_mode=True)
+                return await message.bot.send_message(context.key.chat_id,text,**menu_options)
+            return await _remove_shop_reply_keyboard_locked(
+                message,text,context,command_mode=True,send_options=options,raise_on_error=True)
+        finally:
+            pending=getattr(lock,"_shop_reply_data",data)
+            lock._shop_reply_data=await retire_shop_reply_keyboard_removals(message,context,pending)
 
 
 class CommandMenuMessage(Message):
@@ -10427,21 +10521,16 @@ async def hide_shop_keyboard_for_callback(call):
             data=await context.get_data()
         except sqlite3.Error:
             data={}
-        if data.get("mode")=="command" and data.get("hidden_confirmed"):
-            return
-        text="⌨️ Keyboard mengetik aktif."
-        rendered=await _remove_shop_reply_keyboard_locked(call,text,context,command_mode=True)
-        sender=getattr(rendered,"from_user",None)
-        if (rendered and getattr(rendered,"text",None)==text
-                and getattr(getattr(rendered,"chat",None),"id",None)==context.key.chat_id
-                and type(getattr(rendered,"message_id",None)) is int and rendered.message_id>0
-                and rendered.message_id!=getattr(call.message,"message_id",None)
-                and sender is not None and getattr(sender,"is_bot",False)
-                and getattr(sender,"id",None)==context.key.bot_id):
-            try:
-                await call.bot.delete_message(context.key.chat_id,rendered.message_id)
-            except Exception:
-                pass
+        lock=shop_reply_keyboard_lock(context)
+        cached=getattr(lock,"_shop_reply_data",None)
+        if isinstance(cached,dict) and cached.get("generation")==data.get("generation"):
+            data=cached
+        lock._shop_reply_data=data
+        if not (data.get("mode")=="command" and data.get("hidden_confirmed")):
+            await _remove_shop_reply_keyboard_locked(
+                call,"⌨️ Keyboard mengetik aktif.",context,command_mode=True)
+        lock._shop_reply_data=await retire_shop_reply_keyboard_removals(
+            call,context,getattr(lock,"_shop_reply_data",data))
 
 
 class CommandKeyboardMiddleware(BaseMiddleware):
@@ -29719,8 +29808,188 @@ async def global_error_handler(event: ErrorEvent):
 
 
 
+def owner_topup_note_keyboard(topup_id: int, *, back=False):
+    rows=[]
+    if back:
+        rows.append([InlineKeyboardButton(text="⬅️ Kembali",callback_data=f"ownerproofback:topup:{topup_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="📝 Kirim Catatan",callback_data=f"proofnote:topup:{topup_id}")])
+    rows.append([InlineKeyboardButton(text="🏠 Menu Awal",callback_data="owner:panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def clear_owner_topup_note(state):
+    if state is None:
+        return
+    try:
+        if await state.get_state()==OwnerState.topup_proof_note.state:
+            await state.clear()
+    except sqlite3.Error:
+        logging.warning("Owner topup note state could not be cleared")
+
+
+def claim_owner_topup_note(topup_id,owner_id,event_type,note):
+    """Audit/claim one note in the existing event table; never change money."""
+    if (not is_owner(owner_id) or type(topup_id) is not int or not 0<topup_id<=9223372036854775807
+            or not isinstance(event_type,str) or not re.fullmatch(r"owner_note:[0-9]{1,19}:[0-9]{1,19}:[0-9]{1,19}",event_type)
+            or event_type.split(":")[2]!=str(owner_id) or not isinstance(note,str) or not 1<=len(note.strip())<=500):
+        return None,"invalid"
+    conn=None
+    try:
+        conn=db()
+        begin_immediate_retry(conn)
+        row=conn.execute("SELECT * FROM topups WHERE id=?",(topup_id,)).fetchone()
+        if not row:
+            return None,"not_found"
+        if type(row["user_id"]) is not int or not 0<row["user_id"]<=9223372036854775807:
+            return None,"invalid"
+        if row["status"] not in {"pending","completed","expired"}:
+            return None,"final"
+        previous=conn.execute("SELECT detail,actor_id FROM payment_events WHERE entity_type='topup' AND entity_id=? AND event_type=?",
+                              (topup_id,event_type)).fetchone()
+        if previous:
+            try:
+                detail=json.loads(previous["detail"])
+            except (TypeError,ValueError):
+                return None,"invalid"
+            if not isinstance(detail,dict):
+                return None,"invalid"
+            if previous["actor_id"]!=owner_id or detail.get("text")!=note:
+                return None,"invalid"
+            return row,str(detail.get("delivery") or "UNKNOWN")
+        conn.execute("""INSERT INTO payment_events(entity_type,entity_id,event_type,amount,actor_id,detail,created_at)
+                        VALUES('topup',?,?,0,?,?,?)""",
+                     (topup_id,event_type,owner_id,json.dumps({"text":note,"delivery":"SENDING"},ensure_ascii=False),
+                      datetime.now().isoformat(timespec="seconds")))
+        conn.commit()
+        return row,"claimed"
+    except sqlite3.Error:
+        logging.warning("Owner topup note claim could not be saved invoice=%s",topup_id)
+        return None,"storage_error"
+    finally:
+        if conn is not None:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
+
+def finish_owner_topup_note(topup_id,owner_id,event_type,delivery,message_id=0):
+    if not is_owner(owner_id) or delivery not in {"SENT","FAILED","UNKNOWN"}:
+        return False
+    conn=None
+    try:
+        conn=db()
+        begin_immediate_retry(conn)
+        row=conn.execute("SELECT detail FROM payment_events WHERE entity_type='topup' AND entity_id=? AND event_type=? AND actor_id=?",
+                         (topup_id,event_type,owner_id)).fetchone()
+        if not row:
+            return False
+        detail=json.loads(row["detail"])
+        if not isinstance(detail,dict):
+            return False
+        if detail.get("delivery")!="SENDING":
+            return detail.get("delivery")==delivery
+        detail.update(delivery=delivery,message_id=message_id)
+        conn.execute("UPDATE payment_events SET detail=? WHERE entity_type='topup' AND entity_id=? AND event_type=? AND actor_id=?",
+                     (json.dumps(detail,ensure_ascii=False),topup_id,event_type,owner_id))
+        conn.commit()
+        return True
+    except (sqlite3.Error,TypeError,ValueError):
+        logging.warning("Owner topup note result could not be saved invoice=%s",topup_id)
+        return False
+    finally:
+        if conn is not None:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
+
+@router.callback_query(F.data.startswith("proofnote:"))
+async def owner_topup_note_start(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await safe_callback_notice(call,"Akses ditolak.",show_alert=True)
+    if call.message is None or call.message.chat.type!="private" or call.message.chat.id!=call.from_user.id:
+        return await safe_callback_notice(call,"Catatan hanya dapat dikirim dari chat pribadi owner.",show_alert=True)
+    target=payment_transaction_callback(call.data,"proofnote")
+    if not target or target[0]!="topup":
+        return await safe_callback_notice(call,"Invoice top up tidak valid.",show_alert=True)
+    conn=None
+    try:
+        conn=db()
+        row=conn.execute("SELECT * FROM topups WHERE id=?",(target[1],)).fetchone()
+    except sqlite3.Error:
+        return await safe_callback_notice(call,"Invoice belum bisa dibuka. Coba lagi.",show_alert=True)
+    finally:
+        if conn is not None:conn.close()
+    if not row or row["status"] not in {"pending","completed","expired"}:
+        return await safe_callback_notice(call,"Invoice tidak tersedia untuk catatan.",show_alert=True)
+    await state.clear()
+    await state.set_state(OwnerState.topup_proof_note)
+    await state.update_data(owner_topup_note_id=target[1])
+    return await owner_proof_result_screen(call,
+        "📝 <b>CATATAN UNTUK USER</b>\n\n"
+        f"🧾 {topup_invoice(target[1])}\n"
+        f"👤 User ID: <code>{row['user_id']}</code>\n"
+        f"💰 Saldo invoice: <b>{rupiah(row['amount'])}</b>\n"
+        f"💳 Total transfer: <b>{rupiah(row['payment_total'])}</b>\n\n"
+        "Ketik catatan yang akan dikirim ke user (maksimal 500 karakter).\n"
+        "Contoh: Nominal bukti berbeda dengan total transfer. Mohon cek kode unik pada invoice.\n\n"
+        "Catatan tidak mengubah nominal, status pembayaran, atau saldo.",
+        reply_markup=owner_topup_note_keyboard(target[1],back=True))
+
+
+@router.message(OwnerState.topup_proof_note,F.text & ~F.text.startswith("/"))
+async def owner_topup_note_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id) or message.chat.type!="private" or message.chat.id!=message.from_user.id:
+        return await message.answer("Akses ditolak.")
+    if await state.get_state()!=OwnerState.topup_proof_note.state:
+        return
+    data=await state.get_data()
+    topup_id=data.get("owner_topup_note_id")
+    note=(message.text or "").strip()
+    if not 1<=len(note)<=500:
+        return await message.answer("⚠️ Catatan harus berisi 1–500 karakter.")
+    if type(topup_id) is not int or not 0<topup_id<=9223372036854775807:
+        await state.clear()
+        return await message.answer("Sesi catatan tidak valid. Buka bukti top up kembali.",reply_markup=owner_proof_home_keyboard())
+    if type(message.message_id) is not int or not 0<message.message_id<=9223372036854775807:
+        return await message.answer("Pesan catatan tidak valid.")
+    event_type=f"owner_note:{message.bot.id}:{message.from_user.id}:{message.message_id}"
+    row,status=await asyncio.to_thread(claim_owner_topup_note,topup_id,message.from_user.id,event_type,note)
+    if status=="SENT":
+        await state.clear()
+        return await message.answer("✅ Catatan ini sudah dikirim; tidak dikirim ulang.",reply_markup=owner_topup_note_keyboard(topup_id,back=True))
+    if status!="claimed":
+        text=("Catatan belum dapat disimpan. Coba lagi." if status=="storage_error" else
+              "Status pengiriman catatan sebelumnya belum dapat dipastikan. Periksa chat user sebelum mengirim catatan baru." if status in {"SENDING","UNKNOWN"} else
+              "Catatan sebelumnya gagal terkirim. Periksa apakah user dapat menerima pesan, lalu kirim catatan baru." if status=="FAILED" else
+              "Invoice atau sesi catatan tidak tersedia. Buka bukti top up kembali.")
+        return await message.answer("⚠️ "+text,reply_markup=owner_topup_note_keyboard(topup_id,back=True))
+    try:
+        sent=await message.bot.send_message(int(row["user_id"]),
+            "📝 <b>CATATAN OWNER • ISI SALDO</b>\n\n"
+            f"🧾 {topup_invoice(topup_id)}\n"
+            f"💳 Total transfer invoice: <b>{rupiah(row['payment_total'])}</b>\n\n"
+            f"{html.escape(note)}",parse_mode="HTML",
+            reply_markup=payment_proof_status_keyboard("topup",topup_id))
+        if not isinstance(sent,Message) or sent.chat.id!=int(row["user_id"]) or type(sent.message_id) is not int or sent.message_id<=0:
+            raise RuntimeError("Unconfirmed note delivery")
+    except Exception as exc:
+        delivery="FAILED" if isinstance(exc,(TelegramForbiddenError,TelegramBadRequest)) else "UNKNOWN"
+        await asyncio.to_thread(finish_owner_topup_note,topup_id,message.from_user.id,event_type,delivery)
+        logging.warning("Owner topup note delivery failed invoice=%s type=%s",topup_id,type(exc).__name__)
+        return await message.answer("⚠️ Catatan belum terkonfirmasi terkirim. Saldo dan status invoice tidak berubah. "
+                                    "Periksa chat user sebelum mengirim catatan baru.",
+                                    reply_markup=owner_topup_note_keyboard(topup_id,back=True))
+    saved=await asyncio.to_thread(finish_owner_topup_note,topup_id,message.from_user.id,event_type,"SENT",sent.message_id)
+    await state.clear()
+    text="✅ <b>CATATAN TERKIRIM</b>\n\n"+f"🧾 {topup_invoice(topup_id)}\n👤 User ID: <code>{row['user_id']}</code>\n\n"+html.escape(note)
+    if not saved:text+="\n\n⚠️ Pesan terkirim, tetapi pencatatan hasil belum selesai. Jangan kirim ulang catatan yang sama."
+    await message.answer(text,parse_mode="HTML",reply_markup=owner_topup_note_keyboard(topup_id,back=True))
+
+
 @router.callback_query(F.data.startswith("proofapprove:"))
-async def owner_proof_approve(call: CallbackQuery, bot: Bot):
+async def owner_proof_approve(call: CallbackQuery, bot: Bot, state: FSMContext = None):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
@@ -29797,32 +30066,49 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
         return
 
     if entity == "topup":
+        await clear_owner_topup_note(state)
+        await safe_callback_notice(call,"Memproses konfirmasi top up…")
         conn = None
         try:
             conn = db()
             topup_row = conn.execute("SELECT * FROM topups WHERE id=?", (entity_id,)).fetchone()
         except sqlite3.Error:
-            return await safe_callback_notice(call, "Top up belum bisa dibuka. Coba lagi.", show_alert=True)
+            return await owner_proof_result_screen(call,"⚠️ Top up belum bisa dibuka. Coba lagi.",
+                reply_markup=owner_payment_proof_keyboard("topup",entity_id))
         finally:
             if conn is not None:
                 conn.close()
         if not topup_row:
-            return await call.answer("Top up tidak ditemukan.", show_alert=True)
-        if topup_payment_terminal(topup_row):
-            return await call.answer(
-                "Top up sudah final dan tidak bisa dikonfirmasi lagi.",
-                show_alert=True
-            )
+            return await owner_proof_result_screen(call,"⚠️ Top up tidak ditemukan.",alert_text="Top up tidak ditemukan.")
+        if topup_payment_terminal(topup_row) and topup_row["status"]!="completed":
+            return await owner_proof_result_screen(call,
+                "⚠️ <b>TOP UP SUDAH FINAL</b>\n\n"
+                f"🧾 {topup_invoice(entity_id)}\n"
+                f"Status: <b>{html.escape(str(topup_row['status']))}</b>\n"
+                "Saldo tidak ditambah dari invoice ini.",alert_text="Top up sudah final.")
 
-        result, status = verify_topup_atomic(entity_id, call.from_user.id)
-        if status == "already_completed":
-            return await call.answer("Top up sudah diverifikasi.", show_alert=True)
-        if status != "completed":
-            return await call.answer("Top up gagal diverifikasi.", show_alert=True)
+        result, status = await asyncio.to_thread(verify_topup_atomic,entity_id,call.from_user.id)
+        if status not in {"completed","already_completed"} or not result:
+            return await owner_proof_result_screen(call,
+                "⚠️ <b>KONFIRMASI TOP UP BELUM BERHASIL</b>\n\n"
+                f"🧾 {topup_invoice(entity_id)}\n"
+                "Saldo tidak ditambah oleh tindakan ini. Periksa status sebelum mencoba lagi.",
+                alert_text="Top up belum berhasil diverifikasi.",
+                reply_markup=owner_payment_proof_keyboard("topup",entity_id))
 
         row, balance = result
+        text=("✅ <b>TOP UP DIKONFIRMASI</b>\n\n"
+              f"🧾 {topup_invoice(entity_id)}\n"
+              f"👤 User ID: <code>{row['user_id']}</code>\n"
+              f"💰 Saldo masuk: <b>{rupiah(row['amount'])}</b>\n"
+              f"💵 Saldo sekarang: <b>{rupiah(balance)}</b>\n\n"
+              +("ℹ️ Invoice sudah pernah dikonfirmasi. Tidak ada saldo tambahan kedua."
+                if status=="already_completed" else "✅ DIKONFIRMASI OWNER • Saldo berhasil diproses."))
+        keyboard=owner_topup_note_keyboard(entity_id)
+        # Leave the permanent owner result before any slow/failed buyer PM.
+        await owner_proof_result_screen(call,text,alert_text="Top up dikonfirmasi.",reply_markup=keyboard)
         try:
-            if not await OTP_STORE.payments.notify_topup_receipt(bot, entity_id):
+            if status=="completed" and not await OTP_STORE.payments.notify_topup_receipt(bot, entity_id):
                 await bot.send_message(
                     row["user_id"],
                     "✅ <b>TOP UP DIKONFIRMASI</b>\n\n"
@@ -29831,17 +30117,11 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
                     f"💵 Saldo sekarang: <b>{rupiah(balance)}</b>",
                     reply_markup=topup_done_keyboard(), parse_mode="HTML"
                 )
-        except Exception:
-            pass
-
-        await safe_callback_notice(call, "Top up dikonfirmasi.", show_alert=True)
-        try:
-            await call.message.edit_caption(
-                caption=payment_proof_caption("topup", row) + "\n\n✅ <b>DIKONFIRMASI OWNER</b>",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.warning("Topup receipt delivery failed invoice=%s type=%s",entity_id,type(exc).__name__)
+            await owner_proof_result_screen(call,text+
+                "\n\n⚠️ Pesan ke user belum terkirim. Saldo sudah diproses; user dapat cek saldo.",
+                reply_markup=keyboard)
 
 
         try:
@@ -29852,7 +30132,7 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot):
 
 
 @router.callback_query(F.data.startswith("proofreject:"))
-async def owner_proof_reject(call: CallbackQuery):
+async def owner_proof_reject(call: CallbackQuery,state: FSMContext = None):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
@@ -29860,6 +30140,9 @@ async def owner_proof_reject(call: CallbackQuery):
     if not target:
         return await safe_callback_notice(call, "Data transaksi tidak valid.", show_alert=True)
     entity, entity_id = target
+
+    if entity=="topup":
+        await clear_owner_topup_note(state)
 
     conn=db()
     row=conn.execute(
@@ -29919,7 +30202,7 @@ async def owner_proof_reject(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("ownerproofback:"))
-async def owner_proof_back(call: CallbackQuery):
+async def owner_proof_back(call: CallbackQuery,state: FSMContext = None):
     """Return from reject menu without mutating payment state."""
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
@@ -29929,6 +30212,8 @@ async def owner_proof_back(call: CallbackQuery):
     if not target:
         return await safe_callback_notice(call,"Data transaksi tidak valid.",show_alert=True)
     entity,entity_id=target
+    if entity=="topup":
+        await clear_owner_topup_note(state)
     conn=None
     try:
         conn=db()
@@ -30148,12 +30433,14 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
 
 
 @router.callback_query(F.data.startswith("proofpending:"))
-async def owner_proof_pending(call: CallbackQuery, bot: Bot):
+async def owner_proof_pending(call: CallbackQuery, bot: Bot,state: FSMContext = None):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
     _, entity, raw_id = call.data.split(":")
     entity_id = int(raw_id)
+    if entity=="topup":
+        await clear_owner_topup_note(state)
 
     conn = db()
     row = conn.execute(
@@ -34324,7 +34611,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.84"
+EXPECTED_SOURCE_VERSION = "16.87"
 
 
 def source_integrity_self_test():

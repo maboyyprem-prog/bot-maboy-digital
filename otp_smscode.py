@@ -2079,18 +2079,74 @@ class AdminHandler:
         if not self.store.host.is_owner(user):
             raise StoreError("FORBIDDEN", "Menu ini hanya untuk owner.")
 
-    async def prices(self, message, user, kind, *, page=1, country=None, platform=None):
+    @staticmethod
+    def price_label(value, fallback, limit=60):
+        value = value if isinstance(value, str) and value.strip() else fallback
+        value = " ".join("".join(char for char in value if char.isprintable() or char.isspace()).split())
+        label = ""
+        for char in value or fallback:
+            escaped = escape(char)
+            if len(label)+len(escaped) > limit:
+                break
+            label += escaped
+        return label
+
+    async def price_services(self, message, user, *, page, country, platform):
         self.authorize(user)
-        if kind not in {"provider", "jual"}:
-            raise StoreError("INPUT", "Pilih Harga Provider atau Harga Jual.")
+        context = {"kind": "both", "view": "services", "country": country, "platform": platform}
+        title, buttons = "📋 <b>HARGA PROVIDER &amp; JUAL</b>\n📱 Pilih layanan SMSCode", []
+        try:
+            rows = await self.store.catalog.listing("/catalog/services", {"country_id": country} if country is not None else None)
+        except StoreError as exc:
+            text = title+"\n\n⚠️ Daftar layanan belum dapat diambil. "+escape(exc.public)
+            buttons.append([("🔄 Coba Lagi", "admin_prices", {**context, "page": page})])
+        else:
+            services, seen = [], set()
+            for row in rows:
+                try:
+                    ident = integer(row.get("id"), 1, 2**31-1)
+                except StoreError:
+                    continue
+                if row.get("active") is not True or ident in seen or not isinstance(row.get("name"), str) or not row["name"].strip():
+                    continue
+                services.append(row)
+                seen.add(ident)
+            pages = max(1, (len(services)+7)//8)
+            page = min(page, pages)
+            text = title+f"\nHalaman {page}/{pages}\n\n"+("Pilih layanan untuk melihat modal dan harga jual." if services else "Belum ada layanan aktif.")
+            for row in services[(page-1)*8:page*8]:
+                label = html.unescape(self.price_label(row["name"], f"Layanan #{row['id']}", 160))
+                buttons.append([("📱 "+label, "admin_prices", {"kind": "both", "country": country, "platform": row["id"], "page": 1, "services_page": page})])
+            navigation = []
+            if page > 1:
+                navigation.append(("◀️ Sebelumnya", "admin_prices", {**context, "page": page-1}))
+            if page < pages:
+                navigation.append(("Berikutnya ▶️", "admin_prices", {**context, "page": page+1}))
+            if navigation:
+                buttons.append(navigation)
+        buttons.append([("⬅️ Kembali", "admin_prices", {"kind": "both", "country": country, "platform": platform}), ("🏠 Menu Awal", "home", {})])
+        return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, buttons))
+
+    async def prices(self, message, user, kind=None, *, page=1, country=None, platform=None, view="products", services_page=1):
+        self.authorize(user)
+        kind = "both" if kind is None else kind
+        if not isinstance(kind, str) or kind not in {"provider", "jual", "both"}:
+            raise StoreError("INPUT", "Buka daftar Harga Provider & Jual.")
+        if not isinstance(view, str) or view not in {"products", "services"}:
+            raise StoreError("INPUT", "Halaman harga tidak valid.")
         page = self.number(page, 1, 10000)
+        services_page = self.number(services_page, 1, 10000)
+        country = self.number(country, 1, 2**31-1) if country is not None else None
+        platform = self.number(platform, 1, 2**31-1) if platform is not None else None
+        if view == "services":
+            return await self.price_services(message, user, page=page, country=country, platform=platform)
         params = {"page": page, "limit": 8, "sort": "price_asc"}
         if country is not None:
-            params["country_id"] = self.number(country, 1, 2**31-1)
+            params["country_id"] = country
         if platform is not None:
-            params["platform_id"] = self.number(platform, 1, 2**31-1)
-        context = {"kind": kind, "country": country, "platform": platform}
-        title = "📋 HARGA PROVIDER" if kind == "provider" else "🏷️ HARGA JUAL"
+            params["platform_id"] = platform
+        context = {"kind": "both", "country": country, "platform": platform, "services_page": services_page}
+        title = "📋 <b>HARGA PROVIDER &amp; JUAL</b>"
         buttons = []
         try:
             rows = await self.store.catalog.listing("/catalog/products", params)
@@ -2098,16 +2154,44 @@ class AdminHandler:
             text = title+"\n\n⚠️ Daftar harga belum dapat diambil. "+escape(exc.public)
             buttons.append([("🔄 Coba Lagi", "admin_prices", {**context, "page": page})])
         else:
-            text, shown, invalid = [f"{title} • halaman {page}"], 0, 0
+            # Provider names enrich this read-only owner view; a failed name
+            # lookup must not hide live modal/sale prices or change checkout.
+            results = await asyncio.gather(
+                self.store.catalog.listing("/catalog/services", {"country_id": country} if country is not None else None),
+                self.store.catalog.listing("/catalog/countries"), return_exceptions=True)
+            names, incomplete = [], False
+            for result in results:
+                lookup = {}
+                if isinstance(result, list):
+                    for item in result:
+                        try:
+                            ident = integer(item.get("id"), 1, 2**31-1)
+                        except StoreError:
+                            continue
+                        lookup.setdefault(ident, item)
+                else:
+                    incomplete = True
+                names.append(lookup)
+            service_names, country_names = names
+            selected = self.price_label(service_names.get(platform, {}).get("name"), f"Layanan #{platform}") if platform is not None else "Semua layanan"
+            text, shown, invalid, groups = [f"{title} • halaman {page}\n📱 {selected}\nModal dan jual per nomor"], 0, 0, {}
             for row in rows[:8]:
                 if row.get("active") is not True:
                     continue
                 try:
                     stock, cost, ident = integer(row.get("available")), integer(row.get("price")), integer(row.get("id"), 1)
+                    country_id, platform_id = integer(row.get("country_id"), 1, 2**31-1), integer(row.get("platform_id"), 1, 2**31-1)
+                    operator_id = row.get("operator_id")
+                    if operator_id is not None:
+                        integer(operator_id, 1, 2**31-1)
                 except StoreError:
                     invalid += 1
                     continue
                 if not stock:
+                    continue
+                if (country is not None and country_id != country) or (platform is not None and platform_id != platform):
+                    continue
+                if service_names.get(platform_id, {}).get("active") is False or country_names.get(country_id, {}).get("active") is False:
                     continue
                 try:
                     sale, _ = self.store.pricing.calculate(row)
@@ -2115,19 +2199,20 @@ class AdminHandler:
                 except (StoreError, InvalidOperation, KeyError, TypeError, ValueError):
                     # A stale override must not hide a valid provider price.
                     selling = "Perlu memperbarui aturan harga"
-                name = str(row.get("name") or f"Negara #{row.get('country_id')} • Layanan #{row.get('platform_id')}")
-                label = ""
-                for char in name[:180]:
-                    escaped = escape(char)
-                    if len(label)+len(escaped) > 180:
-                        break
-                    label += escaped
-                text.append(f"Produk {ident} • {label}\nModal {money(cost)} • Jual {selling} • Stok {stock}")
+                service = self.price_label(service_names.get(platform_id, {}).get("name") or row.get("platform_name"), f"Layanan #{platform_id}")
+                country_name = self.price_label(country_names.get(country_id, {}).get("name") or row.get("country_name"), f"Negara #{country_id}", 48)
+                operator = self.price_label(row.get("operator_name"), "Any" if operator_id is None else f"Operator #{operator_id}", 32)
+                entry = f"🌍 {country_name} • 📶 {operator}\nModal {money(cost)} • Jual {selling}\nStok {stock} • Produk {ident}"
+                groups.setdefault(platform_id, (service, []))[1].append(entry)
                 shown += 1
+            for service, entries in groups.values():
+                text.append("📱 <b>"+service+"</b>\n"+"\n\n".join(entries))
             if not shown:
                 text.append("Belum ada produk aktif dan tersedia pada halaman ini.")
             if invalid:
                 text.append(f"⚠️ {invalid} data produk belum valid; tidak ditampilkan.")
+            if incomplete:
+                text.append("ℹ️ Nama katalog belum lengkap; harga berasal dari produk live.")
             text = "\n\n".join(text)
             navigation = []
             if page > 1:
@@ -2136,6 +2221,9 @@ class AdminHandler:
                 navigation.append(("Berikutnya ▶️", "admin_prices", {**context, "page": page+1}))
             if navigation:
                 buttons.append(navigation)
+        buttons.append([("📱 Pilih Layanan" if platform is None else "📱 Ganti Layanan", "admin_prices", {"kind": "both", "view": "services", "country": country, "platform": platform, "page": services_page})])
+        if platform is not None:
+            buttons.append([("🌐 Semua Layanan", "admin_prices", {"kind": "both", "country": country})])
         buttons.append([("⬅️ Kembali", "admin_prices_menu", {}), ("🏠 Menu Awal", "home", {})])
         return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, buttons))
 
@@ -2276,7 +2364,7 @@ class AdminHandler:
                 "Prioritas: produk → negara+layanan → layanan → negara → global.")
             return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [
                 [("📈 ATUR PERSENTASE", "admin_input", {"setting": "percent"}), ("💵 ATUR NOMINAL", "admin_input", {"setting": "fixed"})],
-                [("⚙️ PILIH MODE", "admin_modes", {})], [("📋 HARGA PROVIDER", "admin_prices", {"kind": "provider"}), ("🛒 HARGA JUAL", "admin_prices", {"kind": "jual"})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]))
+                [("⚙️ PILIH MODE", "admin_modes", {})], [("📋 HARGA PROVIDER & JUAL", "admin_prices", {"kind": "both"})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]))
         stats = self.store.repo.one("""SELECT count(*) total,COALESCE(sum(selling_price_idr-refund_idr),0) revenue,
             COALESCE(sum(selling_price_idr-refund_idr-provider_cost_idr+provider_refund_idr),0) profit,
             COALESCE(sum(status='COMPLETED'),0) completed,COALESCE(sum(status IN ('ACTIVE','OTP_RECEIVED')),0) pending,
@@ -2431,7 +2519,8 @@ def register(router, store):
                 await admin.handle(message, user, sections[action])
             elif action == "admin_prices":
                 await admin.prices(message, user, payload.get("kind"), page=payload.get("page", 1),
-                                   country=payload.get("country"), platform=payload.get("platform"))
+                                   country=payload.get("country"), platform=payload.get("platform"),
+                                   view=payload.get("view", "products"), services_page=payload.get("services_page", 1))
             elif action == "admin_toggle":
                 await admin.handle(message, user, ["off" if store.settings()["enabled"] else "on"])
             elif action == "admin_modes":
