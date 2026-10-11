@@ -229,7 +229,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deployment ZIP contains only main.py, bot.py, otp_smscode.py, requirements.txt,
 # project_backup.py and .gitignore. Keep tests, fixtures and reports in full backups.
-BOT_VERSION = "16.88"
+BOT_VERSION = "16.89"
 SCHEMA_VERSION = 190
 
 CHECKOUT_TERMS_SHORT = (
@@ -34646,7 +34646,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.88"
+EXPECTED_SOURCE_VERSION = "16.89"
 
 
 def source_integrity_self_test():

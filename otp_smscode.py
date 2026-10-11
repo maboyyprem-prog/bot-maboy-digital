@@ -434,18 +434,64 @@ class CatalogService:
             raise StoreError("INVALID_RESPONSE")
         return rows
 
+    @staticmethod
+    def named_rows(rows, *, operators=False):
+        valid, seen = [], set()
+        field = "operator_id" if operators else "id"
+        for row in rows:
+            if (row.get("active") is False if operators else row.get("active") is not True):
+                continue
+            if field not in row:
+                continue
+            ident = row[field]
+            try:
+                if ident is not None or not operators:
+                    integer(ident, 1)
+            except StoreError:
+                continue
+            if operators:
+                # Official operator names may be null. Keep the carrier ID so
+                # carrier-specific stock remains reachable.
+                name = next((row[key].strip() for key in ("name", "local_name", "code")
+                             if isinstance(row.get(key), str) and row[key].strip()),
+                            "Any" if ident is None else f"Operator #{ident}")
+                row = {**row, "name": name}
+            elif not isinstance(row.get("name"), str) or not row["name"].strip():
+                continue
+            if ident not in seen:
+                valid.append(row)
+                seen.add(ident)
+        return valid
+
     async def products(self, country, platform, operator=None, page=1, *, limit=50):
         params = {"country_id": country, "platform_id": platform, "page": page, "limit": limit, "sort": "price_asc"}
         if operator is not None:
             params["operator_id"] = operator
         raw = await self.listing("/catalog/products", params)
-        rows = [row for row in raw if row.get("active") is True and isinstance(row.get("available"), int)
-                and row["available"] > 0 and row.get("country_id") == country
-                and row.get("platform_id") == platform and row.get("operator_id") == operator
-                and isinstance(row.get("catalog_product_id"), int)]
+        rows = []
+        for row in raw:
+            if row.get("active") is not True:
+                continue
+            try:
+                for field in ("id", "catalog_product_id", "country_id", "platform_id", "available"):
+                    integer(row.get(field), 1)
+                integer(row.get("price"))
+                if row.get("operator_id") is not None:
+                    integer(row["operator_id"], 1)
+            except StoreError:
+                continue
+            if (row["country_id"] == country and row["platform_id"] == platform
+                    and row.get("operator_id") == operator):
+                rows.append(row)
         return rows, len(raw) >= limit
 
     async def live_product(self, product):
+        if not isinstance(product, dict):
+            raise StoreError("INVALID_RESPONSE")
+        for field in ("id", "catalog_product_id", "country_id", "platform_id"):
+            integer(product.get(field), 1)
+        if product.get("operator_id") is not None:
+            integer(product["operator_id"], 1)
         for page in range(1, 201):
             rows, more = await self.products(product["country_id"], product["platform_id"], product.get("operator_id"), page)
             for row in rows:
@@ -851,6 +897,13 @@ class PaymentService:
                     delay = max(getattr(exc, "retry_after", 0) or 0, min(900, 10*2**min(payment["retries"], 6)))
                     self.store.repo.execute("UPDATE otp_payments SET next_retry_at=?,retries=retries+1,error_code=? WHERE payment_id=? AND state='PAID'",
                                             (now+delay, exc.code, payment["payment_id"]))
+            except Exception as exc:
+                # Preserve held funds and any committed attempt. A failure for
+                # one invoice must not block other buyers in this batch.
+                logging.warning("OTP payment reconciliation: %s", type(exc).__name__)
+                delay = min(900, 10*2**min(payment["retries"], 6))
+                self.store.repo.execute("UPDATE otp_payments SET next_retry_at=?,retries=retries+1,error_code='INTERNAL_ERROR' WHERE payment_id=? AND state='PAID'",
+                                        (now+delay, payment["payment_id"]))
         for payment in self.store.repo.rows("SELECT p.*,a.state attempt_state FROM otp_payments p JOIN otp_purchase_attempts a ON a.attempt_id=p.attempt_id WHERE p.state='BUYING'"):
             if payment["attempt_state"] in {"CAPTURED", "FAILED"}:
                 state = "COMPLETED" if payment["attempt_state"] == "CAPTURED" else "WALLET_CREDITED"
@@ -1821,16 +1874,17 @@ class UIBuilder:
 
     async def home(self, message, user):
         settings, api = self.store.settings(), self.store.api
-        if not self.store.config.token or self.store.config.error:
-            status = "Pembelian belum tersedia"
-        elif not settings["enabled"]:
-            status = "Pembelian ditutup"
-        elif api.last_error:
-            status = "Gangguan sementara"
-        elif time.time()-api.last_ok <= 120:
-            status = "Siap menerima pesanan (pemeriksaan terakhir)"
+        # Owner enablement is durable; API activity is not the store's ON/OFF
+        # state. Idle shops and restarts must not turn an enabled shop unknown.
+        status = "Aktif" if settings["enabled"] else "Ditutup owner"
+        if not settings["enabled"]:
+            note = "Pembelian baru ditutup. Pesanan lama tetap dipantau."
+        elif self.store.config.error or not self.store.config.token or not self.store.has_encryption():
+            note = "Pembelian belum tersedia; owner perlu melengkapi pengaturan toko."
+        elif getattr(api, "blocked_until", 0) > time.time():
+            note = "Layanan sedang jeda. Coba kembali setelah "+str(max(1, int(api.blocked_until-time.time())+1))+" detik."
         else:
-            status = "Status belum tersedia"
+            note = "Stok dan layanan diperiksa saat memilih nomor."
         profile = self.store.repo.one("SELECT username FROM verified_users WHERE user_id=?", (user,))
         username = profile["username"] if profile else ""
         if message.from_user and message.from_user.id == user:
@@ -1840,7 +1894,7 @@ class UIBuilder:
         await self.send(message, f"🛍️ <b>{USER_BRAND}</b>\n🏠 <b>Menu Awal</b>\n👤 User: {escape(identity)}\n\n"
             + mode +
             f"💰 Saldo Kamu: <b>{money(self.store.host.get_balance(user))}</b>\n"
-            f"🛍️ Status toko: {escape(status)}\n\nPilih menu di bawah:", self.home_keyboard(user))
+            f"🛍️ Status toko: {escape(status)}\n{escape(note)}\n\nPilih menu di bawah:", self.home_keyboard(user))
 
     async def selection(self, message, user, kind, payload=None, query=""):
         self.store.require_ready()
@@ -1848,18 +1902,19 @@ class UIBuilder:
         page = max(0, min(int(payload.get("page", 0)), 1000))
         if kind == "countries":
             rows = await self.store.catalog.listing("/catalog/countries")
-            rows = [row for row in rows if row.get("active") is True]
+            rows = self.store.catalog.named_rows(rows)
             rows = [row for row in rows if query.casefold() in (str(row.get("name"))+str(row.get("code"))).casefold()]
             buttons = [(UserFormatter.label(row.get("emoji") or "🌍")+" "+UserFormatter.label(row["name"]), "services",
                         {"country": row["id"], "country_name": row["name"]}) for row in rows]
             title = "🌍 PILIH NEGARA"
         elif kind == "services":
             rows = await self.store.catalog.listing("/catalog/services", {"country_id": payload["country"]})
-            rows = [row for row in rows if row.get("active") is True and query.casefold() in str(row.get("name", "")).casefold()]
+            rows = [row for row in self.store.catalog.named_rows(rows) if query.casefold() in row["name"].casefold()]
             buttons = [(UserFormatter.label(row["name"]), "operators", {**payload, "platform": row["id"], "platform_name": row["name"], "page": 0}) for row in rows]
             title = "📱 PILIH LAYANAN • "+escape(UserFormatter.label(payload.get("country_name")))
         elif kind == "operators":
             rows = await self.store.catalog.listing("/catalog/operators", {"country_id": payload["country"], "platform_id": payload["platform"]})
+            rows = self.store.catalog.named_rows(rows, operators=True)
             if not rows:
                 rows = [{"operator_id": None, "name": "Any"}]
             buttons = [(UserFormatter.label(row.get("name") or "Any"), "products", {**payload, "operator": row["operator_id"], "operator_name": row.get("name") or "Any", "page": 0}) for row in rows]
@@ -2332,8 +2387,11 @@ class AdminHandler:
                         raise StoreError("INPUT", "Mode rule tidak valid.")
                     if len(args) != (7 if mode == "kombinasi" else 6):
                         raise StoreError("INPUT", "Cantumkan nilai markup sesuai mode.")
-                    percent = Decimal(args[5]) if mode in {"persen", "kombinasi"} else Decimal(0)
-                    if not percent.is_finite() or not 0 <= percent <= 10000:
+                    try:
+                        percent = Decimal(args[5]) if mode in {"persen", "kombinasi"} else Decimal(0)
+                    except InvalidOperation:
+                        raise StoreError("INPUT", "Persentase tidak valid.") from None
+                    if not percent.is_finite() or not 0 <= percent <= 10000 or percent.as_tuple().exponent < -4:
                         raise StoreError("INPUT", "Persentase tidak valid.")
                     fixed = self.number(args[6], 0, 10**9) if mode == "kombinasi" and len(args) == 7 else self.number(args[5], 0, 10**9) if mode == "nominal" else 0
                     self.rule(user, scope, key, {"mode": {"persen": "percent", "nominal": "fixed", "kombinasi": "combined"}[mode], "percent": str(percent), "fixed": fixed})
@@ -2344,7 +2402,8 @@ class AdminHandler:
                 page = self.number(args[4], 1, 10000) if len(args) >= 5 else 1
                 return await self.prices(message, user, sub, page=page, country=country, platform=platform)
         if section == "orders":
-            return await self.store.ui.history(message, user, page=int(args[1]) if len(args) > 1 else 0, admin=True)
+            page = self.number(args[1], 0, 10000) if len(args) > 1 else 0
+            return await self.store.ui.history(message, user, page=page, admin=True)
         if section in {"limit", "markup"}:
             raise StoreError("INPUT", "Parameter admin belum lengkap. Gunakan /otp admin harga untuk panduan.")
         if section == "webhook":
@@ -2402,7 +2461,10 @@ class AdminHandler:
     def number(value, low, high):
         if not re.fullmatch(r"[0-9]{1,12}", str(value)):
             raise StoreError("INPUT", "Gunakan angka bulat tanpa pemisah.")
-        return integer(int(value), low, high)
+        value = int(value)
+        if not low <= value <= high:
+            raise StoreError("INPUT", f"Masukkan angka antara {low} dan {high}.")
+        return value
 
     def rule(self, user, scope, key, rule):
         self.authorize(user)
