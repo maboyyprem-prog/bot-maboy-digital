@@ -1,4 +1,4 @@
-# MaboyyDigital v16.97
+# MaboyyDigital v16.98
 
 Paket ringkas: **13 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -42,6 +42,11 @@ Status API sekarang memeriksa koneksi saat dibuka, bukan hanya hasil terakhir.
 Katalog besar kini dibaca bertahap melalui file sementara dengan batas khusus
 64 MiB; decode berjalan pada worker. Respons order/profil tetap memakai batas lama.
 Jika katalog gagal, saldo profil yang berhasil dibaca tetap tampil pada owner.
+Validasi dilakukan per layanan: angka bulat seperti `100.0` dibaca dengan tepat,
+duplikat identik digabung, dan entri invalid/ID konflik tidak dijual. Layanan valid
+tetap diproses. Buka **Status API → Rincian Katalog** untuk ID, min/max, alasan
+penolakan, serta jumlah layanan yang valid. Seluruh data invalid tetap menghentikan
+pembelian; batas pecahan/format ambigu tidak dipaksakan menjadi jumlah.
 Status menyebut **Profil/Katalog**, HTTP, dan penyebab yang aman: key ditolak,
 izin IP, format respons, atau field saldo/harga yang perlu diperbaiki.
 Saldo provider membaca `balance`/`saldo`; nilai hilang/bertentangan tidak dianggap nol.
@@ -82,7 +87,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v16.97 yang lulus 372 tes mock dan 49 pemeriksaan transaksi.
+v16.98 yang lulus 389 tes mock dan 49 pemeriksaan transaksi.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.

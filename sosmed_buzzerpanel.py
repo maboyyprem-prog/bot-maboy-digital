@@ -81,6 +81,53 @@ def decimal(value, low=0, high=MAX_MONEY):
         raise StoreError("INPUT") from None
 
 
+def catalog_integer(value, low=0, high=MAX_MONEY):
+    """Catalogue-only integral numbers; wallet/checkout number() stays strict.
+
+    JSON 100.0 and '100.00' are exact integral quantities. Localized grouping,
+    fractional quantities and bools are not guessed into an order quantity.
+    """
+    if isinstance(value, bool) or value is None:
+        raise StoreError('PROVIDER', detail='Nilai kosong/boolean tidak dapat menjadi bilangan bulat.')
+    if isinstance(value, str):
+        value = value.strip()
+        # Repeated grouping separators/spaces are unambiguous counts; a single
+        # dotted group remains ambiguous and must not change a charge by 1000x.
+        if (re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{3}){2,}',value)
+                or re.fullmatch(r'[0-9]{1,3}(?:,[0-9]{3}){2,}',value)):
+            value = value.replace('.','').replace(',','')
+        elif re.fullmatch(r'[0-9]{1,3}(?:[ \u00a0\u202f][0-9]{3})+',value):
+            value = re.sub(r'[ \u00a0\u202f]','',value)
+        if len(value)>64 or not re.fullmatch(r'[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]{1,3})?', value):
+            raise StoreError('PROVIDER', detail='Format angka tidak didukung; pemisah lokal atau teks tidak diasumsikan.')
+        if re.fullmatch(r'[+-]?[0-9]{1,3}\.000', value):
+            raise StoreError('PROVIDER', detail='Format bertitik ambigu: angka desimal atau pemisah ribuan belum diketahui.')
+    elif not isinstance(value, (int, float, Decimal)):
+        raise StoreError('PROVIDER', detail='Tipe nilai bukan angka.')
+    try:
+        result = Decimal(str(value))
+        if not result.is_finite() or result != result.to_integral_value():
+            raise StoreError('PROVIDER', detail='Nilai pecahan/nonfinite tidak dapat menjadi jumlah bulat.')
+        if result<low or result>high:
+            raise StoreError('PROVIDER', detail='Nilai negatif/nol atau melebihi batas jumlah yang didukung.')
+        return int(result)
+    except (InvalidOperation, ValueError, TypeError):
+        raise StoreError('PROVIDER', detail='Nilai tidak dapat dibaca sebagai bilangan bulat.') from None
+
+
+def catalog_value_label(value):
+    # Owner diagnostics contain numeric evidence, never arbitrary API text.
+    if value is None:
+        return 'kosong'
+    if isinstance(value, bool):
+        return 'boolean'
+    if isinstance(value, (int, float, Decimal)):
+        return str(value)[:64]
+    if isinstance(value, str) and len(value)<=64 and re.fullmatch(r'[0-9eE+., \t\r\n-]+', value):
+        return value.strip()
+    return 'format/tipe tidak didukung'
+
+
 def flag(value):
     return value is True or value == 1 or (isinstance(value, str) and value.lower() in {"true", "yes", "1"})
 
@@ -770,6 +817,20 @@ class CatalogService:
         self.profile_checked_at = 0
         self.failure_stage = 'profile'
 
+    def diagnostics(self):
+        row = self.store.repo.one("SELECT value FROM sosmed_settings WHERE key='catalog_diagnostics'")
+        try:
+            report = json.loads(row['value']) if row else {}
+            return report if isinstance(report,dict) and report.get('fingerprint') == self.store.contract_fingerprint() else {}
+        except (ValueError,TypeError):
+            return {}
+
+    @staticmethod
+    def duplicate_signature(service):
+        fields = ('name','category','type','currency','rate_unit','min_quantity','max_quantity',
+                  'refill_supported','dripfeed_supported','description','enabled','order_supported')
+        return (tuple(service[field] for field in fields),Decimal(service['provider_rate']),FormAdapter.target_kind(service))
+
     async def sync(self, force=False, return_rows=True):
         async with self.lock:
             synced = self.store.repo.one("SELECT MAX(last_synced_at) AS stamp FROM sosmed_services")
@@ -791,19 +852,43 @@ class CatalogService:
             rows = await self.store.api.request("services")
             if not isinstance(rows, list) or len(rows)>100000:
                 raise StoreError("PROVIDER", detail='services: data bukan daftar layanan atau terlalu besar.', stage='services')
-            prepared, seen = [], set()
+            prepared, blocked = {}, set()
+            report = {'fingerprint':profile_fingerprint,'checked_at':time.time(),'received':len(rows),
+                      'valid_unique':0,'rejected_rows':0,'identical_duplicates':0,'conflicting_ids':0,
+                      'purchasable':0,'reasons':{},'examples':[],'state':'PROCESSING'}
+            def reject(index, raw, sid, field, reason):
+                report['rejected_rows'] += 1
+                report['reasons'][field] = report['reasons'].get(field,0)+1
+                if sid is not None:
+                    blocked.add(sid)
+                    prepared.pop(sid,None)
+                if len(report['examples'])<1000:
+                    report['examples'].append({'row':index,'id':sid,'field':field,'reason':reason,
+                        'min':catalog_value_label(raw.get('min')) if isinstance(raw,dict) else 'kosong',
+                        'max':catalog_value_label(raw.get('max')) if isinstance(raw,dict) else 'kosong'})
             fallback_unit = self.store.provider_units()["rate_unit"]
             form_rules={}
             for row in self.store.repo.all("SELECT key,value FROM sosmed_settings WHERE key LIKE 'service_form:%'"):
                 try:form_rules[row['key'].split(':',1)[1]]=json.loads(row['value'])['type']
                 except (ValueError,KeyError,TypeError):continue
             now = time.time()
-            for raw in rows:
+            for index, raw in enumerate(rows,1):
                 if not isinstance(raw, dict):
-                    raise StoreError("PROVIDER", detail='services: setiap layanan harus berupa objek JSON.', stage='services')
+                    reject(index,raw,None,'objek','Entri layanan bukan objek JSON.')
+                    continue
                 field = 'service/id'
+                sid = None
                 try:
-                    sid = number(raw.get("service", raw.get("id")), 1, 10**12, "PROVIDER")
+                    # Native id is authoritative; legacy service IDs still work.
+                    sid = catalog_integer(raw.get('id',raw.get('service')),1,10**12)
+                    if 'id' in raw and 'service' in raw:
+                        try: legacy = catalog_integer(raw['service'],1,10**12)
+                        except StoreError: legacy = None  # Some feeds use service as a display name.
+                        if legacy is not None and legacy!=sid:
+                            raise StoreError('PROVIDER',detail='Kolom id dan service menunjuk ID yang berbeda.')
+                    if sid in blocked:
+                        reject(index,raw,sid,'ID','ID ini memiliki entri lain yang invalid/bertentangan; seluruh ID dinonaktifkan.')
+                        continue
                     field = 'name/category'
                     name, category = (raw.get(key) for key in ('name', 'category'))
                     if any(not isinstance(x, str) or not x.strip() for x in (name, category)):
@@ -813,10 +898,13 @@ class CatalogService:
                     raw={**raw,'_form_source':form_source}
                     field = 'rate/price'
                     rate = str(decimal(raw.get("rate", raw.get("price"))))
-                    field = 'min/max atau ID duplikat'
-                    low, high = number(raw.get("min"), 0), number(raw.get("max"), 0)
-                    if high<low or sid in seen:
-                        raise StoreError("PROVIDER")
+                    field = 'min'
+                    low = catalog_integer(raw.get('min'))
+                    field = 'max'
+                    high = catalog_integer(raw.get('max'))
+                    field = 'min/max'
+                    if high<low:
+                        raise StoreError('PROVIDER',detail='Max lebih kecil daripada min; batas tidak ditukar atau diasumsikan.')
                     available = service_available(raw) and low >= 1 and high >= low
                     field = 'currency'
                     service_currency = raw.get("currency", currency)
@@ -836,15 +924,35 @@ class CatalogService:
                                "metadata_source": "API" if raw.get("description") or raw.get('note') else "", "last_synced_at": now,
                                "enabled": int(available), "order_supported": int(available and FormAdapter.supported({"type":kind,"raw_catalog":raw}) and service_currency=="IDR" and currency=="IDR" and unit=="1000"),
                                "raw_catalog": encoded(raw)}
-                except StoreError:
-                    # Reject the entire malformed catalogue instead of silently
-                    # disabling legitimate services with a broken partial sync.
-                    raise StoreError('PROVIDER', detail='services: kolom '+field+' tidak valid; cocokkan respons katalog resmi. Katalog terakhir dipertahankan.', stage='services') from None
-                seen.add(sid)
-                prepared.append(service)
+                except StoreError as exc:
+                    reject(index,raw,sid,field,exc.detail or 'Kolom '+field+' tidak valid.')
+                    continue
+                if sid in prepared:
+                    if self.duplicate_signature(prepared[sid]) == self.duplicate_signature(service):
+                        report['identical_duplicates'] += 1
+                    else:
+                        report['conflicting_ids'] += 1
+                        reject(index,raw,sid,'ID duplikat','ID duplikat memiliki harga, batas, status atau input berbeda; seluruh ID dinonaktifkan.')
+                    continue
+                prepared[sid] = service
+            report['valid_unique'] = len(prepared)
+            report['blocked_ids'] = len(blocked)
+            report['state'] = 'PARTIAL' if report['rejected_rows'] else 'COMPLETE'
+            if profile_fingerprint != self.store.contract_fingerprint():
+                raise StoreError('CONFIG','Konfigurasi berubah selama pemeriksaan katalog. Periksa kembali.',stage='services')
+            if rows and not prepared:
+                report['state'] = 'REJECTED'
+                with self.store.repo.connection(True) as conn:
+                    conn.execute('INSERT OR REPLACE INTO sosmed_settings VALUES(?,?,?)',('catalog_diagnostics',encoded(report),now))
+                first = report['examples'][0]
+                ident = 'ID #'+str(first['id']) if first['id'] is not None else 'ID tidak valid'
+                detail = (f"services: {report['rejected_rows']} entri ditolak; belum ada layanan valid. "
+                          f"Entri {first['row']}, {ident}, kolom {first['field']}: {first['reason']} "
+                          'Katalog terakhir dipertahankan. Lihat tombol Rincian Katalog.')
+                raise StoreError('PROVIDER',detail,detail=detail,stage='services')
             with self.store.repo.connection(True) as conn:
-                conn.execute("UPDATE sosmed_services SET enabled=0")
-                for service in prepared:
+                conn.execute("UPDATE sosmed_services SET enabled=0,order_supported=0")
+                for service in prepared.values():
                     fields = list(service)
                     conn.execute("INSERT INTO sosmed_services("+",".join(fields)+") VALUES("+",".join("?" for _ in fields)+") ON CONFLICT(provider_service_id) DO UPDATE SET "+",".join(f"{field}=excluded.{field}" for field in fields if field!="provider_service_id"), tuple(service.values()))
                 for setting in conn.execute("SELECT * FROM sosmed_service_settings").fetchall():
@@ -853,6 +961,8 @@ class CatalogService:
                         conn.execute(f"UPDATE sosmed_services SET enabled=0 WHERE {field}=?", (setting["scope_key"],))
                 for meta in conn.execute("SELECT * FROM sosmed_metadata").fetchall():
                     conn.execute("UPDATE sosmed_services SET description=?,metadata_source=? WHERE provider_service_id=?", (meta["description"], meta["source"], meta["service_id"]))
+                report['purchasable'] = conn.execute('SELECT COUNT(*) FROM sosmed_services WHERE enabled=1 AND order_supported=1').fetchone()[0]
+                conn.execute('INSERT OR REPLACE INTO sosmed_settings VALUES(?,?,?)',('catalog_diagnostics',encoded(report),now))
             self.last_profile = balance
             return self.store.repo.all("SELECT * FROM sosmed_services ORDER BY category,provider_service_id") if return_rows else None
 

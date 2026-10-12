@@ -35,7 +35,7 @@ NAVIGATION_ACTIONS = {
     "admin_orders", "admin_services", "admin_categories", "admin_prices",
     "admin_settings", "admin_pricing", "admin_scope", "admin_pending",
     "admin_refunds", "admin_detail",
-    "admin_form", "admin_units",
+    "admin_form", "admin_units", "admin_catalog",
 }
 
 
@@ -706,12 +706,20 @@ class AdminHandler:
         if verified and not result:
             verification += '; pemeriksaan API belum lulus'
         http = health.get('http_status')
+        report = self.store.catalog.diagnostics()
+        catalog_summary = ''
+        if report:
+            catalog_summary = (f"Layanan: {report['valid_unique']}/{report['received']} unik valid • "
+                               f"Dapat dibeli: {report['purchasable']}\n"
+                               f"Dilewati: {report['rejected_rows']} • Duplikat identik: {report['identical_duplicates']} • "
+                               f"ID konflik: {report['conflicting_ids']}\n")
         provider_balance = "Tidak tersedia"
         profile = result["profile"] if result else (
             self.store.catalog.last_profile if self.store.catalog.last_profile_fingerprint == self.store.contract_fingerprint() and stage.startswith('services') else None)
         if profile:
             provider_balance = provider_money(profile["balance"]) if profile["currency"] == "IDR" else esc(profile["balance"])+" "+esc(profile["currency"] or "(mata uang belum dikonfirmasi)")
         text = ("🔌 <b>STATUS INTEGRASI SOSMED</b>\nProvider: BuzzerPanel.id\n\n"
+                f"Versi bot: {esc(getattr(self.store.host,'BOT_VERSION','-'),40)}\n"
                 f"Konfigurasi: {'Tersedia' if health.get('configured') else 'Belum lengkap'}\n"
                 f"API: {current_status}\n"
                 f"Profil: {profile_status} • Katalog: {catalog_status}\n"
@@ -719,16 +727,48 @@ class AdminHandler:
                 f"HTTP: {http if type(http) is int else '-'}\n"
                 f"Diperiksa: {instant(health.get('checked_at'))}\n"
                 f"Sync katalog: {instant(health.get('catalog_synced_at'))}\n"
+                f"{catalog_summary}"
                 f"Kode gangguan: {esc(health.get('error') or '-')}\n\n"
                 f"Verifikasi pembelian: {verification}\n"
                 f"{explanation}\n\n"
                 "Refill memerlukan verifikasi terpisah; cancel belum didokumentasikan.\n"
                 "Timeout pembelian tidak dikirim ulang otomatis. Periksa menu Rekonsiliasi untuk transaksi yang belum pasti.")
         keyboard = self.ui.navigation(user, "admin_menu", admin=True)
+        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="📋 Rincian Katalog", callback_data=self.store.token(user,"admin_catalog",ttl=86400))])
         keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="💱 Mata Uang & Satuan", callback_data=self.store.token(user, "admin_units", ttl=86400))])
         if not verified or not self.store.settings()["enabled"]:
             keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="🟢 Periksa & Buka Toko", callback_data=self.store.token(user, "admin_toggle", {"enabled": True, "back": "admin_menu"}))])
         await self.ui.send(message, text, keyboard)
+
+    async def catalog_report(self, message, user, payload=None):
+        self.authorize(user)
+        report = self.store.catalog.diagnostics()
+        if not report:
+            return await self.ui.send(message,'📋 <b>RINCIAN KATALOG</b>\n\nBelum ada rincian untuk konfigurasi akun ini. Buka Status API untuk memeriksa.',
+                                      self.ui.navigation(user,'admin_status',admin=True))
+        examples = report.get('examples',[])
+        count = len(examples)
+        page = min(number((payload or {}).get('page',0),0,100000),max(0,math.ceil(count/PAGE_SIZE)-1))
+        text = ("📋 <b>RINCIAN VALIDASI KATALOG</b>\n"
+                f"Diperiksa: {instant(report['checked_at'])}\n"
+                f"Masuk: {report['received']} • Unik valid: {report['valid_unique']} • Dapat dibeli: {report['purchasable']}\n"
+                f"Ditolak: {report['rejected_rows']} • Identik digabung: {report['identical_duplicates']}\n"
+                f"ID konflik: {report['conflicting_ids']} • Status: {esc(report['state'])}\n\n")
+        for example in examples[page*PAGE_SIZE:(page+1)*PAGE_SIZE]:
+            ident = '#'+str(example['id']) if example['id'] is not None else 'ID tidak valid'
+            text += (f"<b>Entri {example['row']} • {ident}</b>\n"
+                     f"Kolom: {esc(example['field'],80)} • Min: {esc(example['min'],90)} • Max: {esc(example['max'],90)}\n"
+                     f"{esc(self.ui.provider_label(example['reason']),230)}\n\n")
+        if not examples:
+            text += '✅ Tidak ada entri yang ditolak.\n\n'
+        elif report['rejected_rows']>count:
+            text += f"Ditampilkan {count} contoh pertama dari {report['rejected_rows']} penolakan.\n\n"
+        text += (f"Halaman {page+1}/{max(1,math.ceil(count/PAGE_SIZE))}\n"
+                 "Entri invalid/ID konflik tidak dijual; layanan valid tetap dapat diproses. "
+                 "Bilangan bulat JSON/100.0 dapat dibaca; pecahan, min/max terbalik, dan pemisah ambigu perlu diperbaiki pada sumber.")
+        rows = self.ui.pages(user,'admin_catalog',{},page,count)+[
+            [('🔄 Periksa Lagi','admin_status',{})],[('⬅️ Kembali','admin_menu',{})]]
+        return await self.ui.send(message,text,self.ui.keyboard(user,rows))
 
     async def pending(self, message, user, payload=None, *, refunds=False):
         self.authorize(user)
@@ -955,6 +995,8 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await admin.statistics(message, user, profit=action == "admin_profit")
     if action == "admin_status":
         return await admin.health(message, user)
+    if action == "admin_catalog":
+        return await admin.catalog_report(message,user,payload)
     if action == "admin_units":
         return await admin.units(message, user)
     if action == "admin_units_choose":
