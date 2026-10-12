@@ -227,10 +227,10 @@ ORDER_RESERVATION_MINUTES = env_int("ORDER_RESERVATION_MINUTES",15,5)
 STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
-# Deployment ZIP contains only main.py, bot.py, otp_smscode.py, requirements.txt,
-# project_backup.py and .gitignore. Keep tests, fixtures and reports in full backups.
-BOT_VERSION = "16.89"
-SCHEMA_VERSION = 190
+# Deploy-ready releases include all runtime modules, tests and safe documentation.
+# Runtime data and credentials belong in encrypted full backups, not GitHub.
+BOT_VERSION = "16.90"
+SCHEMA_VERSION = 191
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -308,6 +308,11 @@ router = Router()
 import sys as _otp_sys
 import otp_smscode
 OTP_STORE = otp_smscode.register(router, otp_smscode.Store(_otp_sys.modules[__name__]))
+import sosmed_buzzerpanel
+import sosmed_ui
+SOSMED_STORE = sosmed_ui.register(
+    router, sosmed_buzzerpanel.Store(_otp_sys.modules[__name__])
+)
 START_TIME = time.time()
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
@@ -1520,6 +1525,7 @@ def init_db():
     )
 
     otp_smscode.init_schema(conn)
+    sosmed_buzzerpanel.init_schema(conn)
     reconcile_all_inventory_stock(conn)
     sync_all_product_sold_from_history(conn)
     conn.commit()
@@ -9028,6 +9034,8 @@ PROJECT_BACKUP_REQUIRED_FILES = (
     "main.py",
     "bot.py",
     "otp_smscode.py",
+    "sosmed_buzzerpanel.py",
+    "sosmed_ui.py",
 )
 
 PROJECT_BACKUP_OPTIONAL_FILES = (
@@ -9037,6 +9045,9 @@ PROJECT_BACKUP_OPTIONAL_FILES = (
     "VARIABLE_RAILWAY.md",
     "project_backup.py",
     "OTP_OPERATIONS.md",
+    "RAILWAY_RESTORE.md",
+    "SOSMED_OPERATIONS.md",
+    "railway.json",
 )
 
 
@@ -10546,7 +10557,7 @@ class CommandKeyboardMiddleware(BaseMiddleware):
                     r"am_mail_[1-9][0-9]{0,9}",str(command.args or "").strip())):
                 return await handler(CommandMenuMessage.wrap(event),data)
         elif isinstance(event,CallbackQuery) and (str(event.data or "").startswith(
-                (otp_smscode.PREFIX,"owner:","tools:","utools:","toolsaccess","tm:"))
+                (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,"owner:","tools:","utools:","toolsaccess","tm:"))
                 or getattr(getattr(data.get("handler"),"callback",None),"__name__","").startswith(
                     ("owner_","user_tools_"))):
             main_menu=False
@@ -12784,6 +12795,7 @@ class CallbackTraceMiddleware(BaseMiddleware):
 def shopping_navigation_states() -> set:
     return {
         otp_smscode.OTPState.topup_amount.state, otp_smscode.OTPState.topup_proof.state,
+        *(item.state for item in sosmed_ui.SosmedOrderState.__all_states__),
         CheckoutState.waiting_note.state, CheckoutState.waiting_voucher.state,
         CheckoutState.waiting_payment_proof.state, CheckoutState.waiting_family_gmail.state,
         ReviewState.waiting_comment.state, LoginProofState.waiting_photo.state,
@@ -34646,7 +34658,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.89"
+EXPECTED_SOURCE_VERSION = "16.90"
 
 
 def source_integrity_self_test():
@@ -34763,6 +34775,11 @@ async def main():
         logging.warning("OTP worker startup failed: %s", type(exc).__name__)
 
     try:
+        background_tasks.extend(await SOSMED_STORE.start(bot))
+    except Exception as exc:
+        logging.warning("SOSMED worker startup failed: %s", type(exc).__name__)
+
+    try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(
             bot,
@@ -34801,6 +34818,11 @@ async def main():
             await OTP_STORE.close()
         except Exception:
             logging.warning("OTP client cleanup failed.")
+
+        try:
+            await SOSMED_STORE.close()
+        except Exception:
+            logging.warning("SOSMED client cleanup failed.")
 
         try:
             await runner.cleanup()

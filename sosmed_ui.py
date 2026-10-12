@@ -1,0 +1,1084 @@
+"""Telegram views for the additive social-media store.
+
+The provider client, money movements and order lifecycle live in
+``sosmed_buzzerpanel``. This module only validates navigation and collects
+documented form fields. It shares the host router, wallet and deposit flow.
+"""
+import html
+import json
+import logging
+import math
+import re
+import shlex
+import time
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+
+from aiogram import F
+from aiogram.filters import Command
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
+
+import sosmed_buzzerpanel as core
+from otp_smscode import MenuMessage, TEXT_MENU_ACTIONS
+
+PREFIX = "sosmed:"
+PAGE_SIZE = 8
+USER_BRAND = "MABOYY SOSMED STORE"
+ADMIN_BRAND = "MABOYY SOSMED ADMIN"
+TERMINAL = {"COMPLETED", "PARTIAL", "CANCELED", "FAILED"}
+NAVIGATION_ACTIONS = {
+    "home", "categories", "services", "detail", "orders", "history", "check",
+    "favorites", "favorite", "balance", "help", "search", "admin_menu",
+    "admin_balance", "admin_stats", "admin_profit", "admin_status",
+    "admin_orders", "admin_services", "admin_categories", "admin_prices",
+    "admin_settings", "admin_pricing", "admin_scope", "admin_pending",
+    "admin_refunds", "admin_detail",
+}
+
+
+def esc(value, limit=1400):
+    # Bound escaped fragments without splitting entities or enclosing markup.
+    result, size = [], 0
+    for character in str(value if value is not None else ""):
+        encoded = html.escape(character)
+        if size+len(encoded)>limit:
+            result.append("…")
+            break
+        result.append(encoded)
+        size += len(encoded)
+    return "".join(result)
+
+
+def number(value, low=0, high=10**12):
+    if isinstance(value, bool) or not re.fullmatch(r"[0-9]{1,13}", str(value).strip()):
+        raise core.StoreError("INPUT", "Kirim angka bulat yang valid.")
+    result = int(value)
+    if not low <= result <= high:
+        raise core.StoreError("INPUT", "Angka di luar batas yang diizinkan.")
+    return result
+
+
+def instant(value):
+    if not value:
+        return "Belum tersedia"
+    try:
+        return datetime.fromtimestamp(float(value), timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    except (ValueError, TypeError, OverflowError, OSError):
+        return "Belum tersedia"
+
+
+def provider_money(value):
+    """Show the exact API balance, including supported fractional rupiah."""
+    value = Decimal(str(value))
+    whole, _, fraction = format(value, "f").partition(".")
+    text = "Rp"+f"{int(whole):,}".replace(",", ".")
+    return text+(","+fraction.rstrip("0") if fraction.rstrip("0") else "")
+
+
+class SosmedOrderState(StatesGroup):
+    field = State()
+    search = State()
+    admin_value = State()
+
+
+class UserFormatter:
+    """White-label only bot-generated catalog text; no raw provider errors."""
+
+    @staticmethod
+    def label(value, limit=400, *, secret=""):
+        text = str(value or "")
+        if secret:
+            text = text.replace(secret, "")
+        text = re.sub(r"https?://[^\s<>]+", "", text, flags=re.I)
+        text = re.sub(r"\b(?:[a-z0-9_-]+\.)*buzzerpanel\s*\.\s*id(?:/[^\s<>]*)?", "", text, flags=re.I)
+        text = re.sub(r"\bbuzzer\s*panel\b", "", text, flags=re.I)
+        return " ".join(text.split()).strip(" •|·-/")[:limit] or "-"
+
+    @staticmethod
+    def kind(value):
+        return {"default": "Default", "custom comments": "Custom Comments",
+                "comment": "Comment", "mentions custom list": "Mentions Custom List",
+                "mentionscustomlist": "Mentions Custom List", "comment replies": "Comment Replies",
+                "commentreplies": "Comment Replies",
+                "package": "Package", "subscription": "Subscription",
+                "subscriptions": "Subscriptions", "mentions": "Mentions",
+                "poll": "Poll", "drip-feed": "Drip-feed"}.get(
+                    str(value).strip().lower(), "Tipe lain (belum didukung)")
+
+    @staticmethod
+    def status(value):
+        return {
+            "PENDING": "Menunggu proses", "PROCESSING": "Sedang diproses",
+            "IN_PROGRESS": "Sedang berjalan", "COMPLETED": "Selesai",
+            "PARTIAL": "Selesai sebagian", "CANCELED": "Dibatalkan",
+            "FAILED": "Gagal", "UNKNOWN": "Sedang diperiksa",
+            "RESERVED": "Pembayaran ditahan", "REQUESTING": "Sedang diproses",
+            "RECONCILIATION_REQUIRED": "Menunggu kepastian transaksi",
+            "PENDING_RECONCILIATION": "Menunggu kepastian transaksi",
+            "CAPTURED": "Pesanan dibuat", "REFILL_PENDING": "Refill sedang diperiksa",
+            "SUCCESS": "Pesanan dibuat",
+        }.get(str(value).upper().replace(" ", "_"), "Sedang diperiksa")
+
+    @staticmethod
+    def error(exc):
+        # An API response can contain upstream account details. Select a local
+        # message by code instead of reflecting exception strings to buyers.
+        return {
+            "PRIVATE": "Gunakan /sosmed melalui chat privat bot.",
+            "CHANNEL": "Buka /start dan ikuti verifikasi channel dahulu.",
+            "FORBIDDEN": "Menu ini tidak dapat diakses oleh akun kamu.",
+            "BLOCKED": "Akun kamu dibatasi owner.",
+            "INPUT": "Input belum sesuai. Periksa petunjuk pada menu.",
+            "VALIDATION": "Input belum sesuai persyaratan layanan.",
+            "TOKEN": "Tombol kedaluwarsa atau bukan milik kamu. Buka /sosmed lagi.",
+            "NOT_FOUND": "Layanan atau pesanan tidak ditemukan.",
+            "DISABLED": "Pembelian baru ditutup owner. Pesanan lama tetap dapat dicek.",
+            "CLOSED": "Pembelian baru sedang ditutup. Pesanan lama tetap dapat dicek.",
+            "NOT_CONFIGURED": "Pembelian sementara belum tersedia. Hubungi owner.",
+            "CONFIG": "Pembelian sementara belum tersedia. Hubungi owner.",
+            "UNSUPPORTED": "Tipe layanan ini belum tersedia untuk pembelian.",
+            "UNSUPPORTED_TYPE": "Tipe layanan ini belum tersedia untuk pembelian.",
+            "TYPE": "Tipe layanan ini belum tersedia untuk pembelian.",
+            "CURRENCY": "Layanan ini belum tersedia untuk pembelian.",
+            "USER_BALANCE": "Saldo kamu tidak cukup. Pilih Isi Saldo.",
+            "INSUFFICIENT_BALANCE": "Pesanan sementara belum dapat diproses.",
+            "QUOTE_EXPIRED": "Konfirmasi harga kedaluwarsa. Pilih layanan kembali.",
+            "PRICE_CHANGED": "Harga berubah. Pilih layanan kembali untuk menyetujui harga terbaru.",
+            "BELOW_COST": "Harga layanan perlu diperbarui owner.",
+            "ORDER_LIMIT": "Batas pesanan aktif tercapai. Tunggu pesanan sebelumnya.",
+            "ACTIVE_LIMIT": "Batas pesanan aktif tercapai. Tunggu pesanan sebelumnya.",
+            "COOLDOWN": "Tunggu sebentar sebelum mengirim permintaan kembali.",
+            "RATE_LIMIT": "Terlalu banyak permintaan. Coba kembali setelah jeda.",
+            "RATE_LIMIT_EXCEEDED": "Terlalu banyak permintaan. Coba kembali setelah jeda.",
+            "MAINTENANCE": "Pembelian sementara ditutup untuk pemeliharaan.",
+            "SAFE_MODE": "Pembelian sementara ditunda. Hubungi owner.",
+            "REFILL_UNSUPPORTED": "Layanan ini tidak menyediakan refill.",
+            "REFILL": "Refill belum tersedia. Periksa ketentuan dan status layanan.",
+            "CANCEL_UNSUPPORTED": "Pembatalan tidak tersedia untuk layanan ini.",
+            "CANCEL": "Pembatalan belum tersedia. Periksa ketentuan dan status layanan.",
+            "CONFLICT": "Tindakan belum tersedia. Periksa status pesanan dahulu.",
+            "REFILL_PENDING": "Permintaan refill sebelumnya masih diproses.",
+            "NETWORK": "Hasil permintaan belum pasti. Periksa pesanan dan jangan membeli ulang.",
+            "UNCERTAIN": "Transaksi sedang diperiksa. Jangan membeli ulang.",
+            "LOCAL_DATABASE": "Transaksi sedang diperiksa. Jangan mengulang pembayaran.",
+        }.get(getattr(exc, "code", ""), "Layanan mengalami gangguan sementara. Coba kembali nanti.")
+
+
+def search_input(text):
+    """Small bounded search grammar, not SQL or a provider request body."""
+    if len(text) > 300:
+        raise core.StoreError("INPUT", "Pencarian maksimal 300 karakter.")
+    query, filters = [], {}
+    for word in text.split():
+        if ":" not in word:
+            query.append(word)
+            continue
+        key, value = word.split(":", 1)
+        key = key.lower()
+        if key in {"refill", "tersedia"}:
+            if value.lower() not in {"ya", "tidak", "true", "false", "1", "0"}:
+                raise core.StoreError("INPUT", "Filter "+key+":ya atau "+key+":tidak.")
+            filters["refill" if key == "refill" else "available"] = value.lower() in {"ya", "true", "1"}
+        elif key in {"min", "max", "harga"}:
+            filters[{"min": "min_quantity", "max": "max_quantity", "harga": "max_price_idr"}[key]] = number(value, 1, 10**12)
+        else:
+            query.append(word)
+    return " ".join(query).strip(), filters
+
+
+class UIBuilder:
+    def __init__(self, store):
+        self.store = store
+
+    def provider_label(self, value):
+        text = str(value or "")
+        for name in ("token", "secret"):
+            secret = getattr(self.store.config, name, "")
+            if secret:
+                text = text.replace(secret, "")
+        return text
+
+    def public_label(self, value, limit=400):
+        return UserFormatter.label(self.provider_label(value), limit)
+
+    def keyboard(self, user, rows, *, bot_home=False):
+        buttons = []
+        for row in rows:
+            actual = []
+            for label, action, payload in row:
+                if action.startswith("admin") and not self.store.owner(user):
+                    raise core.StoreError("FORBIDDEN", "Menu ini hanya untuk owner.")
+                token = self.store.token(user, action, payload or {}, ttl=86400 if action in NAVIGATION_ACTIONS else 300)
+                if len(token.encode("utf-8")) > 64:
+                    raise core.StoreError("INPUT", "Data tombol terlalu panjang.")
+                safe_label = str(label)
+                for name in ("token", "secret"):
+                    secret = getattr(self.store.config, name, "")
+                    if secret:
+                        safe_label = safe_label.replace(secret, "[dirahasiakan]")
+                actual.append(InlineKeyboardButton(text=safe_label[:64], callback_data=token))
+            if actual:
+                buttons.append(actual)
+        if bot_home:
+            buttons.append([InlineKeyboardButton(text="⬅️ Kembali ke Bot", callback_data="home")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    def navigation(self, user, back="home", payload=None, *, admin=False):
+        home = "admin_menu" if admin else "home"
+        rows = []
+        if back != home:
+            rows.append([("⬅️ Kembali", back, payload or {}), ("🏠 Menu Awal", home, {})])
+        else:
+            rows.append([("⬅️ Kembali", home, {})])
+        return self.keyboard(user, rows)
+
+    async def send(self, message, text, keyboard=None):
+        if keyboard is None:
+            keyboard = self.navigation(message.chat.id)
+        sent = await message.answer(text, reply_markup=keyboard, parse_mode="HTML",
+                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
+        message_id = getattr(sent, "message_id", None) or getattr(message, "target_id", None) or message.message_id
+        if isinstance(message_id, int) and message_id > 0:
+            with self.store.repo.connection(True) as conn:
+                conn.execute("""INSERT INTO sosmed_ui_sessions(user_id,message_id,payload,updated_at)
+                    VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+                    message_id=excluded.message_id,updated_at=excluded.updated_at""",
+                    (message.chat.id, message_id, "{}", time.time()))
+        return sent
+
+    def input_message(self, message):
+        row = self.store.repo.one("SELECT message_id FROM sosmed_ui_sessions WHERE user_id=?", (message.from_user.id,))
+        return MenuMessage(message, message_id=row["message_id"]) if row and row["message_id"] else message
+
+    async def home(self, message, user):
+        profile = self.store.repo.one("SELECT username FROM verified_users WHERE user_id=?", (user,))
+        username = getattr(message.from_user, "username", "") if message.from_user and message.from_user.id == user else ""
+        username = username or (profile.get("username", "") if profile else "")
+        identity = "@"+username.lstrip("@") if username else "User "+str(user)
+        settings = self.store.settings()
+        rows = [
+            [("🛒 BELI LAYANAN", "categories", {})],
+            [("📂 KATEGORI", "categories", {}), ("🔎 CARI", "search", {})],
+            [("📦 PESANAN SAYA", "orders", {}), ("⭐ FAVORIT", "favorites", {})],
+            [("💰 SALDO SAYA", "balance", {}), ("📜 RIWAYAT", "history", {})],
+            [("❓ PANDUAN", "help", {})],
+        ]
+        if self.store.owner(user):
+            rows.append([("👑 PANEL OWNER", "admin_menu", {})])
+        status = "Aktif" if settings["enabled"] else "Ditutup owner"
+        note = ("Ketersediaan diperiksa saat memilih layanan." if settings["enabled"] else
+                "Pembelian baru ditutup. Pesanan lama tetap dapat dicek.")
+        if settings["enabled"] and (self.store.config.error or not self.store.config.token
+                                    or not getattr(self.store.config, "contract_verified", False)):
+            note = "Pembelian belum tersedia. Owner perlu melengkapi pengaturan toko."
+        await self.send(message, f"🛍️ <b>{USER_BRAND}</b>\n🏠 <b>Menu Awal</b>\n"
+                        f"👤 Akun: {esc(identity)}\n💰 Saldo: <b>{core.money(self.store.balance(user))}</b>\n"
+                        f"🛍️ Toko: {esc(status)}\n{esc(note)}\n\nPilih menu di bawah:",
+                        self.keyboard(user, rows, bot_home=True))
+
+    async def balance(self, message, user):
+        keyboard = self.navigation(user)
+        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="➕ Isi Saldo", callback_data="wallet:topup")])
+        await self.send(message, "💰 <b>SALDO SAYA</b>\n\n"
+                        f"Saldo kamu: <b>{core.money(self.store.balance(user))}</b>\n\n"
+                        "Saldo yang sama dipakai untuk belanja, OTP, dan layanan sosmed. "
+                        "Isi Saldo menggunakan pembayaran bot yang sudah tersedia.", keyboard)
+
+    def pages(self, user, action, payload, page, total):
+        count = max(1, math.ceil(total/PAGE_SIZE))
+        rows = []
+        if page > 0:
+            rows.append(("⬅️ Sebelumnya", action, {**payload, "page": page-1}))
+        if page+1 < count:
+            rows.append(("Berikutnya ➡️", action, {**payload, "page": page+1}))
+        return [rows] if rows else []
+
+    async def categories(self, message, user, payload=None, *, admin=False):
+        payload = payload or {}
+        await self.store.catalog.sync()
+        categories = ([row["category"] for row in self.store.repo.all("SELECT DISTINCT category FROM sosmed_services ORDER BY category")]
+                      if admin else self.store.catalog.categories())
+        page = min(number(payload.get("page", 0), 0, 100000), max(0, math.ceil(len(categories)/PAGE_SIZE)-1))
+        action = "admin_categories" if admin else "categories"
+        rows = []
+        for category in categories[page*PAGE_SIZE:(page+1)*PAGE_SIZE]:
+            target = "admin_scope" if admin else "services"
+            data = {"scope": "category", "key": category} if admin else {"category": category, "page": 0}
+            rows.append([(self.public_label(category, 60) if not admin else self.provider_label(category)[:60], target, data)])
+        rows += self.pages(user, action, {}, page, len(categories))
+        rows.append([("📋 Semua Layanan", "admin_services" if admin else "services", {})])
+        rows.append([("⬅️ Kembali", "admin_pricing" if admin else "home", {})])
+        title = "📂 MARKUP KATEGORI" if admin else "📂 PILIH KATEGORI"
+        await self.send(message, f"<b>{title}</b>\nHalaman {page+1}/{max(1, math.ceil(len(categories)/PAGE_SIZE))}"
+                        + ("\nBelum ada kategori tersedia." if not categories else "\nPilih kategori:"), self.keyboard(user, rows))
+
+    async def services(self, message, user, payload=None, *, admin=False, favorites=False):
+        payload = payload or {}
+        await self.store.catalog.sync()
+        page = number(payload.get("page", 0), 0, 100000)
+        category, query = payload.get("category"), payload.get("query", "")
+        if favorites:
+            all_rows = self.store.repo.favorites(user)
+            total = len(all_rows)
+            page = min(page, max(0, math.ceil(total/PAGE_SIZE)-1))
+            services = all_rows[page*PAGE_SIZE:(page+1)*PAGE_SIZE]
+        elif admin:
+            terms, parameters = [], []
+            if category:
+                terms.append("category=?")
+                parameters.append(str(category))
+            if query:
+                terms.append("(instr(lower(name),lower(?))>0 OR instr(lower(category),lower(?))>0)")
+                parameters.extend([str(query)[:200]]*2)
+            where = " WHERE "+" AND ".join(terms) if terms else ""
+            total = self.store.repo.one("SELECT COUNT(*) n FROM sosmed_services"+where, parameters)["n"]
+            page = min(page, max(0, math.ceil(total/PAGE_SIZE)-1))
+            services = self.store.repo.all("SELECT * FROM sosmed_services"+where+" ORDER BY category,provider_service_id LIMIT ? OFFSET ?",
+                                           (*parameters, PAGE_SIZE, page*PAGE_SIZE))
+        else:
+            services, total = self.store.catalog.listing(category=category, query=query, page=page, filters=payload.get("filters"))
+            if total and page*PAGE_SIZE >= total:
+                page = (total-1)//PAGE_SIZE
+                services, total = self.store.catalog.listing(category=category, query=query, page=page, filters=payload.get("filters"))
+        rows, lines = [], []
+        for service in services:
+            sid = service["provider_service_id"]
+            try:
+                cost, sale = self.store.pricing.rate(service)
+                unit = "paket" if service.get("rate_unit") == "package" else "1.000"
+                price = f"Modal {core.money(cost)} • Jual {core.money(sale)} / {unit}" if admin else f"{core.money(sale)} / {unit}"
+            except core.StoreError:
+                price = "Harga belum tersedia"
+            name = self.provider_label(service["name"])[:180] if admin else self.public_label(service["name"], 180)
+            lines.append(f"<b>#{esc(sid)} {esc(name, 220)}</b>\n{esc(price, 120)}\n"
+                         f"Min {esc(service['min_quantity'])} • Max {esc(service['max_quantity'])}"
+                         + (" • Refill" if service.get("refill_supported") and (admin or self.store.config.refill_verified) else "")
+                         + (" • OFF" if admin and not service.get("enabled") else ""))
+            rows.append([(f"#{sid} {name}"[:60], "admin_detail" if admin else "detail", {"id": sid, "back": payload})])
+        action = "admin_services" if admin else "favorites" if favorites else "services"
+        rows += self.pages(user, action, payload, page, total)
+        if not admin:
+            rows.append([("🔎 Cari / Filter", "search", {"category": category})])
+        rows.append([("⬅️ Kembali", "admin_menu" if admin else "home" if favorites else "categories", {})])
+        title = "📋 HARGA MODAL & JUAL" if admin else "⭐ FAVORIT SAYA" if favorites else "📱 PILIH LAYANAN"
+        caption = "" if not category else "\n"+esc(self.provider_label(category)[:180] if admin else self.public_label(category, 180))
+        await self.send(message, f"<b>{title}</b>{caption}\nHalaman {page+1}/{max(1, math.ceil(total/PAGE_SIZE))} • {total} layanan\n\n"
+                        + ("\n\n".join(lines) if lines else "Belum ada layanan sesuai pilihan."), self.keyboard(user, rows))
+
+    async def detail(self, message, user, service_id, back=None, *, admin=False):
+        await self.store.catalog.sync()
+        service = self.store.catalog.service(service_id, active=not admin)
+        name = self.provider_label(service["name"])[:220] if admin else self.public_label(service["name"], 220)
+        category = self.provider_label(service["category"])[:180] if admin else self.public_label(service["category"], 180)
+        description = service.get("description") or "Deskripsi rinci belum tersedia."
+        description = self.provider_label(description)[:1000] if admin else self.public_label(description, 1000)
+        try:
+            cost, sale = self.store.pricing.rate(service)
+            price_ready = True
+        except core.StoreError:
+            cost, sale, price_ready = None, None, False
+        unit = "1.000" if str(service.get("rate_unit")) == "1000" else "unit belum dikonfirmasi"
+        text = (f"📱 <b>DETAIL LAYANAN</b>\n#{esc(service_id)} • {esc(category, 300)}\n"
+                f"<b>{esc(name, 600)}</b>\n\n📌 {esc(description, 1000)}\n\n"
+                f"Tipe: {esc(UserFormatter.kind(service['type']) if not admin else self.provider_label(service['type']))}\n"
+                f"Min: {esc(service['min_quantity'])} • Max: {esc(service['max_quantity'])}\n"
+                f"💰 Harga jual / {unit}: <b>{core.money(sale) if price_ready else 'Belum tersedia'}</b>\n"
+                "Total sesuai jumlah ditampilkan sebelum pembayaran.\n"
+                f"🔄 Refill: {'Tersedia sesuai ketentuan layanan' if service.get('refill_supported') and getattr(self.store.config, 'refill_verified', False) else 'Belum tersedia di toko'}\n"
+                "❌ Pembatalan: Belum tersedia di toko\n\n"
+                f"📋 Input:\n{esc(core.FormAdapter.instructions(service), 400)}")
+        rows = []
+        if admin:
+            text += f"\n\nModal / {unit}: {core.money(cost) if price_ready else 'Belum tersedia'}\nMata uang: {esc(service['currency'] or 'Belum dikonfirmasi')}\n"
+            text += f"Sumber metadata: {esc(service.get('metadata_source') or 'API')}\nSync: {instant(service['last_synced_at'])}"
+            rows.append([("🏷️ Atur Harga", "admin_scope", {"scope": "service", "key": str(service_id)})])
+            rows.append([("🟢 ON / OFF", "admin_service_toggle", {"id": service_id, "enabled": not bool(service.get("enabled"))})])
+            rows.append([("📝 Metadata", "admin_input", {"kind": "metadata", "id": service_id})])
+        else:
+            if (price_ready and service.get("order_supported", False) and core.FormAdapter.supported(service) and service.get("enabled", True)
+                    and getattr(self.store.config, "contract_verified", False)):
+                rows.append([("🛒 PESAN SEKARANG", "buy", {"id": service_id, "drip": False})])
+                if service.get("dripfeed_supported"):
+                    rows.append([("⏱️ PESAN DRIP-FEED", "buy", {"id": service_id, "drip": True})])
+            else:
+                text += "\n\nPembelian layanan ini belum tersedia di toko."
+            rows.append([("⭐ Tambah / Hapus Favorit", "favorite", {"id": service_id, "back": back or {}})])
+        rows.append([("⬅️ Kembali", "admin_services" if admin else "services", back or {}),
+                     ("🏠 Menu Awal", "admin_menu" if admin else "home", {})])
+        await self.send(message, text, self.keyboard(user, rows))
+
+    async def quote(self, message, user, quote):
+        service = quote["service"]
+        parameters = quote.get("parameters", {})
+        balance, sale = self.store.balance(user), quote["sale"]
+        text = (f"🛒 <b>KONFIRMASI PESANAN</b>\n{esc(self.public_label(service['name'], 220), 600)}\n"
+                f"🔗 Target: <code>{esc(quote['target'], 1000)}</code>\n🔢 Jumlah: {esc(quote['quantity'])}\n")
+        if parameters.get("comments"):
+            comments = str(parameters["comments"])
+            preview = comments if len(comments) <= 500 else comments[:500]+"…"
+            text += "💬 Pratinjau komentar (input asli tetap utuh):\n<pre>"+esc(preview, 700)+"</pre>\n"
+        if parameters.get("usernames"):
+            text += "👥 Pratinjau username:\n<pre>"+esc(str(parameters["usernames"]), 700)+"</pre>\n"
+        if parameters.get("runs"):
+            text += f"⏱️ {esc(parameters['runs'])} run • interval {esc(parameters.get('interval'))} menit\n"
+        text += (f"\n💰 Harga: <b>{core.money(sale)}</b>\n💳 Saldo: {core.money(balance)}\n"
+                 f"Sisa saldo: {core.money(balance-sale) if balance >= sale else 'Saldo belum cukup'}\n"
+                 f"⏳ Konfirmasi hingga: {instant(quote['expires_at'])}\n\n"
+                 "Periksa target dan input. Pesanan mengikuti ketentuan layanan.")
+        rows = [[("✅ BAYAR & ORDER", "pay", {"quote": quote["quote_id"]})],
+                [("✏️ Ubah Input", "buy", {"id": service["provider_service_id"], "drip": bool(parameters.get("runs"))}),
+                 ("❌ Batal", "detail", {"id": service["provider_service_id"]})]]
+        if balance < sale:
+            keyboard = self.keyboard(user, rows)
+            keyboard.inline_keyboard.insert(1, [InlineKeyboardButton(text="➕ Isi Saldo", callback_data="wallet:topup")])
+        else:
+            keyboard = self.keyboard(user, rows)
+        await self.send(message, text, keyboard)
+
+    def order_text(self, order, *, admin=False):
+        name = self.provider_label(order["service_name_snapshot"])[:220] if admin else self.public_label(order["service_name_snapshot"], 220)
+        oid = order.get("id", order.get("internal_order_id"))
+        text = (f"📦 <b>STATUS PESANAN SOSMED</b>\n🆔 Order bot: #{esc(oid)}\n"
+                f"📱 {esc(name, 600)}\n🔗 Target: <code>{esc(order['target'], 1000)}</code>\n"
+                f"🔢 Jumlah: {esc(order['quantity'])}\n📊 Status: {esc(UserFormatter.status(order['status']))}\n"
+                f"💰 Harga: {core.money(order['selling_price'])}\n🕒 Beli: {instant(order['created_at'])}\n")
+        if order.get("start_count") is not None:
+            text += f"📈 Start count: {esc(order['start_count'])}\n"
+        if order.get("remains") is not None:
+            text += f"📉 Belum terpenuhi: {esc(order['remains'])}\n"
+        if order.get("refund_amount"):
+            text += f"↩️ Refund masuk saldo: {core.money(order['refund_amount'])}\n"
+        elif order.get("refund_state") == "AWAITING_PROVIDER_PROOF":
+            text += "↩️ Refund sedang diperiksa; saldo belum dikreditkan.\n"
+        if admin:
+            text += (f"\nUser: {esc(order['user_id'])}\nProvider order: {esc(order.get('provider_order_id') or '-')}\n"
+                     f"Modal: {core.money(order['provider_cost'])}\nProfit kotor: {core.money(order['gross_profit'])}\n"
+                     f"Status asli: {esc(order.get('raw_provider_status') or '-')}\n")
+        return text
+
+    def order_keyboard(self, user, order, *, admin=False):
+        oid = order.get("id", order.get("internal_order_id"))
+        rows = [[("🔄 REFRESH STATUS", "admin_check" if admin else "check", {"id": oid})]]
+        # Admin views do not grant ownership of buyers' order actions.
+        if not admin:
+            if order.get("refill_supported") and order["status"] == "COMPLETED" and getattr(self.store.config, "refill_verified", False):
+                rows.append([("🔄 REQUEST REFILL", "refill", {"id": oid})])
+        rows.append([("⬅️ Kembali", "admin_orders" if admin else "orders", {}),
+                     ("🏠 Menu Awal", "admin_menu" if admin else "home", {})])
+        return self.keyboard(user, rows)
+
+    async def check(self, message, user, order_id, *, admin=False, refresh=True):
+        order = await self.store.orders.refresh(user, order_id, admin=admin) if refresh else self.store.repo.order(user, order_id)
+        text = self.order_text(order, admin=admin)
+        refill = self.store.repo.one("SELECT status FROM sosmed_refills WHERE order_id=? ORDER BY id DESC LIMIT 1", (order_id,))
+        if refill:
+            text += "\n🔄 Refill: "+esc({"PENDING": "Menunggu hasil", "REQUESTING": "Sedang diajukan", "COMPLETED": "Selesai",
+                                           "REJECTED": "Ditolak", "FAILED": "Gagal", "UNKNOWN": "Sedang diperiksa"}.get(refill["status"], "Sedang diperiksa"))
+        await self.send(message, text, self.order_keyboard(user, order, admin=admin))
+
+    async def orders(self, message, user, payload=None, *, history=False, admin=False):
+        payload = payload or {}
+        page = number(payload.get("page", 0), 0, 100000)
+        orders, total = self.store.repo.orders(user, page=page, history=history, admin=admin)
+        if total and page*PAGE_SIZE >= total:
+            page = (total-1)//PAGE_SIZE
+            orders, total = self.store.repo.orders(user, page=page, history=history, admin=admin)
+        action = "admin_orders" if admin else "history" if history else "orders"
+        rows, lines = [], []
+        for order in orders:
+            oid = order.get("id", order.get("internal_order_id"))
+            name = self.provider_label(order["service_name_snapshot"])[:100] if admin else self.public_label(order["service_name_snapshot"], 100)
+            lines.append(f"<b>#{esc(oid)} {esc(name)}</b>\n{esc(UserFormatter.status(order['status']))} • {core.money(order['selling_price'])}")
+            rows.append([(f"#{oid} {name}"[:60], "admin_check" if admin else "check", {"id": oid})])
+        # Uncertain purchases may have no provider/local order yet. Keep them
+        # visible to the buyer rather than inviting a second purchase.
+        pending = [] if history or admin else self.store.repo.all("""SELECT attempt_id,state FROM sosmed_purchase_attempts
+            WHERE user_id=? AND state IN ('RESERVED','REQUESTING','RECONCILIATION_REQUIRED','PENDING_RECONCILIATION')
+            ORDER BY created_at DESC LIMIT 5""", (user,))
+        if pending:
+            lines += ["⏳ Pembelian "+esc(row["attempt_id"][:12])+": "+esc(UserFormatter.status(row["state"])) for row in pending]
+            lines.append("Dana transaksi yang belum pasti tetap ditahan. Jangan membeli ulang; owner akan memeriksanya.")
+        rows += self.pages(user, action, {}, page, total)
+        rows.append([("⬅️ Kembali", "admin_menu" if admin else "home", {})])
+        title = "SEMUA PESANAN" if admin else "RIWAYAT PEMBELIAN" if history else "PESANAN SAYA"
+        await self.send(message, f"📦 <b>{title}</b>\nHalaman {page+1}/{max(1, math.ceil(total/PAGE_SIZE))}\n\n"
+                        + ("\n\n".join(lines) if lines else "Belum ada pesanan."), self.keyboard(user, rows))
+
+
+class AdminHandler:
+    def __init__(self, store):
+        self.store, self.ui = store, store.ui
+
+    def authorize(self, user):
+        if not self.store.owner(user):
+            raise core.StoreError("FORBIDDEN", "Menu ini hanya untuk owner.")
+
+    async def dashboard(self, message, user, *, balance_only=False):
+        self.authorize(user)
+        balance = "Saldo provider tidak tersedia"
+        status = "Belum terhubung"
+        try:
+            data = await self.store.provider_balance()
+            currency = str(data.get("currency", ""))
+            balance = provider_money(data["balance"]) if currency == "IDR" else f"{data['balance']} {currency or '(mata uang belum dikonfirmasi)'} (pembelian IDR belum tersedia)"
+            status = "Terhubung"
+        except Exception as exc:
+            if not isinstance(exc, core.StoreError):
+                logging.warning("SOSMED balance error: %s", type(exc).__name__)
+            elif exc.code == "CURRENCY":
+                balance += " (mata uang API belum didukung)"
+        settings, stats = self.store.settings(), self.store.stats(user)
+        text = f"👑 <b>{ADMIN_BRAND}</b>\nProvider: BuzzerPanel.id\n🔌 API: {status}\n💰 {esc(balance)}\n"
+        if not balance_only:
+            text += (f"\n🛍️ Toko: {'ON' if settings['enabled'] else 'OFF'}\n"
+                     f"📦 Total order: {stats.get('total', 0)}\n"
+                     f"⏳ Pending: {stats.get('pending', 0)} • 🔄 Diproses: {stats.get('processing', 0)}\n"
+                     f"✅ Selesai: {stats.get('completed', 0)} • ⚠️ Partial: {stats.get('partial', 0)}\n"
+                     f"❌ Dibatalkan: {stats.get('canceled', 0)}\n"
+                     f"💵 Omzet: {core.money(stats.get('revenue', 0))}\n"
+                     f"📈 Profit kotor sementara: {core.money(stats.get('gross_profit', 0))}")
+        rows = [[("💰 Saldo Provider", "admin_balance", {}), ("📊 Statistik", "admin_stats", {})],
+                [("📋 Modal & Jual", "admin_services", {}), ("🏷️ Atur Harga", "admin_pricing", {})],
+                [("📦 Semua Order", "admin_orders", {}), ("⏳ Rekonsiliasi", "admin_pending", {})],
+                [("↩️ Refund Pending", "admin_refunds", {}), ("🔌 Status API", "admin_status", {})],
+                [("🔄 Sync Katalog", "admin_sync", {}), ("⚙️ Pengaturan", "admin_settings", {})],
+                [("🛍️ Menu Pembeli", "home", {})]]
+        await self.ui.send(message, text, self.ui.keyboard(user, rows, bot_home=True))
+
+    async def statistics(self, message, user, *, profit=False):
+        self.authorize(user)
+        stats = self.store.stats(user)
+        text = ("📈 <b>LAPORAN PROFIT</b>" if profit else "📊 <b>STATISTIK SOSMED</b>") + "\n\n"
+        text += (f"Total: {stats.get('total', 0)}\nPending: {stats.get('pending', 0)}\n"
+                 f"Processing: {stats.get('processing', 0)}\nCompleted: {stats.get('completed', 0)}\n"
+                 f"Partial: {stats.get('partial', 0)}\nCanceled: {stats.get('canceled', 0)}\n"
+                 f"Omzet setelah refund: {core.money(stats.get('revenue', 0))}\n"
+                 f"Profit kotor sementara: {core.money(stats.get('gross_profit', 0))}\n\n"
+                 "Transaksi yang belum pasti tidak dianggap penjualan selesai. "
+                 "Refund yang belum terkonfirmasi perlu rekonsiliasi.")
+        await self.ui.send(message, text, self.ui.navigation(user, "admin_menu", admin=True))
+
+    async def pricing(self, message, user):
+        self.authorize(user)
+        settings = self.store.settings()
+        text = ("🏷️ <b>PENGATURAN HARGA SOSMED</b>\nProvider: BuzzerPanel.id\n\n"
+                f"Mode: {esc(settings['mode'])}\nMarkup: {esc(settings['percent'])}%\n"
+                f"Tambahan: {core.money(settings['fixed'])}\nPembulatan: {esc(settings['rounding'])}\n"
+                f"Minimum transaksi: {core.money(settings['min_sale'])}\n\n"
+                f"Jual di bawah modal: {'Diizinkan owner' if settings['allow_loss'] else 'Ditolak'}\n"
+                "Prioritas: harga/aturan layanan → kategori → global. Harga lama tetap tersimpan pada order.")
+        rows = [[("📈 Persentase", "admin_input", {"setting": "percent"}), ("💵 Nominal", "admin_input", {"setting": "fixed"})],
+                [("⚙️ Mode", "admin_modes", {}), ("🔢 Pembulatan", "admin_input", {"setting": "rounding"})],
+                [("📂 Markup Kategori", "admin_categories", {}), ("📦 Markup Layanan", "admin_services", {})],
+                [("💰 Minimum Harga", "admin_input", {"setting": "min_sale"}), ("📋 Modal & Jual", "admin_services", {})],
+                [("⬅️ Kembali", "admin_menu", {})]]
+        await self.ui.send(message, text, self.ui.keyboard(user, rows))
+
+    async def scope(self, message, user, payload):
+        self.authorize(user)
+        scope, key = payload.get("scope"), str(payload.get("key", ""))
+        if scope not in {"service", "category"} or not key or len(key) > 500:
+            raise core.StoreError("INPUT", "Aturan harga tidak valid.")
+        saved = self.store.repo.one("SELECT rule FROM sosmed_pricing_rules WHERE scope=? AND scope_key=?", (scope, key))
+        settings = self.store.settings()
+        rule = json.loads(saved["rule"]) if saved else {"mode": settings["mode"], "percent": settings["percent"], "fixed": settings["fixed"]}
+        text = f"🏷️ <b>ATUR HARGA {esc(scope.upper())}</b>\n{esc(key)}\n\n"
+        if "sale_rate" in rule:
+            text += f"Harga jual tetap / unit: {core.money(Decimal(str(rule['sale_rate'])))}\n"
+        else:
+            text += f"Mode: {esc(rule.get('mode', 'percent'))}\nMarkup: {esc(rule.get('percent', '0'))}%\nTambahan: {core.money(rule.get('fixed', 0))}\n"
+        text += "\nMode Persentase memakai persen; Nominal memakai tambahan; Kombinasi memakai keduanya. Pilih nilai untuk aturan khusus."
+        rows = [[("📈 Persentase", "admin_input", {**payload, "setting": "percent"}),
+                 ("💵 Nominal", "admin_input", {**payload, "setting": "fixed"})],
+                [("⚙️ Mode", "admin_modes", payload)],
+                [("🧹 Reset Aturan", "admin_rule_reset", payload)]]
+        if scope == "service":
+            rows.insert(2, [("🏷️ Harga Tetap / Unit", "admin_input", {**payload, "setting": "sale_rate"})])
+        if scope == "category":
+            rows.append([("🟢 Aktifkan Kategori", "admin_category_toggle", {"key": key, "enabled": True}),
+                         ("🔴 Matikan Kategori", "admin_category_toggle", {"key": key, "enabled": False})])
+        rows.append([("⬅️ Kembali", "admin_pricing", {})])
+        await self.ui.send(message, text, self.ui.keyboard(user, rows))
+
+    async def settings(self, message, user):
+        self.authorize(user)
+        settings = self.store.settings()
+        text = ("⚙️ <b>PENGATURAN TOKO SOSMED</b>\n\n"
+                f"Toko: {'ON' if settings['enabled'] else 'OFF'}\n"
+                f"Limit order aktif: {esc(settings['max_active'])}/user\n"
+                f"Limit jumlah: {esc(settings['max_quantity'])}\nPolling: {esc(settings['poll_seconds'])} detik\n\n"
+                f"Kontrak API akun: {'Terverifikasi oleh operator' if getattr(self.store.config, 'contract_verified', False) else 'Belum diverifikasi'}\n"
+                f"Refill API: {'Terverifikasi' if getattr(self.store.config, 'refill_verified', False) else 'Belum diverifikasi'} • "
+                "Cancel API: Tidak didokumentasikan; dinonaktifkan\n\n"
+                "Mematikan toko hanya menghentikan pembelian baru. Pesanan lama tetap dipantau.")
+        rows = [[("🔴 Tutup Toko" if settings["enabled"] else "🟢 Buka Toko", "admin_toggle", {"enabled": not bool(settings["enabled"])})],
+                [("📦 Limit Order", "admin_input", {"setting": "max_active"}),
+                 ("🔢 Limit Jumlah", "admin_input", {"setting": "max_quantity"})],
+                [("⏱️ Polling", "admin_input", {"setting": "poll_seconds"}),
+                 ("📂 Kategori", "admin_categories", {})],
+                [("⬅️ Kembali", "admin_menu", {})]]
+        await self.ui.send(message, text, self.ui.keyboard(user, rows))
+
+    async def health(self, message, user):
+        self.authorize(user)
+        health = self.store.health()
+        text = ("🔌 <b>STATUS INTEGRASI SOSMED</b>\nProvider: BuzzerPanel.id\n\n"
+                f"Konfigurasi: {'Tersedia' if health.get('configured') else 'Belum lengkap'}\n"
+                f"API terakhir: {'Terhubung' if health.get('connected') else 'Belum tersedia'}\n"
+                f"Diperiksa: {instant(health.get('checked_at'))}\n"
+                f"Sync katalog: {instant(health.get('catalog_synced_at'))}\n"
+                f"Kode gangguan: {esc(health.get('error') or '-')}\n\n"
+                f"Kontrak pembelian akun: {'Terverifikasi oleh operator' if getattr(self.store.config, 'contract_verified', False) else 'Belum diverifikasi'}\n"
+                "Pembelian, refill, dan cancel membutuhkan pemeriksaan dokumentasi API akun. "
+                "Mengaktifkan toko tidak melewati pemeriksaan tersebut.\n\n"
+                "Timeout pembelian tidak dikirim ulang otomatis. Periksa menu Rekonsiliasi untuk transaksi yang belum pasti.")
+        await self.ui.send(message, text, self.ui.navigation(user, "admin_menu", admin=True))
+
+    async def pending(self, message, user, payload=None, *, refunds=False):
+        self.authorize(user)
+        page = number((payload or {}).get("page", 0), 0, 100000)
+        if refunds:
+            rows = self.store.repo.all("SELECT * FROM sosmed_orders WHERE refund_state='AWAITING_PROVIDER_PROOF' ORDER BY id DESC LIMIT 8 OFFSET ?", (page*PAGE_SIZE,))
+            count = self.store.repo.one("SELECT COUNT(*) n FROM sosmed_orders WHERE refund_state='AWAITING_PROVIDER_PROOF'")["n"]
+            lines = [f"Order #{row['id']} • {esc(row['refund_state'])}" for row in rows]
+            note = ("Kredit saldo hanya setelah bukti refund resmi diperiksa.\n"
+                    "Command: /sosmed admin refund &lt;order&gt; &lt;refund_modal_idr&gt; &lt;referensi_bukti&gt;")
+        else:
+            rows = self.store.repo.all("""SELECT * FROM sosmed_purchase_attempts
+                WHERE state IN ('RESERVED','REQUESTING','RECONCILIATION_REQUIRED','PENDING_RECONCILIATION')
+                ORDER BY created_at DESC LIMIT 8 OFFSET ?""", (page*PAGE_SIZE,))
+            count = self.store.repo.one("""SELECT COUNT(*) n FROM sosmed_purchase_attempts
+                WHERE state IN ('RESERVED','REQUESTING','RECONCILIATION_REQUIRED','PENDING_RECONCILIATION')""")["n"]
+            lines = [f"<code>{esc(row['attempt_id'])}</code>\nUser {row['user_id']} • {esc(row['state'])}" for row in rows]
+            note = ("Periksa dashboard resmi sebelum melampirkan hasil atau melepas dana. Tidak ada pembelian ulang otomatis.\n\n"
+                    "/sosmed admin reconcile &lt;attempt&gt; &lt;provider_order&gt; &lt;referensi_bukti&gt;\n"
+                    "/sosmed admin release &lt;attempt&gt; &lt;referensi_bukti_tidak_ada_order&gt;")
+        action = "admin_refunds" if refunds else "admin_pending"
+        keyboard_rows = self.ui.pages(user, action, {}, page, count)+[[('⬅️ Kembali', 'admin_menu', {})]]
+        await self.ui.send(message, ("↩️ <b>REFUND PERLU DIPERIKSA</b>\n\n" if refunds else "⏳ <b>REKONSILIASI PEMBELIAN</b>\n\n")
+                           + ("\n\n".join(lines) if lines else "Tidak ada transaksi menunggu.")+"\n\n"+note,
+                           self.ui.keyboard(user, keyboard_rows))
+
+    async def command(self, message, user, args):
+        self.authorize(user)
+        name = args[0].lower() if args else ""
+        if name in {"", "saldo"}:
+            return await self.dashboard(message, user, balance_only=name == "saldo")
+        if name in {"statistik", "profit"}:
+            return await self.statistics(message, user, profit=name == "profit")
+        if name == "layanan" and len(args) == 3 and args[1].lower() in {"on", "off"}:
+            self.store.catalog.toggle(user, "service", str(number(args[2], 1)), args[1].lower() == "on")
+            return await self.settings(message, user)
+        if name in {"layanan", "harga"}:
+            if name == "layanan" or len(args) > 1 and args[1].lower() in {"provider", "jual"}:
+                return await self.ui.services(message, user, admin=True)
+            if len(args) == 1:
+                return await self.pricing(message, user)
+            if len(args) == 4 and args[1] == "set":
+                self.store.pricing.set_rule(user, "service", str(number(args[2], 1)), {"sale_rate": str(number(args[3], 0))})
+            elif len(args) == 3 and args[1] == "reset":
+                self.store.pricing.reset_rule(user, "service", str(number(args[2], 1)))
+            else:
+                raise core.StoreError("INPUT", "Format harga: /sosmed admin harga set <service_id> <harga_unit> atau harga reset <service_id>.")
+            return await self.pricing(message, user)
+        if name == "markup" and len(args) == 3:
+            key = {"persen": "percent", "nominal": "fixed", "mode": "mode"}.get(args[1].lower())
+            if not key:
+                raise core.StoreError("INPUT", "Markup: persen, nominal, atau mode.")
+            value = args[2]
+            if key == "mode":
+                value = {"persen": "percent", "nominal": "fixed", "kombinasi": "combined"}.get(value.lower(), value.lower())
+            elif key == "fixed":
+                value = number(value)
+            self.store.set_setting(key, value, user)
+            return await self.pricing(message, user)
+        if name in {"kategori", "layanan"} and len(args) >= 3:
+            # Quoted category names are handled by shlex in the command router.
+            if args[1].lower() in {"on", "off"} and len(args) == 3:
+                self.store.catalog.toggle(user, "category" if name == "kategori" else "service", args[2], args[1].lower() == "on")
+                return await self.settings(message, user)
+        if name in {"rule", "aturan"} and len(args) == 5:
+            scope, key, component, value = args[1:]
+            component = {"persen": "percent", "nominal": "fixed", "harga": "sale_rate", "mode": "mode"}.get(component.lower())
+            if scope not in {"service", "category"} or not component:
+                raise core.StoreError("INPUT", "Aturan: service/category, lalu persen/nominal/harga/mode.")
+            if component == "mode":
+                value = {"persen": "percent", "nominal": "fixed", "kombinasi": "combined"}.get(value, value)
+            self.store.pricing.set_rule(user, scope, key, {component: value})
+            return await self.scope(message, user, {"scope": scope, "key": key})
+        if name in {"orders", "pesanan"}:
+            return await self.ui.orders(message, user, admin=True)
+        if name in {"pending", "rekonsiliasi", "refunds"}:
+            return await self.pending(message, user, refunds=name == "refunds")
+        if name == "sync":
+            services = await self.store.catalog.sync(force=True)
+            await self.ui.send(message, f"✅ Sinkronisasi selesai: {len(services)} layanan dari API.", self.ui.navigation(user, "admin_menu", admin=True))
+            return
+        if name in {"on", "off"}:
+            self.store.set_setting("enabled", name == "on", user)
+            return await self.settings(message, user)
+        if name == "rugi" and len(args) == 2 and args[1].lower() in {"on", "off"}:
+            self.store.set_setting("allow_loss", args[1].lower() == "on", user)
+            return await self.pricing(message, user)
+        if name in {"limit", "jumlah", "polling", "pembulatan", "minimum"} and len(args) == 2:
+            key = {"limit": "max_active", "jumlah": "max_quantity", "polling": "poll_seconds", "pembulatan": "rounding", "minimum": "min_sale"}[name]
+            self.store.set_setting(key, number(args[1]), user)
+            return await self.settings(message, user)
+        if name == "status":
+            return await self.health(message, user)
+        if name == "metadata" and len(args) >= 4:
+            self.store.catalog.metadata(user, number(args[1], 1), " ".join(args[3:]), args[2])
+            return await self.ui.detail(message, user, number(args[1], 1), admin=True)
+        if name == "reconcile" and len(args) == 4:
+            await self.store.admin_reconcile(user, args[1], number(args[2], 1), args[3])
+            return await self.pending(message, user)
+        if name == "release" and len(args) == 3:
+            self.store.admin_release(user, args[1], args[2])
+            return await self.pending(message, user)
+        if name == "refund" and len(args) == 4:
+            await self.store.admin_refund(user, number(args[1], 1), number(args[2], 1), args[3])
+            return await self.pending(message, user, refunds=True)
+        raise core.StoreError("INPUT", "Gunakan /sosmed admin, saldo, harga, markup, orders, statistik, profit, sync, status, on/off, limit, atau pending.")
+
+
+FIELD_LABELS = {
+    "link": "🔗 Kirim link atau username target sesuai layanan. Bot tidak membuka link ini.",
+    "quantity": "🔢 Kirim jumlah pembelian (angka bulat).",
+    "comments": "💬 Kirim komentar asli, satu komentar per baris. Komentar dikirim sesuai input kamu.",
+    "runs": "⏱️ Kirim jumlah run drip-feed (angka bulat).",
+    "interval": "⏱️ Kirim interval antar-run dalam menit (angka bulat).",
+    "username": "👤 Kirim username target sesuai layanan.",
+    "usernames": "👥 Kirim daftar username sesuai petunjuk, satu username per baris.",
+    "answer_number": "📊 Kirim nomor pilihan polling (angka bulat).",
+    "hashtag": "#️⃣ Kirim hashtag sesuai layanan.",
+    "media": "🔗 Kirim link media sesuai layanan.",
+    "keywords": "🔎 Kirim kata kunci sesuai persyaratan layanan.",
+}
+
+
+async def register_dispatch(store, ui, admin, message, user, action, payload, state):
+    """Public dispatch helper; role and ownership checks are repeated here."""
+    if action.startswith("admin"):
+        admin.authorize(user)
+    if action not in {"field", "admin_value"}:
+        await store.host.shopping_navigation_exit(user, state)
+        await state.clear()
+    if action == "home":
+        return await ui.home(message, user)
+    if action == "balance":
+        return await ui.balance(message, user)
+    if action == "categories":
+        return await ui.categories(message, user, payload)
+    if action in {"services", "favorites"}:
+        return await ui.services(message, user, payload, favorites=action == "favorites")
+    if action == "detail":
+        return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"))
+    if action == "favorite":
+        store.repo.favorite(user, number(payload["id"], 1))
+        return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"))
+    if action in {"orders", "history"}:
+        return await ui.orders(message, user, payload, history=action == "history")
+    if action == "check":
+        return await ui.check(message, user, number(payload["id"], 1))
+    if action == "search":
+        await state.set_state(SosmedOrderState.search)
+        await state.update_data(sosmed_search_context=payload)
+        return await ui.send(message, "🔎 <b>CARI / FILTER LAYANAN</b>\n\nKirim nama layanan atau kategori.\n"
+                             "Filter opsional: refill:ya tersedia:ya min:100 max:10000 harga:20000\n"
+                             "min membatasi minimal pembelian; max memilih kapasitas maksimal; harga membatasi harga jual per unit.", ui.navigation(user))
+    if action == "help":
+        text = ("❓ <b>PANDUAN SOSMED</b>\n\nPilih kategori dan layanan, baca detail, isi parameter, lalu konfirmasi pembayaran saldo.\n"
+                "Saldo dipakai bersama fitur belanja dan OTP. Isi Saldo memakai pembayaran bot yang sudah tersedia.\n"
+                "Jika hasil pembelian belum pasti, jangan membeli ulang. Cek Pesanan Saya dan hubungi owner.\n"
+                "Refill/pembatalan hanya tersedia sesuai layanan. Refund menunggu bukti pengembalian dana terkonfirmasi.\n\n"
+                "/sosmed beli • kategori • layanan • cari &lt;nama&gt;\n"
+                "/sosmed detail &lt;id layanan&gt;\n/sosmed saldo • pesanan • riwayat • favorit\n"
+                "/sosmed cek &lt;id order bot&gt;\n/sosmed refill &lt;id order bot&gt;\n/sosmed batal &lt;id order bot&gt;\n\n"
+                "Gunakan layanan sesuai ketentuan platform. Jangan mengirim spam, ancaman, atau pelecehan.")
+        return await ui.send(message, text, ui.navigation(user))
+    if action == "buy":
+        store.purchase_guard(user)
+        service = await store.catalog.live(number(payload["id"], 1))
+        if not service.get("order_supported", False):
+            raise core.StoreError("TYPE")
+        fields = core.FormAdapter.fields(service, drip=bool(payload.get("drip")))
+        if not core.FormAdapter.supported(service) or not fields or any(field not in FIELD_LABELS for field in fields):
+            raise core.StoreError("UNSUPPORTED_TYPE", "Form layanan belum didukung.")
+        if not store.owner(user) and (store.host.safe_mode_enabled() or store.host.maintenance_enabled()):
+            raise core.StoreError("MAINTENANCE", "Pembelian sementara ditutup.")
+        await state.set_state(SosmedOrderState.field)
+        await state.update_data(sosmed_service_id=service["provider_service_id"], sosmed_fields=fields,
+                                sosmed_index=0, sosmed_parameters={})
+        return await ui.send(message, "🛒 <b>ISI PESANAN</b>\n"+esc(ui.public_label(service['name'], 220))+"\n\n"
+                             +FIELD_LABELS[fields[0]]+f"\nMin {service['min_quantity']} • Max {service['max_quantity']}",
+                             ui.navigation(user, "detail", {"id": service["provider_service_id"]}))
+    if action == "pay":
+        result = await store.purchase.buy(user, str(payload["quote"]))
+        if result.get("state") in {"CAPTURED", "SUCCESS"} and result.get("order"):
+            order = result["order"]
+            return await ui.send(message, "✅ <b>PESANAN BERHASIL DIBUAT!</b>\n\n"+ui.order_text(order), ui.order_keyboard(user, order))
+        if result.get("state") in {"FAILED", "RELEASED"}:
+            return await ui.send(message, "❌ Pesanan tidak berhasil dibuat. Dana transaksi yang ditahan telah dilepas.", ui.navigation(user))
+        return await ui.send(message, "⏳ Hasil pesanan belum pasti. Dana transaksi ini tetap ditahan. "
+                             "Jangan membeli ulang; periksa Pesanan Saya atau hubungi owner.",
+                             ui.keyboard(user, [[("📦 Pesanan Saya", "orders", {})], [("🏠 Menu Awal", "home", {})]]))
+    if action == "refill":
+        result = await store.orders.refill(user, number(payload["id"], 1))
+        status = str(result.get("status", "PENDING")).upper()
+        text = "Permintaan refill tercatat. Hasil mengikuti ketentuan layanan."
+        if status in {"UNKNOWN", "RECONCILIATION_REQUIRED"}:
+            text = "Hasil permintaan refill belum pasti. Jangan mengirim refill ulang; owner akan memeriksanya."
+        elif status in {"REJECTED", "FAILED"}:
+            text = "Permintaan refill ditolak. Periksa ketentuan layanan atau hubungi owner."
+        return await ui.send(message, "🔄 "+text, ui.navigation(user, "check", {"id": payload["id"]}))
+    if action == "confirm_cancel":
+        if not getattr(store.config, "cancel_verified", False):
+            raise core.StoreError("CANCEL_UNSUPPORTED", "Pembatalan belum tersedia di toko.")
+        order = await store.orders.refresh(user, number(payload["id"], 1))
+        if not order.get("cancel_supported"):
+            raise core.StoreError("CANCEL_UNSUPPORTED", "Pembatalan tidak tersedia.")
+        return await ui.send(message, f"❌ <b>KONFIRMASI PEMBATALAN</b>\nOrder #{esc(payload['id'])}\n\n"
+                             "Pembatalan mengikuti ketentuan layanan. Refund hanya dikreditkan setelah pengembalian dana resmi terkonfirmasi.",
+                             ui.keyboard(user, [[("✅ Ajukan Pembatalan", "cancel", {"id": payload["id"]})],
+                                                [("⬅️ Kembali", "check", {"id": payload["id"]})]]))
+    if action == "cancel":
+        order = await store.orders.cancel(user, number(payload["id"], 1), confirmed=True)
+        note = {"REJECTED": "Permintaan pembatalan ditolak. Pesanan tetap mengikuti status terakhir.",
+                "UNKNOWN": "Hasil pembatalan belum pasti. Jangan mengulang; owner akan memeriksanya.",
+                "ACCEPTED": "Permintaan pembatalan diterima. Refund menunggu bukti pengembalian dana terkonfirmasi."}.get(order.get("cancel_state"), "Permintaan pembatalan sedang diperiksa.")
+        return await ui.send(message, "❌ "+note+"\n\n"
+                             +ui.order_text(order), ui.order_keyboard(user, order))
+    if action == "admin_menu":
+        return await admin.dashboard(message, user)
+    if action == "admin_balance":
+        return await admin.dashboard(message, user, balance_only=True)
+    if action in {"admin_stats", "admin_profit"}:
+        return await admin.statistics(message, user, profit=action == "admin_profit")
+    if action == "admin_status":
+        return await admin.health(message, user)
+    if action == "admin_orders":
+        return await ui.orders(message, user, payload, admin=True)
+    if action == "admin_check":
+        return await ui.check(message, user, number(payload["id"], 1), admin=True)
+    if action == "admin_services":
+        return await ui.services(message, user, payload, admin=True)
+    if action == "admin_detail":
+        return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"), admin=True)
+    if action == "admin_categories":
+        return await ui.categories(message, user, payload, admin=True)
+    if action == "admin_pricing":
+        return await admin.pricing(message, user)
+    if action == "admin_settings":
+        return await admin.settings(message, user)
+    if action == "admin_scope":
+        return await admin.scope(message, user, payload)
+    if action == "admin_toggle":
+        if type(payload.get("enabled")) is not bool:
+            raise core.StoreError("INPUT", "Pengaturan toko tidak valid.")
+        store.set_setting("enabled", payload["enabled"], user)
+        return await admin.settings(message, user)
+    if action in {"admin_category_toggle", "admin_service_toggle"}:
+        store.catalog.toggle(user, "category" if action == "admin_category_toggle" else "service",
+                             payload.get("key") if action == "admin_category_toggle" else str(number(payload["id"], 1)), bool(payload["enabled"]))
+        return await admin.settings(message, user)
+    if action == "admin_rule_reset":
+        store.pricing.reset_rule(user, payload["scope"], payload["key"])
+        return await admin.scope(message, user, payload)
+    if action == "admin_sync":
+        return await admin.command(message, user, ["sync"])
+    if action in {"admin_pending", "admin_refunds"}:
+        return await admin.pending(message, user, payload, refunds=action == "admin_refunds")
+    if action == "admin_modes":
+        rows = [[(label, "admin_mode", {**payload, "mode": mode})] for label, mode in
+                [("Persentase", "percent"), ("Nominal", "fixed"), ("Kombinasi", "combined")]]
+        rows.append([("⬅️ Kembali", "admin_scope" if payload.get("scope") else "admin_pricing", payload)])
+        return await ui.send(message, "⚙️ Pilih mode harga:", ui.keyboard(user, rows))
+    if action == "admin_mode":
+        if payload.get("scope"):
+            store.pricing.set_rule(user, payload["scope"], payload["key"], {"mode": payload["mode"]})
+            return await admin.scope(message, user, payload)
+        store.set_setting("mode", payload["mode"], user)
+        return await admin.pricing(message, user)
+    if action == "admin_input":
+        await state.set_state(SosmedOrderState.admin_value)
+        await state.update_data(sosmed_admin_input=payload)
+        prompt = "📝 Kirim sumber metadata dan deskripsi dengan format: sumber deskripsi lengkap." if payload.get("kind") == "metadata" else "Kirim nilai untuk "+str(payload.get("setting"))+"."
+        if payload.get("setting") == "rounding":
+            prompt += " Pilihan: 0, 100, 500, atau 1000."
+        return await ui.send(message, esc(prompt), ui.navigation(user, "admin_scope" if payload.get("scope") else "admin_pricing", payload, admin=True))
+    raise core.StoreError("INPUT", "Menu belum dikenal.")
+
+
+def register(router, store):
+    """Register once on the existing router before its generic fallback."""
+    store.ui = UIBuilder(store)
+    admin, ui = AdminHandler(store), store.ui
+
+    async def guard(message, user):
+        if not message or str(message.chat.type) != "private" or message.chat.id != user:
+            raise core.StoreError("PRIVATE", "Gunakan /sosmed melalui chat privat bot.")
+        if store.host.security_blocked(user):
+            raise core.StoreError("BLOCKED", "Akun kamu dibatasi owner.")
+        if not await store.host.is_channel_member(message.bot, user):
+            raise core.StoreError("CHANNEL", "Buka /start dan verifikasi channel dahulu.")
+        profile = store.repo.one("SELECT username FROM verified_users WHERE user_id=?", (user,))
+        username = profile.get("username", "") if profile else ""
+        if message.from_user and message.from_user.id == user:
+            username = getattr(message.from_user, "username", "") or username
+        store.host.mark_user_verified(user, username)
+
+    async def failure(message, exc, user, admin_context=False):
+        if not isinstance(exc, core.StoreError):
+            logging.warning("SOSMED handler error: %s", type(exc).__name__)
+        if admin_context and store.owner(user) and isinstance(exc, core.StoreError):
+            # core.public is curated; raw API messages are never included.
+            text = exc.public
+        else:
+            text = UserFormatter.error(exc)
+        if message and str(message.chat.type) == "private" and message.chat.id == user:
+            await ui.send(message, "⚠️ "+esc(text), ui.navigation(user, "admin_menu" if admin_context and store.owner(user) else "home", admin=admin_context and store.owner(user)))
+
+    @router.message(Command("sosmed"))
+    async def sosmed_command(message, state):
+        user, admin_context = message.from_user.id, False
+        try:
+            await guard(message, user)
+            store.repo.rate(user, "command", 30, 60)
+            text = message.text or ""
+            if len(text) > 1500:
+                raise core.StoreError("INPUT", "Command terlalu panjang.")
+            try:
+                args = shlex.split(text)[1:]
+            except ValueError:
+                raise core.StoreError("INPUT", "Tanda kutip command belum lengkap.") from None
+            if len(args) > 40:
+                raise core.StoreError("INPUT", "Command terlalu panjang.")
+            await store.host.shopping_navigation_exit(user, state)
+            await state.clear()
+            if args and args[0].lower() == "admin":
+                admin_context = True
+                return await admin.command(message, user, args[1:])
+            name = args[0].lower() if args else ""
+            mapping = {"": "home", "beli": "categories", "kategori": "categories", "layanan": "services",
+                       "cari": "search", "detail": "detail", "saldo": "balance", "pesanan": "orders",
+                       "cek": "check", "refill": "refill", "batal": "confirm_cancel", "riwayat": "history",
+                       "favorit": "favorites", "bantuan": "help"}
+            action = mapping.get(name)
+            if not action:
+                raise core.StoreError("INPUT", "Command belum dikenal. Gunakan /sosmed bantuan.")
+            payload = {}
+            if action in {"detail", "check", "refill", "confirm_cancel"}:
+                if len(args) != 2:
+                    raise core.StoreError("INPUT", "Gunakan /sosmed "+name+" <id>.")
+                payload["id"] = number(args[1], 1, 2**63-1)
+            elif name == "cari" and len(args) > 1:
+                query, filters = search_input(" ".join(args[1:]))
+                action, payload = "services", {"query": query, "filters": filters}
+            elif len(args) > 1:
+                raise core.StoreError("INPUT", "Parameter command tidak sesuai.")
+            await register_dispatch(store, ui, admin, message, user, action, payload, state)
+        except Exception as exc:
+            await failure(message, exc, user, admin_context)
+
+    @router.callback_query(F.data.startswith(PREFIX))
+    async def sosmed_callback(call, state):
+        user, action, menu, answered = call.from_user.id, "", None, False
+        try:
+            await guard(call.message, user)
+            store.repo.rate(user, "callback", 40, 60)
+            action, payload = store.resolve(user, call.data)
+            if action.startswith("admin"):
+                admin.authorize(user)
+            await call.answer()
+            answered = True
+            menu = MenuMessage(call.message)
+            await register_dispatch(store, ui, admin, menu, user, action, payload, state)
+        except Exception as exc:
+            if not answered:
+                try:
+                    await call.answer("Permintaan belum berhasil.", show_alert=True)
+                except Exception:
+                    pass
+            await failure(menu or (MenuMessage(call.message) if call.message else None), exc, user, action.startswith("admin"))
+
+    @router.message(SosmedOrderState.search, F.text & ~F.text.startswith("/") & ~F.text.in_(TEXT_MENU_ACTIONS))
+    async def sosmed_search(message, state):
+        user, menu = message.from_user.id, message
+        try:
+            await guard(message, user)
+            store.repo.rate(user, "search", 10, 60)
+            menu = ui.input_message(message)
+            values = await state.get_data()
+            context = values.get("sosmed_search_context", {})
+            query, filters = search_input(message.text or "")
+            await state.clear()
+            await ui.services(menu, user, {**context, "query": query, "filters": filters, "page": 0})
+        except Exception as exc:
+            await failure(menu, exc, user)
+
+    @router.message(SosmedOrderState.field, F.text & ~F.text.startswith("/") & ~F.text.in_(TEXT_MENU_ACTIONS))
+    async def sosmed_field(message, state):
+        user, menu = message.from_user.id, message
+        try:
+            await guard(message, user)
+            store.repo.rate(user, "field", 30, 60)
+            menu = ui.input_message(message)
+            values = await state.get_data()
+            service_id, fields = values.get("sosmed_service_id"), values.get("sosmed_fields", [])
+            index, parameters = values.get("sosmed_index", 0), values.get("sosmed_parameters", {})
+            if not isinstance(fields, list) or not 0 <= index < len(fields) or fields[index] not in FIELD_LABELS:
+                raise core.StoreError("INPUT", "Sesi input tidak tersedia. Pilih layanan lagi.")
+            field = fields[index]
+            text = message.text or ""
+            if len(text) > 12000:
+                raise core.StoreError("INPUT", "Input terlalu panjang.")
+            value = number(text.strip(), 1, 10**12) if field in {"quantity", "runs", "interval", "answer_number"} else text if field == "comments" else text.strip()
+            if field == "link":
+                value = core.FormAdapter.target(value)
+            parameters = {**parameters, field: value}
+            index += 1
+            if index < len(fields):
+                await state.update_data(sosmed_index=index, sosmed_parameters=parameters)
+                await ui.send(menu, FIELD_LABELS[fields[index]], ui.navigation(user, "detail", {"id": service_id}))
+            else:
+                quote = await store.purchase.quote(user, service_id, parameters)
+                await state.clear()
+                await ui.quote(menu, user, quote)
+        except Exception as exc:
+            await failure(menu, exc, user)
+
+    @router.message(SosmedOrderState.admin_value, F.text & ~F.text.startswith("/") & ~F.text.in_(TEXT_MENU_ACTIONS))
+    async def sosmed_admin_value(message, state):
+        user, menu = message.from_user.id, message
+        try:
+            await guard(message, user)
+            admin.authorize(user)
+            store.repo.rate(user, "admin_input", 20, 60)
+            menu = ui.input_message(message)
+            payload = (await state.get_data()).get("sosmed_admin_input", {})
+            text = (message.text or "").strip()
+            if len(text) > 2000:
+                raise core.StoreError("INPUT", "Input terlalu panjang.")
+            if payload.get("kind") == "metadata":
+                parts = text.split(maxsplit=1)
+                if len(parts) != 2:
+                    raise core.StoreError("INPUT", "Kirim sumber metadata lalu deskripsi.")
+                store.catalog.metadata(user, number(payload["id"], 1), parts[1], parts[0])
+                await state.clear()
+                return await ui.detail(menu, user, payload["id"], admin=True)
+            key = payload.get("setting")
+            if key not in {"percent", "fixed", "rounding", "min_sale", "max_active", "max_quantity", "poll_seconds", "sale_rate"}:
+                raise core.StoreError("INPUT", "Pengaturan tidak valid.")
+            value = text if key in {"percent", "sale_rate"} else number(text)
+            if payload.get("scope"):
+                store.pricing.set_rule(user, payload["scope"], payload["key"], {key: value})
+                await state.clear()
+                return await admin.scope(menu, user, payload)
+            store.set_setting(key, value, user)
+            await state.clear()
+            await admin.pricing(menu, user) if key in {"percent", "fixed", "rounding", "min_sale"} else await admin.settings(menu, user)
+        except Exception as exc:
+            await failure(menu, exc, user, True)
+
+    return store

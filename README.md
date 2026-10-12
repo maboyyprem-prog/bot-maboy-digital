@@ -1,63 +1,48 @@
-# MaboyyDigital
+# MaboyyDigital v16.90
 
-Bot Telegram toko digital, versi **v16.89**. Python **3.10+**; diuji menggunakan Python 3.12.
+Paket ringkas: **12 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
-## Upload GitHub / Railway
+## Jalankan
 
-Unggah tujuh file langsung ke root repository, tanpa subfolder:
-`main.py`, `bot.py`, `otp_smscode.py`, `requirements.txt`, `project_backup.py`, `.gitignore`, dan `README.md`.
-
-Untuk update dari v16.88, unggah `bot.py`, `main.py`, `otp_smscode.py`, dan `README.md` dari paket ini, lalu redeploy. Untuk repository baru, gunakan seluruh tujuh file.
-
-```bash
-python -m pip install -r requirements.txt
-python main.py
-```
-
-Start Command Railway: `python main.py`. Gunakan satu replica dan pasang Volume di `/data`; health check tersedia di `/health`.
-
-## Variables
-
-Isi melalui Railway Variables atau `.env` lokal. Ganti placeholder berikut dengan nilai milik sendiri:
-
-```dotenv
-BOT_TOKEN=TOKEN_BOT_TELEGRAM
-ADMIN_ID=ID_TELEGRAM_OWNER
-ADMIN_USERNAME=USERNAME_OWNER_TANPA_AT
-DB_PATH=/data/shop.db
-BACKUP_DIR=/data/backups
-```
-
-`ADMIN_ID` harus berupa angka. `ADMIN_USERNAME` opsional. Path `/data` memerlukan Volume; untuk lokal dapat memakai `DB_PATH=shop.db` dan `BACKUP_DIR=backups`. Pertahankan database, kunci enkripsi, serta konfigurasi pembayaran/provider saat update.
-
-Untuk mengaktifkan toko OTP:
-
-```dotenv
-SMSCODE_API_TOKEN=TOKEN_API_PROVIDER
-SMSCODE_OTP_ENABLED=true
-SMSCODE_WEBHOOK_PUBLIC_URL=https://bot-maboy-digital-production.up.railway.app/webhooks/smscode/otp
-```
-
-Gunakan domain deployment sendiri jika berbeda. Owner membuka `/otp` → **WEBHOOK** → **HUBUNGKAN WEBHOOK** → **TEST WEBHOOK**. Bot mengambil secret resmi provider secara otomatis; jika mengisi `SMSCODE_WEBHOOK_SECRET`, nilainya harus sama dengan secret tersebut. Polling tetap memantau SMS tanpa webhook.
-
-`OTP_STORAGE_ENCRYPTION_KEY` opsional untuk enkripsi SMS; pertahankan nilainya saat redeploy. Untuk fitur AM, gunakan konfigurasi `/tools` yang sudah ada; tombol panduan login tidak memerlukan variabel baru.
-
-Status toko OTP mengikuti ON/OFF yang disimpan owner dan tetap benar setelah restart. Pengaturan yang belum lengkap atau jeda layanan ditampilkan terpisah; stok diperiksa saat memilih nomor.
+Python 3.12. Install `pip install -r requirements.txt`, lalu `python main.py`.
+Railway: Start Command `python main.py`, health `/health`, satu replica.
+Pasang Volume `/data`; Variables `DB_PATH=/data/shop.db`, `BACKUP_DIR=/data/backups`.
+Pertahankan database, token, konfigurasi pembayaran, dan kunci enkripsi existing.
+Hentikan poller lama sebelum menggunakan token yang sama pada Railway baru.
 
 ## Command
 
-| Command | Fungsi |
-|---|---|
-| `/start` | Menu Awal dan belanja |
-| `/otp` | Toko OTP user atau panel owner sesuai akses |
-| `/tools` | Tools owner dan user yang diberi akses; tersedia Panduan Login AM via Email |
-| `/owner` | Panel khusus owner |
-| `/ping` | Status bot, khusus owner |
+`/start` · `/otp` · `/sosmed` · `/tools` · `/owner` · `/ping`.
+Panel Sosmed owner: `/sosmed admin`. Saldo user dipakai bersama oleh toko, OTP, dan Sosmed.
 
-Saldo user digunakan bersama oleh fitur toko dan OTP. OTP mendukung **Buy Now (QRIS)** dan **Buy Saldo** melalui alur pembayaran existing; saldo provider hanya tampil pada owner.
+## Variabel
 
-## Backup
+Isi `BOT_TOKEN` dan `ADMIN_ID` numerik melalui Railway Variables; daftar contoh ada di `.env.example`.
+Sosmed memerlukan **BUZZERPANEL_API_KEY** dan **BUZZERPANEL_SECRET_KEY**.
+Endpoint: `BUZZERPANEL_API_URL=https://buzzerpanel.id/api/json.php`.
 
-Gunakan `python project_backup.py --help` untuk full backup terenkripsi, verifikasi, dan restore. Simpan arsip serta kunci dekripsi secara terpisah di lokasi privat; sertakan database dan volume aplikasi. Restore ke lokasi baru dan jangan menimpa transaksi produksi.
+Default `SOSMED_ENABLED=false`, `SOSMED_API_CONTRACT_VERIFIED=false`,
+`SOSMED_REFILL_API_VERIFIED=false`. Respons akun, currency, satuan rate, dan form
+harus cocok sebelum mengaktifkan `SOSMED_API_CONTRACT_VERIFIED=true` lalu
+`/sosmed admin on`. `BUZZERPANEL_CURRENCY`/`SOSMED_RATE_UNIT` boleh kosong;
+isi `IDR`/`1000` hanya setelah dikonfirmasi jika API tidak menyediakannya.
+Cancel dan tipe yang belum didokumentasikan tidak diaktifkan.
 
-Jangan unggah `.env`, token, database, session, log, atau backup privat ke GitHub.
+OTP tetap memakai Variables existing; jika webhook digunakan, alamatnya
+`https://DOMAIN_BOT_ANDA/webhooks/smscode/otp`.
+
+## Isi paket
+
+Enam file Python aktif: `main.py`, `bot.py`, `otp_smscode.py`,
+`sosmed_buzzerpanel.py`, `sosmed_ui.py`, `project_backup.py`.
+File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
+`.python-version`, `railway.json`.
+
+Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
+tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
+v16.90 yang lulus 256 tes mock dan 49 pemeriksaan transaksi.
+
+Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
+project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
+Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot lama.
+Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.

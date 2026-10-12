@@ -78,6 +78,25 @@ def sqlite_snapshot(source,destination):
     return digest(destination)
 
 
+def sqlite_contents(path):
+    """Describe the consistent snapshot without recording any application rows."""
+    path=Path(path).resolve()
+    conn=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=30)
+    try:
+        schema=conn.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall()
+        schema_bytes=json.dumps(schema,ensure_ascii=False,separators=(',',':')).encode()
+        counts={}
+        for (name,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+            quoted='"'+name.replace('"','""')+'"'
+            counts[name]=conn.execute('SELECT COUNT(*) FROM '+quoted).fetchone()[0]
+        return {'schema_sha256':hashlib.sha256(schema_bytes).hexdigest(),
+                'table_row_counts':counts}
+    finally:conn.close()
+
+
 def encrypt(source,destination,key,manifest_hash):
     nonce=os.urandom(12)
     header=MAGIC+nonce+bytes.fromhex(manifest_hash)
@@ -159,11 +178,19 @@ def restore_archive(tar_path,manifest,target):
         info=destination.lstat()
         if stat.S_IMODE(info.st_mode)!=item['mode'] or info.st_mtime_ns!=item['mtime_ns']:
             raise ValueError('Restored metadata mismatch: '+item['path'])
+    for storage in manifest.get('external_storages',[]):
+        for item in storage['entries']:
+            destination=target/storage['archive_prefix']/item['path']
+            info=destination.lstat()
+            if stat.S_IMODE(info.st_mode)!=item['mode'] or info.st_mtime_ns!=item['mtime_ns']:
+                raise ValueError('Restored external metadata mismatch: '+item['path'])
     for item in manifest['databases']:
         conn=sqlite3.connect((target/item['archive_path']).as_uri()+'?mode=ro',uri=True)
         try:
             if conn.execute('PRAGMA integrity_check').fetchall()!=[('ok',)]:raise ValueError('Restored SQLite snapshot is corrupt.')
         finally:conn.close()
+        if 'contents' in item and sqlite_contents(target/item['archive_path'])!=item['contents']:
+            raise ValueError('Restored SQLite schema or table counts differ from snapshot.')
     return {'entries_verified':len(expected)-len(manifest['databases']),'databases_verified':len(manifest['databases'])}
 
 
@@ -247,7 +274,8 @@ def create(root,folder,key_path,label,databases=(),external=()):
             info=destination.stat()
             snapshots.append({'source':str(source),'archive_path':f'database-{label}/database-{index}.sqlite',
                               'type':'file','mode':0o600,'mtime_ns':info.st_mtime_ns,'atime_ns':info.st_atime_ns,
-                              'size':info.st_size,'sha256':checksum,'staging_path':str(destination)})
+                              'size':info.st_size,'sha256':checksum,'staging_path':str(destination),
+                              'contents':sqlite_contents(destination)})
         # Reading an idle WAL database can create and retire SQLite sidecars,
         # changing its directory's mtime. Record the filesystem after all
         # consistent snapshots are closed. Every file is still inventoried;
@@ -280,6 +308,8 @@ def create(root,folder,key_path,label,databases=(),external=()):
                     path=Path(storage['source'])/item['path']
                     name=storage['archive_prefix'] if item['path']=='.' else storage['archive_prefix']+'/'+item['path']
                     info=archive.gettarinfo(str(path),arcname=name)
+                    info.pax_headers['mtime']=str(item['mtime_ns']/1_000_000_000)
+                    info.pax_headers['atime']=str(item['atime_ns']/1_000_000_000)
                     if item['type']=='file':
                         with open(path,'rb') as handle:archive.addfile(info,handle)
                     else:archive.addfile(info)
