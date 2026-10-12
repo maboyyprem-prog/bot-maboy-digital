@@ -1,4 +1,4 @@
-# MaboyyDigital v16.94
+# MaboyyDigital v16.96
 
 Paket ringkas: **13 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -39,15 +39,27 @@ untuk memeriksa koneksi, lalu **Periksa & Buka Toko** untuk mengaktifkan toko.
 Tombol berubah menjadi **Tutup Toko** saat aktif. Bot memeriksa profile/services
 tanpa membuat order. Semua kontrol ini tersedia dalam menu yang sama.
 Status API sekarang memeriksa koneksi saat dibuka, bukan hanya hasil terakhir.
+Status menyebut **Profil/Katalog**, HTTP, dan penyebab yang aman: key ditolak,
+izin IP, format respons, atau field saldo/harga yang perlu diperbaiki.
+Saldo provider membaca `balance`/`saldo`; nilai hilang/bertentangan tidak dianggap nol.
+Field pribadi pada Profile tidak ditampilkan dalam panel.
+Katalog standar `id/price/note` tanpa `type` memakai form target + jumlah sesuai API;
+catatan `note` tampil sebagai panduan username/URL. Layanan khusus yang belum jelas
+bisa diatur owner: Modal & Jual → pilih layanan → **Tipe/Input** → konfirmasi.
+Status `Success` berarti selesai, `Error` berarti gagal; refund tetap perlu bukti.
 Verifikasi berhasil tersimpan di database dan bertahan setelah restart;
 `SOSMED_API_CONTRACT_VERIFIED=true` tidak wajib untuk alur tombol ON ini.
 
 Default `SOSMED_ENABLED=false` hanya untuk kondisi awal; pengaturan ON owner yang
 tersimpan diprioritaskan. `SOSMED_REFILL_API_VERIFIED=false` tetap terpisah.
-`BUZZERPANEL_CURRENCY`/`SOSMED_RATE_UNIT` boleh kosong jika API sudah menyebutnya.
-Jika API tidak menyebut currency/unit, isi `IDR`/`1000` hanya setelah akun dan tarif
-per 1.000 dikonfirmasi. Owner mendapat nama variabel yang perlu diperbaiki saat
-pemeriksaan gagal. Redeploy setelah memperbarui Railway Variables.
+Jika Profile tidak menyebut mata uang, buka **Status API → Mata Uang & Satuan**:
+konfirmasi **IDR** setelah saldo akun bertanda Rp, dan **/ 1.000** setelah kolom
+harga layanan menyatakan tarif per 1.000. Kedua konfirmasi terpisah, tersimpan,
+dan tidak memakai nilai saldo pada foto. Lalu tekan **Periksa & Buka Toko**.
+Harga per 1.000 yang belum diketahui perlu dicek pada daftar layanan provider.
+Alternatif Variables existing: `BUZZERPANEL_CURRENCY=IDR`, `SOSMED_RATE_UNIT=1000`;
+keduanya opsional bila API/konfirmasi owner sudah menyebutnya. Nilai eksplisit API
+tetap diperiksa, dan pergantian akun API memerlukan konfirmasi baru.
 Cancel dan tipe yang belum didokumentasikan tidak diaktifkan.
 
 OTP tetap memakai Variables existing; jika webhook digunakan, alamatnya
@@ -62,7 +74,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v16.94 yang lulus 315 tes mock dan 49 pemeriksaan transaksi.
+v16.96 yang lulus 358 tes mock dan 49 pemeriksaan transaksi.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.

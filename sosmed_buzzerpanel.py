@@ -1,8 +1,8 @@
 """BuzzerPanel store core: additive SQLite tables and the existing wallet.
 
 Request fields follow the owner's PHP/Node documentation for /api/json.php.
-Successful live catalog/profile/status layouts, account currency and pricing
-units remain unverified: buying defaults off until they are explicitly checked.
+Response layouts follow the supplied official examples. Account currency and
+pricing units must be read from the API or explicitly confirmed by the owner.
 No non-idempotent order request is replayed. Ambiguous results retain the hold
 for audited reconciliation. No undocumented cancellation action is sent.
 """
@@ -79,10 +79,20 @@ def flag(value):
     return value is True or value == 1 or (isinstance(value, str) and value.lower() in {"true", "yes", "1"})
 
 
+def service_available(raw):
+    # Missing status keeps the catalogue's existing availability contract.
+    # An explicit inactive/unknown status must never be sold as active.
+    values = [raw[key] for key in ('active', 'status') if key in raw]
+    return all(flag(value) or (isinstance(value, str) and value.strip().casefold() in
+               {'active', 'available', 'aktif', 'enabled'}) for value in values)
+
+
 class StoreError(Exception):
-    def __init__(self, code, message=None, *, uncertain=False, retry_after=0):
+    def __init__(self, code, message=None, *, uncertain=False, retry_after=0, detail="", stage=""):
         super().__init__(code)
         self.code, self.uncertain, self.retry_after = code, uncertain, retry_after
+        # These are local, curated descriptions, never upstream response text.
+        self.detail, self.stage = detail, stage
         messages = {
             "INPUT": "Input belum sesuai. Periksa kembali data pesanan.",
             "NOT_FOUND": "Layanan atau pesanan tidak ditemukan.",
@@ -90,6 +100,10 @@ class StoreError(Exception):
             "TOKEN": "Tombol sudah kedaluwarsa. Buka /sosmed lagi.",
             "CONFIG": "Pengaturan pembelian belum lengkap. Hubungi owner.",
             "AUTH": "Koneksi toko belum dapat diautentikasi. Hubungi owner.",
+            "IP_RESTRICTED": "Koneksi toko belum tersedia. Hubungi owner.",
+            "API_DISABLED": "Koneksi toko belum tersedia. Hubungi owner.",
+            "PROVIDER_BALANCE": "Layanan belum tersedia. Hubungi owner.",
+            "REQUEST_SCHEMA": "Layanan belum tersedia. Hubungi owner.",
             "CLOSED": "Pembelian baru sedang ditutup oleh owner.",
             "USER_BALANCE": "Saldo kamu tidak cukup. Isi saldo melalui /start → Isi Saldo.",
             "CURRENCY": "Mata uang layanan belum didukung. Pembelian dihentikan sementara.",
@@ -361,6 +375,47 @@ class APIClient:
         self.session = None
         self.contract_validator = None
         self.checked_at, self.last_ok, self.error, self.cooldown_until = 0, False, "", 0
+        self.last_action, self.http_status, self.detail = "", None, ""
+
+    @staticmethod
+    def read_rejection(envelope):
+        """Classify a failed read without reflecting account details or secrets."""
+        containers = [envelope]
+        if isinstance(envelope.get('data'), dict):
+            containers.append(envelope['data'])
+        hints = [str(item.get(key, '')).casefold() for item in containers
+                 for key in ('code', 'error', 'message', 'msg') if isinstance(item.get(key), (str, int))]
+        hint = ' '.join(hints)
+        if (re.search(r'\bip\b|ip_address|ip_whitelist', hint)
+                and any(word in hint for word in ('whitelist', 'allowlist', 'not allowed', 'tidak diizinkan', 'blocked', 'ditolak'))):
+            return 'IP_RESTRICTED', 'Izin IP API ditolak. Cocokkan whitelist provider dengan IP keluar server Railway.'
+        if (any(word in hint for word in ('api key', 'secret key', 'api_key', 'secret_key', 'authentication', 'unauthorized'))
+                and any(word in hint for word in ('salah', 'invalid', 'wrong', 'tidak valid', 'not found', 'missing', 'kosong', 'unauthorized', 'failed'))):
+            return 'AUTH', 'Autentikasi ditolak. Periksa API Key dan Secret Key dari akun yang sama.'
+        if (any(word in hint for word in ('api', 'account', 'akun'))
+                and any(word in hint for word in ('disabled', 'nonaktif', 'dinonaktifkan', 'suspended'))):
+            return 'API_DISABLED', 'API atau akun dinonaktifkan oleh provider. Periksa pengaturan akun provider.'
+        if any(word in hint for word in ('rate limit', 'too many requests', 'terlalu banyak permintaan')):
+            return 'RATE_LIMIT', 'Batas request provider tercapai. Tunggu sebelum memeriksa kembali.'
+        if any(word in hint for word in ('saldo tidak cukup', 'insufficient balance', 'not enough funds')):
+            return 'PROVIDER_BALANCE', 'Saldo akun provider tidak cukup menurut API. Periksa/isi saldo akun BuzzerPanel, bukan wallet user bot.'
+        if 'permintaan tidak sesuai' in hint or 'jumlah pesan tidak sesuai' in hint:
+            return 'REQUEST_SCHEMA', 'API menolak format/parameter request. Cocokkan action profile/services dengan dokumentasi akun dan endpoint /api/json.php.'
+        if 'layanan tidak ditemukan' in hint or 'layanan tidak tersedia' in hint:
+            return 'PROVIDER', 'API menyatakan layanan tidak ditemukan/tersedia. Periksa katalog dan status layanan provider.'
+        if 'pesanan tidak ditemukan' in hint:
+            return 'NOT_FOUND', 'API belum menemukan ID pesanan/refill tersebut. Periksa ID provider; transaksi lokal tidak dihapus atau direfund otomatis.'
+        return 'PROVIDER', 'API mengembalikan status gagal. Periksa izin akun dan respons profile/services pada panel provider.'
+
+    @staticmethod
+    def read_success(value):
+        if type(value) is bool:
+            return value
+        if type(value) is int and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str) and value.strip().casefold() in {'true', 'false', '1', '0'}:
+            return value.strip().casefold() in {'true', '1'}
+        return None
 
     async def request(self, action, **parameters):
         if (not self.config.token or not self.config.secret or self.config.error
@@ -374,7 +429,9 @@ class APIClient:
         if set(parameters) & {"key", "api_key", "secret_key", "action"}:
             raise StoreError("INPUT")
         wire_action = {"balance": "profile", "add": "order", "refill_status": "status_refill"}.get(action, action)
+        self.last_action, self.http_status, self.detail = wire_action, None, ""
         write = wire_action in {"order", "refill"}
+        catalog_read = wire_action in {'profile', 'services', 'services_1', 'services2', 'services3'}
         verified = (self.contract_validator() if self.contract_validator is not None
                     else self.config.contract_verified)
         if write and not verified:
@@ -414,12 +471,17 @@ class APIClient:
             if self.session is None or self.session.closed:
                 self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.config.timeout), trust_env=True)
             form = {"api_key": self.config.token, "secret_key": self.config.secret, "action": wire_action, **wire_parameters}
-            async with self.session.post(self.config.url, data=form, allow_redirects=False) as response:
+            async with self.session.post(self.config.url, data=form, allow_redirects=False,
+                                         headers={'Accept': 'application/json'}) as response:
+                self.http_status = response.status
+                def problem(detail, code='PROVIDER', *, retry_after=0):
+                    return StoreError(code, uncertain=write, retry_after=retry_after,
+                                      detail=f'{wire_action} • HTTP {response.status}: {detail}', stage=wire_action)
                 parts, size = [], 0
                 async for part in response.content.iter_chunked(16384):
                     size += len(part)
                     if size > 8*1024*1024:
-                        raise StoreError("PROVIDER", uncertain=write)
+                        raise problem('Respons melebihi batas ukuran aman.')
                     parts.append(part)
                 if response.status == 429:
                     try:
@@ -427,31 +489,37 @@ class APIClient:
                     except (TypeError, ValueError):
                         delay = 60
                     self.cooldown_until = time.time()+delay
-                    raise StoreError("RATE_LIMIT", uncertain=write, retry_after=delay)
+                    raise problem('Batas request tercapai. Tunggu sesuai Retry-After.', 'RATE_LIMIT', retry_after=delay)
                 if response.status >= 500:
-                    raise StoreError("NETWORK", uncertain=write)
-                if not write and response.status in {401, 403}:
-                    raise StoreError("AUTH")
+                    raise problem('Server provider mengalami gangguan. Coba kembali nanti.', 'NETWORK')
+                if 300 <= response.status < 400:
+                    raise problem('Endpoint mengalihkan request. Gunakan URL resmi /api/json.php; redirect API tidak diikuti.')
                 try:
                     envelope = json.loads(b"".join(parts), parse_float=Decimal)
                 except (ValueError, UnicodeError):
-                    raise StoreError("PROVIDER", uncertain=write) from None
-                if response.status!=200 or not isinstance(envelope, dict) or type(envelope.get("status")) is not bool:
-                    raise StoreError("PROVIDER", uncertain=write)
-                if envelope["status"] is not True:
+                    code = 'AUTH' if not write and response.status in {401, 403} else 'PROVIDER'
+                    raise problem('Respons bukan JSON. Periksa endpoint, izin API/IP, dan filter akses provider.', code) from None
+                if not isinstance(envelope, dict):
+                    raise problem('Respons harus berupa objek JSON dengan field status dan data.')
+                if not write and response.status in {401, 403}:
+                    code, detail = self.read_rejection(envelope)
+                    raise problem(detail, code if code in {'IP_RESTRICTED', 'API_DISABLED'} else 'AUTH')
+                if response.status!=200:
+                    raise problem('Request HTTP ditolak; periksa endpoint dan konfigurasi API.')
+                success = self.read_success(envelope.get('status')) if catalog_read else envelope.get('status')
+                if type(success) is not bool:
+                    raise problem('Field status tidak dikenali; diperlukan status true/false dan data.')
+                if success is not True:
                     # The observed auth rejection belongs to a READ services
                     # request. No paid-order rejection semantics were supplied;
                     # never infer that an unsuccessful order envelope proves
                     # that the provider did not create/charge the order.
                     if not write:
-                        error_data = envelope.get("data")
-                        hint = error_data.get("msg", "") if isinstance(error_data, dict) else ""
-                        if isinstance(hint, str):
-                            hint = hint.lower()
-                            if (any(word in hint for word in ("api key", "secret key", "api_key", "secret_key"))
-                                    and any(word in hint for word in ("salah", "invalid", "wrong", "tidak valid"))):
-                                raise StoreError("AUTH")
-                    raise StoreError("PROVIDER", uncertain=write)
+                        code, detail = self.read_rejection(envelope)
+                        if code=='RATE_LIMIT':
+                            self.cooldown_until=time.time()+60
+                        raise problem(detail, code, retry_after=60 if code=='RATE_LIMIT' else 0)
+                    raise problem('Hasil order/refill belum pasti; perlu rekonsiliasi dan tidak dikirim ulang.')
                 data = envelope.get("data")
                 if wire_action in {"order", "refill"}:
                     if not isinstance(data, dict):
@@ -462,19 +530,26 @@ class APIClient:
                         raise StoreError("PROVIDER", uncertain=True) from None
                     data = {"order" if wire_action=="order" else "refill": ident}
                 elif wire_action in {"services", "services_1", "services2", "services3"}:
-                    if isinstance(data, dict) and isinstance(data.get("services"), list):
+                    if isinstance(data, dict) and 'services' in data:
                         data = data["services"]
+                    if (isinstance(data, dict) and data and all(re.fullmatch(r'[0-9]+', key) for key in data)
+                            and all(isinstance(row, dict) and ('service' in row or 'id' in row) for row in data.values())):
+                        data = list(data.values())
                     if not isinstance(data, list):
-                        raise StoreError("PROVIDER")
+                        raise problem('Data services bukan daftar layanan. Cocokkan bentuk respons services pada akun provider.')
+                elif wire_action=='profile' and isinstance(data, list) and len(data)==1 and isinstance(data[0], dict):
+                    data = data[0]
                 elif not isinstance(data, dict):
-                    raise StoreError("PROVIDER")
+                    raise problem('Data respons bukan objek yang dapat dibaca.')
                 self.last_ok, self.error, self.checked_at = True, "", time.time()
                 return data
         except (aiohttp.ClientError, asyncio.TimeoutError):
             self.last_ok, self.error, self.checked_at = False, "NETWORK", time.time()
-            raise StoreError("NETWORK", uncertain=write) from None
+            self.detail = wire_action+': koneksi/timeout gagal. Periksa akses keluar server ke API provider.'
+            raise StoreError("NETWORK", uncertain=write, detail=self.detail, stage=wire_action) from None
         except StoreError as exc:
             self.last_ok, self.error, self.checked_at = False, exc.code, time.time()
+            self.detail = exc.detail
             raise
 
     async def close(self):
@@ -490,6 +565,60 @@ class FormAdapter:
     """
     TYPES = {"default", "comment", "mentions custom list", "comment replies"}
     MULTILINE = {"comment", "mentions custom list", "comment replies"}
+
+    @staticmethod
+    def catalogue_type(raw, override=None):
+        supplied = raw.get('type')
+        if supplied is not None and not isinstance(supplied, str):
+            raise StoreError('PROVIDER')
+        supplied = (supplied or '').strip()
+        aliases = {'default': 'Default', 'comment': 'Comment',
+                   'mentions custom list': 'Mentions Custom List', 'mentionscustomlist': 'Mentions Custom List',
+                   'comment replies': 'Comment Replies', 'commentreplies': 'Comment Replies'}
+        if supplied and supplied.casefold() not in aliases:
+            # A package/subscription/unknown explicit type cannot be forced
+            # into a per-1,000 quantity form by an owner override.
+            return supplied, 'API'
+        if override in aliases.values():
+            return override, 'OWNER'
+        if supplied:
+            return aliases[supplied.casefold()], 'API'
+        native = {'id', 'name', 'price', 'min', 'max', 'category'}.issubset(raw) and 'service' not in raw and 'rate' not in raw
+        text = ' '.join(str(raw.get(key, '')) for key in ('name','category','note','description')).casefold()
+        special = re.search(r'comment|komentar|mention|repl(?:y|ies)|balasan|package|paket|subscription|poll|drip|hashtag|keyword|commentlike',text)
+        if native and not special:
+            # The supplied native documentation defines the standard request
+            # as service + data + quantity even though services omits type.
+            return 'Default', 'DOCUMENTED_STANDARD'
+        return 'Unknown', 'UNVERIFIED'
+
+    @staticmethod
+    def target_kind(service):
+        raw = service.get('raw_catalog', {})
+        if isinstance(raw, str):
+            try:raw=json.loads(raw)
+            except ValueError:return 'any'
+        note = str(raw.get('note','')) if isinstance(raw,dict) else ''
+        username=bool(re.search(r'\b(?:input|masukkan)\s+username\b',note,re.I))
+        url=bool(re.search(r'\b(?:input|masukkan)\s+(?:post\s+)?(?:url|link)\b',note,re.I))
+        return 'username' if username and not url else 'url' if url and not username else 'any'
+
+    @classmethod
+    def target_for(cls, service, value):
+        value=cls.target(value)
+        kind=cls.target_kind(service)
+        if kind=='username' and not re.fullmatch(r'@?[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}',value):
+            raise StoreError('INPUT','Catatan layanan meminta username. Kirim username, bukan URL.')
+        if kind=='url' and urlparse(value).scheme.lower() not in {'https','http'}:
+            raise StoreError('INPUT','Catatan layanan meminta URL. Kirim link HTTP/HTTPS target.')
+        return value
+
+    @classmethod
+    def target_prompt(cls, service):
+        kind=cls.target_kind(service)
+        return ('👤 Kirim username target sesuai catatan layanan.' if kind=='username' else
+                '🔗 Kirim URL HTTP/HTTPS target sesuai catatan layanan.' if kind=='url' else
+                '🔗 Kirim link atau username target sesuai layanan. Bot tidak membuka link ini.')
 
     @classmethod
     def supported(cls, service):
@@ -558,7 +687,7 @@ class FormAdapter:
         if not cls.supported(service) or not isinstance(parameters, dict):
             raise StoreError("TYPE")
         kind = service["type"].strip().lower()
-        target = cls.target(parameters.get("link"))
+        target = cls.target_for(service, parameters.get("link"))
         body = {"service": number(service["provider_service_id"], 1), "data": target}
         if kind=="default":
             quantity = number(parameters.get("quantity"), 1, 1000000000)
@@ -595,7 +724,7 @@ class FormAdapter:
         if kind in {"comment", "comment replies"}:
             return "Kirim target layanan, lalu komentar asli: satu komentar per baris. Jumlah dihitung dari baris valid."
         if kind=="default":
-            return "Kirim link atau username yang sesuai layanan, lalu jumlah."
+            return cls.target_prompt(service)+" Lalu kirim jumlah sesuai min/max."
         return "Tipe ini belum tersedia untuk pemesanan melalui bot."
 
 
@@ -604,36 +733,53 @@ class CatalogService:
         self.store = store
         self.lock = asyncio.Lock()
         self.last_profile = None
+        self.failure_stage = 'profile'
 
     async def sync(self, force=False):
         async with self.lock:
             synced = self.store.repo.one("SELECT MAX(last_synced_at) AS stamp FROM sosmed_services")
             if not force and synced and synced["stamp"] and time.time()-synced["stamp"]<self.store.settings()["catalog_seconds"]:
                 return self.store.repo.all("SELECT * FROM sosmed_services ORDER BY category,provider_service_id")
+            self.failure_stage = 'profile'
             balance = await self.store.provider_balance()
             currency = balance["currency"]
+            self.failure_stage = 'services'
             rows = await self.store.api.request("services")
             if not isinstance(rows, list) or len(rows)>100000:
-                raise StoreError("PROVIDER")
+                raise StoreError("PROVIDER", detail='services: data bukan daftar layanan atau terlalu besar.', stage='services')
             prepared, seen = [], set()
+            fallback_unit = self.store.provider_units()["rate_unit"]
+            form_rules={}
+            for row in self.store.repo.all("SELECT key,value FROM sosmed_settings WHERE key LIKE 'service_form:%'"):
+                try:form_rules[row['key'].split(':',1)[1]]=json.loads(row['value'])['type']
+                except (ValueError,KeyError,TypeError):continue
             now = time.time()
             for raw in rows:
                 if not isinstance(raw, dict):
-                    raise StoreError("PROVIDER")
+                    raise StoreError("PROVIDER", detail='services: setiap layanan harus berupa objek JSON.', stage='services')
+                field = 'service/id'
                 try:
                     sid = number(raw.get("service", raw.get("id")), 1, 10**12, "PROVIDER")
-                    name, category, kind = (raw.get(key) for key in ("name", "category", "type"))
-                    if any(not isinstance(x, str) or not x.strip() for x in (name, category, kind)):
+                    field = 'name/category'
+                    name, category = (raw.get(key) for key in ('name', 'category'))
+                    if any(not isinstance(x, str) or not x.strip() for x in (name, category)):
                         raise StoreError("PROVIDER")
+                    field = 'type'
+                    kind,form_source=FormAdapter.catalogue_type(raw,form_rules.get(str(sid)))
+                    raw={**raw,'_form_source':form_source}
+                    field = 'rate/price'
                     rate = str(decimal(raw.get("rate", raw.get("price"))))
-                    low, high = number(raw.get("min"), 1), number(raw.get("max"), 1)
+                    field = 'min/max atau ID duplikat'
+                    low, high = number(raw.get("min"), 0), number(raw.get("max"), 0)
                     if high<low or sid in seen:
                         raise StoreError("PROVIDER")
+                    available = service_available(raw) and low >= 1 and high >= low
+                    field = 'currency'
                     service_currency = raw.get("currency", currency)
                     if not isinstance(service_currency, str) or (service_currency and not re.fullmatch(r"[A-Za-z]{3}", service_currency.strip())):
                         raise StoreError("PROVIDER")
                     service_currency = service_currency.strip().upper()
-                    raw_unit = raw.get("rate_unit", raw.get("pricing_unit", self.store.config.rate_unit))
+                    raw_unit = raw.get("rate_unit", raw.get("pricing_unit", fallback_unit))
                     unit = str(raw_unit).strip() if raw_unit is not None else ""
                     unit = {"per_1000":"1000", "per1000":"1000", "per 1000":"1000"}.get(unit.lower(), unit)
                     service = {"provider_service_id": sid, "name": name.strip()[:1000], "category": category.strip()[:500],
@@ -642,14 +788,14 @@ class CatalogService:
                                "min_quantity": low, "max_quantity": high,
                                "refill_supported": int(flag(raw.get("refill"))), "cancel_supported": 0,
                                "dripfeed_supported": 0,
-                               "description": raw.get("description", "") if isinstance(raw.get("description", ""), str) else "",
-                               "metadata_source": "API" if raw.get("description") else "", "last_synced_at": now,
-                               "enabled": int(flag(raw["active"])) if "active" in raw else 1, "order_supported": int(FormAdapter.supported({"type":kind,"raw_catalog":raw}) and service_currency=="IDR" and currency=="IDR" and unit=="1000"),
+                               "description": raw.get('description') if isinstance(raw.get('description'),str) and raw.get('description') else raw.get('note','') if isinstance(raw.get('note',''),str) else '',
+                               "metadata_source": "API" if raw.get("description") or raw.get('note') else "", "last_synced_at": now,
+                               "enabled": int(available), "order_supported": int(available and FormAdapter.supported({"type":kind,"raw_catalog":raw}) and service_currency=="IDR" and currency=="IDR" and unit=="1000"),
                                "raw_catalog": encoded(raw)}
                 except StoreError:
                     # Reject the entire malformed catalogue instead of silently
                     # disabling legitimate services with a broken partial sync.
-                    raise
+                    raise StoreError('PROVIDER', detail='services: kolom '+field+' tidak valid; cocokkan respons katalog resmi. Katalog terakhir dipertahankan.', stage='services') from None
                 seen.add(sid)
                 prepared.append(service)
             with self.store.repo.connection(True) as conn:
@@ -734,6 +880,29 @@ class CatalogService:
             conn.execute("INSERT OR REPLACE INTO sosmed_metadata VALUES(?,?,?,?,?)", (number(ident, 1), text, source, time.time(), actor))
             conn.execute("UPDATE sosmed_services SET description=?,metadata_source=? WHERE provider_service_id=?", (text, source, ident))
         self.store.repo.audit(actor, "metadata", {"service": ident, "source": source})
+
+    def set_form(self, actor, ident, kind):
+        self.store.require_owner(actor)
+        ident=number(ident,1)
+        row=self.service(ident,active=False)
+        if kind is not None and kind not in {'Default','Comment','Mentions Custom List','Comment Replies'}:
+            raise StoreError('TYPE')
+        raw=json.loads(row['raw_catalog'])
+        supplied=(raw.get('type') or '').strip().casefold()
+        if supplied and supplied not in {'default','comment','mentions custom list','mentionscustomlist','comment replies','commentreplies'}:
+            raise StoreError('TYPE','Tipe khusus API ini belum didukung; jenis dan satuan harganya tidak dapat diganti secara paksa.')
+        with self.store.repo.connection(True) as conn:
+            self.store.require_owner(actor)
+            if kind is None:
+                conn.execute('DELETE FROM sosmed_settings WHERE key=?',('service_form:'+str(ident),))
+            else:
+                conn.execute('INSERT OR REPLACE INTO sosmed_settings VALUES(?,?,?)',
+                             ('service_form:'+str(ident),encoded({'type':kind,'source':'OWNER','actor':actor}),time.time()))
+            conn.execute('UPDATE sosmed_services SET last_synced_at=0')
+            # Old quotes must be reconfirmed after an input contract changes.
+            conn.execute("UPDATE sosmed_quotes SET state='EXPIRED' WHERE service_id=? AND state='OPEN'",(ident,))
+            conn.execute('INSERT INTO sosmed_audit(actor,action,payload,created_at) VALUES(?,?,?,?)',
+                         (actor,'service_form',encoded({'service':ident,'type':kind}),time.time()))
 
     def toggle(self, actor, scope, key, enabled):
         self.store.require_owner(actor)
@@ -1041,7 +1210,7 @@ class OrderService:
     @staticmethod
     def mapped(status):
         key = str(status or "").strip().lower().replace("_", " ")
-        return {"pending": "PENDING", "processing": "PROCESSING", "in progress": "IN_PROGRESS", "completed": "COMPLETED", "partial": "PARTIAL", "canceled": "CANCELED", "cancelled": "CANCELED"}.get(key, "UNKNOWN")
+        return {"pending": "PENDING", "processing": "PROCESSING", "in progress": "IN_PROGRESS", "completed": "COMPLETED", "success": "COMPLETED", "error": "FAILED", "failed": "FAILED", "partial": "PARTIAL", "canceled": "CANCELED", "cancelled": "CANCELED"}.get(key, "UNKNOWN")
 
     async def refresh(self, user, order_id, admin=False):
         if admin:
@@ -1074,7 +1243,7 @@ class OrderService:
             current = conn.execute("SELECT status FROM sosmed_orders WHERE id=?", (row["id"],)).fetchone()
             # Provider can revise terminal states. Persist the real latest
             # response, and keep UNKNOWN visible instead of guessing success.
-            conn.execute("UPDATE sosmed_orders SET status=?,raw_provider_status=?,start_count=?,remains=?,provider_charge=?,updated_at=?,next_poll_at=?,terminal_at=?,refund_state=CASE WHEN ? IN ('PARTIAL','CANCELED') AND refund_amount=0 THEN 'AWAITING_PROVIDER_PROOF' ELSE refund_state END WHERE id=?",
+            conn.execute("UPDATE sosmed_orders SET status=?,raw_provider_status=?,start_count=?,remains=?,provider_charge=?,updated_at=?,next_poll_at=?,terminal_at=?,refund_state=CASE WHEN ? IN ('PARTIAL','CANCELED','FAILED') AND refund_amount=0 THEN 'AWAITING_PROVIDER_PROOF' ELSE refund_state END WHERE id=?",
                          (status, response["status"][:100], start, remains, charge, now, now+self.store.settings()["poll_seconds"], now if status in TERMINAL else None, status, row["id"]))
         result = self.store.repo.one("SELECT * FROM sosmed_orders WHERE id=?", (row["id"],))
         result["internal_order_id"] = result["id"]
@@ -1129,7 +1298,7 @@ class OrderService:
         if not isinstance(response, dict) or not isinstance(response.get("status"), str):
             raise StoreError("PROVIDER")
         raw = response["status"].strip().lower()
-        state = {"completed": "COMPLETED", "rejected": "REJECTED", "failed": "FAILED", "pending": "PENDING", "in progress": "PENDING"}.get(raw, "UNKNOWN")
+        state = {"completed": "COMPLETED", "success": "COMPLETED", "rejected": "REJECTED", "failed": "FAILED", "error": "FAILED", "pending": "PENDING", "processing": "PENDING", "in progress": "PENDING"}.get(raw, "UNKNOWN")
         with self.store.repo.connection(True) as conn:
             conn.execute("UPDATE sosmed_refills SET status=?,updated_at=? WHERE id=?", (state, time.time(), row["id"]))
         return self.store.repo.one("SELECT * FROM sosmed_refills WHERE id=?", (row["id"],))
@@ -1175,6 +1344,7 @@ class Store:
         self.purchase, self.orders = PurchaseService(self), OrderService(self)
         self._tasks, self._bot, self._owner_token = [], None, secrets.token_hex(12)
         self._started = False
+        self._last_check = None
 
     def owner(self, user):
         return bool(self.host.is_owner(user))
@@ -1196,9 +1366,69 @@ class Store:
     def contract_fingerprint(self):
         # Store only a digest, never credentials. A different account, endpoint,
         # currency or unit must be checked again before accepting purchases.
+        units = self.provider_units()
         return hashlib.sha256(encoded({"url": self.config.url, "key": self.config.token,
-            "secret": self.config.secret, "currency": self.config.currency,
-            "unit": self.config.rate_unit, "contract": "json.php-order-v1"}).encode()).hexdigest()
+            "secret": self.config.secret, "currency": units["currency"],
+            "unit": units["rate_unit"], "contract": "json.php-order-v1"}).encode()).hexdigest()
+
+    def account_fingerprint(self):
+        # A saved unit confirmation belongs to this account, not every future
+        # account that happens to use the same bot/database.
+        return hashlib.sha256(encoded({"url": self.config.url, "key": self.config.token,
+                                      "secret": self.config.secret}).encode()).hexdigest()
+
+    def confirmed_provider_units(self, conn=None):
+        try:
+            row = (conn.execute("SELECT value FROM sosmed_settings WHERE key='provider_units'").fetchone()
+                   if conn is not None else self.repo.one("SELECT value FROM sosmed_settings WHERE key='provider_units'"))
+            proof = json.loads(row["value"]) if row else {}
+            if (isinstance(proof, dict) and proof.get("account") == self.account_fingerprint()
+                    and proof.get("currency", "") in {"", "IDR"}
+                    and proof.get("rate_unit", "") in {"", "1000"}):
+                return proof
+        except (sqlite3.OperationalError, ValueError, TypeError):
+            pass
+        return {}
+
+    def provider_units(self):
+        proof = self.confirmed_provider_units()
+        return {"currency": self.config.currency or proof.get("currency", ""),
+                "rate_unit": self.config.rate_unit or proof.get("rate_unit", ""),
+                "currency_source": "VARIABLE" if self.config.currency else "OWNER" if proof.get("currency") else "UNAVAILABLE",
+                "unit_source": "VARIABLE" if self.config.rate_unit else "OWNER" if proof.get("rate_unit") else "UNAVAILABLE"}
+
+    def set_provider_unit(self, actor, field, value, account):
+        self.require_owner(actor)
+        if field not in {"currency", "rate_unit", "reset"} or value != {"currency": "IDR", "rate_unit": "1000", "reset": None}[field]:
+            raise StoreError("INPUT")
+        if self.configuration_issues() or account != self.account_fingerprint():
+            raise StoreError("CONFIG", "Konfigurasi akun berubah atau belum lengkap. Buka pengaturan mata uang/satuan lagi.")
+        with self.repo.connection(True) as conn:
+            self.require_owner(actor)
+            if account != self.account_fingerprint():
+                raise StoreError("CONFIG")
+            before = self.confirmed_provider_units(conn)
+            after = {} if field == "reset" else {**before, field: value}
+            if field != "reset" and getattr(self.config, field) and getattr(self.config, field) != value:
+                raise StoreError("CURRENCY")
+            if before == after:
+                return
+            now = time.time()
+            after.update(account=account, actor=actor, checked_at=now)
+            if field == "reset":
+                conn.execute("DELETE FROM sosmed_settings WHERE key='provider_units'")
+            else:
+                conn.execute("INSERT OR REPLACE INTO sosmed_settings VALUES(?,?,?)", ("provider_units", encoded(after), now))
+            # Only new, unpaid purchases need a new quote/check. Existing
+            # orders, holds, wallet entries and background tracking are intact.
+            conn.execute("DELETE FROM sosmed_settings WHERE key='verified_purchase_contract'")
+            conn.execute("INSERT OR REPLACE INTO sosmed_settings VALUES(?,?,?)", ("enabled", "false", now))
+            conn.execute("UPDATE sosmed_services SET last_synced_at=0,order_supported=0")
+            conn.execute("UPDATE sosmed_quotes SET state='EXPIRED' WHERE state='OPEN'")
+            conn.execute("INSERT INTO sosmed_audit(actor,action,payload,created_at) VALUES(?,?,?,?)",
+                         (actor, "provider_unit", encoded({"field": field, "value": value,
+                          "before": {key: before.get(key, "") for key in ("currency", "rate_unit")}}), now))
+        self._last_check = None
 
     def purchase_contract_verified(self):
         if self.configuration_issues():
@@ -1219,17 +1449,29 @@ class Store:
         if issues:
             raise StoreError("CONFIG", "Lengkapi Railway Variables: "+"; ".join(issues)+". Redeploy setelah memperbaiki variabel.")
         fingerprint = self.contract_fingerprint()
+        check = {'fingerprint': fingerprint, 'connected': False, 'checked_at': time.time(),
+                 'stage': 'profile', 'error': '', 'detail': '', 'http_status': None}
+        self._last_check = check
         try:
             rows = await self.catalog.sync(force=True)
         except StoreError as exc:
-            if exc.code == "AUTH":
-                raise StoreError("AUTH", "API menolak autentikasi. Periksa BUZZERPANEL_API_KEY dan BUZZERPANEL_SECRET_KEY pada akun yang sama, serta izin IP API bila digunakan.") from None
-            if exc.code in {"INPUT", "PROVIDER"}:
-                raise StoreError("PROVIDER", "Profil atau katalog API belum dapat dibaca. Periksa respons sukses profile/services dan konfigurasi akun; harga dan saldo tidak diasumsikan.") from None
-            raise
+            stage = exc.stage or self.catalog.failure_stage
+            detail = exc.detail or {
+                'AUTH': 'Autentikasi ditolak. Periksa BUZZERPANEL_API_KEY dan BUZZERPANEL_SECRET_KEY dari akun yang sama.',
+                'IP_RESTRICTED': 'Izin IP API ditolak. Periksa whitelist pada akun provider.',
+                'API_DISABLED': 'API atau akun provider dinonaktifkan.',
+                'NETWORK': 'Koneksi/timeout gagal. Periksa akses server ke API provider.',
+                'RATE_LIMIT': 'Batas request tercapai. Tunggu sebelum memeriksa kembali.',
+            }.get(exc.code, 'Respons '+stage+' belum dapat dibaca. Cocokkan respons profile/services pada panel provider.')
+            check.update(stage=stage, error=exc.code, detail=detail, checked_at=time.time(),
+                         http_status=getattr(self.api, 'http_status', None))
+            raise StoreError(exc.code if exc.code!='INPUT' else 'PROVIDER', detail,
+                             detail=detail, stage=stage, retry_after=exc.retry_after) from None
         self.require_owner(actor)
         if fingerprint != self.contract_fingerprint():
             raise StoreError("CONFIG", "Konfigurasi berubah selama pemeriksaan. Periksa koneksi kembali.")
+        check.update(connected=True, checked_at=time.time(), stage='complete',
+                     http_status=getattr(self.api, 'http_status', None))
         return {"profile": self.catalog.last_profile, "services": rows, "fingerprint": fingerprint}
 
     def catalogue_issues(self, rows=None, profile=None):
@@ -1240,18 +1482,18 @@ class Store:
             if profile.get("currency"):
                 issues.append("Mata uang profil bukan IDR; konversi belum didukung")
             else:
-                issues.append("API profile tidak menyebut mata uang. Jika akun sudah dikonfirmasi IDR, isi BUZZERPANEL_CURRENCY=IDR lalu redeploy")
+                issues.append("API profile tidak menyebut mata uang. Konfirmasi IDR pada tombol Mata Uang & Satuan setelah memeriksa akun; alternatif BUZZERPANEL_CURRENCY=IDR")
         if not rows:
             issues.append("Katalog belum berisi layanan; periksa Status API / Sync Katalog")
         elif not any(row["enabled"] and row["order_supported"] for row in rows):
             if not any(row["enabled"] for row in rows):
                 issues.append("Semua layanan/kategori ditutup atau tidak aktif")
             if any(row["enabled"] and not row["rate_unit"] for row in rows):
-                issues.append("API tidak menyebut satuan rate. Jika tarif sudah dikonfirmasi per 1.000, isi SOSMED_RATE_UNIT=1000 lalu redeploy")
+                issues.append("API tidak menyebut satuan rate. Konfirmasi per 1.000 pada tombol Mata Uang & Satuan setelah memeriksa tarif; alternatif SOSMED_RATE_UNIT=1000")
             if not any(row["currency"] == "IDR" for row in rows):
                 issues.append("Mata uang layanan IDR belum dikonfirmasi")
             if not any(FormAdapter.supported(row) for row in rows):
-                issues.append("Tipe/form layanan belum didukung oleh kontrak order bot")
+                issues.append("Form layanan khusus belum didukung/dipastikan. Owner dapat memilih Tipe/Input pada detail layanan berdasarkan dokumentasi resmi")
             if not issues:
                 issues.append("Belum ada layanan dengan mata uang, satuan harga, dan form yang didukung")
         return issues
@@ -1335,16 +1577,35 @@ class Store:
 
     async def provider_balance(self):
         response = await self.api.request("balance")
-        if not isinstance(response, dict) or "balance" not in response:
-            raise StoreError("PROVIDER")
-        value = str(decimal(response["balance"]))
-        raw_currency = response.get("currency")
-        if raw_currency is not None:
-            if not isinstance(raw_currency, str) or not re.fullmatch(r"[A-Za-z]{3}", raw_currency.strip()):
-                raise StoreError("PROVIDER")
-            currency, source = raw_currency.strip().upper(), "API"
-        elif self.config.currency:
-            currency, source = self.config.currency, "OWNER_ATTESTATION"
+        problem = lambda detail: StoreError('PROVIDER', detail='profile: '+detail, stage='profile')
+        if not isinstance(response, dict):
+            raise problem('data profil harus berupa objek JSON.')
+        containers = [response]+[response[key] for key in ('profile', 'account', 'user') if isinstance(response.get(key), dict)]
+        values, currencies = [], []
+        try:
+            for item in containers:
+                values.extend(decimal(item[key]) for key in ('balance', 'saldo') if key in item)
+                for key in ('currency', 'mata_uang'):
+                    if key in item and item[key] is not None:
+                        raw = item[key]
+                        if not isinstance(raw, str) or not re.fullmatch(r'[A-Za-z]{3}', raw.strip()):
+                            raise problem('currency/mata_uang harus kode tiga huruf seperti IDR.')
+                        currencies.append(raw.strip().upper())
+        except StoreError as exc:
+            if exc.stage == 'profile':
+                raise
+            raise problem('balance/saldo harus angka nonnegatif, tanpa pemisah ribuan atau simbol Rp.') from None
+        if not values:
+            raise problem('field balance/saldo tidak ditemukan, termasuk di profile/account/user. Cocokkan nama field saldo pada respons profile.')
+        if len(set(values)) != 1 or len(set(currencies)) > 1:
+            raise problem('field saldo atau mata uang saling bertentangan; respons perlu diperiksa, saldo tidak dipilih secara acak.')
+        value = str(values[0])
+        if currencies:
+            currency, source = currencies[0], "API"
+        elif self.provider_units()["currency"]:
+            units = self.provider_units()
+            currency = units["currency"]
+            source = "OWNER_ATTESTATION" if units["currency_source"] == "VARIABLE" else "OWNER_CONFIRMATION"
         else:
             currency, source = "", "UNAVAILABLE"
         return {"balance": value, "currency": currency, "currency_source": source}
@@ -1363,8 +1624,14 @@ class Store:
 
     def health(self):
         row = self.repo.one("SELECT MAX(last_synced_at) AS stamp FROM sosmed_services")
-        return {"connected": bool(getattr(self.api, "last_ok", False)),
-                "checked_at": getattr(self.api, "checked_at", 0), "error": getattr(self.api, "error", ""),
+        check = self._last_check or {}
+        if check.get('fingerprint') != self.contract_fingerprint():
+            check = {}
+        return {"connected": check.get('connected', bool(getattr(self.api, "last_ok", False))),
+                "checked_at": check.get('checked_at', getattr(self.api, "checked_at", 0)),
+                "error": check.get('error', getattr(self.api, "error", "")),
+                "stage": check.get('stage', ''), "detail": check.get('detail', ''),
+                "http_status": check.get('http_status'),
                 "configured": not bool(self.configuration_issues()),
                 "configuration_issues": self.configuration_issues(),
                 "contract_verified": self.purchase_contract_verified(),
@@ -1400,6 +1667,7 @@ class Store:
         totals = self.repo.one("SELECT COUNT(*) AS total,COALESCE(SUM(selling_price-refund_amount),0) AS revenue,COALESCE(SUM(gross_profit-refund_amount),0) AS gross_profit FROM sosmed_orders")
         totals.update({"states": states, "active": sum(value for key,value in states.items() if key not in TERMINAL),
                        "pending": states.get("PENDING",0), "processing": states.get("PROCESSING",0)+states.get("IN_PROGRESS",0),
+                       "failed": states.get('FAILED',0),
                        "completed": states.get("COMPLETED",0), "partial": states.get("PARTIAL",0), "canceled": states.get("CANCELED",0),
                        "reconciliation": self.repo.one("SELECT COUNT(*) AS count FROM sosmed_purchase_attempts WHERE state='RECONCILIATION_REQUIRED'")["count"],
                        "refund_pending": self.repo.one("SELECT COUNT(*) AS count FROM sosmed_orders WHERE refund_state='AWAITING_PROVIDER_PROOF'")["count"],
@@ -1440,7 +1708,7 @@ class Store:
         self.require_owner(user)
         proof = self.proof(proof_ref)
         row = await self.orders.refresh(user, order_id, admin=True)
-        if row["status"] not in {"PARTIAL", "CANCELED"}:
+        if row["status"] not in {"PARTIAL", "CANCELED", "FAILED"}:
             raise StoreError("PROOF")
         provider_amount = number(provider_refund_idr, 1, row["provider_cost"])
         # The documented API has no refund receipt endpoint. This operation is

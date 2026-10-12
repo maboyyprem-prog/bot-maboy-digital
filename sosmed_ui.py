@@ -34,6 +34,7 @@ NAVIGATION_ACTIONS = {
     "admin_orders", "admin_services", "admin_categories", "admin_prices",
     "admin_settings", "admin_pricing", "admin_scope", "admin_pending",
     "admin_refunds", "admin_detail",
+    "admin_form", "admin_units",
 }
 
 
@@ -395,6 +396,7 @@ class UIBuilder:
             rows.append([("🏷️ Atur Harga", "admin_scope", {"scope": "service", "key": str(service_id)})])
             rows.append([("🟢 ON / OFF", "admin_service_toggle", {"id": service_id, "enabled": not bool(service.get("enabled"))})])
             rows.append([("📝 Metadata", "admin_input", {"kind": "metadata", "id": service_id})])
+            rows.append([("📋 Tipe/Input", "admin_form", {"id": service_id})])
         else:
             if (price_ready and service.get("order_supported", False) and core.FormAdapter.supported(service) and service.get("enabled", True)
                     and self.store.purchase_contract_verified()):
@@ -514,6 +516,22 @@ class AdminHandler:
         if not self.store.owner(user):
             raise core.StoreError("FORBIDDEN", "Menu ini hanya untuk owner.")
 
+    async def form(self, message, user, payload):
+        self.authorize(user)
+        ident=number(payload['id'],1)
+        service=self.store.catalog.service(ident,active=False)
+        raw=json.loads(service['raw_catalog'])
+        text=("📋 <b>TIPE / INPUT LAYANAN</b>\n"+esc(self.ui.provider_label(service['name']),500)+
+              f"\nTipe saat ini: {esc(service['type'])}\nSumber: {esc(raw.get('_form_source','API'))}\n\n"
+              "Pilih sesuai dokumentasi layanan. Default memakai target + jumlah; komentar/mentions memakai daftar per baris. "
+              "Package, subscription, dan tipe khusus lain tetap memerlukan kontrak harga/input yang benar.")
+        rows=[[(label,'admin_form_choose',{'id':ident,'type':kind})] for label,kind in (
+            ('Target + Jumlah','Default'),('Komentar Custom','Comment'),
+            ('Mentions Custom List','Mentions Custom List'),('Comment Replies','Comment Replies'))]
+        rows.append([('🔄 Ikuti API','admin_form_choose',{'id':ident,'type':None})])
+        rows.append([('⬅️ Kembali','admin_detail',{'id':ident})])
+        await self.ui.send(message,text,self.ui.keyboard(user,rows))
+
     async def dashboard(self, message, user, *, balance_only=False):
         self.authorize(user)
         balance = "Saldo provider tidak tersedia"
@@ -535,7 +553,7 @@ class AdminHandler:
                      f"📦 Total order: {stats.get('total', 0)}\n"
                      f"⏳ Pending: {stats.get('pending', 0)} • 🔄 Diproses: {stats.get('processing', 0)}\n"
                      f"✅ Selesai: {stats.get('completed', 0)} • ⚠️ Partial: {stats.get('partial', 0)}\n"
-                     f"❌ Dibatalkan: {stats.get('canceled', 0)}\n"
+                     f"❌ Dibatalkan: {stats.get('canceled', 0)} • Gagal: {stats.get('failed', 0)}\n"
                      f"💵 Omzet: {core.money(stats.get('revenue', 0))}\n"
                      f"📈 Profit kotor sementara: {core.money(stats.get('gross_profit', 0))}")
         rows = [[("💰 Saldo Provider", "admin_balance", {}), ("📊 Statistik", "admin_stats", {})],
@@ -554,7 +572,7 @@ class AdminHandler:
         text = ("📈 <b>LAPORAN PROFIT</b>" if profit else "📊 <b>STATISTIK SOSMED</b>") + "\n\n"
         text += (f"Total: {stats.get('total', 0)}\nPending: {stats.get('pending', 0)}\n"
                  f"Processing: {stats.get('processing', 0)}\nCompleted: {stats.get('completed', 0)}\n"
-                 f"Partial: {stats.get('partial', 0)}\nCanceled: {stats.get('canceled', 0)}\n"
+                 f"Partial: {stats.get('partial', 0)}\nCanceled: {stats.get('canceled', 0)} • Failed: {stats.get('failed', 0)}\n"
                  f"Omzet setelah refund: {core.money(stats.get('revenue', 0))}\n"
                  f"Profit kotor sementara: {core.money(stats.get('gross_profit', 0))}\n\n"
                  "Transaksi yang belum pasti tidak dianggap penjualan selesai. "
@@ -621,7 +639,27 @@ class AdminHandler:
                  ("🔢 Limit Jumlah", "admin_input", {"setting": "max_quantity"})],
                 [("⏱️ Polling", "admin_input", {"setting": "poll_seconds"}),
                  ("📂 Kategori", "admin_categories", {})],
+                [("💱 Mata Uang & Satuan", "admin_units", {})],
                 [("⬅️ Kembali", "admin_menu", {})]]
+        await self.ui.send(message, text, self.ui.keyboard(user, rows))
+
+    async def units(self, message, user):
+        self.authorize(user)
+        units = self.store.provider_units()
+        labels = {"VARIABLE": "Variables", "OWNER": "Konfirmasi owner", "UNAVAILABLE": "Belum dikonfirmasi"}
+        currency = units["currency"] or "Belum dikonfirmasi"
+        rate = "per 1.000" if units["rate_unit"] == "1000" else "Belum dikonfirmasi"
+        text = ("💱 <b>MATA UANG & SATUAN HARGA</b>\n\n"
+                f"Mata uang cadangan: {esc(currency)} • {labels[units['currency_source']]}\n"
+                f"Satuan cadangan: {rate} • {labels[units['unit_source']]}\n\n"
+                "Jika API tidak menyebutnya, cocokkan dashboard akun dan kolom harga layanan sebelum konfirmasi. "
+                "Saldo bertanda Rp berarti IDR. Pilih per 1.000 hanya jika tarif memang berlaku untuk 1.000 jumlah.\n\n"
+                "Data eksplisit dari API tetap diperiksa. Setelah perubahan, gunakan Status API → Periksa & Buka Toko.")
+        rows = [[("💵 Konfirmasi IDR", "admin_units_choose", {"field": "currency", "value": "IDR"}),
+                 ("🔢 Konfirmasi / 1.000", "admin_units_choose", {"field": "rate_unit", "value": "1000"})],
+                [("🔄 Hapus Konfirmasi Owner", "admin_units_choose", {"field": "reset", "value": None})],
+                [("🔌 Status API", "admin_status", {})],
+                [("⬅️ Kembali", "admin_settings", {})]]
         await self.ui.send(message, text, self.ui.keyboard(user, rows))
 
     async def health(self, message, user):
@@ -645,17 +683,34 @@ class AdminHandler:
         else:
             explanation = "✅ Pemeriksaan berhasil. Toko siap menerima konfirmasi pembelian."
         current_status = "Terhubung" if result else "Pemeriksaan belum berhasil"
+        stage = health.get('stage', '')
+        profile_status = ('Terbaca' if stage=='complete' or stage.startswith('services')
+                          else 'Gagal' if stage=='profile' else 'Belum diperiksa')
+        catalog_status = ('Terbaca' if stage=='complete' else 'Gagal' if stage.startswith('services')
+                          else 'Belum diperiksa')
+        verification = ('Flag operator aktif' if self.store.config.contract_verified else 'Tersimpan') if verified else 'Belum selesai'
+        if verified and not result:
+            verification += '; pemeriksaan API belum lulus'
+        http = health.get('http_status')
+        provider_balance = "Tidak tersedia"
+        if result:
+            profile = result["profile"]
+            provider_balance = provider_money(profile["balance"]) if profile["currency"] == "IDR" else esc(profile["balance"])+" "+esc(profile["currency"] or "(mata uang belum dikonfirmasi)")
         text = ("🔌 <b>STATUS INTEGRASI SOSMED</b>\nProvider: BuzzerPanel.id\n\n"
                 f"Konfigurasi: {'Tersedia' if health.get('configured') else 'Belum lengkap'}\n"
                 f"API: {current_status}\n"
+                f"Profil: {profile_status} • Katalog: {catalog_status}\n"
+                f"Saldo provider: {provider_balance}\n"
+                f"HTTP: {http if type(http) is int else '-'}\n"
                 f"Diperiksa: {instant(health.get('checked_at'))}\n"
                 f"Sync katalog: {instant(health.get('catalog_synced_at'))}\n"
                 f"Kode gangguan: {esc(health.get('error') or '-')}\n\n"
-                f"Verifikasi pembelian: {'Tersimpan / operator' if verified else 'Belum selesai'}\n"
+                f"Verifikasi pembelian: {verification}\n"
                 f"{explanation}\n\n"
                 "Refill memerlukan verifikasi terpisah; cancel belum didokumentasikan.\n"
                 "Timeout pembelian tidak dikirim ulang otomatis. Periksa menu Rekonsiliasi untuk transaksi yang belum pasti.")
         keyboard = self.ui.navigation(user, "admin_menu", admin=True)
+        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="💱 Mata Uang & Satuan", callback_data=self.store.token(user, "admin_units", ttl=86400))])
         if not verified or not self.store.settings()["enabled"]:
             keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="🟢 Periksa & Buka Toko", callback_data=self.store.token(user, "admin_toggle", {"enabled": True, "back": "admin_menu"}))])
         await self.ui.send(message, text, keyboard)
@@ -839,7 +894,7 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         await state.update_data(sosmed_service_id=service["provider_service_id"], sosmed_fields=fields,
                                 sosmed_index=0, sosmed_parameters={})
         return await ui.send(message, "🛒 <b>ISI PESANAN</b>\n"+esc(ui.public_label(service['name'], 220))+"\n\n"
-                             +FIELD_LABELS[fields[0]]+f"\nMin {service['min_quantity']} • Max {service['max_quantity']}",
+                             +(core.FormAdapter.target_prompt(service) if fields[0]=='link' else FIELD_LABELS[fields[0]])+f"\nMin {service['min_quantity']} • Max {service['max_quantity']}",
                              ui.navigation(user, "detail", {"id": service["provider_service_id"]}))
     if action == "pay":
         result = await store.purchase.buy(user, str(payload["quote"]))
@@ -885,6 +940,27 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await admin.statistics(message, user, profit=action == "admin_profit")
     if action == "admin_status":
         return await admin.health(message, user)
+    if action == "admin_units":
+        return await admin.units(message, user)
+    if action == "admin_units_choose":
+        field, value = payload.get("field"), payload.get("value")
+        if field not in {"currency", "rate_unit", "reset"} or value != {"currency": "IDR", "rate_unit": "1000", "reset": None}[field]:
+            raise core.StoreError("INPUT")
+        units = store.provider_units()
+        if field == "reset":
+            old = (units["currency"] or "Belum diketahui")+" / "+(units["rate_unit"] or "Belum diketahui")
+            new = "Konfirmasi owner dihapus; nilai API/Variables tetap berlaku"
+        else:
+            old, new = units[field] or "Belum dikonfirmasi", "IDR (rupiah)" if field == "currency" else "Harga untuk 1.000 jumlah"
+        text = ("💱 <b>KONFIRMASI MATA UANG / SATUAN</b>\n\n"
+                f"Lama: {esc(old)}\nBaru: {esc(new)}\n\n"
+                "Simpan setelah cocok dengan dashboard dan tarif layanan. Pembelian baru perlu diperiksa kembali; quote yang belum dibayar harus dibuat ulang.")
+        rows = [[("✅ Simpan", "admin_units_confirm", {"field": field, "value": value, "account": store.account_fingerprint()})],
+                [("❌ Batal", "admin_units", {})]]
+        return await ui.send(message, text, ui.keyboard(user, rows))
+    if action == "admin_units_confirm":
+        store.set_provider_unit(user, payload.get("field"), payload.get("value"), payload.get("account"))
+        return await admin.units(message, user)
     if action == "admin_orders":
         return await ui.orders(message, user, payload, admin=True)
     if action == "admin_check":
@@ -893,6 +969,28 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await ui.services(message, user, payload, admin=True)
     if action == "admin_detail":
         return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"), admin=True)
+    if action == 'admin_form':
+        return await admin.form(message,user,payload)
+    if action == 'admin_form_choose':
+        ident=number(payload['id'],1)
+        service=store.catalog.service(ident,active=False)
+        kind=payload.get('type')
+        if kind not in {None,'Default','Comment','Mentions Custom List','Comment Replies'}:
+            raise core.StoreError('TYPE')
+        raw=json.loads(service['raw_catalog'])
+        before=service['type']
+        after=core.FormAdapter.catalogue_type(raw)[0] if kind is None else kind
+        text=("📋 <b>KONFIRMASI TIPE INPUT</b>\n"+esc(ui.provider_label(service['name']),500)+
+              f"\nLama: {esc(before)}\nBaru: {esc(after)}\n\n"
+              "Konfirmasi sesuai dokumentasi provider. Quote yang belum dibayar harus dikonfirmasi ulang.")
+        rows=[[('✅ Simpan','admin_form_confirm',{'id':ident,'type':kind})],
+              [('❌ Batal','admin_form',{'id':ident})]]
+        return await ui.send(message,text,ui.keyboard(user,rows))
+    if action == 'admin_form_confirm':
+        ident=number(payload['id'],1)
+        store.catalog.set_form(user,ident,payload.get('type'))
+        await store.catalog.sync(force=True)
+        return await ui.detail(message,user,ident,admin=True)
     if action == "admin_categories":
         return await ui.categories(message, user, payload, admin=True)
     if action == "admin_pricing":
@@ -1071,7 +1169,7 @@ def register(router, store):
                 raise core.StoreError("INPUT", "Input terlalu panjang.")
             value = number(text.strip(), 1, 10**12) if field in {"quantity", "runs", "interval", "answer_number"} else text if field == "comments" else text.strip()
             if field == "link":
-                value = core.FormAdapter.target(value)
+                value = core.FormAdapter.target_for(store.catalog.service(number(service_id,1)),value)
             parameters = {**parameters, field: value}
             index += 1
             if index < len(fields):
