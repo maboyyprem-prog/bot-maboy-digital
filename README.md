@@ -1,4 +1,4 @@
-# MaboyyDigital v16.93
+# MaboyyDigital v16.94
 
 Paket ringkas: **13 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -22,6 +22,8 @@ Saldo user dipakai bersama oleh toko, OTP, dan Sosmed.
 Buka `/owner` → Pengaturan Pembayaran → Rekening Transfer. Tambah/edit bank, nomor,
 pemilik, dan catatan; periksa data lama/baru lalu tekan Simpan. Rekening dapat
 aktif/nonaktif, dijadikan utama, atau dihapus dari daftar dengan soft delete.
+Menu rekening ringkas dalam empat baris. Tambah/Edit membuka form bertahap dengan
+tombol Kembali/Batal; input mengganti pesan form yang sama sebelum konfirmasi.
 User memilih rekening aktif ketika deposit/checkout. Invoice menyimpan rekening
 dan nomor salin sendiri; perubahan rekening tidak mengubah snapshot invoice.
 Tidak ada variabel baru atau wallet baru untuk multi-rekening.
@@ -60,7 +62,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v16.93 yang lulus 309 tes mock dan 49 pemeriksaan transaksi.
+v16.94 yang lulus 315 tes mock dan 49 pemeriksaan transaksi.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.

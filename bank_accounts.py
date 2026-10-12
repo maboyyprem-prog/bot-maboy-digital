@@ -281,13 +281,15 @@ class Manager:
 
     def menu(self):
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=label, callback_data=PREFIX+action)]
-            for label, action in (("➕ TAMBAH REKENING", "add"), ("📋 DAFTAR REKENING", "list:0"),
-                ("✏️ EDIT REKENING", "select:edit:0"), ("🟢 AKTIF/NONAKTIF", "select:toggle:0"),
-                ("⭐ REKENING UTAMA", "select:default:0"), ("🗑 HAPUS REKENING", "select:delete:0"),
-                ("📜 RIWAYAT", "history:0"))]+[[InlineKeyboardButton(text="🔙 KEMBALI", callback_data="owner:qris_settings")]])
+            [InlineKeyboardButton(text=label, callback_data=action) for label, action in row]
+            for row in (
+                (("➕ Tambah", PREFIX+"add"), ("📋 Daftar", PREFIX+"list:0")),
+                (("✏️ Edit", PREFIX+"select:edit:0"), ("🟢 Aktif/Nonaktif", PREFIX+"select:toggle:0")),
+                (("⭐ Utama", PREFIX+"select:default:0"), ("🗑 Hapus", PREFIX+"select:delete:0")),
+                (("📜 Riwayat", PREFIX+"history:0"), ("⬅️ Kembali", "owner:qris_settings")),
+            )])
 
-    async def show(self, target, text="🏦 <b>MANAJEMEN REKENING</b>\n\nKelola rekening transfer. Perubahan disimpan setelah konfirmasi.", keyboard=None):
+    async def show(self, target, text="🏦 <b>MANAJEMEN REKENING</b>\n\nPilih tindakan. Perubahan perlu konfirmasi.", keyboard=None):
         keyboard = keyboard or self.menu()
         if hasattr(target, "message") and hasattr(target, "data"):
             return await self.host.safe_edit_or_answer(target, text, reply_markup=keyboard, parse_mode="HTML")
@@ -326,14 +328,47 @@ class Manager:
         message = target.message if hasattr(target, "message") else target
         await state.set_data({"bank_id": ident, "bank_values": values, "bank_fields": fields,
                               "bank_index": 0, "bank_menu_id": message.message_id})
-        await self.show(target, "🏦 <b>DATA REKENING</b>\n\nKirim "+html.escape(LABELS[fields[0]])+".")
+        await self.form(target, actor, state)
+
+    def form_data(self, data):
+        fields, index, values = data.get('bank_fields'), data.get('bank_index'), data.get('bank_values')
+        if (not isinstance(fields, list) or not fields or any(field not in FIELDS for field in fields)
+                or type(index) is not int or not 0 <= index < len(fields)
+                or not isinstance(values, dict) or set(values) != set(FIELDS)
+                or any(not isinstance(value, str) for value in values.values())):
+            raise BankError("Sesi rekening tidak tersedia. Buka Rekening Transfer kembali.")
+        return fields, index, values
+
+    async def form(self, target, actor, state, warning=None):
+        self.owner(actor)
+        data = await state.get_data()
+        fields, index, values = self.form_data(data)
+        field = fields[index]
+        title = "✏️ EDIT REKENING" if data.get('bank_id') else "➕ TAMBAH REKENING"
+        text = f"<b>{title}</b>\nLangkah {index+1}/{len(fields)}\n\nKirim {html.escape(LABELS[field])}."
+        if values[field]:
+            text += "\nSaat ini: <code>"+fragment(values[field], 300)+"</code>"
+        if warning:
+            text += "\n\n⚠️ "+html.escape(warning)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Kembali", callback_data=PREFIX+"form_back"),
+            InlineKeyboardButton(text="❌ Batal", callback_data=PREFIX+"form_cancel"),
+        ]])
+        # Only the input form uses the strict existing menu renderer. Remember
+        # a replacement message if Telegram reports the previous one deleted.
+        render = MenuMessage(target.message) if hasattr(target, 'message') and hasattr(target, 'data') else target
+        sent = await self.show(render, text, keyboard)
+        menu_id = getattr(render, 'target_id', None) or getattr(sent, 'message_id', None)
+        if type(menu_id) is int and menu_id > 0:
+            await state.update_data(bank_menu_id=menu_id)
 
     async def edit_menu(self, target, actor, ident):
         self.owner(actor)
         row = self.account(ident, active=False)
-        buttons = [[InlineKeyboardButton(text=LABELS[field].split(' (')[0],callback_data=PREFIX+f"field:{ident}:{field}")] for field in FIELDS]
-        buttons += [[InlineKeyboardButton(text="✏️ Edit Semua Data",callback_data=PREFIX+f"editall:{ident}")],
-                    [InlineKeyboardButton(text="🔙 Daftar",callback_data=PREFIX+"list:0")]]
+        fields = [InlineKeyboardButton(text=LABELS[field].split(' (')[0],callback_data=PREFIX+f"field:{ident}:{field}") for field in FIELDS]
+        buttons = [fields[:2],fields[2:],[
+            InlineKeyboardButton(text="✏️ Edit Semua",callback_data=PREFIX+f"editall:{ident}"),
+            InlineKeyboardButton(text="⬅️ Daftar",callback_data=PREFIX+"list:0")]]
         await self.show(target,"✏️ <b>EDIT REKENING</b>\n\n"+account_text(row)+"\n\nPilih data yang ingin diubah.",InlineKeyboardMarkup(inline_keyboard=buttons))
 
     async def preview(self, target, actor, action, ident=None, values=None):
@@ -422,6 +457,18 @@ def register(router, manager):
             await call.answer();answered=True
             action=parts[0]
             if action=='add':return await manager.start_edit(call,call.from_user.id,state)
+            if action in {'form_back', 'form_cancel'} and len(parts)==1:
+                if await state.get_state() != BankState.field.state:
+                    raise BankError("Form rekening sudah tidak aktif. Buka Rekening Transfer kembali.")
+                data = await state.get_data()
+                fields, index, values = manager.form_data(data)
+                if action=='form_cancel' or index==0:
+                    await state.clear()
+                    if action=='form_back' and data.get('bank_id'):
+                        return await manager.edit_menu(call,call.from_user.id,data['bank_id'])
+                    return await manager.show(call)
+                await state.update_data(bank_index=index-1)
+                return await manager.form(call,call.from_user.id,state)
             if (action=='list' and len(parts)==2) or (action=='select' and len(parts)==3):
                 kind,page=('detail',int(parts[1])) if action=='list' else (parts[1],int(parts[2]))
                 return await manager.listing(call,call.from_user.id,kind,page)
@@ -430,7 +477,8 @@ def register(router, manager):
                 if kind=='edit':return await manager.edit_menu(call,call.from_user.id,ident)
                 if kind=='detail':
                     row=manager.account(ident,active=False)
-                    buttons=[[InlineKeyboardButton(text=label,callback_data=PREFIX+f"pick:{kind}:{ident}")] for label,kind in (("✏️ Edit","edit"),("🟢 Aktif/Nonaktif","toggle"),("⭐ Rekening Utama","default"),("🗑 Hapus","delete"))]
+                    actions=[InlineKeyboardButton(text=label,callback_data=PREFIX+f"pick:{kind}:{ident}") for label,kind in (("✏️ Edit","edit"),("🟢 Aktif/Nonaktif","toggle"),("⭐ Utama","default"),("🗑 Hapus","delete"))]
+                    buttons=[actions[:2],actions[2:]]
                     buttons.append([InlineKeyboardButton(text="🔙 Daftar",callback_data=PREFIX+"list:0")])
                     return await manager.show(call,account_text(row)+f"\nStatus: {'AKTIF' if row['active'] else 'NONAKTIF'} • Utama: {'YA' if row['is_default'] else 'TIDAK'}",InlineKeyboardMarkup(inline_keyboard=buttons))
                 return await manager.preview(call,call.from_user.id,kind,ident)
@@ -474,11 +522,10 @@ def register(router, manager):
         try:
             manager.owner(message.from_user.id)
             if str(message.chat.type)!='private' or message.chat.id!=message.from_user.id:raise BankError("Gunakan chat privat.")
-            data=await state.get_data();fields=data.get('bank_fields',[]);index=data.get('bank_index',0)
-            if not isinstance(index,int) or not 0<=index<len(fields) or fields[index] not in FIELDS:raise BankError("Sesi rekening tidak tersedia. Buka menu kembali.")
+            data=await state.get_data();fields,index,previous=manager.form_data(data)
             field=fields[index];value=message.text.strip()
             if field=='note' and value=='-':value=''
-            values={**data['bank_values'],field:value}
+            values={**previous,field:value}
             # Validate the current field before advancing; the complete form
             # is validated again before creating a persistent confirmation.
             placeholder={"bank_name":"QA", "account_number":"1234", "holder_name":"QA", "note":""}
@@ -486,10 +533,19 @@ def register(router, manager):
             menu=MenuMessage(message,message_id=data.get('bank_menu_id'))
             if index+1<len(fields):
                 await state.update_data(bank_values=values,bank_index=index+1)
-                return await manager.show(menu,"Kirim "+html.escape(LABELS[fields[index+1]])+".")
+                return await manager.form(menu,message.from_user.id,state)
             await manager.preview(menu,message.from_user.id,'edit' if data.get('bank_id') else 'add',data.get('bank_id'),values)
             await state.clear()
         except BankError as exc:
+            if manager.host.is_owner(message.from_user.id) and str(message.chat.type)=='private' and message.chat.id==message.from_user.id:
+                try:
+                    data=await state.get_data()
+                    manager.form_data(data)
+                except BankError:
+                    await state.clear()
+                else:
+                    return await manager.form(MenuMessage(message,message_id=data.get('bank_menu_id')),
+                                              message.from_user.id,state,str(exc))
             await message.answer("⚠️ "+html.escape(str(exc)),parse_mode="HTML")
         except (ValueError,TypeError,KeyError,IndexError,sqlite3.Error):
             await state.clear()

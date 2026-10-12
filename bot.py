@@ -229,7 +229,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "16.93"
+BOT_VERSION = "16.94"
 SCHEMA_VERSION = 192
 
 CHECKOUT_TERMS_SHORT = (
@@ -34683,7 +34683,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.93"
+EXPECTED_SOURCE_VERSION = "16.94"
 
 
 def source_integrity_self_test():
