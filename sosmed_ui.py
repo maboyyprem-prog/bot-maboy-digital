@@ -24,6 +24,7 @@ from otp_smscode import MenuMessage, TEXT_MENU_ACTIONS
 
 PREFIX = "sosmed:"
 PAGE_SIZE = 8
+SERVICE_PAGE_SIZE = core.CATALOG_PAGE_SIZE
 USER_BRAND = "MABOYY SOSMED STORE"
 ADMIN_BRAND = "MABOYY SOSMED ADMIN"
 TERMINAL = {"COMPLETED", "PARTIAL", "CANCELED", "FAILED"}
@@ -286,8 +287,8 @@ class UIBuilder:
                         "Saldo yang sama dipakai untuk belanja, OTP, dan layanan sosmed. "
                         "Isi Saldo menggunakan pembayaran bot yang sudah tersedia.", keyboard)
 
-    def pages(self, user, action, payload, page, total):
-        count = max(1, math.ceil(total/PAGE_SIZE))
+    def pages(self, user, action, payload, page, total, page_size=PAGE_SIZE):
+        count = max(1, math.ceil(total/page_size))
         rows = []
         if page > 0:
             rows.append(("⬅️ Sebelumnya", action, {**payload, "page": page-1}))
@@ -297,7 +298,7 @@ class UIBuilder:
 
     async def categories(self, message, user, payload=None, *, admin=False):
         payload = payload or {}
-        await self.store.catalog.sync()
+        await self.store.catalog.sync(return_rows=False)
         categories = ([row["category"] for row in self.store.repo.all("SELECT DISTINCT category FROM sosmed_services ORDER BY category")]
                       if admin else self.store.catalog.categories())
         page = min(number(payload.get("page", 0), 0, 100000), max(0, math.ceil(len(categories)/PAGE_SIZE)-1))
@@ -315,15 +316,21 @@ class UIBuilder:
                         + ("\nBelum ada kategori tersedia." if not categories else "\nPilih kategori:"), self.keyboard(user, rows))
 
     async def services(self, message, user, payload=None, *, admin=False, favorites=False):
-        payload = payload or {}
-        await self.store.catalog.sync()
+        payload = dict(payload or {})
+        refresh = payload.pop("refresh", False) is True
+        if favorites:
+            payload["view"] = "favorites"
+        else:
+            payload.pop("view", None)
+        await self.store.catalog.sync(force=refresh, return_rows=False)
+        page_size = SERVICE_PAGE_SIZE
         page = number(payload.get("page", 0), 0, 100000)
         category, query = payload.get("category"), payload.get("query", "")
         if favorites:
             all_rows = self.store.repo.favorites(user)
             total = len(all_rows)
-            page = min(page, max(0, math.ceil(total/PAGE_SIZE)-1))
-            services = all_rows[page*PAGE_SIZE:(page+1)*PAGE_SIZE]
+            page = min(page, max(0, math.ceil(total/page_size)-1))
+            services = all_rows[page*page_size:(page+1)*page_size]
         elif admin:
             terms, parameters = [], []
             if category:
@@ -334,16 +341,19 @@ class UIBuilder:
                 parameters.extend([str(query)[:200]]*2)
             where = " WHERE "+" AND ".join(terms) if terms else ""
             total = self.store.repo.one("SELECT COUNT(*) n FROM sosmed_services"+where, parameters)["n"]
-            page = min(page, max(0, math.ceil(total/PAGE_SIZE)-1))
+            page = min(page, max(0, math.ceil(total/page_size)-1))
             services = self.store.repo.all("SELECT * FROM sosmed_services"+where+" ORDER BY category,provider_service_id LIMIT ? OFFSET ?",
-                                           (*parameters, PAGE_SIZE, page*PAGE_SIZE))
+                                           (*parameters, page_size, page*page_size))
         else:
-            services, total = self.store.catalog.listing(category=category, query=query, page=page, filters=payload.get("filters"))
-            if total and page*PAGE_SIZE >= total:
-                page = (total-1)//PAGE_SIZE
-                services, total = self.store.catalog.listing(category=category, query=query, page=page, filters=payload.get("filters"))
+            services, total = self.store.catalog.listing(category=category, query=query, page=page, filters=payload.get("filters"), page_size=page_size)
+            if total and page*page_size >= total:
+                page = (total-1)//page_size
+                services, total = self.store.catalog.listing(category=category, query=query, page=page, filters=payload.get("filters"), page_size=page_size)
+            elif not total:
+                page = 0
+        payload["page"] = page
         rows, lines = [], []
-        for service in services:
+        for index, service in enumerate(services, page*page_size+1):
             sid = service["provider_service_id"]
             try:
                 cost, sale = self.store.pricing.rate(service)
@@ -351,25 +361,26 @@ class UIBuilder:
                 price = f"Modal {core.money(cost)} • Jual {core.money(sale)} / {unit}" if admin else f"{core.money(sale)} / {unit}"
             except core.StoreError:
                 price = "Harga belum tersedia"
-            name = self.provider_label(service["name"])[:180] if admin else self.public_label(service["name"], 180)
-            lines.append(f"<b>#{esc(sid)} {esc(name, 220)}</b>\n{esc(price, 120)}\n"
-                         f"Min {esc(service['min_quantity'])} • Max {esc(service['max_quantity'])}"
-                         + (" • Refill" if service.get("refill_supported") and (admin or self.store.config.refill_verified) else "")
+            name = self.provider_label(service["name"])[:80] if admin else self.public_label(service["name"], 80)
+            lines.append(f"<b>{index}. #{esc(sid)} {esc(name, 180)}</b>\n{esc(price, 120)}"
                          + (" • OFF" if admin and not service.get("enabled") else ""))
-            rows.append([(f"#{sid} {name}"[:60], "admin_detail" if admin else "detail", {"id": sid, "back": payload})])
+            rows.append([(f"{index}. {name}"[:60], "admin_detail" if admin else "detail", {"id": sid, "back": payload})])
         action = "admin_services" if admin else "favorites" if favorites else "services"
-        rows += self.pages(user, action, payload, page, total)
+        rows += self.pages(user, action, payload, page, total, page_size)
+        rows.append([("🔄 Refresh Layanan", action, {**payload, "refresh": True})])
         if not admin:
             rows.append([("🔎 Cari / Filter", "search", {"category": category})])
         rows.append([("⬅️ Kembali", "admin_menu" if admin else "home" if favorites else "categories", {})])
         title = "📋 HARGA MODAL & JUAL" if admin else "⭐ FAVORIT SAYA" if favorites else "📱 PILIH LAYANAN"
         caption = "" if not category else "\n"+esc(self.provider_label(category)[:180] if admin else self.public_label(category, 180))
-        await self.send(message, f"<b>{title}</b>{caption}\nHalaman {page+1}/{max(1, math.ceil(total/PAGE_SIZE))} • {total} layanan\n\n"
+        stamp = self.store.repo.one("SELECT MAX(last_synced_at) stamp FROM sosmed_services")
+        await self.send(message, f"<b>{title}</b>{caption}\nHalaman {page+1}/{max(1, math.ceil(total/page_size))} • {total} layanan\n"
+                        f"Diperbarui: {instant(stamp['stamp'] if stamp else 0)}\nPilih layanan untuk detail dan input.\n\n"
                         + ("\n\n".join(lines) if lines else "Belum ada layanan sesuai pilihan."), self.keyboard(user, rows))
 
-    async def detail(self, message, user, service_id, back=None, *, admin=False):
-        await self.store.catalog.sync()
-        service = self.store.catalog.service(service_id, active=not admin)
+    async def detail(self, message, user, service_id, back=None, *, admin=False, refresh=False):
+        await self.store.catalog.sync(force=refresh, return_rows=False)
+        service = self.store.catalog.service(service_id, active=not admin and not refresh)
         name = self.provider_label(service["name"])[:220] if admin else self.public_label(service["name"], 220)
         category = self.provider_label(service["category"])[:180] if admin else self.public_label(service["category"], 180)
         description = service.get("description") or "Deskripsi rinci belum tersedia."
@@ -384,6 +395,7 @@ class UIBuilder:
                 f"<b>{esc(name, 600)}</b>\n\n📌 {esc(description, 1000)}\n\n"
                 f"Tipe: {esc(UserFormatter.kind(service['type']) if not admin else self.provider_label(service['type']))}\n"
                 f"Min: {esc(service['min_quantity'])} • Max: {esc(service['max_quantity'])}\n"
+                f"Status: {'Tersedia' if service.get('enabled') else 'Tidak tersedia'}\n"
                 f"💰 Harga jual / {unit}: <b>{core.money(sale) if price_ready else 'Belum tersedia'}</b>\n"
                 "Total sesuai jumlah ditampilkan sebelum pembayaran.\n"
                 f"🔄 Refill: {'Tersedia sesuai ketentuan layanan' if service.get('refill_supported') and getattr(self.store.config, 'refill_verified', False) else 'Belum tersedia di toko'}\n"
@@ -406,7 +418,9 @@ class UIBuilder:
             else:
                 text += "\n\nPembelian layanan ini belum tersedia di toko."
             rows.append([("⭐ Tambah / Hapus Favorit", "favorite", {"id": service_id, "back": back or {}})])
-        rows.append([("⬅️ Kembali", "admin_services" if admin else "services", back or {}),
+        rows.append([("🔄 Refresh Layanan", "admin_detail" if admin else "detail", {"id": service_id, "back": back or {}, "refresh": True})])
+        back_action = "admin_services" if admin else "favorites" if (back or {}).get("view") == "favorites" else "services"
+        rows.append([("⬅️ Kembali", back_action, back or {}),
                      ("🏠 Menu Awal", "admin_menu" if admin else "home", {})])
         await self.send(message, text, self.keyboard(user, rows))
 
@@ -693,8 +707,9 @@ class AdminHandler:
             verification += '; pemeriksaan API belum lulus'
         http = health.get('http_status')
         provider_balance = "Tidak tersedia"
-        if result:
-            profile = result["profile"]
+        profile = result["profile"] if result else (
+            self.store.catalog.last_profile if self.store.catalog.last_profile_fingerprint == self.store.contract_fingerprint() and stage.startswith('services') else None)
+        if profile:
             provider_balance = provider_money(profile["balance"]) if profile["currency"] == "IDR" else esc(profile["balance"])+" "+esc(profile["currency"] or "(mata uang belum dikonfirmasi)")
         text = ("🔌 <b>STATUS INTEGRASI SOSMED</b>\nProvider: BuzzerPanel.id\n\n"
                 f"Konfigurasi: {'Tersedia' if health.get('configured') else 'Belum lengkap'}\n"
@@ -856,7 +871,7 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
     if action in {"services", "favorites"}:
         return await ui.services(message, user, payload, favorites=action == "favorites")
     if action == "detail":
-        return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"))
+        return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"), refresh=payload.get("refresh") is True)
     if action == "favorite":
         store.repo.favorite(user, number(payload["id"], 1))
         return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"))
@@ -968,7 +983,7 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
     if action == "admin_services":
         return await ui.services(message, user, payload, admin=True)
     if action == "admin_detail":
-        return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"), admin=True)
+        return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"), admin=True, refresh=payload.get("refresh") is True)
     if action == 'admin_form':
         return await admin.form(message,user,payload)
     if action == 'admin_form_choose':

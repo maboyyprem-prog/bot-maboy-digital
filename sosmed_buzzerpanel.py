@@ -15,8 +15,10 @@ import os
 import re
 import secrets
 import sqlite3
+import tempfile
 import time
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
@@ -30,6 +32,10 @@ ADMIN_BRAND = "MABOYY SOSMED ADMIN"
 TERMINAL = {"COMPLETED", "PARTIAL", "CANCELED", "FAILED"}
 ACTIVE = {"PENDING", "PROCESSING", "IN_PROGRESS", "UNKNOWN"}
 PAGE_SIZE = 8
+CATALOG_PAGE_SIZE = 6
+API_RESPONSE_BYTES = 8*1024*1024
+CATALOG_RESPONSE_BYTES = 64*1024*1024
+JSON_SPOOL_BYTES = 1024*1024
 MAX_MONEY = 10**12
 
 
@@ -417,6 +423,43 @@ class APIClient:
             return value.strip().casefold() in {'true', '1'}
         return None
 
+    @staticmethod
+    async def response_json(response, wire_action, write, problem):
+        limit = CATALOG_RESPONSE_BYTES if wire_action in {'services', 'services_1', 'services2', 'services3'} else API_RESPONSE_BYTES
+        # Do not retain a list of chunks and another joined copy of a large
+        # catalogue. The temporary file rolls onto disk and is always closed.
+        try:
+            with tempfile.SpooledTemporaryFile(max_size=JSON_SPOOL_BYTES, mode='w+b') as body:
+                size = 0
+                async for part in response.content.iter_chunked(65536):
+                    size += len(part)
+                    if size > limit:
+                        raise problem(f'Respons melebihi batas {limit//(1024*1024)} MiB untuk {wire_action}.')
+                    body.write(part)
+                body.seek(0)
+                if size <= JSON_SPOOL_BYTES:
+                    return json.load(body, parse_float=Decimal)
+                # Large JSON decoding is CPU work; it must not block incoming
+                # Telegram updates. Cancellation waits for the decoder before
+                # its file is closed, and never repeats an HTTP request.
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix='sosmed-json') as executor:
+                    job = executor.submit(json.load, body, parse_float=Decimal)
+                    try:
+                        while not job.done():
+                            await asyncio.sleep(.01)
+                    except asyncio.CancelledError:
+                        # Keep the file alive until its reader exits, including
+                        # shutdown; this executor belongs only to this decode.
+                        while not job.done():
+                            await asyncio.sleep(.01)
+                        raise
+                    return job.result()
+        except (ValueError, UnicodeError):
+            code = 'AUTH' if not write and response.status in {401, 403} else 'PROVIDER'
+            raise problem('Respons bukan JSON. Periksa endpoint, izin API/IP, dan filter akses provider.', code) from None
+        except OSError:
+            raise problem('Penyimpanan sementara respons API tidak dapat dibaca. Periksa ruang penyimpanan server.') from None
+
     async def request(self, action, **parameters):
         if (not self.config.token or not self.config.secret or self.config.error
                 or self.config.url != "https://buzzerpanel.id/api/json.php"):
@@ -477,12 +520,6 @@ class APIClient:
                 def problem(detail, code='PROVIDER', *, retry_after=0):
                     return StoreError(code, uncertain=write, retry_after=retry_after,
                                       detail=f'{wire_action} • HTTP {response.status}: {detail}', stage=wire_action)
-                parts, size = [], 0
-                async for part in response.content.iter_chunked(16384):
-                    size += len(part)
-                    if size > 8*1024*1024:
-                        raise problem('Respons melebihi batas ukuran aman.')
-                    parts.append(part)
                 if response.status == 429:
                     try:
                         delay = min(86400, max(1, int(response.headers.get("Retry-After", "60"))))
@@ -494,11 +531,7 @@ class APIClient:
                     raise problem('Server provider mengalami gangguan. Coba kembali nanti.', 'NETWORK')
                 if 300 <= response.status < 400:
                     raise problem('Endpoint mengalihkan request. Gunakan URL resmi /api/json.php; redirect API tidak diikuti.')
-                try:
-                    envelope = json.loads(b"".join(parts), parse_float=Decimal)
-                except (ValueError, UnicodeError):
-                    code = 'AUTH' if not write and response.status in {401, 403} else 'PROVIDER'
-                    raise problem('Respons bukan JSON. Periksa endpoint, izin API/IP, dan filter akses provider.', code) from None
+                envelope = await self.response_json(response, wire_action, write, problem)
                 if not isinstance(envelope, dict):
                     raise problem('Respons harus berupa objek JSON dengan field status dan data.')
                 if not write and response.status in {401, 403}:
@@ -733,15 +766,26 @@ class CatalogService:
         self.store = store
         self.lock = asyncio.Lock()
         self.last_profile = None
+        self.last_profile_fingerprint = ''
+        self.profile_checked_at = 0
         self.failure_stage = 'profile'
 
-    async def sync(self, force=False):
+    async def sync(self, force=False, return_rows=True):
         async with self.lock:
             synced = self.store.repo.one("SELECT MAX(last_synced_at) AS stamp FROM sosmed_services")
             if not force and synced and synced["stamp"] and time.time()-synced["stamp"]<self.store.settings()["catalog_seconds"]:
-                return self.store.repo.all("SELECT * FROM sosmed_services ORDER BY category,provider_service_id")
+                return self.store.repo.all("SELECT * FROM sosmed_services ORDER BY category,provider_service_id") if return_rows else None
             self.failure_stage = 'profile'
+            self.last_profile = None
+            self.last_profile_fingerprint = ''
+            self.profile_checked_at = 0
+            profile_fingerprint = self.store.contract_fingerprint()
             balance = await self.store.provider_balance()
+            if profile_fingerprint != self.store.contract_fingerprint():
+                raise StoreError('CONFIG', 'Konfigurasi berubah selama pemeriksaan profil. Periksa kembali.', stage='profile')
+            self.last_profile = balance
+            self.last_profile_fingerprint = profile_fingerprint
+            self.profile_checked_at = time.time()
             currency = balance["currency"]
             self.failure_stage = 'services'
             rows = await self.store.api.request("services")
@@ -810,13 +854,14 @@ class CatalogService:
                 for meta in conn.execute("SELECT * FROM sosmed_metadata").fetchall():
                     conn.execute("UPDATE sosmed_services SET description=?,metadata_source=? WHERE provider_service_id=?", (meta["description"], meta["source"], meta["service_id"]))
             self.last_profile = balance
-            return self.store.repo.all("SELECT * FROM sosmed_services ORDER BY category,provider_service_id")
+            return self.store.repo.all("SELECT * FROM sosmed_services ORDER BY category,provider_service_id") if return_rows else None
 
     def categories(self):
         return [r["category"] for r in self.store.repo.all("SELECT DISTINCT category FROM sosmed_services WHERE enabled=1 ORDER BY category")]
 
-    def listing(self, category=None, query="", page=0, filters=None):
+    def listing(self, category=None, query="", page=0, filters=None, page_size=PAGE_SIZE):
         page = number(page, 0, 100000)
+        page_size = number(page_size, 1, 50)
         filters = dict(filters or {})
         aliases = {"min_quantity": "min", "max_quantity": "max", "max_price_idr": "price"}
         for original, alias in aliases.items():
@@ -845,7 +890,13 @@ class CatalogService:
         if "max" in filters:
             terms.append("max_quantity>=?")
             args.append(number(filters["max"], 1))
-        rows = self.store.repo.all("SELECT * FROM sosmed_services WHERE "+" AND ".join(terms)+" ORDER BY category,provider_service_id", args)
+        where = " WHERE "+" AND ".join(terms)
+        if "price" not in filters:
+            total = self.store.repo.one("SELECT COUNT(*) n FROM sosmed_services"+where, args)["n"]
+            rows = self.store.repo.all("SELECT * FROM sosmed_services"+where+" ORDER BY category,provider_service_id LIMIT ? OFFSET ?",
+                                       (*args, page_size, page*page_size))
+            return rows, total
+        rows = self.store.repo.all("SELECT * FROM sosmed_services"+where+" ORDER BY category,provider_service_id", args)
         if "price" in filters:
             cap = number(filters["price"], 1)
             priced = []
@@ -859,7 +910,7 @@ class CatalogService:
                 if sale<=cap:
                     priced.append(row)
             rows = priced
-        return rows[page*PAGE_SIZE:(page+1)*PAGE_SIZE], len(rows)
+        return rows[page*page_size:(page+1)*page_size], len(rows)
 
     def service(self, ident, active=True):
         row = self.store.repo.one("SELECT * FROM sosmed_services WHERE provider_service_id=?"+(" AND enabled=1" if active else ""), (number(ident, 1),))
@@ -868,7 +919,7 @@ class CatalogService:
         return row
 
     async def live(self, ident):
-        await self.sync(force=True)
+        await self.sync(force=True, return_rows=False)
         return self.service(ident)
 
     def metadata(self, actor, ident, text, source):
@@ -1749,7 +1800,7 @@ class Store:
         await self.orders.poll_once()
         if self.settings()["enabled"] and self.config.token:
             try:
-                await self.catalog.sync()
+                await self.catalog.sync(return_rows=False)
             except StoreError:
                 pass
 

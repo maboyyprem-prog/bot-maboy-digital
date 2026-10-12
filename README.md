@@ -1,4 +1,4 @@
-# MaboyyDigital v16.96
+# MaboyyDigital v16.97
 
 Paket ringkas: **13 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -39,6 +39,9 @@ untuk memeriksa koneksi, lalu **Periksa & Buka Toko** untuk mengaktifkan toko.
 Tombol berubah menjadi **Tutup Toko** saat aktif. Bot memeriksa profile/services
 tanpa membuat order. Semua kontrol ini tersedia dalam menu yang sama.
 Status API sekarang memeriksa koneksi saat dibuka, bukan hanya hasil terakhir.
+Katalog besar kini dibaca bertahap melalui file sementara dengan batas khusus
+64 MiB; decode berjalan pada worker. Respons order/profil tetap memakai batas lama.
+Jika katalog gagal, saldo profil yang berhasil dibaca tetap tampil pada owner.
 Status menyebut **Profil/Katalog**, HTTP, dan penyebab yang aman: key ditolak,
 izin IP, format respons, atau field saldo/harga yang perlu diperbaiki.
 Saldo provider membaca `balance`/`saldo`; nilai hilang/bertentangan tidak dianggap nol.
@@ -47,6 +50,11 @@ Katalog standar `id/price/note` tanpa `type` memakai form target + jumlah sesuai
 catatan `note` tampil sebagai panduan username/URL. Layanan khusus yang belum jelas
 bisa diatur owner: Modal & Jual → pilih layanan → **Tipe/Input** → konfirmasi.
 Status `Success` berarti selesai, `Error` berarti gagal; refund tetap perlu bukti.
+Daftar layanan user/owner berisi **6 pilihan per halaman**, dengan Sebelumnya,
+Berikutnya, detail, dan **Refresh Layanan**. Refresh memperbarui harga, min/max,
+catatan dan ketersediaan dari API; katalog juga diperbarui mengikuti TTL existing.
+Harga/min/max tetap diperiksa ulang sebelum pembayaran. Wallet tidak berubah
+karena membuka halaman atau memakai Refresh.
 Verifikasi berhasil tersimpan di database dan bertahan setelah restart;
 `SOSMED_API_CONTRACT_VERIFIED=true` tidak wajib untuk alur tombol ON ini.
 
@@ -74,7 +82,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v16.96 yang lulus 358 tes mock dan 49 pemeriksaan transaksi.
+v16.97 yang lulus 372 tes mock dan 49 pemeriksaan transaksi.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
