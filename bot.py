@@ -229,8 +229,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "16.90"
-SCHEMA_VERSION = 191
+BOT_VERSION = "16.93"
+SCHEMA_VERSION = 192
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -313,6 +313,8 @@ import sosmed_ui
 SOSMED_STORE = sosmed_ui.register(
     router, sosmed_buzzerpanel.Store(_otp_sys.modules[__name__])
 )
+import bank_accounts
+BANK_ACCOUNTS = bank_accounts.register(router, bank_accounts.Manager(_otp_sys.modules[__name__]))
 START_TIME = time.time()
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
@@ -1526,6 +1528,7 @@ def init_db():
 
     otp_smscode.init_schema(conn)
     sosmed_buzzerpanel.init_schema(conn)
+    bank_accounts.init_schema(conn)
     reconcile_all_inventory_stock(conn)
     sync_all_product_sold_from_history(conn)
     conn.commit()
@@ -5611,30 +5614,32 @@ def order_payment_state_ok(order) -> tuple[bool, str]:
 
 
 def bank_transfer_ready() -> bool:
-    return bool(
-        get_setting("bank_name", "").strip()
-        and get_setting("bank_account", "").strip()
-        and get_setting("bank_holder", "").strip()
-    )
+    return bool(BANK_ACCOUNTS.active())
 
 
-def bank_transfer_text() -> str:
-    bank = html.escape(get_setting("bank_name", "-"))
-    account_raw = str(get_setting("bank_account", "-") or "-").strip()
-    account_raw = account_raw.replace("\r", "").replace("\n", "").strip()
-    account = html.escape(account_raw)
-    holder = html.escape(get_setting("bank_holder", "-"))
-
-    return (
-        f"🏦 Bank: <b>{bank}</b>\n"
-        f"👤 Atas Nama: <b>{holder}</b>\n"
-        f"💳 Nomor Rekening: <code>{account}</code>"
-    )
+def bank_transfer_text(*, entity=None, entity_id=None) -> str:
+    if entity is not None:
+        row = BANK_ACCOUNTS.snapshot(entity, entity_id)
+    else:
+        try:
+            row = BANK_ACCOUNTS.account()
+        except bank_accounts.BankError:
+            row = None
+    return bank_accounts.account_text(row)
 
 
-def bank_account_copy_button() -> InlineKeyboardButton:
-    account = str(get_setting("bank_account", "") or "").strip()
+def bank_account_copy_button(*, entity=None, entity_id=None) -> InlineKeyboardButton:
+    if entity is not None:
+        snapshot = BANK_ACCOUNTS.snapshot(entity, entity_id)
+        account = str(snapshot["account_number"] if snapshot else "").strip()
+    else:
+        try:
+            account = str(BANK_ACCOUNTS.account()["account_number"]).strip()
+        except bank_accounts.BankError:
+            account = ""
     account = account.replace("\r", "").replace("\n", "").strip()
+    if not account:
+        return owner_contact_button() or InlineKeyboardButton(text="🏠 Menu Awal", callback_data="home")
     return InlineKeyboardButton(
         text="📋 Salin Nomor Rekening",
         copy_text=CopyTextButton(text=account)
@@ -5644,7 +5649,7 @@ def bank_account_copy_button() -> InlineKeyboardButton:
 def bank_order_pending_keyboard(order_id: int):
     base=transaction_pending_keyboard(order_id, include_proof=True)
     rows=[
-        [bank_account_copy_button()],
+        [bank_account_copy_button(entity="order", entity_id=order_id)],
         *base.inline_keyboard
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -5669,8 +5674,8 @@ def topup_pending_keyboard(topup_id: int, bank: bool = False):
     if expiry and expiry <= datetime.now(timezone.utc):
         return topup_done_keyboard()
     rows = []
-    if bank and bank_transfer_ready():
-        rows.append([bank_account_copy_button()])
+    if bank or str(row["payment_method"] or "") == "BANK_TRANSFER":
+        rows.append([bank_account_copy_button(entity="topup", entity_id=topup_id)])
     if not proof_locked_status(row):
         rows.append([InlineKeyboardButton(text="📤 Kirim Bukti Pembayaran", callback_data=f"proofsubmit:topup:{topup_id}")])
     rows.append([InlineKeyboardButton(text="🔄 Cek Status", callback_data=f"statuscheck:topup:{topup_id}")])
@@ -8579,6 +8584,8 @@ def topup_status_view(row):
         f"📌 Status: <b>{html.escape(status)}</b>\n"
         + topup_expiry_text(row)
     )
+    if str(row["payment_method"] or "") == "BANK_TRANSFER":
+        text += bank_transfer_text(entity="topup",entity_id=entity_id)+"\n"
     if str(row["reject_reason"] or "").strip():
         text += f"Alasan: {html.escape(str(row['reject_reason'])[:300])}\n"
     keyboard = (topup_pending_keyboard(entity_id, bank=str(row["payment_method"] or "") == "BANK_TRANSFER")
@@ -8685,6 +8692,8 @@ def order_detail_text(order) -> str:
         lines.append(f"✅ Selesai: <code>{rating_html_excerpt(completed,70)}</code>")
     if reject_reason:
         lines.append(f"❌ Alasan: <b>{rating_html_excerpt(reject_reason,500)}</b>")
+    if str(order["payment_method"] or "") == "BANK_TRANSFER":
+        lines.append(bank_transfer_text(entity="order",entity_id=order["id"]))
     lines += ["", f"<i>{rating_html_excerpt(STORE_FOOTER,200)}</i>"]
     return "\n".join(lines)
 
@@ -8753,6 +8762,9 @@ def order_detail_keyboard(order, *, include_history: bool = True):
     payment_status=str(order["payment_status"] or "")
     proof_used=proof_locked_status(order)
     reviewed=order_has_review(int(order["id"]))
+
+    if str(order["payment_method"] or "") == "BANK_TRANSFER" and payment_status == "unpaid" and status == "pending":
+        rows.append([bank_account_copy_button(entity="order",entity_id=order["id"])])
 
     if status=="completed" and order["fulfillment_status"]=="delivered":
         if not reviewed and str(order["payment_method"] or "")!="OWNER_FREE":
@@ -8929,7 +8941,13 @@ def owner_payment_proof_keyboard(entity: str, entity_id: int):
 
 
 def payment_proof_caption(entity: str, row) -> str:
+    bank_tail = ""
+    if row["payment_method"] == "BANK_TRANSFER":
+        snapshot = BANK_ACCOUNTS.snapshot(entity, row["id"])
+        if snapshot:
+            bank_tail = "\n\nTujuan transfer: " + bank_accounts.fragment(snapshot["bank_name"],70) + "\n<code>" + bank_accounts.fragment(snapshot["account_number"],100) + "</code>\na.n. " + bank_accounts.fragment(snapshot["holder_name"],100)
     if entity == "order":
+        proof_note = bank_accounts.fragment(row["note"] or "-",260) if bank_tail else html.escape(row["note"] or "-")
         return (
             "🧾 <b>BUKTI PEMBAYARAN ORDER</b>\n\n"
             f"Invoice: <b>{invoice(row['id'])}</b>\n"
@@ -8937,9 +8955,9 @@ def payment_proof_caption(entity: str, row) -> str:
             f"Metode: <b>{html.escape(payment_method_label(row['payment_method']))}</b>\n"
             f"Total: <b>{rupiah(row['payment_total'] or row['total'])}</b>\n"
             f"Kode unik: <b>+{int(row['unique_code'] or 0)}</b>\n"
-            f"Catatan: <b>{html.escape(row['note'] or '-')}</b>\n\n"
+            f"Catatan: <b>{proof_note}</b>\n\n"
             "Periksa bukti sebelum konfirmasi."
-        )
+        ) + bank_tail
 
     return (
         "💰 <b>BUKTI PEMBAYARAN TOP UP</b>\n\n"
@@ -8952,7 +8970,7 @@ def payment_proof_caption(entity: str, row) -> str:
         "Periksa bukti sebelum konfirmasi.\n"
         "Nominal bukti harus sesuai Total transfer, termasuk kode unik. "
         "Jika berbeda, gunakan Kirim Catatan untuk memberi tahu user."
-    )
+    ) + bank_tail
 
 
 def get_min_topup() -> int:
@@ -9036,6 +9054,7 @@ PROJECT_BACKUP_REQUIRED_FILES = (
     "otp_smscode.py",
     "sosmed_buzzerpanel.py",
     "sosmed_ui.py",
+    "bank_accounts.py",
 )
 
 PROJECT_BACKUP_OPTIONAL_FILES = (
@@ -10557,7 +10576,7 @@ class CommandKeyboardMiddleware(BaseMiddleware):
                     r"am_mail_[1-9][0-9]{0,9}",str(command.args or "").strip())):
                 return await handler(CommandMenuMessage.wrap(event),data)
         elif isinstance(event,CallbackQuery) and (str(event.data or "").startswith(
-                (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,"owner:","tools:","utools:","toolsaccess","tm:"))
+                (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,bank_accounts.PREFIX,"owner:","tools:","utools:","toolsaccess","tm:"))
                 or getattr(getattr(data.get("handler"),"callback",None),"__name__","").startswith(
                     ("owner_","user_tools_"))):
             main_menu=False
@@ -12161,18 +12180,7 @@ def owner_wallet_menu():
 
 
 def bank_settings_menu():
-    ready = bank_transfer_ready()
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🏦 Nama Bank", callback_data="owner:bank_name")
-    kb.button(text="💳 No. Rekening", callback_data="owner:bank_account")
-    kb.button(text="👤 Atas Nama", callback_data="owner:bank_holder")
-    kb.button(
-        text=("✅ Status: AKTIF" if ready else "⚠️ Status: BELUM LENGKAP"),
-        callback_data="owner:bank_preview"
-    )
-    kb.button(text="⬅️ Kembali", callback_data="owner:qris_settings")
-    kb.adjust(2, 1, 1, 1)
-    return kb.as_markup()
+    return BANK_ACCOUNTS.menu()
 
 
 
@@ -12796,6 +12804,7 @@ def shopping_navigation_states() -> set:
     return {
         otp_smscode.OTPState.topup_amount.state, otp_smscode.OTPState.topup_proof.state,
         *(item.state for item in sosmed_ui.SosmedOrderState.__all_states__),
+        *(item.state for item in bank_accounts.BankState.__all_states__),
         CheckoutState.waiting_note.state, CheckoutState.waiting_voucher.state,
         CheckoutState.waiting_payment_proof.state, CheckoutState.waiting_family_gmail.state,
         ReviewState.waiting_comment.state, LoginProofState.waiting_photo.state,
@@ -12820,7 +12829,7 @@ async def shopping_navigation_exit(user_id: int, state: FSMContext = None):
     if current is not None:
         data = await state.get_data()
         # Tools credentials and unrelated metadata remain available when returning.
-        prefixes = ("checkout_", "proof_", "review_", "login_proof_", "user_complaint_", "family_", "bundle_")
+        prefixes = ("checkout_", "proof_", "review_", "login_proof_", "user_complaint_", "family_", "bundle_", "bank_")
         retained = {key: value for key, value in data.items() if not str(key).startswith(prefixes)}
         await state.set_data(retained)
         await state.set_state(None)
@@ -21977,7 +21986,7 @@ async def checkout_voucher_input(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("processbank:"))
-async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
+async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext, bank_account_id=None):
     numbers = callback_positive_numbers(call.data, "processbank", 2)
     if not numbers:
         return await safe_callback_notice(call, "Variasi atau jumlah tidak valid.", show_alert=True)
@@ -21999,6 +22008,10 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             "Transfer rekening belum dikonfigurasi owner.",
             show_alert=True
         )
+
+    if bank_account_id is None and len(BANK_ACCOUNTS.active()) > 1:
+        await BANK_ACCOUNTS.choices(call, {"flow":"order", "variant_id":variant_id, "qty":requested_qty}, state)
+        return await safe_callback_notice(call)
 
     async with purchase_lock(call.from_user.id):
 
@@ -22023,6 +22036,12 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
 
         conn = db()
         begin_immediate_retry(conn)
+
+        try:
+            selected_bank = BANK_ACCOUNTS.account(bank_account_id, conn=conn)
+        except bank_accounts.BankError as exc:
+            conn.rollback(); conn.close()
+            return await safe_callback_notice(call, str(exc), show_alert=True)
 
         duplicate = checkout_duplicate_order(
             conn, call.from_user.id, variant_id, requested_qty, "BANK_TRANSFER"
@@ -22120,6 +22139,13 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         )
         order_id = cur.lastrowid
 
+        try:
+            BANK_ACCOUNTS.capture(conn, "order", order_id, selected_bank["id"])
+        except (bank_accounts.BankError, sqlite3.Error):
+            conn.rollback(); conn.close()
+            logging.warning("Bank invoice snapshot failed; order creation rolled back.")
+            return await safe_callback_notice(call,"Invoice belum dapat dibuat dengan aman. Coba kembali; saldo tetap aman.",show_alert=True)
+
         if not verify_saved_payment_method(conn, order_id, "BANK_TRANSFER"):
             conn.rollback()
             conn.close()
@@ -22159,7 +22185,7 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             f"🔢 Kode unik: <b>+{unique_code}</b>\n"
             f"💵 <b>TOTAL TRANSFER: {rupiah(payment_total)}</b>\n"
             f"{note_text}\n"
-            + bank_transfer_text()
+            + bank_transfer_text(entity="order", entity_id=order_id)
             + f"\n\n{expiry_text}"
               f"⏳ Stok direservasi selama <b>{ORDER_RESERVATION_MINUTES} menit</b>.\n"
               "⚠️ Transfer harus sesuai total hingga kode unik.\n"
@@ -23512,18 +23538,21 @@ def manual_topup_callback_amount(data, method):
     return parse_manual_topup_amount(parts[2])
 
 
-def create_or_reuse_manual_topup(user_id, username, amount, method):
+def create_or_reuse_manual_topup(user_id, username, amount, method, bank_account_id=None):
     """Keep one active invoice for the same user, amount and payment method."""
     conn = None
     try:
         conn = db()
         conn.execute("BEGIN IMMEDIATE")
+        selected_bank = BANK_ACCOUNTS.account(bank_account_id, conn=conn) if method=="BANK_TRANSFER" else None
         recent = conn.execute(
             """SELECT * FROM topups
                WHERE user_id=? AND amount=? AND payment_method=? AND status='pending'
                  AND NOT EXISTS (SELECT 1 FROM otp_payments p WHERE p.topup_id=topups.id)
+                 AND (? IS NULL OR EXISTS(SELECT 1 FROM bank_invoice_snapshots s
+                     WHERE s.entity='topup' AND s.entity_id=topups.id AND s.bank_id=?))
                ORDER BY id DESC LIMIT 1""",
-            (user_id, amount, method)
+            (user_id, amount, method, selected_bank["id"] if selected_bank else None, selected_bank["id"] if selected_bank else None)
         ).fetchone()
         if recent:
             expiry = parse_stored_datetime(recent["expires_at"])
@@ -23547,6 +23576,8 @@ def create_or_reuse_manual_topup(user_id, username, amount, method):
             (user_id, username or "", amount, unique_code, amount + unique_code,
              method, datetime.now().isoformat(timespec="seconds"), topup_expiry_iso())
         )
+        if selected_bank:
+            BANK_ACCOUNTS.capture(conn, "topup", cur.lastrowid, selected_bank["id"])
         saved = conn.execute("SELECT * FROM topups WHERE id=?", (cur.lastrowid,)).fetchone()
         conn.commit()
         return saved, True
@@ -23575,7 +23606,7 @@ def manual_topup_invoice_text(topup, *, bank=False):
         f"{topup_expiry_text(topup)}\n"
     )
     if bank:
-        text += bank_transfer_text() + "\n\n⚠️ Transfer sesuai nominal hingga kode unik.\n"
+        text += bank_transfer_text(entity="topup", entity_id=topup["id"]) + "\n\n⚠️ Transfer sesuai nominal hingga kode unik.\n"
     else:
         note = str(get_setting("payment_note", DEFAULT_PAYMENT_NOTE) or "").strip()
         note = note[:240]
@@ -23599,7 +23630,8 @@ async def notify_manual_topup_created(call, topup, *, bank=False):
             f"👤 {html.escape(user)}\n"
             f"💰 Saldo: <b>{rupiah(topup['amount'])}</b>\n"
             f"🔢 Kode unik: <b>+{topup['unique_code']}</b>\n"
-            f"💳 Transfer: <b>{rupiah(topup['payment_total'])}</b>",
+            f"💳 Transfer: <b>{rupiah(topup['payment_total'])}</b>"
+            + ("\n\n"+bank_transfer_text(entity="topup",entity_id=topup["id"]) if bank else ""),
             parse_mode="HTML"
         )
     except Exception:
@@ -23687,7 +23719,7 @@ async def wallet_topup_method_qris(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("topupmethod:bank:"))
-async def wallet_topup_method_bank(call: CallbackQuery):
+async def wallet_topup_method_bank(call: CallbackQuery, bank_account_id=None):
     if safe_mode_enabled() and not is_owner(call.from_user.id):
         return await safe_callback_notice(
             call, "Sistem sedang Safe Mode. Pembayaran sementara ditahan.", show_alert=True
@@ -23702,6 +23734,9 @@ async def wallet_topup_method_bank(call: CallbackQuery):
         return await safe_callback_notice(
             call, "Transfer rekening belum dikonfigurasi owner.", show_alert=True
         )
+    if bank_account_id is None and len(BANK_ACCOUNTS.active()) > 1:
+        await BANK_ACCOUNTS.choices(call, {"flow":"topup", "amount":amount})
+        return await safe_callback_notice(call)
     try:
         rate_ok, retry_after = persistent_rate_limit(
             call.from_user.id, "topup_payment", limit=4, window_seconds=60
@@ -23712,7 +23747,7 @@ async def wallet_topup_method_bank(call: CallbackQuery):
                 show_alert=True
             )
         topup, created = create_or_reuse_manual_topup(
-            call.from_user.id, call.from_user.username, amount, "BANK_TRANSFER"
+            call.from_user.id, call.from_user.username, amount, "BANK_TRANSFER", bank_account_id
         )
     except Exception as exc:
         logging.warning("Manual bank topup invoice unavailable (%s)", type(exc).__name__)
@@ -24126,15 +24161,7 @@ async def owner_bank_settings(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
     await state.clear()
-    status = "AKTIF" if bank_transfer_ready() else "BELUM LENGKAP"
-    await safe_edit_or_answer(
-        call,
-        "🏦 <b>PENGATURAN REKENING TRANSFER</b>\n\n"
-        f"Status: <b>{status}</b>\n\n"
-        + bank_transfer_text(),
-        reply_markup=bank_settings_menu(),
-        parse_mode="HTML"
-    )
+    await BANK_ACCOUNTS.show(call)
     await call.answer()
 
 
@@ -24142,75 +24169,73 @@ async def owner_bank_settings(call: CallbackQuery, state: FSMContext):
 async def owner_bank_name(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
-    await state.set_state(OwnerState.set_bank_name)
-    await safe_edit_or_answer(call, 
-        "🏦 Kirim nama bank.\nContoh: <code>BCA</code>",
-        reply_markup=back_owner(),
-        parse_mode="HTML"
-    )
-    await call.answer()
-
+    try:
+        row = BANK_ACCOUNTS.account(active=False)
+        await BANK_ACCOUNTS.start_edit(call,call.from_user.id,state,row["id"],"bank_name")
+    except bank_accounts.BankError:
+        await BANK_ACCOUNTS.start_edit(call,call.from_user.id,state)
+    await safe_callback_notice(call)
 
 @router.message(OwnerState.set_bank_name)
 async def owner_bank_name_input(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
-    value = (message.text or "").strip()
-    if not value:
-        return await message.answer("❌ Nama bank tidak boleh kosong.")
-    set_setting("bank_name", value[:60])
-    await state.clear()
-    await message.answer("✅ Nama bank disimpan.", reply_markup=bank_settings_menu())
-
+    try:
+        row = BANK_ACCOUNTS.account(active=False)
+        values = {key:row[key] for key in bank_accounts.FIELDS}
+        values["bank_name"] = (message.text or "").strip()
+        await BANK_ACCOUNTS.preview(message,message.from_user.id,"edit",row["id"],values)
+        await state.clear()
+    except bank_accounts.BankError:
+        await BANK_ACCOUNTS.start_edit(message,message.from_user.id,state)
 
 @router.callback_query(F.data == "owner:bank_account")
 async def owner_bank_account(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
-    await state.set_state(OwnerState.set_bank_account)
-    await safe_edit_or_answer(call, 
-        "💳 Kirim nomor rekening.\nContoh: <code>1234567890</code>",
-        reply_markup=back_owner(),
-        parse_mode="HTML"
-    )
-    await call.answer()
-
+    try:
+        row = BANK_ACCOUNTS.account(active=False)
+        await BANK_ACCOUNTS.start_edit(call,call.from_user.id,state,row["id"],"account_number")
+    except bank_accounts.BankError:
+        await BANK_ACCOUNTS.start_edit(call,call.from_user.id,state)
+    await safe_callback_notice(call)
 
 @router.message(OwnerState.set_bank_account)
 async def owner_bank_account_input(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
-    value = (message.text or "").strip().replace(" ", "")
-    if not value or len(value) > 40:
-        return await message.answer("❌ Nomor rekening tidak valid.")
-    set_setting("bank_account", value)
-    await state.clear()
-    await message.answer("✅ Nomor rekening disimpan.", reply_markup=bank_settings_menu())
-
+    try:
+        row = BANK_ACCOUNTS.account(active=False)
+        values = {key:row[key] for key in bank_accounts.FIELDS}
+        values["account_number"] = (message.text or "").strip()
+        await BANK_ACCOUNTS.preview(message,message.from_user.id,"edit",row["id"],values)
+        await state.clear()
+    except bank_accounts.BankError:
+        await BANK_ACCOUNTS.start_edit(message,message.from_user.id,state)
 
 @router.callback_query(F.data == "owner:bank_holder")
 async def owner_bank_holder(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
-    await state.set_state(OwnerState.set_bank_holder)
-    await safe_edit_or_answer(call, 
-        "👤 Kirim nama pemilik rekening.",
-        reply_markup=back_owner()
-    )
-    await call.answer()
-
+    try:
+        row = BANK_ACCOUNTS.account(active=False)
+        await BANK_ACCOUNTS.start_edit(call,call.from_user.id,state,row["id"],"holder_name")
+    except bank_accounts.BankError:
+        await BANK_ACCOUNTS.start_edit(call,call.from_user.id,state)
+    await safe_callback_notice(call)
 
 @router.message(OwnerState.set_bank_holder)
 async def owner_bank_holder_input(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
-    value = (message.text or "").strip()
-    if not value:
-        return await message.answer("❌ Nama pemilik rekening tidak boleh kosong.")
-    set_setting("bank_holder", value[:100])
-    await state.clear()
-    await message.answer("✅ Atas nama rekening disimpan.", reply_markup=bank_settings_menu())
-
+    try:
+        row = BANK_ACCOUNTS.account(active=False)
+        values = {key:row[key] for key in bank_accounts.FIELDS}
+        values["holder_name"] = (message.text or "").strip()
+        await BANK_ACCOUNTS.preview(message,message.from_user.id,"edit",row["id"],values)
+        await state.clear()
+    except bank_accounts.BankError:
+        await BANK_ACCOUNTS.start_edit(message,message.from_user.id,state)
 
 @router.callback_query(F.data == "owner:bank_preview")
 async def owner_bank_preview(call: CallbackQuery):
@@ -34658,7 +34683,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.90"
+EXPECTED_SOURCE_VERSION = "16.93"
 
 
 def source_integrity_self_test():

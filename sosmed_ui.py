@@ -269,8 +269,8 @@ class UIBuilder:
         status = "Aktif" if settings["enabled"] else "Ditutup owner"
         note = ("Ketersediaan diperiksa saat memilih layanan." if settings["enabled"] else
                 "Pembelian baru ditutup. Pesanan lama tetap dapat dicek.")
-        if settings["enabled"] and (self.store.config.error or not self.store.config.token
-                                    or not getattr(self.store.config, "contract_verified", False)):
+        if settings["enabled"] and not self.store.purchase_contract_verified():
+            status = "Pengaturan belum lengkap"
             note = "Pembelian belum tersedia. Owner perlu melengkapi pengaturan toko."
         await self.send(message, f"🛍️ <b>{USER_BRAND}</b>\n🏠 <b>Menu Awal</b>\n"
                         f"👤 Akun: {esc(identity)}\n💰 Saldo: <b>{core.money(self.store.balance(user))}</b>\n"
@@ -397,7 +397,7 @@ class UIBuilder:
             rows.append([("📝 Metadata", "admin_input", {"kind": "metadata", "id": service_id})])
         else:
             if (price_ready and service.get("order_supported", False) and core.FormAdapter.supported(service) and service.get("enabled", True)
-                    and getattr(self.store.config, "contract_verified", False)):
+                    and self.store.purchase_contract_verified()):
                 rows.append([("🛒 PESAN SEKARANG", "buy", {"id": service_id, "drip": False})])
                 if service.get("dripfeed_supported"):
                     rows.append([("⏱️ PESAN DRIP-FEED", "buy", {"id": service_id, "drip": True})])
@@ -543,6 +543,8 @@ class AdminHandler:
                 [("📦 Semua Order", "admin_orders", {}), ("⏳ Rekonsiliasi", "admin_pending", {})],
                 [("↩️ Refund Pending", "admin_refunds", {}), ("🔌 Status API", "admin_status", {})],
                 [("🔄 Sync Katalog", "admin_sync", {}), ("⚙️ Pengaturan", "admin_settings", {})],
+                [("🔴 Tutup Toko" if settings["enabled"] else "🟢 Periksa & Buka Toko", "admin_toggle",
+                  {"enabled": not bool(settings["enabled"]), "back": "admin_menu"})],
                 [("🛍️ Menu Pembeli", "home", {})]]
         await self.ui.send(message, text, self.ui.keyboard(user, rows, bot_home=True))
 
@@ -608,11 +610,13 @@ class AdminHandler:
                 f"Toko: {'ON' if settings['enabled'] else 'OFF'}\n"
                 f"Limit order aktif: {esc(settings['max_active'])}/user\n"
                 f"Limit jumlah: {esc(settings['max_quantity'])}\nPolling: {esc(settings['poll_seconds'])} detik\n\n"
-                f"Kontrak API akun: {'Terverifikasi oleh operator' if getattr(self.store.config, 'contract_verified', False) else 'Belum diverifikasi'}\n"
+                f"Pembelian: {'Terverifikasi' if self.store.purchase_contract_verified() else 'Perlu pemeriksaan'}\n"
                 f"Refill API: {'Terverifikasi' if getattr(self.store.config, 'refill_verified', False) else 'Belum diverifikasi'} • "
                 "Cancel API: Tidak didokumentasikan; dinonaktifkan\n\n"
+                "Buka Toko memeriksa profil, katalog, mata uang, dan harga tanpa membeli layanan. "
+                "Hasil pemeriksaan tersimpan; flag verifikasi manual tidak wajib.\n"
                 "Mematikan toko hanya menghentikan pembelian baru. Pesanan lama tetap dipantau.")
-        rows = [[("🔴 Tutup Toko" if settings["enabled"] else "🟢 Buka Toko", "admin_toggle", {"enabled": not bool(settings["enabled"])})],
+        rows = [[("🔴 Tutup Toko" if settings["enabled"] else "🟢 Periksa & Buka Toko", "admin_toggle", {"enabled": not bool(settings["enabled"])})],
                 [("📦 Limit Order", "admin_input", {"setting": "max_active"}),
                  ("🔢 Limit Jumlah", "admin_input", {"setting": "max_quantity"})],
                 [("⏱️ Polling", "admin_input", {"setting": "poll_seconds"}),
@@ -622,18 +626,39 @@ class AdminHandler:
 
     async def health(self, message, user):
         self.authorize(user)
+        issues, result = [], None
+        try:
+            # A status button must perform a real read-only check, rather than
+            # displaying an uninitialized last_ok value forever.
+            result = await self.store.check_provider(user)
+            issues.extend(self.store.catalogue_issues(result["services"], result["profile"]))
+        except core.StoreError as exc:
+            issues.append(exc.public)
         health = self.store.health()
+        verified = health.get("contract_verified", False)
+        if not verified:
+            issues.append("Tekan tombol Periksa & Buka Toko untuk memverifikasi pembelian")
+        if not self.store.settings()["enabled"]:
+            issues.append("Pembelian baru masih OFF")
+        if issues:
+            explanation = "\n".join("• "+esc(item) for item in issues)
+        else:
+            explanation = "✅ Pemeriksaan berhasil. Toko siap menerima konfirmasi pembelian."
+        current_status = "Terhubung" if result else "Pemeriksaan belum berhasil"
         text = ("🔌 <b>STATUS INTEGRASI SOSMED</b>\nProvider: BuzzerPanel.id\n\n"
                 f"Konfigurasi: {'Tersedia' if health.get('configured') else 'Belum lengkap'}\n"
-                f"API terakhir: {'Terhubung' if health.get('connected') else 'Belum tersedia'}\n"
+                f"API: {current_status}\n"
                 f"Diperiksa: {instant(health.get('checked_at'))}\n"
                 f"Sync katalog: {instant(health.get('catalog_synced_at'))}\n"
                 f"Kode gangguan: {esc(health.get('error') or '-')}\n\n"
-                f"Kontrak pembelian akun: {'Terverifikasi oleh operator' if getattr(self.store.config, 'contract_verified', False) else 'Belum diverifikasi'}\n"
-                "Pembelian, refill, dan cancel membutuhkan pemeriksaan dokumentasi API akun. "
-                "Mengaktifkan toko tidak melewati pemeriksaan tersebut.\n\n"
+                f"Verifikasi pembelian: {'Tersimpan / operator' if verified else 'Belum selesai'}\n"
+                f"{explanation}\n\n"
+                "Refill memerlukan verifikasi terpisah; cancel belum didokumentasikan.\n"
                 "Timeout pembelian tidak dikirim ulang otomatis. Periksa menu Rekonsiliasi untuk transaksi yang belum pasti.")
-        await self.ui.send(message, text, self.ui.navigation(user, "admin_menu", admin=True))
+        keyboard = self.ui.navigation(user, "admin_menu", admin=True)
+        if not verified or not self.store.settings()["enabled"]:
+            keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="🟢 Periksa & Buka Toko", callback_data=self.store.token(user, "admin_toggle", {"enabled": True, "back": "admin_menu"}))])
+        await self.ui.send(message, text, keyboard)
 
     async def pending(self, message, user, payload=None, *, refunds=False):
         self.authorize(user)
@@ -716,7 +741,10 @@ class AdminHandler:
             await self.ui.send(message, f"✅ Sinkronisasi selesai: {len(services)} layanan dari API.", self.ui.navigation(user, "admin_menu", admin=True))
             return
         if name in {"on", "off"}:
-            self.store.set_setting("enabled", name == "on", user)
+            if name == "on":
+                await self.store.enable_from_provider(user)
+            else:
+                self.store.set_setting("enabled", False, user)
             return await self.settings(message, user)
         if name == "rugi" and len(args) == 2 and args[1].lower() in {"on", "off"}:
             self.store.set_setting("allow_loss", args[1].lower() == "on", user)
@@ -876,7 +904,12 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
     if action == "admin_toggle":
         if type(payload.get("enabled")) is not bool:
             raise core.StoreError("INPUT", "Pengaturan toko tidak valid.")
-        store.set_setting("enabled", payload["enabled"], user)
+        if payload["enabled"]:
+            await store.enable_from_provider(user)
+        else:
+            store.set_setting("enabled", False, user)
+        if payload.get("back") == "admin_menu":
+            return await admin.dashboard(message, user)
         return await admin.settings(message, user)
     if action in {"admin_category_toggle", "admin_service_toggle"}:
         store.catalog.toggle(user, "category" if action == "admin_category_toggle" else "service",
@@ -956,6 +989,9 @@ def register(router, store):
                 raise core.StoreError("INPUT", "Command terlalu panjang.")
             await store.host.shopping_navigation_exit(user, state)
             await state.clear()
+            if not args and store.owner(user):
+                admin_context = True
+                return await admin.dashboard(message, user)
             if args and args[0].lower() == "admin":
                 admin_context = True
                 return await admin.command(message, user, args[1:])

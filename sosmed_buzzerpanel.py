@@ -88,7 +88,8 @@ class StoreError(Exception):
             "NOT_FOUND": "Layanan atau pesanan tidak ditemukan.",
             "FORBIDDEN": "Menu ini hanya untuk owner.",
             "TOKEN": "Tombol sudah kedaluwarsa. Buka /sosmed lagi.",
-            "CONFIG": "Toko belum siap menerima pembelian. Hubungi owner.",
+            "CONFIG": "Pengaturan pembelian belum lengkap. Hubungi owner.",
+            "AUTH": "Koneksi toko belum dapat diautentikasi. Hubungi owner.",
             "CLOSED": "Pembelian baru sedang ditutup oleh owner.",
             "USER_BALANCE": "Saldo kamu tidak cukup. Isi saldo melalui /start → Isi Saldo.",
             "CURRENCY": "Mata uang layanan belum didukung. Pembelian dihentikan sementara.",
@@ -135,25 +136,37 @@ class Config:
     @classmethod
     def environment(cls):
         c = cls()
+        variable = "BUZZERPANEL_CURRENCY"
         try:
             c.token = os.getenv("BUZZERPANEL_API_KEY", "").strip()
             c.secret = os.getenv("BUZZERPANEL_SECRET_KEY", "").strip()
             c.currency = os.getenv("BUZZERPANEL_CURRENCY", "").strip().upper()
+            if c.currency not in {"", "IDR"}:
+                raise ValueError
+            variable = "SOSMED_RATE_UNIT"
             c.rate_unit = os.getenv("SOSMED_RATE_UNIT", "").strip()
-            if c.currency not in {"", "IDR"} or c.rate_unit not in {"", "1000"}:
-                raise ValueError("Currency/rate unit belum didukung")
+            if c.rate_unit not in {"", "1000"}:
+                raise ValueError
+            variable = "BUZZERPANEL_API_URL"
             c.url = os.getenv("BUZZERPANEL_API_URL", c.url).strip().rstrip("/")
             if c.url != "https://buzzerpanel.id/api/json.php":
                 raise ValueError("BUZZERPANEL_API_URL harus endpoint HTTPS resmi /api/json.php")
-            c.enabled = os.getenv("SOSMED_ENABLED", "false").lower() in {"1", "true", "yes"}
-            for field, env in (("contract_verified", "SOSMED_API_CONTRACT_VERIFIED"),
+            for field, env in (("enabled", "SOSMED_ENABLED"),
+                               ("contract_verified", "SOSMED_API_CONTRACT_VERIFIED"),
                                ("refill_verified", "SOSMED_REFILL_API_VERIFIED"),
                                ("cancel_verified", "SOSMED_CANCEL_API_VERIFIED")):
-                setattr(c, field, os.getenv(env, "false").lower() in {"1", "true", "yes"})
-            c.mode = os.getenv("SOSMED_MARKUP_MODE", "percent").lower()
-            c.percent = str(decimal(os.getenv("SOSMED_MARKUP_PERCENT", "25"), 0, 10000))
+                variable = env
+                value = os.getenv(env, "false").strip().lower()
+                if value not in {"0", "1", "false", "true", "no", "yes"}:
+                    raise ValueError
+                setattr(c, field, value in {"1", "true", "yes"})
+            variable = "SOSMED_MARKUP_MODE"
+            c.mode = os.getenv(variable, "percent").strip().lower()
+            c.mode = {"persen": "percent", "nominal": "fixed", "kombinasi": "combined"}.get(c.mode, c.mode)
             if c.mode not in {"percent", "fixed", "combined"}:
-                raise ValueError("Mode markup tidak valid")
+                raise ValueError
+            variable = "SOSMED_MARKUP_PERCENT"
+            c.percent = str(decimal(os.getenv("SOSMED_MARKUP_PERCENT", "25"), 0, 10000))
             for field, env, low, high in (
                 ("fixed", "SOSMED_MARKUP_NOMINAL_IDR", 0, MAX_MONEY),
                 ("rounding", "SOSMED_PRICE_ROUNDING_IDR", 0, 1000),
@@ -165,11 +178,13 @@ class Config:
                 ("max_active", "SOSMED_MAX_ACTIVE_ORDERS_PER_USER", 1, 50),
                 ("max_quantity", "SOSMED_MAX_QUANTITY", 1, 1000000000),
             ):
+                variable = env
                 setattr(c, field, number(os.getenv(env, str(getattr(c, field))), low, high))
+            variable = "SOSMED_PRICE_ROUNDING_IDR"
             if c.rounding not in {0, 100, 500, 1000}:
                 raise ValueError("Pembulatan harus 0, 100, 500 atau 1000")
         except (ValueError, StoreError):
-            c.error, c.enabled = "Konfigurasi SOSMED tidak valid", False
+            c.error, c.enabled = f"{variable} tidak valid", False
         return c
 
 
@@ -344,6 +359,7 @@ class APIClient:
     def __init__(self, config):
         self.config = config
         self.session = None
+        self.contract_validator = None
         self.checked_at, self.last_ok, self.error, self.cooldown_until = 0, False, "", 0
 
     async def request(self, action, **parameters):
@@ -359,7 +375,9 @@ class APIClient:
             raise StoreError("INPUT")
         wire_action = {"balance": "profile", "add": "order", "refill_status": "status_refill"}.get(action, action)
         write = wire_action in {"order", "refill"}
-        if write and not self.config.contract_verified:
+        verified = (self.contract_validator() if self.contract_validator is not None
+                    else self.config.contract_verified)
+        if write and not verified:
             raise StoreError("CONFIG")
         if wire_action=="refill" and not self.config.refill_verified:
             raise StoreError("REFILL")
@@ -412,6 +430,8 @@ class APIClient:
                     raise StoreError("RATE_LIMIT", uncertain=write, retry_after=delay)
                 if response.status >= 500:
                     raise StoreError("NETWORK", uncertain=write)
+                if not write and response.status in {401, 403}:
+                    raise StoreError("AUTH")
                 try:
                     envelope = json.loads(b"".join(parts), parse_float=Decimal)
                 except (ValueError, UnicodeError):
@@ -423,6 +443,14 @@ class APIClient:
                     # request. No paid-order rejection semantics were supplied;
                     # never infer that an unsuccessful order envelope proves
                     # that the provider did not create/charge the order.
+                    if not write:
+                        error_data = envelope.get("data")
+                        hint = error_data.get("msg", "") if isinstance(error_data, dict) else ""
+                        if isinstance(hint, str):
+                            hint = hint.lower()
+                            if (any(word in hint for word in ("api key", "secret key", "api_key", "secret_key"))
+                                    and any(word in hint for word in ("salah", "invalid", "wrong", "tidak valid"))):
+                                raise StoreError("AUTH")
                     raise StoreError("PROVIDER", uncertain=write)
                 data = envelope.get("data")
                 if wire_action in {"order", "refill"}:
@@ -575,6 +603,7 @@ class CatalogService:
     def __init__(self, store):
         self.store = store
         self.lock = asyncio.Lock()
+        self.last_profile = None
 
     async def sync(self, force=False):
         async with self.lock:
@@ -634,6 +663,7 @@ class CatalogService:
                         conn.execute(f"UPDATE sosmed_services SET enabled=0 WHERE {field}=?", (setting["scope_key"],))
                 for meta in conn.execute("SELECT * FROM sosmed_metadata").fetchall():
                     conn.execute("UPDATE sosmed_services SET description=?,metadata_source=? WHERE provider_service_id=?", (meta["description"], meta["source"], meta["service_id"]))
+            self.last_profile = balance
             return self.store.repo.all("SELECT * FROM sosmed_services ORDER BY category,provider_service_id")
 
     def categories(self):
@@ -1052,7 +1082,7 @@ class OrderService:
 
     async def refill(self, user, order_id):
         row = await self.refresh(user, order_id)
-        if not self.store.config.contract_verified or not self.store.config.refill_verified or not row["refill_supported"] or row["status"]!="COMPLETED":
+        if not self.store.purchase_contract_verified() or not self.store.config.refill_verified or not row["refill_supported"] or row["status"]!="COMPLETED":
             raise StoreError("REFILL")
         self.store.repo.rate(user, "refill", 3, 3600)
         now = time.time()
@@ -1140,6 +1170,7 @@ class Store:
         self.host, self.config = host, config or Config.environment()
         self.repo = Repository(host)
         self.api = APIClient(self.config)
+        self.api.contract_validator = self.purchase_contract_verified
         self.catalog, self.pricing = CatalogService(self), PricingService(self)
         self.purchase, self.orders = PurchaseService(self), OrderService(self)
         self._tasks, self._bot, self._owner_token = [], None, secrets.token_hex(12)
@@ -1151,6 +1182,112 @@ class Store:
     def require_owner(self, user):
         if not self.owner(user):
             raise StoreError("FORBIDDEN")
+
+    def configuration_issues(self):
+        issues = [self.config.error] if self.config.error else []
+        if self.config.url != "https://buzzerpanel.id/api/json.php":
+            issues.append("BUZZERPANEL_API_URL harus https://buzzerpanel.id/api/json.php")
+        for key, value in (("BUZZERPANEL_API_KEY", self.config.token),
+                           ("BUZZERPANEL_SECRET_KEY", self.config.secret)):
+            if not value:
+                issues.append(f"{key} belum diisi")
+        return issues
+
+    def contract_fingerprint(self):
+        # Store only a digest, never credentials. A different account, endpoint,
+        # currency or unit must be checked again before accepting purchases.
+        return hashlib.sha256(encoded({"url": self.config.url, "key": self.config.token,
+            "secret": self.config.secret, "currency": self.config.currency,
+            "unit": self.config.rate_unit, "contract": "json.php-order-v1"}).encode()).hexdigest()
+
+    def purchase_contract_verified(self):
+        if self.configuration_issues():
+            return False
+        if self.config.contract_verified:
+            return True
+        try:
+            row = self.repo.one("SELECT value FROM sosmed_settings WHERE key='verified_purchase_contract'")
+            proof = json.loads(row["value"]) if row else {}
+            return (isinstance(proof, dict) and proof.get("verified") is True
+                    and proof.get("fingerprint") == self.contract_fingerprint())
+        except (sqlite3.OperationalError, ValueError, TypeError):
+            return False
+
+    async def check_provider(self, actor):
+        self.require_owner(actor)
+        issues = self.configuration_issues()
+        if issues:
+            raise StoreError("CONFIG", "Lengkapi Railway Variables: "+"; ".join(issues)+". Redeploy setelah memperbaiki variabel.")
+        fingerprint = self.contract_fingerprint()
+        try:
+            rows = await self.catalog.sync(force=True)
+        except StoreError as exc:
+            if exc.code == "AUTH":
+                raise StoreError("AUTH", "API menolak autentikasi. Periksa BUZZERPANEL_API_KEY dan BUZZERPANEL_SECRET_KEY pada akun yang sama, serta izin IP API bila digunakan.") from None
+            if exc.code in {"INPUT", "PROVIDER"}:
+                raise StoreError("PROVIDER", "Profil atau katalog API belum dapat dibaca. Periksa respons sukses profile/services dan konfigurasi akun; harga dan saldo tidak diasumsikan.") from None
+            raise
+        self.require_owner(actor)
+        if fingerprint != self.contract_fingerprint():
+            raise StoreError("CONFIG", "Konfigurasi berubah selama pemeriksaan. Periksa koneksi kembali.")
+        return {"profile": self.catalog.last_profile, "services": rows, "fingerprint": fingerprint}
+
+    def catalogue_issues(self, rows=None, profile=None):
+        rows = rows if rows is not None else self.repo.all("SELECT * FROM sosmed_services")
+        profile = profile if profile is not None else self.catalog.last_profile
+        issues = []
+        if profile is not None and profile.get("currency") != "IDR":
+            if profile.get("currency"):
+                issues.append("Mata uang profil bukan IDR; konversi belum didukung")
+            else:
+                issues.append("API profile tidak menyebut mata uang. Jika akun sudah dikonfirmasi IDR, isi BUZZERPANEL_CURRENCY=IDR lalu redeploy")
+        if not rows:
+            issues.append("Katalog belum berisi layanan; periksa Status API / Sync Katalog")
+        elif not any(row["enabled"] and row["order_supported"] for row in rows):
+            if not any(row["enabled"] for row in rows):
+                issues.append("Semua layanan/kategori ditutup atau tidak aktif")
+            if any(row["enabled"] and not row["rate_unit"] for row in rows):
+                issues.append("API tidak menyebut satuan rate. Jika tarif sudah dikonfirmasi per 1.000, isi SOSMED_RATE_UNIT=1000 lalu redeploy")
+            if not any(row["currency"] == "IDR" for row in rows):
+                issues.append("Mata uang layanan IDR belum dikonfirmasi")
+            if not any(FormAdapter.supported(row) for row in rows):
+                issues.append("Tipe/form layanan belum didukung oleh kontrak order bot")
+            if not issues:
+                issues.append("Belum ada layanan dengan mata uang, satuan harga, dan form yang didukung")
+        return issues
+
+    async def enable_from_provider(self, actor):
+        """Owner's ON action checks only profile/catalog; it never buys an order."""
+        result = await self.check_provider(actor)
+        issues = self.catalogue_issues(result["services"], result["profile"])
+        if issues:
+            raise StoreError("CONFIG", "Toko belum dibuka: "+"; ".join(issues)+".")
+        eligible = [row for row in result["services"] if row["enabled"] and row["order_supported"]]
+        usable = False
+        for row in eligible:
+            try:
+                if row["min_quantity"] <= self.settings()["max_quantity"]:
+                    self.pricing.calculate(row, row["min_quantity"])
+                    usable = True
+                    break
+            except StoreError:
+                continue
+        if not usable:
+            raise StoreError("CONFIG", "Toko belum dibuka: periksa harga jual, markup, dan batas jumlah; belum ada layanan yang dapat dijual.")
+        self.require_owner(actor)
+        now = time.time()
+        proof = {"verified": True, "fingerprint": result["fingerprint"], "actor": actor,
+                 "checked_at": now, "currency": "IDR", "contract": "json.php-order-v1"}
+        with self.repo.connection(True) as conn:
+            self.require_owner(actor)
+            if self.configuration_issues() or result["fingerprint"] != self.contract_fingerprint():
+                raise StoreError("CONFIG", "Konfigurasi berubah. Periksa koneksi kembali.")
+            # Verification and ON survive restart together, without wallet writes.
+            conn.execute("INSERT OR REPLACE INTO sosmed_settings VALUES(?,?,?)", ("verified_purchase_contract", encoded(proof), now))
+            conn.execute("INSERT OR REPLACE INTO sosmed_settings VALUES(?,?,?)", ("enabled", "true", now))
+            conn.execute("INSERT INTO sosmed_audit(actor,action,payload,created_at) VALUES(?,?,?,?)",
+                         (actor, "verified_enable", encoded({"services": len(eligible), "currency": "IDR"}), now))
+        return result
 
     def settings(self):
         c = self.config
@@ -1174,7 +1311,7 @@ class Store:
         if key in {"enabled", "allow_loss"}:
             if type(value) is not bool:
                 raise StoreError("INPUT")
-            if key=="enabled" and value and (self.config.error or not self.config.token or not self.config.secret or not self.config.contract_verified):
+            if key=="enabled" and value and not self.purchase_contract_verified():
                 raise StoreError("CONFIG")
         elif key=="mode":
             value = {"persen": "percent", "nominal": "fixed", "kombinasi": "combined"}.get(value, value)
@@ -1214,7 +1351,7 @@ class Store:
 
     def purchase_guard(self, user):
         number(user, 1)
-        if self.config.error or not self.config.token or not self.config.secret or not self.config.contract_verified:
+        if not self.purchase_contract_verified():
             raise StoreError("CONFIG")
         if not self.settings()["enabled"]:
             raise StoreError("CLOSED")
@@ -1228,8 +1365,9 @@ class Store:
         row = self.repo.one("SELECT MAX(last_synced_at) AS stamp FROM sosmed_services")
         return {"connected": bool(getattr(self.api, "last_ok", False)),
                 "checked_at": getattr(self.api, "checked_at", 0), "error": getattr(self.api, "error", ""),
-                "configured": bool(self.config.token and self.config.secret and not self.config.error),
-                "contract_verified": bool(self.config.contract_verified),
+                "configured": not bool(self.configuration_issues()),
+                "configuration_issues": self.configuration_issues(),
+                "contract_verified": self.purchase_contract_verified(),
                 "refill_verified": bool(self.config.refill_verified),
                 "cancel_verified": False,
                 "cancel_supported": False,
