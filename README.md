@@ -1,4 +1,4 @@
-# MaboyyDigital v17.02
+# MaboyyDigital v17.03
 
 Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -16,6 +16,13 @@ Hentikan poller lama sebelum menggunakan token yang sama pada Railway baru.
 `/sosmed` membuka panel owner untuk owner dan toko pembeli untuk user.
 Owner bisa memilih **Menu Pembeli** untuk belanja memakai wallet pribadinya.
 Saldo user dipakai bersama oleh toko, OTP, dan Sosmed.
+
+Pembelian baru **/otp dan /sosmed hanya memakai saldo bot**. OTP memakai
+**Buy Saldo**, Sosmed memakai **Bayar Saldo**. Jika saldo kurang, pilih
+**Isi Saldo** melalui alur deposit existing, lalu pilih layanan kembali.
+QRIS/payment gateway tetap tersedia untuk isi saldo dan checkout produk existing.
+Invoice QRIS OTP yang sudah dibuat sebelum pembaruan tetap direkonsiliasi dengan
+aturan lama; tombol QRIS lama tidak bisa membuat invoice pembelian baru.
 
 ## Harga dan layanan Sosmed
 
@@ -130,7 +137,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.02; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.03; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.

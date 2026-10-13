@@ -697,7 +697,7 @@ class PurchaseService:
 
 
 class PaymentService:
-    """Bind existing QRIS verification to a durable OTP quote and wallet hold."""
+    """Reconcile pre-update QRIS invoices; new OTP purchases use the wallet."""
 
     def __init__(self, store):
         self.store = store
@@ -719,77 +719,16 @@ class PaymentService:
             raise StoreError("PAYMENT_UNAVAILABLE", "Pembayaran sementara ditahan. Coba kembali nanti.")
 
     async def create(self, user, quote_id):
+        # Keep the old entry point to reject previously rendered pay_qris
+        # callbacks server-side. Legacy settlement/status/worker paths remain
+        # intact so already-issued invoices and paid funds are not orphaned.
         self.require_checkout(user)
         quote = self.store.repo.one("SELECT * FROM otp_quotes WHERE quote_id=? AND buyer_user_id=?", (quote_id, user))
         if not quote:
             raise StoreError("NOT_FOUND")
-        existing = self.store.repo.one("SELECT * FROM otp_payments WHERE quote_id=? AND user_id=?", (quote_id, user))
-        if existing:
-            return existing
-        if quote["status"] != "OPEN" or quote["expires_at"] <= time.time():
+        if quote["status"] == "OPEN" and quote["expires_at"] <= time.time():
             raise StoreError("QUOTE_EXPIRED")
-        await self.store.purchase.revalidate(user, quote)
-        amount = integer(quote["selling_price_idr"], 1)
-        auto = self.store.host.shopeepay_ready()
-        if not auto and not self.store.host.get_setting("qris_file_id", ""):
-            raise StoreError("PAYMENT_UNAVAILABLE", "QRIS belum tersedia. Gunakan Buy Saldo atau hubungi owner.")
-        payment_id, reference, now = secrets.token_urlsafe(18), "OTP-"+secrets.token_hex(12), time.time()
-        with self.store.repo.connection(True) as conn:
-            previous = conn.execute("SELECT * FROM otp_payments WHERE quote_id=?", (quote_id,)).fetchone()
-            if previous:
-                return dict(previous)
-            live = conn.execute("SELECT * FROM otp_quotes WHERE quote_id=? AND buyer_user_id=?", (quote_id, user)).fetchone()
-            if not live or live["status"] != "OPEN" or live["expires_at"] <= now:
-                raise StoreError("QUOTE_EXPIRED")
-            settings = self.store.settings(conn)
-            if not settings["enabled"]:
-                raise StoreError("DISABLED")
-            active = conn.execute("SELECT count(*) FROM otp_orders WHERE buyer_user_id=? AND status IN ('ACTIVE','OTP_RECEIVED')", (user,)).fetchone()[0]
-            attempts = conn.execute("SELECT count(*) FROM otp_purchase_attempts WHERE user_id=? AND state IN ('RESERVED','REQUESTING','PENDING_RECONCILIATION')", (user,)).fetchone()[0]
-            waiting = conn.execute("SELECT count(*) FROM otp_payments WHERE user_id=? AND state IN ('CREATING','CREATE_UNKNOWN','PENDING','PAID')", (user,)).fetchone()[0]
-            if active+attempts+waiting >= settings["max_active"]:
-                raise StoreError("ORDER_LIMIT")
-            topup_id, total, expires = None, amount, now+900
-            if not auto:
-                code = self.store.host.unique_code_for_order(conn)
-                profile = conn.execute("SELECT username FROM verified_users WHERE user_id=?", (user,)).fetchone()
-                expiry = self.store.host.topup_expiry_iso()
-                topup = conn.execute("""INSERT INTO topups(user_id,username,amount,unique_code,payment_total,
-                    payment_method,status,created_at,expires_at) VALUES(?,?,?,?,?,'QRIS_MANUAL','pending',?,?)""",
-                    (user, profile["username"] if profile else "", amount, code, amount+code,
-                     datetime.now().isoformat(timespec='seconds'), expiry))
-                topup_id, total = topup.lastrowid, amount+code
-                expires = self.store.host.parse_stored_datetime(expiry).timestamp()
-                reference = self.store.host.topup_invoice(topup_id)
-            conn.execute("""INSERT INTO otp_payments(payment_id,quote_id,user_id,method,state,amount_idr,payment_total_idr,
-                topup_id,partner_reference,created_at,expires_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (payment_id, quote_id, user, "AUTO_QRIS" if auto else "QRIS_MANUAL", "CREATING" if auto else "PENDING",
-                 amount, total, topup_id, reference, now, expires, now))
-            conn.execute("UPDATE otp_quotes SET status='PAYMENT_PENDING' WHERE quote_id=?", (quote_id,))
-        if auto:
-            try:
-                result = await self.store.host.shopeepay_generate_qr(0, amount, partner_reference=reference)
-                if not isinstance(result, dict) or result.get("partner_reference") != reference:
-                    raise StoreError("INVALID_RESPONSE", uncertain=True)
-                url = str(result.get("qr_url") or "")
-                content = result.get("qr_content") or ""
-                if url and (urlparse(url).scheme != "https" or not urlparse(url).netloc):
-                    raise StoreError("INVALID_RESPONSE", uncertain=True)
-                if not isinstance(content, str) or len(content.encode()) > 2048 or not (url or content):
-                    raise StoreError("INVALID_RESPONSE", uncertain=True)
-                encrypted = self.store.encrypt({"qr_content": content}) if content else ""
-                # Commit only the original request's result; a callback can have
-                # settled the payment while the generate response was in flight.
-                self.store.repo.execute("UPDATE otp_payments SET qr_url=?,qr_payload=?,state=CASE WHEN state='CREATING' THEN 'PENDING' ELSE state END,updated_at=? WHERE payment_id=?",
-                    (url, encrypted, time.time(), payment_id))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # The gateway has no verified idempotent retry adapter here.
-                # Never create a second invoice after a timeout/lost response.
-                self.store.repo.execute("UPDATE otp_payments SET state='CREATE_UNKNOWN',error_code=?,updated_at=? WHERE payment_id=? AND state='CREATING'",
-                    (type(exc).__name__, time.time(), payment_id))
-        return self.owned(user, payment_id)
+        raise StoreError("WALLET_ONLY", "Pembelian OTP memakai saldo bot. Pilih Buy Saldo atau Isi Saldo.")
 
     def settle(self, conn, payment, *, already_credited=False):
         if payment["paid_at"] is not None:
@@ -1500,7 +1439,8 @@ class UserFormatter:
             "RETENTION": "SMS sudah melewati masa penyimpanan.",
             "PAYMENT_PENDING": "QRIS untuk pembelian ini sudah dibuat. Periksa invoice di Pesanan Saya sebelum memilih pembayaran lain.",
             "PAYMENT_PAID": "Pembayaran sudah diterima atau sedang diproses. Periksa Pesanan Saya; jangan membayar ulang.",
-            "PAYMENT_UNAVAILABLE": "QRIS belum tersedia atau pembayaran sementara ditahan. Gunakan Buy Saldo atau hubungi owner.",
+            "PAYMENT_UNAVAILABLE": "Pembayaran saldo sementara ditahan. Coba kembali nanti atau hubungi owner.",
+            "WALLET_ONLY": "Pembelian OTP memakai saldo bot. Pilih Buy Saldo atau Isi Saldo, lalu pilih nomor kembali.",
         }.get(getattr(exc, "code", ""), "Layanan OTP mengalami gangguan sementara. Coba kembali nanti.")
 
 
@@ -1962,17 +1902,16 @@ class UIBuilder:
     async def quote(self, message, user, quote):
         product = json.loads(quote["product"])
         balance = self.store.host.get_balance(user)
-        after = ("Saldo setelah Buy Saldo: "+money(balance-quote["selling_price_idr"]) if balance >= quote["selling_price_idr"]
-                 else "Saldo belum cukup untuk Buy Saldo. Kamu dapat memilih Buy Now (QRIS).")
+        after = ("Saldo setelah beli: "+money(balance-quote["selling_price_idr"]) if balance >= quote["selling_price_idr"]
+                 else "Saldo belum cukup. Pilih Isi Saldo, lalu pilih nomor kembali.")
         await self.send(message, "🛒 <b>KONFIRMASI "+("REAKTIVASI" if quote["parent_order_id"] else "PEMBELIAN")+"</b>\n\n"
             f"🌍 Negara: {escape(UserFormatter.label(product['country_name']))}\n📱 Layanan: {escape(UserFormatter.label(product['platform_name']))}\n"
             f"📶 Operator: {escape(UserFormatter.label(product.get('operator_name') or 'Any'))}\n"
             f"💰 Harga: <b>{money(quote['selling_price_idr'])}</b>\n💳 Saldo: {money(balance)}\n"
             f"{after}\n"
-            f"⏳ Harga berlaku {self.store.config.quote_ttl} detik sebelum memilih pembayaran.\n"
-            "Pilih metode pembayaran. Refund yang terkonfirmasi masuk ke saldo bot.",
-            self.keyboard(user, [[("⚡ BUY NOW (QRIS)", "pay_qris", {"quote": quote["quote_id"]})],
-                                 [("💰 BUY SALDO", "buy", {"quote": quote["quote_id"]})],
+            f"⏳ Harga berlaku {self.store.config.quote_ttl} detik sebelum konfirmasi.\n"
+            "Pembayaran memakai saldo bot. Refund yang terkonfirmasi masuk ke saldo bot.",
+            self.keyboard(user, [[("💰 BUY SALDO", "buy", {"quote": quote["quote_id"]})],
                                  [("➕ Isi Saldo", "topup", {})],
                                  [("⬅️ Kembali", "products", {"country": product['country_id'], "platform": product['platform_id'],
                                      "country_name": product['country_name'], "platform_name": product['platform_name'],
@@ -2110,8 +2049,8 @@ class UIBuilder:
 
 HELP = (f"🛍️ <b>{USER_BRAND}</b>\n❓ CARA BELI OTP\n\n"
         "1. Pilih negara, layanan, dan nomor.\n"
-        "2. Pilih <b>Buy Now (QRIS)</b> atau <b>Buy Saldo</b>.\n"
-        "3. Nomor dikirim setelah pembayaran terkonfirmasi.\n"
+        "2. Isi Saldo jika belum cukup, lalu pilih <b>Buy Saldo</b>.\n"
+        "3. Saldo ditagihkan setelah nomor terkonfirmasi dan nomor dikirim.\n"
         "4. SMS dan kode OTP masuk otomatis ke chat ini.\n\n"
         "Cek, resend, selesai, dan batal tersedia di Pesanan Saya sesuai status nomor. "
         "Refund yang terkonfirmasi masuk ke saldo bot. Buka /otp untuk kembali.")

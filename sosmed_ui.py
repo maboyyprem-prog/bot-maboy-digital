@@ -478,8 +478,8 @@ class UIBuilder:
         text += (f"\n💰 Harga: <b>{core.money(sale)}</b>\n💳 Saldo: {core.money(balance)}\n"
                  f"Sisa saldo: {core.money(balance-sale) if balance >= sale else 'Saldo belum cukup'}\n"
                  f"⏳ Konfirmasi hingga: {instant(quote['expires_at'])}\n\n"
-                 "Periksa target dan input. Pesanan mengikuti ketentuan layanan.")
-        rows = [[("✅ BAYAR & ORDER", "pay", {"quote": quote["quote_id"]})],
+                 "Pembayaran memakai saldo bot. Periksa target dan input sebelum konfirmasi.")
+        rows = [[("✅ BAYAR SALDO", "pay", {"quote": quote["quote_id"]})],
                 [("✏️ Ubah Input", "buy", {"id": service["provider_service_id"], "drip": bool(parameters.get("runs"))}),
                  ("❌ Batal", "detail", {"id": service["provider_service_id"]})]]
         if balance < sale:
