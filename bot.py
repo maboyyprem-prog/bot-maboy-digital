@@ -229,8 +229,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "16.98"
-SCHEMA_VERSION = 192
+BOT_VERSION = "17.00"
+SCHEMA_VERSION = 193
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -315,6 +315,8 @@ SOSMED_STORE = sosmed_ui.register(
 )
 import bank_accounts
 BANK_ACCOUNTS = bank_accounts.register(router, bank_accounts.Manager(_otp_sys.modules[__name__]))
+import payment_receipts
+PAYMENT_RECEIPTS = payment_receipts.ReceiptService(_otp_sys.modules[__name__])
 START_TIME = time.time()
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
@@ -1529,6 +1531,7 @@ def init_db():
     otp_smscode.init_schema(conn)
     sosmed_buzzerpanel.init_schema(conn)
     bank_accounts.init_schema(conn)
+    payment_receipts.init_schema(conn)
     reconcile_all_inventory_stock(conn)
     sync_all_product_sold_from_history(conn)
     conn.commit()
@@ -2506,9 +2509,9 @@ def business_report(conn):
     ).fetchone()["n"] or 0)
 
     return {
-        "today": revenue("substr(completed_at,1,10)=?", (today,)),
-        "week": revenue("substr(completed_at,1,10)>=?", (week_start,)),
-        "month": revenue("substr(completed_at,1,7)=?", (month,)),
+        "today": revenue("date(completed_at,'+7 hours')=?", (today,)),
+        "week": revenue("date(completed_at,'+7 hours')>=?", (week_start,)),
+        "month": revenue("substr(datetime(completed_at,'+7 hours'),1,7)=?", (month,)),
         "total": total_rev,
         "customers": int(conn.execute(
             """SELECT COUNT(DISTINCT user_id) AS n FROM orders
@@ -2796,47 +2799,8 @@ async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_
     )
     conn.commit(); conn.close()
 
-    # Invoice is best-effort and never controls account fulfillment success.
-    conn=db()
-    fresh=conn.execute("SELECT invoice_sent FROM orders WHERE id=?",(order_id,)).fetchone()
-    conn.close()
-    if fresh and int(fresh["invoice_sent"] or 0)==0:
-        temp_paths=[]
-        invoice_ok=False
-        try:
-            temp_paths=create_success_invoice_images(order_id,delivery_text)
-            if temp_paths:
-                await bot.send_photo(
-                    user_id,
-                    FSInputFile(str(temp_paths[0])),
-                    caption=(
-                        "✅ <b>PEMBAYARAN BERHASIL</b>\n"
-                        f"🧾 Invoice: <b>{invoice(order_id)}</b>"
-                    ),
-                    parse_mode="HTML"
-                )
-                invoice_ok=True
-            else:
-                await bot.send_message(
-                    user_id,
-                    professional_invoice_for_order(order_id)
-                    + "\n\n✅ <b>Pembayaran berhasil.</b>",
-                    parse_mode="HTML"
-                )
-                invoice_ok=True
-        except Exception as exc:
-            logging.exception("Invoice send failed order %s: %s",order_id,exc)
-        finally:
-            for path in temp_paths:
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-
-        if invoice_ok:
-            conn=db()
-            conn.execute("UPDATE orders SET invoice_sent=1 WHERE id=?",(order_id,))
-            conn.commit(); conn.close()
+    # The shared photo outbox owns delivery and restart-safe retry.
+    await payment_receipts.notify(_otp_sys.modules[__name__], bot, "order", order_id)
 
     # Footer is cosmetic but tracked too, so retry does not duplicate it.
     conn=db()
@@ -3285,6 +3249,7 @@ async def prepare_preorder_paid_order(order_id: int, bot: Bot) -> bool:
 
 
 async def fulfill_order(order_id: int, bot: Bot) -> bool:
+    payment_receipts.queue(_otp_sys.modules[__name__], "order", order_id)
     """
     Safe fulfillment:
     1) allocate exact credentials to the order
@@ -3963,15 +3928,7 @@ def parse_stored_datetime(value):
 
 
 def format_wib_datetime(value, *, seconds: bool = False, compact: bool = False) -> str:
-    dt=parse_stored_datetime(value)
-    if not dt:
-        return "-" if value in (None,"","-") else str(value)
-    local=dt.astimezone(DISPLAY_TIMEZONE)
-    if compact:
-        fmt="%d/%m/%Y • %H:%M:%S WIB" if seconds else "%d/%m/%Y • %H:%M WIB"
-    else:
-        fmt="%d-%m-%Y %H:%M:%S WIB" if seconds else "%d-%m-%Y %H:%M WIB"
-    return local.strftime(fmt)
+    return payment_receipts.format_wib(value, seconds=seconds, compact=compact)
 
 
 def format_expiry_time(value: str) -> str:
@@ -4998,131 +4955,17 @@ def draw_wrapped(draw, text: str, xy, font, fill, max_width: int, line_gap: int 
 
 
 def create_success_invoice_images(order_id: int, delivery_text: str):
-    if not PIL_AVAILABLE:
-        raise RuntimeError("Pillow belum terpasang; gunakan fallback invoice teks.")
-
-    """
-    Invoice image only.
-    Account credentials are intentionally NOT rendered into the image.
-    """
-    bundle = order_bundle(order_id)
-    if not bundle:
-        raise ValueError("Order tidak ditemukan.")
-
-    order = bundle["order"]
-    product = bundle["product"]
-    variant = bundle["variant"]
-
-    product_name = product["name"] if product else "-"
-    variant_name = variant["name"] if variant else "-"
-    qty = int(order["qty"] or 0)
-    subtotal = int(order["total"] or 0)
-    discount = int(order["discount_amount"] or 0)
-    payment_total = int(order["payment_total"] or max(0, subtotal - discount))
-    note_text = (order["note"] or "").strip() or "-"
-    payment_method = order["payment_method"] or "-"
-    date_text = invoice_success_datetime(order)
-    voucher_code = (order["voucher_code"] or "").strip()
-
-    dummy = Image.new("RGB", (10, 10), "white")
-    d = ImageDraw.Draw(dummy)
-
-    font_title = invoice_image_font(46, bold=True)
-    font_sub = invoice_image_font(22, bold=False)
-    font_h2 = invoice_image_font(28, bold=True)
-    font_label = invoice_image_font(21, bold=True)
-    font_text = invoice_image_font(21, bold=False)
-    font_small = invoice_image_font(18, bold=False)
-
-    card_width = 1080
-    margin = 50
-    inner = card_width - margin * 2
-
-    note_lines = count_wrapped_lines(d, note_text, font_text, inner - 48)
-    detail_rows = 8 + (1 if discount > 0 else 0) + (1 if voucher_code else 0)
-    detail_height = 40 + (detail_rows * 40)
-    note_height = 70 + max(1, note_lines) * 30
-    total_height = max(980, 140 + 100 + detail_height + 26 + note_height + 120)
-
-    bg = "#0B1220"
-    card = "#111B2F"
-    accent = "#2D7FF9"
-    text_primary = "#F8FAFC"
-    text_muted = "#B7C4D8"
-    text_soft = "#DDE7F5"
-    success = "#22C55E"
-    line_color = "#20304D"
-
-    img = Image.new("RGB", (card_width, total_height), bg)
-    draw = ImageDraw.Draw(img)
-
-    # Header
-    draw.rounded_rectangle((margin, 40, card_width - margin, 170), radius=28, fill=card)
-    draw.rounded_rectangle((margin + 28, 68, margin + 198, 112), radius=18, fill=success)
-    draw.text((margin + 48, 78), "PAID", font=font_label, fill="white")
-    draw.text((margin + 230, 66), "Maboyy Digital", font=font_title, fill=text_primary)
-    draw.text((margin + 230, 120), "Invoice Pembayaran Berhasil", font=font_sub, fill=text_muted)
-
-    y = 205
-
-    # Detail card
-    detail_bottom = y + detail_height
-    draw.rounded_rectangle((margin, y, card_width - margin, detail_bottom), radius=28, fill=card)
-    draw.text((margin + 24, y + 18), "Ringkasan Pembayaran", font=font_h2, fill=text_primary)
-
-    items = [
-        ("Invoice", invoice(order["id"])),
-        ("Tanggal", date_text),
-        ("Produk", product_name),
-        ("Variasi", variant_name),
-        ("Qty", str(qty)),
-        ("Subtotal", rupiah(subtotal)),
-    ]
-    if discount > 0:
-        items.append(("Diskon", f"-{rupiah(discount)}"))
-    if voucher_code:
-        items.append(("Voucher", voucher_code))
-    items.extend([
-        ("Total Dibayar", rupiah(payment_total)),
-        ("Metode", payment_method.upper()),
-    ])
-
-    row_y = y + 64
-    for label, value in items:
-        draw.text((margin + 28, row_y), label, font=font_label, fill=text_muted)
-        wrapped = wrap_pixels(draw, str(value), font_text, 520)
-        draw.text((margin + 340, row_y), wrapped[0], font=font_text, fill=text_soft)
-        if len(wrapped) > 1:
-            extra_y = row_y + 26
-            for extra in wrapped[1:]:
-                draw.text((margin + 340, extra_y), extra, font=font_text, fill=text_soft)
-                extra_y += 26
-            row_y = extra_y + 8
-        else:
-            row_y += 40
-
-    y = detail_bottom + 24
-
-    # Note card
-    note_bottom = y + note_height
-    draw.rounded_rectangle((margin, y, card_width - margin, note_bottom), radius=28, fill=card)
-    draw.text((margin + 24, y + 18), "Catatan Pembeli", font=font_h2, fill=text_primary)
-    draw_wrapped(draw, note_text, (margin + 28, y + 62), font_text, text_soft, inner - 48, line_gap=7)
-
-    footer_y = total_height - 72
-    draw.line((margin + 10, footer_y - 18, card_width - margin - 10, footer_y - 18), fill=line_color, width=2)
-    draw.text(
-        (margin, footer_y),
-        "Pembayaran berhasil • Maboyy Digital • Since 2020",
-        font=font_small,
-        fill=text_muted
-    )
-
-    out = Path(tempfile.gettempdir()) / f"maboyy_invoice_{order_id}.png"
-    img.save(out, format="PNG", optimize=True)
+    """Compatibility API: render the same receipt as every other paid feature."""
+    conn = db()
+    try:
+        data = PAYMENT_RECEIPTS.snapshot(conn, "order", order_id)
+    finally:
+        conn.close()
+    if data is None:
+        raise ValueError("Pembayaran belum terkonfirmasi.")
+    out = Path(tempfile.gettempdir()) / f"maboyy_invoice_{order_id}_{secrets.token_hex(6)}.png"
+    out.write_bytes(payment_receipts.render_invoice(data))
     return [out]
-
-
 
 
 async def send_delivery_payload_text(bot: Bot, user_id: int, order_id: int, delivery_text: str):
@@ -5352,15 +5195,15 @@ async def send_daily_owner_report(bot: Bot):
     today = jakarta_now.date().isoformat()
     conn = db()
     order_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM orders WHERE substr(created_at,1,10)=?",
+        "SELECT COUNT(*) AS n FROM orders WHERE date(created_at,'+7 hours')=?",
         (today,)
     ).fetchone()["n"]
     completed = conn.execute(
-        "SELECT COUNT(*) AS n FROM orders WHERE status='completed' AND substr(completed_at,1,10)=?",
+        "SELECT COUNT(*) AS n FROM orders WHERE status='completed' AND date(completed_at,'+7 hours')=?",
         (today,)
     ).fetchone()["n"]
     revenue = conn.execute(
-        "SELECT COALESCE(SUM(payment_total),0) AS n FROM orders WHERE status='completed' AND substr(completed_at,1,10)=?",
+        "SELECT COALESCE(SUM(payment_total),0) AS n FROM orders WHERE status='completed' AND date(completed_at,'+7 hours')=?",
         (today,)
     ).fetchone()["n"]
     pending = conn.execute(
@@ -8997,7 +8840,7 @@ def create_database_backup() -> Path:
     if not source_path.is_file():
         raise RuntimeError("Database sumber tidak ditemukan; backup dibatalkan.")
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    stamp = datetime.now(JAKARTA_TZ).strftime("%Y%m%d_%H%M%S_%f")
     backup_path = Path(BACKUP_DIR) / f"maboyydigital_{stamp}_{secrets.token_hex(4)}.db"
 
     src = None
@@ -9055,6 +8898,7 @@ PROJECT_BACKUP_REQUIRED_FILES = (
     "sosmed_buzzerpanel.py",
     "sosmed_ui.py",
     "bank_accounts.py",
+    "payment_receipts.py",
 )
 
 PROJECT_BACKUP_OPTIONAL_FILES = (
@@ -9226,7 +9070,7 @@ async def send_backup(bot: Bot, backup_path: Path):
             caption=(
                 "🗄️ <b>BACKUP OTOMATIS MABOYY DIGITAL</b>\n\n"
                 f"📦 Versi bot: <b>v{BOT_VERSION}</b>\n"
-                f"🕒 {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}\n"
+                f"🕒 {datetime.now(JAKARTA_TZ).strftime('%d-%m-%Y %H:%M:%S WIB')}\n"
                 f"💾 Database: <code>{Path(DB_PATH).name}</code>\n\n"
                 "Backup ini dikirim langsung ke PM owner."
             ),
@@ -9290,7 +9134,7 @@ def build_stock_text() -> str:
 
     lines.extend([
         "",
-        f"🕒 Update: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}",
+        f"🕒 Update: {datetime.now(JAKARTA_TZ).strftime('%d-%m-%Y %H:%M:%S WIB')}",
         f"<i>{STORE_FOOTER}</i>"
     ])
     return "\n".join(lines)
@@ -20723,7 +20567,7 @@ async def verify_join(call: CallbackQuery, bot: Bot, state: FSMContext):
         call.from_user.id
     )
 
-    check_time = datetime.now().strftime("%H:%M:%S")
+    check_time = datetime.now(JAKARTA_TZ).strftime("%H:%M:%S")
 
     if joined:
         mark_user_verified(
@@ -24059,6 +23903,7 @@ async def owner_wallet_verify_button(call: CallbackQuery, bot: Bot):
 
     row, balance = result
 
+    await payment_receipts.notify(_otp_sys.modules[__name__], bot, "topup", topup_id)
     try:
         if not await OTP_STORE.payments.notify_topup_receipt(bot, topup_id):
             await bot.send_message(
@@ -24918,7 +24763,7 @@ async def owner_backup_now(call: CallbackQuery, bot: Bot):
             caption=(
                 "🗄️ <b>BACKUP DATABASE MABOYY DIGITAL</b>\n\n"
                 f"📦 Versi bot: <b>v{BOT_VERSION}</b>\n"
-                f"🕒 {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
+                f"🕒 {datetime.now(JAKARTA_TZ).strftime('%d-%m-%Y %H:%M:%S WIB')}"
             ),
             parse_mode="HTML"
         )
@@ -25092,7 +24937,7 @@ async def owner_stats(call: CallbackQuery):
         return await call.answer("Akses ditolak.", show_alert=True)
 
     conn = db()
-    today = datetime.now().date().isoformat()
+    today = datetime.now(JAKARTA_TZ).date().isoformat()
 
     products = conn.execute(
         "SELECT COUNT(*) AS n FROM products WHERE active=1"
@@ -25122,14 +24967,14 @@ async def owner_stats(call: CallbackQuery):
     biz = business_report(conn)
     today_orders = conn.execute(
         """SELECT COUNT(*) AS n FROM orders
-           WHERE substr(created_at,1,10)=?""",
+           WHERE date(created_at,'+7 hours')=?""",
         (today,)
     ).fetchone()["n"]
     today_revenue = conn.execute(
         """SELECT COALESCE(SUM(payment_total),0) AS n FROM orders
            WHERE status='completed'
              AND COALESCE(payment_method,'')!='OWNER_FREE'
-             AND substr(completed_at,1,10)=?""",
+             AND date(completed_at,'+7 hours')=?""",
         (today,)
     ).fetchone()["n"]
     users = conn.execute(
@@ -30179,6 +30024,7 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot, state: FSMContext =
         keyboard=owner_topup_note_keyboard(entity_id)
         # Leave the permanent owner result before any slow/failed buyer PM.
         await owner_proof_result_screen(call,text,alert_text="Top up dikonfirmasi.",reply_markup=keyboard)
+        await payment_receipts.notify(_otp_sys.modules[__name__], bot, "topup", entity_id)
         try:
             if status=="completed" and not await OTP_STORE.payments.notify_topup_receipt(bot, entity_id):
                 await bot.send_message(
@@ -34683,7 +34529,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "16.98"
+EXPECTED_SOURCE_VERSION = "17.00"
 
 
 def source_integrity_self_test():
@@ -34726,6 +34572,7 @@ def runtime_dependency_self_test():
         checks.append(("re_parser",False))
 
     checks.append(("JAKARTA_TZ", str(JAKARTA_TZ)=="Asia/Jakarta"))
+    checks.append(("invoice_photo_renderer", callable(payment_receipts.render_invoice)))
     checks.append(("main_menu", callable(main_menu)))
     checks.append(("parse_rupiah_input", callable(parse_rupiah_input)))
     checks.append(("fulfill_order", callable(fulfill_order)))
@@ -34793,6 +34640,7 @@ async def main():
         asyncio.create_task(periodic_safe_cleanup_loop(), name="periodic_safe_cleanup_loop"),
         asyncio.create_task(smart_owner_alert_loop(bot), name="smart_owner_alert_loop"),
     ]
+    background_tasks.extend(PAYMENT_RECEIPTS.start(bot))
     try:
         background_tasks.extend(await OTP_STORE.start(bot))
     except Exception as exc:

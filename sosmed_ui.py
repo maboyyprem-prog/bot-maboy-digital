@@ -11,7 +11,6 @@ import math
 import re
 import shlex
 import time
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from aiogram import F
@@ -20,6 +19,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 import sosmed_buzzerpanel as core
+import payment_receipts
 from otp_smscode import MenuMessage, TEXT_MENU_ACTIONS
 
 PREFIX = "sosmed:"
@@ -35,7 +35,8 @@ NAVIGATION_ACTIONS = {
     "admin_orders", "admin_services", "admin_categories", "admin_prices",
     "admin_settings", "admin_pricing", "admin_scope", "admin_pending",
     "admin_refunds", "admin_detail",
-    "admin_form", "admin_units", "admin_catalog",
+    "admin_form", "admin_units", "admin_catalog", "popular",
+    "admin_price_categories", "admin_price_breakdown",
 }
 
 
@@ -62,12 +63,7 @@ def number(value, low=0, high=10**12):
 
 
 def instant(value):
-    if not value:
-        return "Belum tersedia"
-    try:
-        return datetime.fromtimestamp(float(value), timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
-    except (ValueError, TypeError, OverflowError, OSError):
-        return "Belum tersedia"
+    return payment_receipts.format_wib(value, compact=True, missing="Belum tersedia")
 
 
 def provider_money(value):
@@ -266,6 +262,10 @@ class UIBuilder:
             [("💰 SALDO SAYA", "balance", {}), ("📜 RIWAYAT", "history", {})],
             [("❓ PANDUAN", "help", {})],
         ]
+        # Platform filters, not invented catalogue services. Availability and
+        # original categories are read from the API when the shortcut is opened.
+        rows.insert(1,[('🎵 TikTok','popular',{'platform':'tiktok'}),
+                       ('📸 Instagram','popular',{'platform':'instagram'})])
         if self.store.owner(user):
             rows.append([("👑 PANEL OWNER", "admin_menu", {})])
         status = "Aktif" if settings["enabled"] else "Ditutup owner"
@@ -276,7 +276,7 @@ class UIBuilder:
             note = "Pembelian belum tersedia. Owner perlu melengkapi pengaturan toko."
         await self.send(message, f"🛍️ <b>{USER_BRAND}</b>\n🏠 <b>Menu Awal</b>\n"
                         f"👤 Akun: {esc(identity)}\n💰 Saldo: <b>{core.money(self.store.balance(user))}</b>\n"
-                        f"🛍️ Toko: {esc(status)}\n{esc(note)}\n\nPilih menu di bawah:",
+                        f"🛍️ Toko: {esc(status)}\n{esc(note)}\n\n⭐ Populer: TikTok • Instagram\nPilih menu di bawah:",
                         self.keyboard(user, rows, bot_home=True))
 
     async def balance(self, message, user):
@@ -296,22 +296,31 @@ class UIBuilder:
             rows.append(("Berikutnya ➡️", action, {**payload, "page": page+1}))
         return [rows] if rows else []
 
-    async def categories(self, message, user, payload=None, *, admin=False):
+    async def categories(self, message, user, payload=None, *, admin=False, browse=False):
         payload = payload or {}
         await self.store.catalog.sync(return_rows=False)
         categories = ([row["category"] for row in self.store.repo.all("SELECT DISTINCT category FROM sosmed_services ORDER BY category")]
                       if admin else self.store.catalog.categories())
+        platform = payload.get('platform')
+        if platform is not None:
+            if not isinstance(platform,str) or platform not in {'tiktok','instagram'}:
+                raise core.StoreError('INPUT')
+            categories = [category for category in categories if core.popular_platform(category)==platform]
         page = min(number(payload.get("page", 0), 0, 100000), max(0, math.ceil(len(categories)/PAGE_SIZE)-1))
-        action = "admin_categories" if admin else "categories"
+        action = "admin_price_categories" if browse else "admin_categories" if admin else "categories"
         rows = []
         for category in categories[page*PAGE_SIZE:(page+1)*PAGE_SIZE]:
-            target = "admin_scope" if admin else "services"
-            data = {"scope": "category", "key": category} if admin else {"category": category, "page": 0}
+            target = "admin_scope" if admin and not browse else "admin_services" if admin else "services"
+            data = {"scope": "category", "key": category} if admin and not browse else {"category": category, "page": 0}
+            if platform:
+                data['platform'] = platform
             rows.append([(self.public_label(category, 60) if not admin else self.provider_label(category)[:60], target, data)])
-        rows += self.pages(user, action, {}, page, len(categories))
-        rows.append([("📋 Semua Layanan", "admin_services" if admin else "services", {})])
-        rows.append([("⬅️ Kembali", "admin_pricing" if admin else "home", {})])
-        title = "📂 MARKUP KATEGORI" if admin else "📂 PILIH KATEGORI"
+        rows += self.pages(user, action, {'platform':platform} if platform else {}, page, len(categories))
+        rows.append([("📋 Semua Layanan", "admin_services" if admin else "services", {'platform':platform} if platform else {})])
+        rows.append([("⬅️ Kembali", "admin_services" if browse else "admin_pricing" if admin else "home", {})])
+        title = "📂 KATEGORI HARGA" if browse else "📂 MARKUP KATEGORI" if admin else "📂 PILIH KATEGORI"
+        if platform:
+            title = ('🎵 TIKTOK' if platform=='tiktok' else '📸 INSTAGRAM')+' · KATEGORI'
         await self.send(message, f"<b>{title}</b>\nHalaman {page+1}/{max(1, math.ceil(len(categories)/PAGE_SIZE))}"
                         + ("\nBelum ada kategori tersedia." if not categories else "\nPilih kategori:"), self.keyboard(user, rows))
 
@@ -326,57 +335,44 @@ class UIBuilder:
         page_size = SERVICE_PAGE_SIZE
         page = number(payload.get("page", 0), 0, 100000)
         category, query = payload.get("category"), payload.get("query", "")
-        if favorites:
-            all_rows = self.store.repo.favorites(user)
-            total = len(all_rows)
-            page = min(page, max(0, math.ceil(total/page_size)-1))
-            services = all_rows[page*page_size:(page+1)*page_size]
-        elif admin:
-            terms, parameters = [], []
-            if category:
-                terms.append("category=?")
-                parameters.append(str(category))
-            if query:
-                terms.append("(instr(lower(name),lower(?))>0 OR instr(lower(category),lower(?))>0)")
-                parameters.extend([str(query)[:200]]*2)
-            where = " WHERE "+" AND ".join(terms) if terms else ""
-            total = self.store.repo.one("SELECT COUNT(*) n FROM sosmed_services"+where, parameters)["n"]
-            page = min(page, max(0, math.ceil(total/page_size)-1))
-            services = self.store.repo.all("SELECT * FROM sosmed_services"+where+" ORDER BY category,provider_service_id LIMIT ? OFFSET ?",
-                                           (*parameters, page_size, page*page_size))
-        else:
-            services, total = self.store.catalog.listing(category=category, query=query, page=page, filters=payload.get("filters"), page_size=page_size)
-            if total and page*page_size >= total:
-                page = (total-1)//page_size
-                services, total = self.store.catalog.listing(category=category, query=query, page=page, filters=payload.get("filters"), page_size=page_size)
-            elif not total:
-                page = 0
+        options = dict(category=category,query=query,filters=payload.get('filters'),page_size=page_size,
+                       admin=admin,platform=payload.get('platform'),favorite_user=user if favorites else None)
+        services, total = self.store.catalog.listing(page=page, **options)
+        if total and page*page_size >= total:
+            page = (total-1)//page_size
+            services, total = self.store.catalog.listing(page=page, **options)
+        elif not total:
+            page = 0
         payload["page"] = page
         rows, lines = [], []
         for index, service in enumerate(services, page*page_size+1):
             sid = service["provider_service_id"]
             try:
                 cost, sale = self.store.pricing.rate(service)
-                unit = "paket" if service.get("rate_unit") == "package" else "1.000"
-                price = f"Modal {core.money(cost)} • Jual {core.money(sale)} / {unit}" if admin else f"{core.money(sale)} / {unit}"
+                price = f"Modal {provider_money(service['provider_rate'])} • Jual {core.money(sale)}" if admin else core.money(sale)
             except core.StoreError:
-                price = "Harga belum tersedia"
-            name = self.provider_label(service["name"])[:80] if admin else self.public_label(service["name"], 80)
+                price = (f"Modal {provider_money(service['provider_rate'])} • Jual belum siap"
+                         if admin and service.get('currency')=='IDR' and service.get('rate_unit')=='1000'
+                         else "Harga belum tersedia")
+            name = " ".join(self.provider_label(service['name']).split())[:46] if admin else self.public_label(service["name"], 46)
             lines.append(f"<b>{index}. #{esc(sid)} {esc(name, 180)}</b>\n{esc(price, 120)}"
                          + (" • OFF" if admin and not service.get("enabled") else ""))
             rows.append([(f"{index}. {name}"[:60], "admin_detail" if admin else "detail", {"id": sid, "back": payload})])
         action = "admin_services" if admin else "favorites" if favorites else "services"
         rows += self.pages(user, action, payload, page, total, page_size)
         rows.append([("🔄 Refresh Layanan", action, {**payload, "refresh": True})])
+        if admin:
+            rows.append([('📂 Pilih Kategori','admin_price_categories',{})])
         if not admin:
             rows.append([("🔎 Cari / Filter", "search", {"category": category})])
-        rows.append([("⬅️ Kembali", "admin_menu" if admin else "home" if favorites else "categories", {})])
+        rows.append([("⬅️ Kembali", "admin_menu" if admin else "home" if favorites else "categories",
+                      {'platform':payload['platform']} if payload.get('platform') and not admin and not favorites else {})])
         title = "📋 HARGA MODAL & JUAL" if admin else "⭐ FAVORIT SAYA" if favorites else "📱 PILIH LAYANAN"
-        caption = "" if not category else "\n"+esc(self.provider_label(category)[:180] if admin else self.public_label(category, 180))
-        stamp = self.store.repo.one("SELECT MAX(last_synced_at) stamp FROM sosmed_services")
+        group = category or {'tiktok':'TikTok','instagram':'Instagram'}.get(payload.get('platform'),'')
+        caption = "" if not group else "\n"+esc(self.provider_label(group)[:70] if admin else self.public_label(group,70))
         await self.send(message, f"<b>{title}</b>{caption}\nHalaman {page+1}/{max(1, math.ceil(total/page_size))} • {total} layanan\n"
-                        f"Diperbarui: {instant(stamp['stamp'] if stamp else 0)}\nPilih layanan untuk detail dan input.\n\n"
-                        + ("\n\n".join(lines) if lines else "Belum ada layanan sesuai pilihan."), self.keyboard(user, rows))
+                        "Tarif per 1.000 • termurah dulu\n\n"
+                        + ("\n".join(lines) if lines else "Belum ada layanan sesuai pilihan."), self.keyboard(user, rows))
 
     async def detail(self, message, user, service_id, back=None, *, admin=False, refresh=False):
         await self.store.catalog.sync(force=refresh, return_rows=False)
@@ -402,10 +398,17 @@ class UIBuilder:
                 "❌ Pembatalan: Belum tersedia di toko\n\n"
                 f"📋 Input:\n{esc(core.FormAdapter.instructions(service), 400)}")
         rows = []
+        if price_ready and service.get('order_supported'):
+            try:
+                _,minimum_sale,_ = self.store.pricing.calculate(service,int(service['min_quantity']))
+                text += f"\n\nPembelian mulai <b>{core.money(minimum_sale)}</b> untuk {service['min_quantity']} jumlah."
+            except core.StoreError:
+                text += '\n\nPesanan minimum perlu diperiksa owner sebelum dibeli.'
         if admin:
-            text += f"\n\nModal / {unit}: {core.money(cost) if price_ready else 'Belum tersedia'}\nMata uang: {esc(service['currency'] or 'Belum dikonfirmasi')}\n"
+            text += f"\n\nModal / {unit}: {provider_money(service['provider_rate']) if price_ready else 'Belum tersedia'}\nMata uang: {esc(service['currency'] or 'Belum dikonfirmasi')}\n"
             text += f"Sumber metadata: {esc(service.get('metadata_source') or 'API')}\nSync: {instant(service['last_synced_at'])}"
             rows.append([("🏷️ Atur Harga", "admin_scope", {"scope": "service", "key": str(service_id)})])
+            rows.append([('💡 Rincian Harga','admin_price_breakdown',{'id':service_id,'back':back or {}})])
             rows.append([("🟢 ON / OFF", "admin_service_toggle", {"id": service_id, "enabled": not bool(service.get("enabled"))})])
             rows.append([("📝 Metadata", "admin_input", {"kind": "metadata", "id": service_id})])
             rows.append([("📋 Tipe/Input", "admin_form", {"id": service_id})])
@@ -609,6 +612,39 @@ class AdminHandler:
                 [("⬅️ Kembali", "admin_menu", {})]]
         await self.ui.send(message, text, self.ui.keyboard(user, rows))
 
+    async def price_breakdown(self, message, user, payload):
+        self.authorize(user)
+        await self.store.catalog.sync(return_rows=False)
+        ident = number(payload.get('id'),1)
+        service = self.store.catalog.service(ident,active=False)
+        cost,sale,snapshot = self.store.pricing.calculate(service,1000)
+        rule,settings = snapshot['rule'],self.store.settings()
+        if 'sale_rate' in rule:
+            policy = 'Harga khusus / 1.000: '+provider_money(rule['sale_rate'])
+        else:
+            labels = {'percent':'Persentase','fixed':'Nominal','combined':'Kombinasi'}
+            policy = 'Mode: '+labels.get(rule['mode'],rule['mode'])
+            if rule['mode'] in {'percent','combined'}:
+                policy += ' • '+str(rule.get('percent','0'))+'%'
+            if rule['mode'] in {'fixed','combined'}:
+                policy += '\nTambahan per transaksi: '+core.money(rule.get('fixed',0))
+        text = ('💡 <b>RINCIAN HARGA</b>\n'+esc(self.ui.provider_label(service['name']),180)+
+                f"\n\nModal API / 1.000: <b>{provider_money(service['provider_rate'])}</b>\n"
+                f"Jual / 1.000: <b>{core.money(sale)}</b>\n"+esc(policy)+
+                f"\nMinimum harga transaksi: {core.money(settings['min_sale'])}\n"
+                f"Pembulatan ke atas: {core.money(settings['rounding'])}\n")
+        try:
+            low = int(service['min_quantity'])
+            low_cost,low_sale,_ = self.store.pricing.calculate(service,low)
+            text += f"\nPesanan minimum {low} jumlah:\nModal {core.money(low_cost)} • Jual {core.money(low_sale)}\n"
+        except core.StoreError:
+            text += '\nPesanan minimum belum memenuhi batas harga toko.\n'
+        text += '\nModal = tarif API × jumlah ÷ 1.000.\nMarkup, minimum transaksi dan pembulatan berlaku pada harga jual.'
+        rows = [[('🏷️ Atur Harga Layanan','admin_scope',{'scope':'service','key':str(ident)})],
+                [('⚙️ Pengaturan Harga','admin_pricing',{})],
+                [('⬅️ Kembali','admin_detail',{'id':ident,'back':payload.get('back',{})})]]
+        await self.ui.send(message,text,self.ui.keyboard(user,rows))
+
     async def scope(self, message, user, payload):
         self.authorize(user)
         scope, key = payload.get("scope"), str(payload.get("key", ""))
@@ -619,7 +655,7 @@ class AdminHandler:
         rule = json.loads(saved["rule"]) if saved else {"mode": settings["mode"], "percent": settings["percent"], "fixed": settings["fixed"]}
         text = f"🏷️ <b>ATUR HARGA {esc(scope.upper())}</b>\n{esc(key)}\n\n"
         if "sale_rate" in rule:
-            text += f"Harga jual tetap / unit: {core.money(Decimal(str(rule['sale_rate'])))}\n"
+            text += f"Harga jual tetap / 1.000: {provider_money(rule['sale_rate'])}\n"
         else:
             text += f"Mode: {esc(rule.get('mode', 'percent'))}\nMarkup: {esc(rule.get('percent', '0'))}%\nTambahan: {core.money(rule.get('fixed', 0))}\n"
         text += "\nMode Persentase memakai persen; Nominal memakai tambahan; Kombinasi memakai keduanya. Pilih nilai untuk aturan khusus."
@@ -628,7 +664,7 @@ class AdminHandler:
                 [("⚙️ Mode", "admin_modes", payload)],
                 [("🧹 Reset Aturan", "admin_rule_reset", payload)]]
         if scope == "service":
-            rows.insert(2, [("🏷️ Harga Tetap / Unit", "admin_input", {**payload, "setting": "sale_rate"})])
+            rows.insert(2, [("🏷️ Harga Tetap / 1.000", "admin_input", {**payload, "setting": "sale_rate"})])
         if scope == "category":
             rows.append([("🟢 Aktifkan Kategori", "admin_category_toggle", {"key": key, "enabled": True}),
                          ("🔴 Matikan Kategori", "admin_category_toggle", {"key": key, "enabled": False})])
@@ -908,6 +944,8 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await ui.balance(message, user)
     if action == "categories":
         return await ui.categories(message, user, payload)
+    if action == 'popular':
+        return await ui.categories(message,user,payload)
     if action in {"services", "favorites"}:
         return await ui.services(message, user, payload, favorites=action == "favorites")
     if action == "detail":
@@ -955,7 +993,9 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         result = await store.purchase.buy(user, str(payload["quote"]))
         if result.get("state") in {"CAPTURED", "SUCCESS"} and result.get("order"):
             order = result["order"]
-            return await ui.send(message, "✅ <b>PESANAN BERHASIL DIBUAT!</b>\n\n"+ui.order_text(order), ui.order_keyboard(user, order))
+            await ui.send(message, "✅ <b>PESANAN BERHASIL DIBUAT!</b>\n\n"+ui.order_text(order), ui.order_keyboard(user, order))
+            await payment_receipts.notify(store.host, message.bot, "sosmed", order["id"])
+            return
         if result.get("state") in {"FAILED", "RELEASED"}:
             return await ui.send(message, "❌ Pesanan tidak berhasil dibuat. Dana transaksi yang ditahan telah dilepas.", ui.navigation(user))
         return await ui.send(message, "⏳ Hasil pesanan belum pasti. Dana transaksi ini tetap ditahan. "
@@ -1024,6 +1064,10 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await ui.check(message, user, number(payload["id"], 1), admin=True)
     if action == "admin_services":
         return await ui.services(message, user, payload, admin=True)
+    if action == 'admin_price_categories':
+        return await ui.categories(message,user,payload,admin=True,browse=True)
+    if action == 'admin_price_breakdown':
+        return await admin.price_breakdown(message,user,payload)
     if action == "admin_detail":
         return await ui.detail(message, user, number(payload["id"], 1), payload.get("back"), admin=True, refresh=payload.get("refresh") is True)
     if action == 'admin_form':

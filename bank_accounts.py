@@ -509,7 +509,7 @@ def register(router, manager):
                 before,after=json.loads(row['before_json']),json.loads(row['after_json'])
                 def status(data):
                     return "\nStatus: "+('AKTIF' if data.get('active') else 'NONAKTIF')+" • Utama: "+('YA' if data.get('is_default') else 'TIDAK')+(" • DIHAPUS" if data.get('deleted_at') else "") if data else ""
-                text=f"📜 <b>PERUBAHAN #{row['id']}</b>\n{html.escape(row['action'])} • Owner {row['actor_id']}\n{html.escape(row['created_at'])}\n\n<b>LAMA</b>\n"+account_text(before)+status(before)+"\n\n<b>BARU</b>\n"+account_text(after)+status(after)
+                text=f"📜 <b>PERUBAHAN #{row['id']}</b>\n{html.escape(row['action'])} • Owner {row['actor_id']}\n{html.escape(manager.host.format_wib_datetime(row['created_at']))}\n\n<b>LAMA</b>\n"+account_text(before)+status(before)+"\n\n<b>BARU</b>\n"+account_text(after)+status(after)
                 return await manager.show(call,text,InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Riwayat",callback_data=PREFIX+"history:0")]]))
             raise BankError("Menu rekening tidak valid.")
         except (BankError,ValueError,TypeError,KeyError,IndexError,OverflowError,sqlite3.Error) as exc:

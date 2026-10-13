@@ -1,6 +1,6 @@
-# MaboyyDigital v16.98
+# MaboyyDigital v17.00
 
-Paket ringkas: **13 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
 ## Jalankan
 
@@ -16,6 +16,35 @@ Hentikan poller lama sebelum menggunakan token yang sama pada Railway baru.
 `/sosmed` membuka panel owner untuk owner dan toko pembeli untuk user.
 Owner bisa memilih **Menu Pembeli** untuk belanja memakai wallet pribadinya.
 Saldo user dipakai bersama oleh toko, OTP, dan Sosmed.
+
+## Harga dan layanan Sosmed
+
+Modal & Jual berisi 6 layanan per halaman, nama singkat, dan tarif **per 1.000**.
+Owner melihat modal terendah dulu; user melihat harga jual terendah dulu.
+Pilih Kategori dan Refresh Layanan memakai katalog asli provider. Menu user
+menyediakan pintasan **TikTok** dan **Instagram**, lalu kategori yang benar-benar
+tersedia; platform kosong tidak dibuatkan layanan fiktif.
+Tarif `price`/`rate` dibaca dengan Decimal tanpa dikalikan 1.000 saat sinkronisasi;
+kolom yang bertentangan dinonaktifkan. Modal pecahan rupiah tampil tepat pada owner.
+Modal order = tarif API × jumlah ÷ 1.000. Harga jual tetap mengikuti pengaturan
+markup, minimum transaksi dan pembulatan existing. Buka detail layanan →
+**Rincian Harga** untuk memeriksa penyebab harga jual; pengaturan tidak direset.
+Detail user menyebut harga pembelian minimum, dan konfirmasi tetap memakai
+jumlah nyata. Price sorting/refresh tidak mengurangi wallet atau membuat order.
+
+## Waktu dan invoice foto
+
+Semua waktu tampilan memakai **WIB (Asia/Jakarta)**: transaksi, kedaluwarsa,
+riwayat, rekening, OTP, Sosmed, pemeriksaan API, dan laporan harian.
+Timestamp internal tetap dipakai sesuai sistem existing; tidak perlu variabel `TZ` baru.
+Pembayaran berhasil mengirim invoice PNG privat untuk produk, isi saldo, OTP,
+dan Sosmed. Nominal, metode, invoice dan waktu berasal dari pembayaran nyata;
+isi saldo memisahkan saldo masuk dengan total transfer/kode unik.
+Invoice tersimpan dalam antrean SQLite, dilindungi lease, dan dicoba ulang
+setelah gagal/restart. Gagal mengirim foto tidak membatalkan pembayaran atau
+menambah saldo kembali. Transaksi lama tidak dikirim massal setelah update.
+Telegram belum menjamin pengiriman tepat sekali jika respons sukses hilang.
+Tidak ada variabel atau dependency baru; `payment_receipts.py` wajib ikut diupload.
 
 ## Rekening transfer
 
@@ -80,14 +109,15 @@ OTP tetap memakai Variables existing; jika webhook digunakan, alamatnya
 
 ## Isi paket
 
-Tujuh file Python aktif: `main.py`, `bot.py`, `otp_smscode.py`,
-`sosmed_buzzerpanel.py`, `sosmed_ui.py`, `project_backup.py`, `bank_accounts.py`.
+Delapan file Python aktif: `main.py`, `bot.py`, `otp_smscode.py`,
+`sosmed_buzzerpanel.py`, `sosmed_ui.py`, `project_backup.py`, `bank_accounts.py`,
+`payment_receipts.py`.
 File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 `.python-version`, `railway.json`.
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v16.98 yang lulus 389 tes mock dan 49 pemeriksaan transaksi.
+v17.00; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.

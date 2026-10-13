@@ -15,6 +15,7 @@ import re
 import secrets
 import sqlite3
 import time
+import payment_receipts
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -822,6 +823,7 @@ class PaymentService:
         if payment["state"] != "PAID":
             # Late payment outcomes already have a durable wallet notification.
             return True
+        await payment_receipts.notify(self.store.host, bot, "otp_payment", payment["payment_id"])
         await bot.send_message(payment["user_id"], f"🛍️ <b>{USER_BRAND}</b>\n✅ Pembayaran QRIS terkonfirmasi\n"
             f"🧾 {escape(payment['partner_reference'])} • {money(payment['amount_idr'])}\nNomor sedang diproses; hasil dikirim otomatis.",
             parse_mode="HTML", reply_markup=self.store.ui.keyboard(payment["user_id"], [[("📦 PESANAN OTP", "orders", {})]]))
@@ -1806,9 +1808,9 @@ class UIBuilder:
                 f"🌍 Negara: {escape(UserFormatter.label(order['country_name']))}\n📱 Layanan: {escape(UserFormatter.label(order['platform_name']))}\n"
                 f"📶 Operator: {escape(UserFormatter.label(order['operator_name']))}\n📞 Nomor: <code>{escape(order['phone_number'])}</code>\n"
                 f"💰 Harga: {money(order['selling_price_idr'])}\n⏳ Status: {UserFormatter.status(order['status'])}\n"
-                f"🕒 Beli: {datetime.fromtimestamp(order['created_at'],timezone.utc).isoformat(timespec='seconds')}\n"
-                f"⌛ Kedaluwarsa: {escape(UserFormatter.label(order['expires_at']))}\n"
-                + (f"✅ Selesai: {datetime.fromtimestamp(order['completed_at'],timezone.utc).isoformat(timespec='seconds')}\n" if order.get('completed_at') else "")
+                f"🕒 Beli: {payment_receipts.format_wib(order['created_at'])}\n"
+                f"⌛ Kedaluwarsa: {payment_receipts.format_wib(order['expires_at'])}\n"
+                + (f"✅ Selesai: {payment_receipts.format_wib(order['completed_at'])}\n" if order.get('completed_at') else "")
                 + f"↩️ Refund: {money(order['refund_idr'])} • {UserFormatter.refund_status(order['refund_state'])}")
 
     def order_keyboard(self, order, user):
@@ -2028,7 +2030,7 @@ class UIBuilder:
                 f"💰 Harga nomor: {money(payment['amount_idr'])}\n"
                 f"🔢 Kode unik: {money(payment['payment_total_idr']-payment['amount_idr'])}\n"
                 f"💳 Total bayar: <b>{money(payment['payment_total_idr'])}</b>\n"
-                f"⌛ Berlaku sampai: {datetime.fromtimestamp(payment['expires_at'], timezone.utc).isoformat(timespec='seconds')}\n"
+                f"⌛ Berlaku sampai: {payment_receipts.format_wib(payment['expires_at'])}\n"
                 f"⏳ Status: {label}\n\n")
         if active:
             text += ("Pembayaran QRIS diperiksa otomatis. " if payment["method"] == "AUTO_QRIS"
@@ -2554,6 +2556,7 @@ def register(router, store):
             if attempt["state"] == "CAPTURED":
                 order = store.repo.one("SELECT * FROM otp_orders WHERE attempt_id=?", (attempt["attempt_id"],))
                 await store.ui.send(message, "✅ Nomor berhasil dibeli. Detail akan dikirim otomatis. Order #"+str(order["id"])+".", store.ui.order_keyboard(order, user))
+                await payment_receipts.notify(store.host, message.bot, "otp_order", order["id"])
             elif attempt["state"] == "FAILED":
                 await store.ui.send(message, "❌ Pembelian gagal. Saldo yang ditahan telah dilepas. "+escape(UserFormatter.error(StoreError(attempt["error_code"]))))
             else:

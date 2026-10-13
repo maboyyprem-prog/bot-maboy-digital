@@ -81,6 +81,31 @@ def decimal(value, low=0, high=MAX_MONEY):
         raise StoreError("INPUT") from None
 
 
+def catalog_rate(raw):
+    """Read the documented tariff once; never scale it by 1,000 here."""
+    fields = [key for key in ('price', 'rate') if key in raw]
+    if not fields:
+        raise StoreError('PROVIDER', detail='Tarif price/rate tidak tersedia.')
+    values = [decimal(raw[key]) for key in fields]
+    if len(values) == 2 and values[0] != values[1]:
+        raise StoreError('PROVIDER', detail='Kolom price dan rate berbeda; harga tidak dipilih secara asal.')
+    return values[0]
+
+
+def popular_platform(category):
+    value = str(category or '').casefold()
+    if re.search(r'\btik[\s_-]*tok\b', value):
+        return 'tiktok'
+    if re.search(r'\binstagram\b', value):
+        return 'instagram'
+    return ''
+
+
+def price_sort_key(value):
+    # Fixed-width millionths preserve exact Decimal order without REAL/float.
+    return f"{int(decimal(value)*1_000_000):019d}"
+
+
 def catalog_integer(value, low=0, high=MAX_MONEY):
     """Catalogue-only integral numbers; wallet/checkout number() stays strict.
 
@@ -343,13 +368,17 @@ class Repository:
         finally:
             conn.close()
 
-    def one(self, sql, args=()):
+    def one(self, sql, args=(), *, prepare=None):
         with self.connection() as conn:
+            if prepare:
+                prepare(conn)
             row = conn.execute(sql, args).fetchone()
             return dict(row) if row is not None else None
 
-    def all(self, sql, args=()):
+    def all(self, sql, args=(), *, prepare=None):
         with self.connection() as conn:
+            if prepare:
+                prepare(conn)
             return [dict(row) for row in conn.execute(sql, args).fetchall()]
 
     def order(self, user, order_id):
@@ -897,7 +926,7 @@ class CatalogService:
                     kind,form_source=FormAdapter.catalogue_type(raw,form_rules.get(str(sid)))
                     raw={**raw,'_form_source':form_source}
                     field = 'rate/price'
-                    rate = str(decimal(raw.get("rate", raw.get("price"))))
+                    rate = str(catalog_rate(raw))
                     field = 'min'
                     low = catalog_integer(raw.get('min'))
                     field = 'max'
@@ -969,7 +998,7 @@ class CatalogService:
     def categories(self):
         return [r["category"] for r in self.store.repo.all("SELECT DISTINCT category FROM sosmed_services WHERE enabled=1 ORDER BY category")]
 
-    def listing(self, category=None, query="", page=0, filters=None, page_size=PAGE_SIZE):
+    def listing(self, category=None, query="", page=0, filters=None, page_size=PAGE_SIZE, *, admin=False, platform=None, favorite_user=None):
         page = number(page, 0, 100000)
         page_size = number(page_size, 1, 50)
         filters = dict(filters or {})
@@ -978,7 +1007,15 @@ class CatalogService:
             if original in filters:
                 filters[alias] = filters.pop(original)
         category = category or filters.pop("category", None)
-        terms, args = ["enabled=1"], []
+        terms, args = ([] if admin else ["enabled=1"]), []
+        if favorite_user is not None:
+            terms.append('EXISTS(SELECT 1 FROM sosmed_favorites f WHERE f.service_id=provider_service_id AND f.user_id=?)')
+            args.append(number(favorite_user,1))
+        if platform is not None:
+            if not isinstance(platform,str) or platform not in {'tiktok','instagram'}:
+                raise StoreError('INPUT')
+            terms.append('sosmed_platform(category)=?')
+            args.append(platform)
         if category:
             terms.append("category=?")
             args.append(str(category))
@@ -1000,27 +1037,18 @@ class CatalogService:
         if "max" in filters:
             terms.append("max_quantity>=?")
             args.append(number(filters["max"], 1))
-        where = " WHERE "+" AND ".join(terms)
-        if "price" not in filters:
-            total = self.store.repo.one("SELECT COUNT(*) n FROM sosmed_services"+where, args)["n"]
-            rows = self.store.repo.all("SELECT * FROM sosmed_services"+where+" ORDER BY category,provider_service_id LIMIT ? OFFSET ?",
-                                       (*args, page_size, page*page_size))
-            return rows, total
-        rows = self.store.repo.all("SELECT * FROM sosmed_services"+where+" ORDER BY category,provider_service_id", args)
+        prepare = self.store.pricing.listing_functions(admin=admin)
         if "price" in filters:
             cap = number(filters["price"], 1)
-            priced = []
-            for row in rows:
-                try:
-                    sale = self.store.pricing.rate(row)[1]
-                except StoreError as exc:
-                    if exc.code in {"CURRENCY", "TYPE", "BELOW_COST"}:
-                        continue  # Unknown prices cannot satisfy a price filter.
-                    raise
-                if sale<=cap:
-                    priced.append(row)
-            rows = priced
-        return rows[page*page_size:(page+1)*page_size], len(rows)
+            terms.append('sosmed_sale(provider_rate,currency,rate_unit,provider_service_id,category)<=?')
+            args.append(cap)
+        where = " WHERE "+" AND ".join(terms) if terms else ''
+        total = self.store.repo.one("SELECT COUNT(*) n FROM sosmed_services"+where, args, prepare=prepare)["n"]
+        rows = self.store.repo.all("SELECT * FROM sosmed_services"+where+
+            " ORDER BY CASE WHEN enabled=1 THEN 0 ELSE 1 END,"+
+            "sosmed_price_sort(provider_rate,currency,rate_unit,provider_service_id,category),provider_service_id LIMIT ? OFFSET ?",
+            (*args,page_size,page*page_size), prepare=prepare)
+        return rows, total
 
     def service(self, ident, active=True):
         row = self.store.repo.one("SELECT * FROM sosmed_services WHERE provider_service_id=?"+(" AND enabled=1" if active else ""), (number(ident, 1),))
@@ -1124,6 +1152,47 @@ class PricingService:
 
     def rate(self, service):
         return self.calculate(service, 1000)[:2]
+
+    def listing_functions(self, *, admin=False):
+        """Bounded SQL pages with the same pricing policy, snapshotted once.
+
+        A temporary pricing context avoids a DB query per catalogue row. It
+        never changes the live checkout service, stored quotes or money math.
+        """
+        settings = self.store.settings()
+        rules = {(row['scope'],row['scope_key']):row['rule'] for row in
+                 self.store.repo.all('SELECT scope,scope_key,rule FROM sosmed_pricing_rules')}
+        class RuleReader:
+            def one(self, sql, args):
+                value = rules.get(tuple(args))
+                return {'rule':value} if value is not None else None
+        class Context:
+            repo = RuleReader()
+            def settings(self):
+                return settings
+        preview = PricingService(Context())
+        def sale(rate,currency,unit,ident,category):
+            try:
+                return preview.rate({'provider_rate':rate,'currency':currency,'rate_unit':unit,
+                                     'provider_service_id':ident,'category':category})[1]
+            except (StoreError,ValueError,TypeError,KeyError,json.JSONDecodeError):
+                return None
+        def key(rate,currency,unit,ident,category):
+            try:
+                if currency!='IDR' or unit!='1000':
+                    return 'Z'
+                raw = price_sort_key(rate)
+                if admin:
+                    return '0'+raw
+                price = sale(rate,currency,unit,ident,category)
+                return '0'+price_sort_key(price)+raw if price is not None else 'Z'
+            except StoreError:
+                return 'Z'
+        def prepare(conn):
+            conn.create_function('sosmed_price_sort',5,key,deterministic=True)
+            conn.create_function('sosmed_sale',5,sale,deterministic=True)
+            conn.create_function('sosmed_platform',1,popular_platform,deterministic=True)
+        return prepare
 
     def set_rule(self, actor, scope, key, rule):
         self.store.require_owner(actor)
