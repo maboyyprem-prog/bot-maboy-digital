@@ -36,7 +36,7 @@ NAVIGATION_ACTIONS = {
     "admin_settings", "admin_pricing", "admin_scope", "admin_pending",
     "admin_refunds", "admin_detail",
     "admin_form", "admin_units", "admin_catalog", "popular",
-    "admin_price_categories", "admin_price_breakdown",
+    "admin_price_categories", "admin_price_breakdown", "admin_search",
 }
 
 
@@ -257,7 +257,8 @@ class UIBuilder:
         settings = self.store.settings()
         rows = [
             [("🛒 BELI LAYANAN", "categories", {})],
-            [("📂 KATEGORI", "categories", {}), ("🔎 CARI", "search", {})],
+            [("🔎 Cari Layanan", "search", {})],
+            [("📂 KATEGORI", "categories", {})],
             [("📦 PESANAN SAYA", "orders", {}), ("⭐ FAVORIT", "favorites", {})],
             [("💰 SALDO SAYA", "balance", {}), ("📜 RIWAYAT", "history", {})],
             [("❓ PANDUAN", "help", {})],
@@ -317,6 +318,8 @@ class UIBuilder:
             rows.append([(self.public_label(category, 60) if not admin else self.provider_label(category)[:60], target, data)])
         rows += self.pages(user, action, {'platform':platform} if platform else {}, page, len(categories))
         rows.append([("📋 Semua Layanan", "admin_services" if admin else "services", {'platform':platform} if platform else {})])
+        rows.append([('🔎 Cari Layanan','admin_search' if admin else 'search',
+                      {'platform':platform} if platform else {})])
         rows.append([("⬅️ Kembali", "admin_services" if browse else "admin_pricing" if admin else "home", {})])
         title = "📂 KATEGORI HARGA" if browse else "📂 MARKUP KATEGORI" if admin else "📂 PILIH KATEGORI"
         if platform:
@@ -363,8 +366,10 @@ class UIBuilder:
         rows.append([("🔄 Refresh Layanan", action, {**payload, "refresh": True})])
         if admin:
             rows.append([('📂 Pilih Kategori','admin_price_categories',{})])
-        if not admin:
-            rows.append([("🔎 Cari / Filter", "search", {"category": category})])
+        rows.append([('🔎 Cari Layanan','admin_search' if admin else 'search',payload)])
+        if payload.get('query') or payload.get('filters'):
+            cleared = {key:value for key,value in payload.items() if key not in {'query','filters'}}
+            rows.append([('✖️ Hapus Pencarian',action,{**cleared,'page':0})])
         rows.append([("⬅️ Kembali", "admin_menu" if admin else "home" if favorites else "categories",
                       {'platform':payload['platform']} if payload.get('platform') and not admin and not favorites else {})])
         title = "📋 HARGA MODAL & JUAL" if admin else "⭐ FAVORIT SAYA" if favorites else "📱 PILIH LAYANAN"
@@ -575,6 +580,7 @@ class AdminHandler:
                      f"📈 Profit kotor sementara: {core.money(stats.get('gross_profit', 0))}")
         rows = [[("💰 Saldo Provider", "admin_balance", {}), ("📊 Statistik", "admin_stats", {})],
                 [("📋 Modal & Jual", "admin_services", {}), ("🏷️ Atur Harga", "admin_pricing", {})],
+                [('🔎 Cari Layanan','admin_search',{})],
                 [("📦 Semua Order", "admin_orders", {}), ("⏳ Rekonsiliasi", "admin_pending", {})],
                 [("↩️ Refund Pending", "admin_refunds", {}), ("🔌 Status API", "admin_status", {})],
                 [("🔄 Sync Katalog", "admin_sync", {}), ("⚙️ Pengaturan", "admin_settings", {})],
@@ -957,12 +963,17 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await ui.orders(message, user, payload, history=action == "history")
     if action == "check":
         return await ui.check(message, user, number(payload["id"], 1))
-    if action == "search":
+    if action in {'search','admin_search'}:
+        is_admin_search = action=='admin_search'
+        context = {key:payload[key] for key in ('category','platform','query','filters','view','page') if key in payload}
         await state.set_state(SosmedOrderState.search)
-        await state.update_data(sosmed_search_context=payload)
-        return await ui.send(message, "🔎 <b>CARI / FILTER LAYANAN</b>\n\nKirim nama layanan atau kategori.\n"
+        await state.update_data(sosmed_search_context={**context,'_admin_search':is_admin_search})
+        back = 'admin_services' if is_admin_search else 'favorites' if context.get('view')=='favorites' else 'services'
+        scope = context.get('category') or {'tiktok':'TikTok','instagram':'Instagram'}.get(context.get('platform'),'Semua layanan')
+        scope = ui.provider_label(scope) if is_admin_search else ui.public_label(scope,180)
+        return await ui.send(message, "🔎 <b>CARI LAYANAN</b>\n"+esc(scope,180)+"\n\nKirim kata kunci, misalnya: followers atau likes.\n"
                              "Filter opsional: refill:ya tersedia:ya min:100 max:10000 harga:20000\n"
-                             "min membatasi minimal pembelian; max memilih kapasitas maksimal; harga membatasi harga jual per unit.", ui.navigation(user))
+                             "Harga memakai tarif per 1.000.", ui.navigation(user,back,context,admin=is_admin_search))
     if action == "help":
         text = ("❓ <b>PANDUAN SOSMED</b>\n\nPilih kategori dan layanan, baca detail, isi parameter, lalu konfirmasi pembayaran saldo.\n"
                 "Saldo dipakai bersama fitur belanja dan OTP. Isi Saldo memakai pembayaran bot yang sudah tersedia.\n"
@@ -1240,17 +1251,31 @@ def register(router, store):
     @router.message(SosmedOrderState.search, F.text & ~F.text.startswith("/") & ~F.text.in_(TEXT_MENU_ACTIONS))
     async def sosmed_search(message, state):
         user, menu = message.from_user.id, message
+        admin_context = False
         try:
             await guard(message, user)
             store.repo.rate(user, "search", 10, 60)
             menu = ui.input_message(message)
             values = await state.get_data()
             context = values.get("sosmed_search_context", {})
+            if not isinstance(context,dict):
+                raise core.StoreError('INPUT','Sesi pencarian tidak tersedia. Buka Cari Layanan lagi.')
+            context = dict(context)
+            admin_context = context.pop('_admin_search',False) is True
+            if admin_context:
+                admin.authorize(user)
             query, filters = search_input(message.text or "")
+            if len(query)>200:
+                raise core.StoreError('INPUT','Kata kunci maksimal 200 karakter.')
+            previous_filters = context.get('filters') or {}
+            if not isinstance(previous_filters,dict):
+                raise core.StoreError('INPUT')
+            filters = {**previous_filters,**filters}
             await state.clear()
-            await ui.services(menu, user, {**context, "query": query, "filters": filters, "page": 0})
+            await ui.services(menu,user,{**context,'query':query,'filters':filters,'page':0},
+                              admin=admin_context,favorites=context.get('view')=='favorites' and not admin_context)
         except Exception as exc:
-            await failure(menu, exc, user)
+            await failure(menu, exc, user,admin_context)
 
     @router.message(SosmedOrderState.field, F.text & ~F.text.startswith("/") & ~F.text.in_(TEXT_MENU_ACTIONS))
     async def sosmed_field(message, state):

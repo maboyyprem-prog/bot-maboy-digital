@@ -1,4 +1,4 @@
-# MaboyyDigital v17.00
+# MaboyyDigital v17.01
 
 Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -31,6 +31,12 @@ markup, minimum transaksi dan pembulatan existing. Buka detail layanan →
 **Rincian Harga** untuk memeriksa penyebab harga jual; pengaturan tidak direset.
 Detail user menyebut harga pembelian minimum, dan konfirmasi tetap memakai
 jumlah nyata. Price sorting/refresh tidak mengurangi wallet atau membuat order.
+
+Tombol **Cari Layanan** tersedia di menu awal user/owner, kategori, TikTok/Instagram,
+Modal & Jual, daftar layanan dan favorit. Ketik kata kunci seperti
+`followers`/`likes`; kategori/platform/favorit yang sedang dibuka tetap dipakai.
+Owner mendapat hasil Modal & Jual. Gunakan **Hapus Pencarian** untuk kembali
+ke daftar tanpa kata kunci/filter. Kembali dan Menu Awal tersedia pada form cari.
 
 ## Waktu dan invoice foto
 
@@ -117,7 +123,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.00; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.01; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
