@@ -1,4 +1,4 @@
-# MaboyyDigital v17.01
+# MaboyyDigital v17.02
 
 Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -37,6 +37,13 @@ Modal & Jual, daftar layanan dan favorit. Ketik kata kunci seperti
 `followers`/`likes`; kategori/platform/favorit yang sedang dibuka tetap dipakai.
 Owner mendapat hasil Modal & Jual. Gunakan **Hapus Pencarian** untuk kembali
 ke daftar tanpa kata kunci/filter. Kembali dan Menu Awal tersedia pada form cari.
+
+Menu kategori memiliki **Cari Kategori** di atas daftar. Ketik nama/kata kunci,
+misalnya `follower`, `likes`, atau `livestream`, lalu pilih kategori hasil pencarian.
+TikTok/Instagram tetap membatasi hasil ke platform yang dipilih. Daftar berisi
+8 kategori per halaman; Kembali dari layanan mempertahankan pencarian dan halaman.
+**Hapus Pencarian Kategori** menampilkan kembali daftar kategori pada platform yang
+sama. Pencarian ini tersedia juga pada kategori harga dan markup owner.
 
 ## Waktu dan invoice foto
 
@@ -123,7 +130,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.01; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.02; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
