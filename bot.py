@@ -229,7 +229,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.07"
+BOT_VERSION = "17.08"
 SCHEMA_VERSION = 197
 
 CHECKOUT_TERMS_SHORT = (
@@ -297,7 +297,7 @@ BOT_CHANGELOG = [
 ]
 
 STORE_NAME = "Maboyy Produk Digital"
-STORE_FOOTER = "Aplikasi Premium • Since 2020"
+STORE_FOOTER = "Maboyy Digital • Since 2020"
 
 
 logging.basicConfig(level=logging.INFO)
@@ -34914,7 +34914,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.07"
+EXPECTED_SOURCE_VERSION = "17.08"
 
 
 def source_integrity_self_test():

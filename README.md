@@ -1,4 +1,4 @@
-# MaboyyDigital v17.07
+# MaboyyDigital v17.08
 
 Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -201,9 +201,13 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.07; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.08; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
 Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot lama.
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
+
+
+Footer toko pada v17.08: **Maboyy Digital • Since 2020**.
+Susunan menu, tombol, pembayaran dan seluruh fitur existing tetap sama.
