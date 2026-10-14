@@ -1,4 +1,4 @@
-# MaboyyDigital v17.06
+# MaboyyDigital v17.07
 
 Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -105,6 +105,28 @@ User memilih rekening aktif ketika deposit/checkout. Invoice menyimpan rekening
 dan nomor salin sendiri; perubahan rekening tidak mengubah snapshot invoice.
 Tidak ada variabel baru atau wallet baru untuk multi-rekening.
 
+## Konfirmasi pembayaran manual
+
+Invoice **QRIS Manual dan Transfer Rekening** untuk pembelian maupun isi saldo
+menunggu keputusan owner **tanpa batas waktu kedaluwarsa**. Tampilan user/owner
+tidak memakai hitung mundur. Invoice pending lama dinormalisasi saat startup;
+timer, cleanup expired, dan restart tidak menutup invoice manual yang menunggu.
+Mode AUTO yang diaktifkan kemudian tidak mengubah metode invoice manual lama.
+
+Owner tetap memakai tombol **Konfirmasi / Tolak / Tandai Pending** yang existing.
+Invoice manual lama yang terlanjur expired bisa dikonfirmasi owner jika belum
+dibatalkan, selesai, dibayar atau ditolak. Transaksi tidak dihidupkan ulang otomatis.
+Stok/slot yang reservasinya pernah dilepas diperiksa ulang agar tidak mengambil
+reservasi pembeli lain. Jika belum tersedia, pembayaran tercatat PAID dan menunggu
+pemenuhan. Konfirmasi ganda aman; pembayaran/log atau kredit wallet disimpan atomik.
+User/owner tetap dapat membatalkan invoice yang belum dibayar lewat alur existing.
+
+Payment gateway otomatis tetap mengikuti masa berlaku existing/provider.
+Quote harga, nomor/SMS OTP, draft pengaturan rekening dan konfirmasi Hapus Stok
+tetap menggunakan masa berlaku yang sesuai; perubahan ini hanya untuk pembayaran
+manual yang memerlukan owner. OTP/Sosmed tetap memakai saldo untuk pembelian baru.
+Tidak ada Variables/dependency/command baru.
+
 ## Hapus stok owner
 
 **/owner → Produk & Stok → Hapus Stok → Produk → Varian → Jumlah → Konfirmasi**.
@@ -179,7 +201,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.06; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.07; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.

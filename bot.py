@@ -229,8 +229,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.06"
-SCHEMA_VERSION = 196
+BOT_VERSION = "17.07"
+SCHEMA_VERSION = 197
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1305,6 +1305,15 @@ def init_db():
     add_column_if_missing(conn, "topups", "verified_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "verified_by", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "topups", "expires_at", "TEXT DEFAULT ''")
+    # Manual invoices wait for an explicit owner decision, not a timer. Do not
+    # revive historical terminal rows or change gateway/provider deadlines.
+    conn.execute("""UPDATE orders SET reserved_until=''
+        WHERE UPPER(TRIM(COALESCE(payment_method,''))) IN ('QRIS','QRIS_MANUAL','BANK_TRANSFER')
+          AND payment_status!='paid' AND status NOT IN ('completed','cancelled','expired','rejected')
+          AND COALESCE(reserved_until,'')!=''""")
+    conn.execute("""UPDATE topups SET expires_at=''
+        WHERE UPPER(TRIM(COALESCE(payment_method,''))) IN ('QRIS','QRIS_MANUAL','BANK_TRANSFER')
+          AND status='pending' AND COALESCE(expires_at,'')!=''""")
     add_column_if_missing(conn, "topups", "updated_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "payment_message_ids", "TEXT DEFAULT '[]'")
     add_column_if_missing(conn, "topups", "payment_review_status", "TEXT DEFAULT ''")
@@ -3174,6 +3183,12 @@ async def prepare_preorder_paid_order(order_id: int, bot: Bot) -> bool:
     first_transition=not bool(str(row["preorder_status"] or "").strip())
     if first_transition:
         qty=max(1,int(row["qty"] or 1))
+        if manual_confirmation_required(row) and int(row['stock_reserved'] or 0)!=1:
+            if not reserve_stock_for_order(conn,int(row['variant_id']),qty):
+                conn.rollback();conn.close()
+                return False
+            conn.execute("UPDATE orders SET stock_reserved=1,reserved_until='' WHERE id=?",(order_id,))
+            row={**dict(row),'stock_reserved':1}
         if int(row["stock_reserved"] or 0)==1:
             conn.execute(
                 """UPDATE product_variants
@@ -3329,6 +3344,17 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
             (int(order["variant_id"]),)
         ).fetchone()
         sharing_mode=bool(variant_row and int(variant_row["sharing_mode"] or 0)==1)
+
+        # Historical manual invoices may be confirmed after their old hold was
+        # released. Reserve free stock before allocation, preserving other
+        # buyers' pending orders. Already allocated credentials are reused above.
+        if manual_confirmation_required(order) and int(order['stock_reserved'] or 0)!=1:
+            sync_variant_stock_from_inventory(conn,int(order['variant_id']))
+            if not reserve_stock_for_order(conn,int(order['variant_id']),qty):
+                conn.rollback();conn.close()
+                return False
+            conn.execute("UPDATE orders SET stock_reserved=1,reserved_until='' WHERE id=?",(order_id,))
+            order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
 
         items = conn.execute(
             """SELECT * FROM inventory_items
@@ -3844,6 +3870,30 @@ async def cancel_pending_order(order_id: int, bot: Bot):
 
     return True, "Order berhasil dibatalkan dan reservasi stok dilepas."
 
+MANUAL_PAYMENT_METHODS = frozenset({'QRIS','QRIS_MANUAL','BANK_TRANSFER'})
+
+
+def manual_confirmation_required(row) -> bool:
+    try:
+        return str(row['payment_method'] or '').strip().upper() in MANUAL_PAYMENT_METHODS
+    except (KeyError,IndexError,TypeError):
+        return False
+
+
+def timed_payment_sql(alias: str = '') -> str:
+    """Fixed payment-method predicate for expiry/retention queries only."""
+    if alias and not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',alias):raise ValueError('Invalid SQL alias')
+    field=(alias+'.' if alias else '')+'payment_method'
+    return "UPPER(TRIM(COALESCE("+field+",''))) NOT IN ('QRIS','QRIS_MANUAL','BANK_TRANSFER')"
+
+
+def owner_confirmable_expired_manual(row) -> bool:
+    if not row or not manual_confirmation_required(row) or str(row['status'] or '')!='expired':return False
+    keys=set(row.keys())
+    return (('payment_status' not in keys or str(row['payment_status'] or '') in {'unpaid','expired'})
+            and ('payment_review_status' not in keys or str(row['payment_review_status'] or '')!='rejected'))
+
+
 def reservation_expiry_iso() -> str:
     return (
         datetime.now(timezone.utc).astimezone() +
@@ -3954,6 +4004,8 @@ def format_expiry_time(value: str) -> str:
 def order_expiry_text(order) -> str:
     if not order:
         return ""
+    if manual_confirmation_required(order):
+        return "⏳ Verifikasi owner tanpa batas waktu.\n" if not order_payment_terminal(order) else ""
     expiry = order["reserved_until"] if "reserved_until" in order.keys() else ""
     if expiry:
         return f"⏳ Kedaluwarsa: <b>{format_expiry_time(expiry)}</b>\n"
@@ -3963,6 +4015,8 @@ def order_expiry_text(order) -> str:
 def topup_expiry_text(topup) -> str:
     if not topup:
         return ""
+    if manual_confirmation_required(topup):
+        return "⏳ Verifikasi owner tanpa batas waktu.\n" if not topup_payment_terminal(topup) else ""
     expiry = topup["expires_at"] if "expires_at" in topup.keys() else ""
     if expiry:
         return f"⏳ Kedaluwarsa: <b>{format_expiry_time(expiry)}</b>\n"
@@ -4334,9 +4388,10 @@ async def purge_stale_invoice_data():
     # Remove dependent records first where needed.
     stale_order_ids = [
         int(r["id"]) for r in conn.execute(
-            """SELECT id FROM orders
+            f"""SELECT id FROM orders
                WHERE created_at < ?
                  AND status IN ('expired','cancelled')
+                 AND (status!='expired' OR {timed_payment_sql()})
                  AND payment_status!='paid'""",
             (cutoff,)
         ).fetchall()
@@ -4359,9 +4414,10 @@ async def purge_stale_invoice_data():
 
     stale_topup_ids = [
         int(r["id"]) for r in conn.execute(
-            """SELECT id FROM topups
+            f"""SELECT id FROM topups
                WHERE created_at < ?
-                 AND status IN ('expired','rejected','cancelled')""",
+                 AND status IN ('expired','rejected','cancelled')
+                 AND (status!='expired' OR {timed_payment_sql()})""",
             (cutoff,)
         ).fetchall()
     ]
@@ -4392,9 +4448,10 @@ async def cleanup_expired_orders(bot: Bot):
             begin_immediate_retry(conn)
 
             rows = conn.execute(
-                """SELECT * FROM orders
+                f"""SELECT * FROM orders
                    WHERE status='pending'
                      AND stock_reserved=1
+                     AND {timed_payment_sql()}
                      AND reserved_until!=''
                      AND reserved_until < ?""",
                 (now_iso,)
@@ -4416,8 +4473,9 @@ async def cleanup_expired_orders(bot: Bot):
                 notify_orders.append((order["user_id"], order["id"]))
 
             stale_topups = conn.execute(
-                """SELECT * FROM topups
+                f"""SELECT * FROM topups
                    WHERE status='pending'
+                     AND {timed_payment_sql()}
                      AND expires_at!=''
                      AND expires_at < ?""",
                 (now_iso,)
@@ -4503,16 +4561,16 @@ def conservative_cleanup_old_data():
             terminal=False
             if row["entity_type"]=="order":
                 obj=conn.execute(
-                    "SELECT status,payment_status FROM orders WHERE id=?",
+                    "SELECT status,payment_status,payment_method,payment_review_status FROM orders WHERE id=?",
                     (row["entity_id"],)
                 ).fetchone()
-                terminal=(not obj) or obj["payment_status"]=="paid" or obj["status"] in {"completed","expired","cancelled"}
+                terminal=(not obj) or ((obj["payment_status"]=="paid" or obj["status"] in {"completed","expired","cancelled"}) and not owner_confirmable_expired_manual(obj))
             elif row["entity_type"]=="topup":
                 obj=conn.execute(
-                    "SELECT status FROM topups WHERE id=?",
+                    "SELECT status,payment_method,payment_review_status FROM topups WHERE id=?",
                     (row["entity_id"],)
                 ).fetchone()
-                terminal=(not obj) or obj["status"] in {"completed","expired","cancelled"}
+                terminal=(not obj) or (obj["status"] in {"completed","expired","cancelled"} and not owner_confirmable_expired_manual(obj))
             else:
                 terminal=True
 
@@ -5385,6 +5443,8 @@ def verify_topup_atomic(topup_id: int, actor_id: int):
         row = conn.execute("SELECT * FROM topups WHERE id=?", (topup_id,)).fetchone()
         if not row:
             return None, "not_found"
+        if manual_confirmation_required(row) and not is_owner(actor_id):
+            return None,"owner_required"
         wallet = conn.execute(
             "SELECT balance FROM wallets WHERE user_id=?", (row["user_id"],)
         ).fetchone()
@@ -5529,8 +5589,7 @@ def topup_pending_keyboard(topup_id: int, bank: bool = False):
         conn.close()
     if not row or str(row["status"] or "") != "pending":
         return topup_done_keyboard()
-    expiry = parse_stored_datetime(row["expires_at"])
-    if expiry and expiry <= datetime.now(timezone.utc):
+    if topup_reservation_expired(row):
         return topup_done_keyboard()
     rows = []
     if bank or str(row["payment_method"] or "") == "BANK_TRANSFER":
@@ -5874,10 +5933,11 @@ def repair_historical_payment_state() -> dict:
         )
 
         cur=conn.execute(
-            """UPDATE orders
+            f"""UPDATE orders
                SET payment_review_status=''
                WHERE status IN ('cancelled','expired')
                  AND payment_status!='paid'
+                 AND (status!='expired' OR {timed_payment_sql()})
                  AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')"""
         )
         report["final_waiting_states"]+=max(0,int(cur.rowcount or 0))
@@ -5941,23 +6001,23 @@ def repair_historical_payment_state() -> dict:
         report["paid_events_backfilled"]=len(paid_rows)
 
         cur=conn.execute(
-            """DELETE FROM payment_proof_sessions
+            f"""DELETE FROM payment_proof_sessions
                WHERE entity_type='order'
                  AND entity_id IN (
                      SELECT id FROM orders
                      WHERE payment_status='paid'
-                        OR status IN ('cancelled','expired','completed')
+                        OR status IN ('cancelled','completed') OR (status='expired' AND {timed_payment_sql()})
                         OR COALESCE(payment_review_status,'')='rejected'
                  )"""
         )
         report["rejected_sessions"]+=max(0,int(cur.rowcount or 0))
 
         cur=conn.execute(
-            """DELETE FROM payment_proof_sessions
+            f"""DELETE FROM payment_proof_sessions
                WHERE entity_type='topup'
                  AND entity_id IN (
                      SELECT id FROM topups
-                     WHERE status IN ('completed','paid','rejected','cancelled','expired')
+                     WHERE status IN ('completed','paid','rejected','cancelled') OR (status='expired' AND {timed_payment_sql()})
                         OR COALESCE(payment_review_status,'')='rejected'
                  )"""
         )
@@ -5980,9 +6040,10 @@ def repair_historical_payment_state() -> dict:
         report["topup_states"]+=max(0,int(cur.rowcount or 0))
 
         cur=conn.execute(
-            """UPDATE topups
+            f"""UPDATE topups
                SET payment_review_status=''
                WHERE status IN ('cancelled','expired')
+                 AND (status!='expired' OR {timed_payment_sql()})
                  AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')"""
         )
         report["topup_states"]+=max(0,int(cur.rowcount or 0))
@@ -6394,22 +6455,22 @@ async def auto_recovery_cycle(bot: Bot, source: str = "periodic"):
 
             if entity == "order":
                 item = conn.execute(
-                    "SELECT payment_status,status FROM orders WHERE id=?",
+                    "SELECT payment_status,status,payment_method,payment_review_status FROM orders WHERE id=?",
                     (entity_id,)
                 ).fetchone()
                 stale = (
                     item is None
                     or item["payment_status"] == "paid"
-                    or item["status"] in {"completed","cancelled","expired"}
+                    or (item["status"] in {"completed","cancelled","expired"} and not owner_confirmable_expired_manual(item))
                 )
             elif entity == "topup":
                 item = conn.execute(
-                    "SELECT status FROM topups WHERE id=?",
+                    "SELECT status,payment_method,payment_review_status FROM topups WHERE id=?",
                     (entity_id,)
                 ).fetchone()
                 stale = (
                     item is None
-                    or item["status"] in {"completed","paid","rejected","cancelled","expired"}
+                    or (item["status"] in {"completed","paid","rejected","cancelled","expired"} and not owner_confirmable_expired_manual(item))
                 )
             else:
                 stale = True
@@ -7134,7 +7195,7 @@ async def transaction_self_test():
     try:
         conn=db()
         historical_issues=int(conn.execute(
-            """SELECT COUNT(*) AS n FROM orders
+            f"""SELECT COUNT(*) AS n FROM orders
                WHERE (
                    status IN ('cancelled','expired','completed')
                    AND COALESCE(stock_reserved,0)!=0
@@ -7145,7 +7206,8 @@ async def transaction_self_test():
                )
                OR (
                    status IN ('cancelled','expired','completed')
-                   AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')
+                   AND (status!='expired' OR {timed_payment_sql()})
+                 AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')
                )"""
         ).fetchone()["n"] or 0)
         conn.close()
@@ -7308,9 +7370,10 @@ async def transaction_self_test():
                  AND COALESCE(payment_review_status,'') NOT IN ('verified','')"""
         ).fetchone()["n"] or 0)
         final_waiting=int(conn.execute(
-            """SELECT COUNT(*) AS n
+            f"""SELECT COUNT(*) AS n
                FROM orders
                WHERE status IN ('cancelled','expired','completed')
+                 AND (status!='expired' OR {timed_payment_sql()})
                  AND COALESCE(payment_review_status,'') IN ('submitted','reviewing')"""
         ).fetchone()["n"] or 0)
         conn.close()
@@ -8320,6 +8383,7 @@ def order_payment_terminal(order) -> bool:
 def order_reservation_expired(order) -> bool:
     if not order:
         return True
+    if manual_confirmation_required(order):return False
     expiry = str(order["reserved_until"] or "").strip()
     if not expiry:
         return False
@@ -8332,6 +8396,7 @@ def order_reservation_expired(order) -> bool:
 def topup_reservation_expired(row) -> bool:
     if not row:
         return True
+    if manual_confirmation_required(row):return False
     keys = set(row.keys()) if hasattr(row, "keys") else set()
     raw = str(row["expires_at"] or "").strip() if "expires_at" in keys else ""
     if not raw:
@@ -9492,87 +9557,53 @@ def owner_payment_success_keyboard():
     ])
 
 
+def confirm_order_payment_atomic(order_id: int, paid_amount: int | None = None, verified_by: int = 0):
+    """Persist a verified payment and audit once; only an owner may recover old manual expiry."""
+    conn=db()
+    try:
+        with conn:
+            begin_immediate_retry(conn)
+            order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+            if not order:return None,False
+            if manual_confirmation_required(order) and not is_owner(verified_by):return None,False
+            recovered=owner_confirmable_expired_manual(order) and is_owner(verified_by)
+            if order_payment_terminal(order) and not recovered:return None,False
+            if order_reservation_expired(order):
+                release_order_reservation(conn,order)
+                conn.execute("UPDATE orders SET status='expired',payment_status='expired',payment_review_status='',reserved_until='' WHERE id=? AND payment_status!='paid'",(order_id,))
+                sync_variant_reserved_stock(conn,int(order['variant_id'] or 0))
+                return None,False
+            if recovered:
+                release_order_reservation(conn,order)
+                sync_variant_reserved_stock(conn,int(order['variant_id'] or 0))
+            now=datetime.now().isoformat(timespec='seconds')
+            changed=conn.execute("""UPDATE orders SET payment_status='paid',status='paid_pending_delivery',
+                payment_verified_at=?,payment_verified_by=?,payment_review_status='verified',payment_error='',
+                reserved_until=CASE WHEN ? THEN '' ELSE reserved_until END
+                WHERE id=? AND payment_status!='paid' AND status NOT IN ('cancelled','completed')
+                  AND (status!='expired' OR ?)""",
+                (now,int(verified_by or 0),manual_confirmation_required(order),order_id,recovered)).rowcount
+            if changed!=1:return None,False
+            amount=int(paid_amount or order['payment_total'] or order['total'])
+            conn.execute("""INSERT OR IGNORE INTO payment_events
+                (entity_type,entity_id,event_type,amount,actor_id,detail,created_at)
+                VALUES('order',?,'paid',?,?,?,?)""",
+                (order_id,amount,int(verified_by or 0),f"method={order['payment_method']}",now))
+        return order,True
+    finally:conn.close()
+
+
 async def mark_order_paid(
     order_id: int,
     bot: Bot,
     paid_amount: int | None = None,
     verified_by: int = 0,
 ):
-    conn = db()
-    begin_immediate_retry(conn)
-    order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-
+    order, first_payment = confirm_order_payment_atomic(order_id,paid_amount,verified_by)
     if not order:
-        conn.rollback()
-        conn.close()
         return False
-
-    if order_payment_terminal(order):
-        conn.rollback()
-        conn.close()
-        return False
-
-    if order_reservation_expired(order):
-        # Expired invoices must never be revived by an old owner button.
-        release_order_reservation(conn, order)
-        conn.execute(
-            """UPDATE orders
-               SET status='expired',
-                   payment_status='expired',
-                   payment_review_status='',
-                   reserved_until=''
-               WHERE id=? AND payment_status!='paid'""",
-            (order_id,)
-        )
-        conn.commit()
-        conn.close()
-        return False
-
-    # Re-read inside the same write transaction so two concurrent
-    # confirmations cannot both become the first payment transition.
-    order = conn.execute(
-        "SELECT * FROM orders WHERE id=?",
-        (order_id,)
-    ).fetchone()
-    if not order:
-        conn.rollback()
-        conn.close()
-        return False
-
-    now = datetime.now().isoformat(timespec="seconds")
-    first_payment = order["payment_status"] != "paid"
 
     if first_payment:
-        updated = conn.execute(
-            """UPDATE orders
-               SET payment_status='paid',
-                   status='paid_pending_delivery',
-                   payment_verified_at=?,
-                   payment_verified_by=?,
-                   payment_review_status='verified',
-                   payment_error=''
-               WHERE id=?
-                 AND payment_status!='paid'
-                 AND status NOT IN ('cancelled','expired','completed')""",
-            (now, int(verified_by or 0), order_id)
-        ).rowcount
-
-        if updated != 1:
-            conn.rollback()
-            conn.close()
-            return False
-
-    conn.commit()
-    conn.close()
-
-    if first_payment:
-        record_payment_event(
-            "order", order_id, "paid",
-            int(paid_amount or order["payment_total"] or order["total"]),
-            verified_by,
-            f"method={order['payment_method']}"
-        )
-
         # Voucher is consumed only on the first successful payment transition.
         record_voucher_usage(
             order["voucher_code"] or "",
@@ -11336,9 +11367,10 @@ def cleanup_data_counts():
                      )"""
             ),
             "expired_orders": count(
-                """SELECT COUNT(*) AS n FROM orders
+                f"""SELECT COUNT(*) AS n FROM orders
                    WHERE payment_status!='paid'
                      AND status NOT IN ('completed','cancelled')
+                     AND {timed_payment_sql()}
                      AND (
                         (reserved_until IS NOT NULL AND reserved_until!='' AND reserved_until<=?)
                         OR status='expired'
@@ -11346,8 +11378,9 @@ def cleanup_data_counts():
                 (now,)
             ),
             "expired_topups": count(
-                """SELECT COUNT(*) AS n FROM topups
+                f"""SELECT COUNT(*) AS n FROM topups
                    WHERE status NOT IN ('completed','paid')
+                     AND {timed_payment_sql()}
                      AND (
                         (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
                         OR status='expired'
@@ -11854,10 +11887,11 @@ def cleanup_execute(kind: str):
 
         if kind in {"orders","safe"}:
             rows=conn.execute(
-                """SELECT id,variant_id,qty,stock_reserved
+                f"""SELECT id,variant_id,qty,stock_reserved
                    FROM orders
                    WHERE payment_status!='paid'
                      AND status NOT IN ('completed','cancelled')
+                     AND {timed_payment_sql()}
                      AND (
                         (reserved_until IS NOT NULL AND reserved_until!='' AND reserved_until<=?)
                         OR status='expired'
@@ -11882,8 +11916,9 @@ def cleanup_execute(kind: str):
 
         if kind in {"topups","safe"}:
             rows=conn.execute(
-                """SELECT id FROM topups
+                f"""SELECT id FROM topups
                    WHERE status NOT IN ('completed','paid')
+                     AND {timed_payment_sql()}
                      AND (
                         (expires_at IS NOT NULL AND expires_at!='' AND expires_at<=?)
                         OR status='expired'
@@ -22102,7 +22137,7 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext, b
                 unique_code,
                 payment_total,
                 1,
-                reservation_expiry_iso(),
+                "",
                 datetime.now().isoformat(timespec="seconds"),
                 voucher_code,
                 discount_amount
@@ -22158,7 +22193,7 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext, b
             f"{note_text}\n"
             + bank_transfer_text(entity="order", entity_id=order_id)
             + f"\n\n{expiry_text}"
-              f"⏳ Stok direservasi selama <b>{ORDER_RESERVATION_MINUTES} menit</b>.\n"
+              "⏳ Stok tetap direservasi sampai konfirmasi atau pembatalan.\n"
               "⚠️ Transfer harus sesuai total hingga kode unik.\n"
               "Setelah pembayaran, kirim bukti pembayaran melalui tombol di bawah.\n\n"
             f"<i>{STORE_FOOTER}</i>"
@@ -22195,7 +22230,7 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext, b
                     f"{owner_voucher_text}"
                     f"🔢 Kode unik: +{unique_code}\n"
                     f"💵 Transfer: {rupiah(payment_total)}\n"
-                    f"⏳ Reservasi: {ORDER_RESERVATION_MINUTES} menit",
+                    "⏳ Konfirmasi owner: tanpa batas waktu",
                     parse_mode="HTML"
                 )
             except Exception:
@@ -22319,7 +22354,7 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
                 unique_code,
                 payment_total,
                 1,
-                reservation_expiry_iso(),
+                "",
                 datetime.now().isoformat(timespec="seconds"),
                 voucher_code,
                 discount_amount
@@ -22380,7 +22415,7 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             f"💵 <b>TOTAL TRANSFER: {rupiah(payment_total)}</b>\n"
             f"{note_text}\n"
             f"{expiry_text}"
-            f"⏳ Stok direservasi selama <b>{ORDER_RESERVATION_MINUTES} menit</b>.\n"
+            "⏳ Stok tetap direservasi sampai konfirmasi atau pembatalan.\n"
             "⚠️ Transfer harus sesuai total hingga kode unik.\n"
             f"📝 {payment_note}\n\n"
             "Setelah pembayaran, kirim bukti pembayaran melalui tombol di bawah.\n\n"
@@ -22431,7 +22466,7 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
                     f"🔢 Kode unik: +{unique_code}\n"
                     f"💵 Transfer: {rupiah(payment_total)}\n"
                     f"📝 Catatan: {checkout_note or '-'}\n"
-                    f"⏳ Reservasi: {ORDER_RESERVATION_MINUTES} menit\n\n"
+                    "⏳ Konfirmasi owner: tanpa batas waktu\n\n"
                     "⏳ Menunggu bukti pembayaran dari user.\n"
                     "Jika user mengirim bukti, bot akan mengirimkannya ke PM owner "
                     "dengan tombol ✅ Konfirmasi / ❌ Tolak / ⏳ Pending.",
@@ -23526,6 +23561,11 @@ def create_or_reuse_manual_topup(user_id, username, amount, method, bank_account
             (user_id, amount, method, selected_bank["id"] if selected_bank else None, selected_bank["id"] if selected_bank else None)
         ).fetchone()
         if recent:
+            if manual_confirmation_required(recent):
+                conn.execute("UPDATE topups SET expires_at='' WHERE id=? AND status='pending'",(recent['id'],))
+                recent=conn.execute('SELECT * FROM topups WHERE id=?',(recent['id'],)).fetchone()
+                conn.commit()
+                return recent,False
             expiry = parse_stored_datetime(recent["expires_at"])
             if not expiry:
                 created = parse_stored_datetime(recent["created_at"])
@@ -23545,7 +23585,8 @@ def create_or_reuse_manual_topup(user_id, username, amount, method, bank_account
                 payment_method,status,created_at,expires_at)
                VALUES(?,?,?,?,?,?,'pending',?,?)""",
             (user_id, username or "", amount, unique_code, amount + unique_code,
-             method, datetime.now().isoformat(timespec="seconds"), topup_expiry_iso())
+             method, datetime.now().isoformat(timespec="seconds"),
+             "" if str(method).strip().upper() in MANUAL_PAYMENT_METHODS else topup_expiry_iso())
         )
         if selected_bank:
             BANK_ACCOUNTS.capture(conn, "topup", cur.lastrowid, selected_bank["id"])
@@ -23585,6 +23626,8 @@ def manual_topup_invoice_text(topup, *, bank=False):
             note = note[:-1]
         if note:
             text += f"📝 {html.escape(note)}\n\n"
+    if manual_confirmation_required(topup):
+        return text + "📎 Setelah transfer, kirim bukti pembayaran ke bot untuk konfirmasi owner."
     return text + "⏳ Setelah transfer, kirim bukti pembayaran ke bot sebelum invoice kedaluwarsa."
 
 
@@ -25444,7 +25487,7 @@ async def owner_verify_payment_view(call: CallbackQuery, bot: Bot):
     if not row:
         return await call.answer("Order tidak ditemukan.",show_alert=True)
 
-    if row["payment_status"]=="paid" or row["status"] in {"cancelled","expired","completed"}:
+    if order_payment_terminal(row) and not owner_confirmable_expired_manual(row):
         return await call.answer(
             "Order sudah final dan tidak perlu diverifikasi lagi.",
             show_alert=True
@@ -25555,7 +25598,8 @@ async def owner_verify_payment_confirm(call: CallbackQuery, bot: Bot):
         ok=await mark_order_paid(
             order_id,
             bot,
-            paid_amount
+            paid_amount,
+            verified_by=call.from_user.id
         )
     except Exception as exc:
         logging.exception("Manual verify payment failed order=%s: %s",order_id,exc)
@@ -30053,9 +30097,13 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot, state: FSMContext =
         if not row:
             return await call.answer("Order tidak ditemukan.", show_alert=True)
 
-        if order_payment_terminal(row):
+        if order_payment_terminal(row) and not owner_confirmable_expired_manual(row):
             return await call.answer(
-                "Order sudah final dan tidak bisa dikonfirmasi lagi.",
+                "Pembayaran sudah dikonfirmasi; transaksi tidak diproses ulang."
+                if row['payment_status']=='paid' or row['status']=='completed'
+                else "Order sudah dibatalkan/ditolak dan tidak bisa dikonfirmasi."
+                if row['status']=='cancelled' or str(row['payment_review_status'] or '')=='rejected'
+                else "Invoice pembayaran otomatis sudah kedaluwarsa.",
                 show_alert=True
             )
 
@@ -30065,12 +30113,15 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot, state: FSMContext =
                 show_alert=True
             )
 
-        ok = await mark_order_paid(
-            entity_id,
-            bot,
-            int(row["payment_total"] or row["total"]),
-            verified_by=call.from_user.id
-        )
+        try:
+            ok = await mark_order_paid(
+                entity_id,
+                bot,
+                int(row["payment_total"] or row["total"]),
+                verified_by=call.from_user.id
+            )
+        except sqlite3.Error:
+            return await safe_callback_notice(call,'Status belum dapat ditampilkan. Refresh transaksi sebelum mencoba kembali.',show_alert=True)
         if not ok:
             return await call.answer("Verifikasi order gagal.", show_alert=True)
 
@@ -30124,7 +30175,8 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot, state: FSMContext =
                 conn.close()
         if not topup_row:
             return await owner_proof_result_screen(call,"⚠️ Top up tidak ditemukan.",alert_text="Top up tidak ditemukan.")
-        if topup_payment_terminal(topup_row) and topup_row["status"]!="completed":
+        if (topup_payment_terminal(topup_row) and topup_row["status"]!="completed"
+                and not owner_confirmable_expired_manual(topup_row)):
             return await owner_proof_result_screen(call,
                 "⚠️ <b>TOP UP SUDAH FINAL</b>\n\n"
                 f"🧾 {topup_invoice(entity_id)}\n"
@@ -30208,13 +30260,13 @@ async def owner_proof_reject(call: CallbackQuery,state: FSMContext = None):
     if entity=="order":
         final=(
             row["payment_status"]=="paid"
-            or row["status"] in {"cancelled","expired","completed"}
+            or (row["status"] in {"cancelled","expired","completed"} and not owner_confirmable_expired_manual(row))
             or str(row["payment_review_status"] or "")=="rejected"
         )
     else:
         final=(
-            topup_payment_terminal(row)
-            or str(row["status"] or "") != "pending"
+            (topup_payment_terminal(row) and not owner_confirmable_expired_manual(row))
+            or (str(row["status"] or "") != "pending" and not owner_confirmable_expired_manual(row))
             or str(row["payment_review_status"] or "")=="rejected"
         )
 
@@ -30283,12 +30335,12 @@ async def owner_proof_back(call: CallbackQuery,state: FSMContext = None):
     if entity=="order":
         final=(
             row["payment_status"]=="paid"
-            or row["status"] in {"cancelled","expired","completed"}
+            or (row["status"] in {"cancelled","expired","completed"} and not owner_confirmable_expired_manual(row))
             or str(row["payment_review_status"] or "")=="rejected"
         )
     else:
         final=(
-            topup_payment_terminal(row)
+            (topup_payment_terminal(row) and not owner_confirmable_expired_manual(row))
             or str(row["payment_review_status"] or "")=="rejected"
         )
 
@@ -30370,10 +30422,10 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
     if entity=="order":
         is_final=(
             row["payment_status"]=="paid"
-            or row["status"] in {"cancelled","expired","completed"}
+            or (row["status"] in {"cancelled","expired","completed"} and not owner_confirmable_expired_manual(row))
         )
     else:
-        is_final=topup_payment_terminal(row) or str(row["status"] or "") != "pending"
+        is_final=(topup_payment_terminal(row) and not owner_confirmable_expired_manual(row)) or (str(row["status"] or "") != "pending" and not owner_confirmable_expired_manual(row))
 
     if is_final:
         conn.rollback()
@@ -30407,9 +30459,10 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
                    payment_review_status='rejected'
                WHERE id=?
                  AND payment_status!='paid'
-                 AND status NOT IN ('cancelled','expired','completed')
+                 AND status NOT IN ('cancelled','completed')
+                 AND (status!='expired' OR ?)
                  AND COALESCE(payment_review_status,'')!='rejected'""",
-            (reason,entity_id)
+            (reason,entity_id,owner_confirmable_expired_manual(row))
         )
     else:
         conn.execute(
@@ -30419,13 +30472,14 @@ async def owner_proof_reject_reason(call: CallbackQuery, bot: Bot):
                    payment_review_status='rejected',
                    updated_at=?
                WHERE id=?
-                 AND status='pending'
+                 AND (status='pending' OR (status='expired' AND ?))
                  AND COALESCE(payment_review_status,'')!='rejected'""",
             (
                 reason,
                 reason,
                 datetime.now().isoformat(timespec="seconds"),
-                entity_id
+                entity_id,
+                owner_confirmable_expired_manual(row)
             )
         )
 
@@ -30482,8 +30536,9 @@ async def owner_proof_pending(call: CallbackQuery, bot: Bot,state: FSMContext = 
     if not is_owner(call.from_user.id):
         return await call.answer("Akses ditolak.", show_alert=True)
 
-    _, entity, raw_id = call.data.split(":")
-    entity_id = int(raw_id)
+    target=payment_transaction_callback(call.data,'proofpending')
+    if not target:return await safe_callback_notice(call,'Data transaksi tidak valid.',show_alert=True)
+    entity,entity_id=target
     if entity=="topup":
         await clear_owner_topup_note(state)
 
@@ -30499,14 +30554,14 @@ async def owner_proof_pending(call: CallbackQuery, bot: Bot,state: FSMContext = 
 
     if entity=="order" and (
         row["payment_status"]=="paid"
-        or row["status"] in {"cancelled","expired","completed"}
+        or (row["status"] in {"cancelled","expired","completed"} and not owner_confirmable_expired_manual(row))
     ):
         return await call.answer(
             "Order sudah final dan tidak bisa ditandai pending.",
             show_alert=True
         )
 
-    if entity=="topup" and row["status"] in {"completed","expired","cancelled","rejected"}:
+    if entity=="topup" and (row["status"] in {"completed","expired","cancelled","rejected"} and not owner_confirmable_expired_manual(row)):
         return await call.answer(
             "Top up sudah final dan tidak bisa ditandai pending.",
             show_alert=True
@@ -30520,18 +30575,23 @@ async def owner_proof_pending(call: CallbackQuery, bot: Bot,state: FSMContext = 
 
     if entity=="order":
         conn=db()
-        conn.execute(
-            "UPDATE orders SET payment_review_status='reviewing' WHERE id=?",
-            (entity_id,)
-        )
+        changed=conn.execute(
+            """UPDATE orders SET payment_review_status='reviewing' WHERE id=? AND payment_status!='paid'
+               AND status NOT IN ('cancelled','completed') AND (status!='expired' OR ?)""",
+            (entity_id,owner_confirmable_expired_manual(row))
+        ).rowcount
         conn.commit(); conn.close()
     elif entity=="topup":
         conn=db()
-        conn.execute(
-            "UPDATE topups SET payment_review_status='reviewing', updated_at=? WHERE id=?",
-            (datetime.now().isoformat(timespec="seconds"),entity_id)
-        )
+        changed=conn.execute(
+            """UPDATE topups SET payment_review_status='reviewing', updated_at=? WHERE id=?
+               AND (status='pending' OR (status='expired' AND ?))""",
+            (datetime.now().isoformat(timespec="seconds"),entity_id,owner_confirmable_expired_manual(row))
+        ).rowcount
         conn.commit(); conn.close()
+
+    if not changed:
+        return await safe_callback_notice(call,'Transaksi sudah diproses; refresh detailnya.',show_alert=True)
 
     try:
         await call.message.edit_caption(
@@ -34854,7 +34914,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.06"
+EXPECTED_SOURCE_VERSION = "17.07"
 
 
 def source_integrity_self_test():
