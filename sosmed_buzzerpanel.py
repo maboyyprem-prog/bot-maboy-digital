@@ -4,7 +4,8 @@ Request fields follow the owner's PHP/Node documentation for /api/json.php.
 Response layouts follow the supplied official examples. Account currency and
 pricing units must be read from the API or explicitly confirmed by the owner.
 No non-idempotent order request is replayed. Ambiguous results retain the hold
-for audited reconciliation. No undocumented cancellation action is sent.
+until audited reconciliation or owner-funded local cancellation. No
+undocumented provider cancellation action is sent.
 """
 import asyncio
 import hashlib
@@ -196,6 +197,8 @@ class StoreError(Exception):
             "REFILL": "Refill belum tersedia untuk pesanan ini.",
             "CANCEL": "Pembatalan belum tersedia untuk pesanan ini.",
             "PROOF": "Bukti rekonsiliasi belum valid atau sudah digunakan.",
+            "HOLD_CANCEL": "Saldo ini tidak dapat dibatalkan: permintaan masih berjalan atau pesanan sudah tercatat. Refresh transaksi dahulu.",
+            "HOLD_CHANGED": "Data saldo ditahan berubah. Buka detail transaksi dan konfirmasi kembali.",
             "BELOW_COST": "Harga layanan perlu diperbarui owner.",
         }
         self.public = message or messages.get(code, "Layanan belum tersedia. Coba kembali nanti.")
@@ -327,6 +330,14 @@ def init_schema(conn):
           refund_id TEXT NOT NULL UNIQUE,status TEXT NOT NULL DEFAULT 'PENDING',attempts INTEGER NOT NULL DEFAULT 0,
           next_retry_at REAL NOT NULL DEFAULT 0,lease_owner TEXT,lease_until REAL NOT NULL DEFAULT 0,
           sent_at REAL,error_code TEXT NOT NULL DEFAULT '',FOREIGN KEY(refund_id) REFERENCES sosmed_refunds(refund_id))""",
+        """CREATE TABLE IF NOT EXISTS sosmed_hold_cancellations(attempt_id TEXT PRIMARY KEY,
+          actor INTEGER NOT NULL,wallet_transaction_id INTEGER NOT NULL UNIQUE,
+          amount INTEGER NOT NULL CHECK(amount>0),created_at REAL NOT NULL,
+          notification_status TEXT NOT NULL DEFAULT 'PENDING',attempts INTEGER NOT NULL DEFAULT 0,
+          next_retry_at REAL NOT NULL DEFAULT 0,lease_owner TEXT,lease_until REAL NOT NULL DEFAULT 0,
+          sent_at REAL,error_code TEXT NOT NULL DEFAULT '',
+          FOREIGN KEY(attempt_id) REFERENCES sosmed_purchase_attempts(attempt_id),
+          FOREIGN KEY(wallet_transaction_id) REFERENCES wallet_ledger(id))""",
         """CREATE TABLE IF NOT EXISTS sosmed_favorites(user_id INTEGER NOT NULL,service_id INTEGER NOT NULL,
           created_at REAL NOT NULL,PRIMARY KEY(user_id,service_id))""",
         """CREATE TABLE IF NOT EXISTS sosmed_callback_tokens(token TEXT PRIMARY KEY,user_id INTEGER NOT NULL,
@@ -345,6 +356,7 @@ def init_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_sosmed_attempt_state ON sosmed_purchase_attempts(state)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_attempt_user ON sosmed_purchase_attempts(user_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_notification_due ON sosmed_notifications(status,next_retry_at,lease_until)",
+        "CREATE INDEX IF NOT EXISTS idx_sosmed_hold_notice_due ON sosmed_hold_cancellations(notification_status,next_retry_at,lease_until)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_services_category ON sosmed_services(category,enabled)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_callback_expiry ON sosmed_callback_tokens(expires_at)",
     ]
@@ -439,7 +451,7 @@ class Repository:
             attempt_terms.append("a.user_id=?")
             args.append(user)
         if not history:
-            attempt_terms.append("a.state!='FAILED'")
+            attempt_terms.append("a.state NOT IN ('FAILED','CANCELED')")
         union = ("SELECT 'ORDER' kind,CAST(id AS TEXT) ident,created_at FROM sosmed_orders"+order_where+
                  " UNION ALL SELECT 'ATTEMPT' kind,attempt_id ident,created_at FROM sosmed_purchase_attempts a WHERE "+" AND ".join(attempt_terms))
         with self.connection() as conn:
@@ -1459,7 +1471,7 @@ class PurchaseService:
             row = conn.execute("SELECT * FROM sosmed_purchase_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
             if not row:
                 raise StoreError("NOT_FOUND")
-            if row["state"]=="FAILED":
+            if row["state"] in {"FAILED", "CANCELED"}:
                 return
             if row["state"] not in {"REQUESTING", "RECONCILIATION_REQUIRED"} or (row["state"]=="RECONCILIATION_REQUIRED" and not proof):
                 raise StoreError("PROOF")
@@ -1528,6 +1540,7 @@ class RefundService:
     async def deliver(self, bot):
         if bot is None:
             return
+        await self.deliver_holds(bot)
         now, owner = time.time(), secrets.token_hex(12)
         jobs = self.store.repo.all("""SELECT notification_id FROM sosmed_notifications WHERE status='PENDING'
             AND next_retry_at<=? AND lease_until<=? ORDER BY rowid LIMIT 20""", (now,now))
@@ -1565,6 +1578,49 @@ class RefundService:
                     conn.execute("""UPDATE sosmed_notifications SET status='SENT',sent_at=?,lease_owner=NULL,
                         lease_until=0,error_code='' WHERE notification_id=? AND lease_owner=?""",
                         (time.time(),row["notification_id"],owner))
+
+    async def deliver_holds(self, bot):
+        """Notify a settled cancellation; never submit orders or credit funds."""
+        if bot is None:
+            return
+        now, owner = time.time(), secrets.token_hex(12)
+        jobs = self.store.repo.all("""SELECT attempt_id FROM sosmed_hold_cancellations
+            WHERE notification_status='PENDING' AND next_retry_at<=? AND lease_until<=?
+            ORDER BY created_at LIMIT 20""", (now,now))
+        for job in jobs:
+            with self.store.repo.connection(True) as conn:
+                changed = conn.execute("""UPDATE sosmed_hold_cancellations SET lease_owner=?,lease_until=?
+                    WHERE attempt_id=? AND notification_status='PENDING' AND next_retry_at<=? AND lease_until<=?""",
+                    (owner,now+60,job['attempt_id'],now,now)).rowcount
+                if not changed:
+                    continue
+                row = dict(conn.execute("""SELECT c.*,a.user_id,q.service_snapshot FROM sosmed_hold_cancellations c
+                    JOIN sosmed_purchase_attempts a ON a.attempt_id=c.attempt_id AND a.state='CANCELED'
+                    JOIN sosmed_quotes q ON q.quote_id=a.quote_id AND q.user_id=a.user_id
+                    WHERE c.attempt_id=?""", (job['attempt_id'],)).fetchone())
+            try:
+                from sosmed_ui import UserFormatter, esc
+                name = json.loads(row['service_snapshot']).get('name','Layanan Sosmed')
+                for field in ('token','secret'):
+                    name = name.replace(getattr(self.store.config,field,'') or '\x00','')
+                await bot.send_message(row['user_id'], "↩️ <b>TRANSAKSI SOSMED DIBATALKAN</b>\n"
+                    f"T-{esc(row['attempt_id'][:12])} • {esc(UserFormatter.label(name),500)}\n"
+                    f"Saldo dikembalikan: <b>{money(row['amount'])}</b>\n"
+                    "Transaksi ditutup dan tidak diproses ulang oleh bot. Lihat Riwayat pada /sosmed.",parse_mode='HTML')
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempts = row['attempts']+1
+                with self.store.repo.connection(True) as conn:
+                    conn.execute("""UPDATE sosmed_hold_cancellations SET attempts=?,notification_status=?,next_retry_at=?,
+                        lease_owner=NULL,lease_until=0,error_code=? WHERE attempt_id=? AND lease_owner=?""",
+                        (attempts,'FAILED' if attempts>=8 else 'PENDING',time.time()+min(3600,10*2**min(attempts,8)),
+                         type(exc).__name__,row['attempt_id'],owner))
+            else:
+                with self.store.repo.connection(True) as conn:
+                    conn.execute("""UPDATE sosmed_hold_cancellations SET notification_status='SENT',sent_at=?,
+                        lease_owner=NULL,lease_until=0,error_code='' WHERE attempt_id=? AND lease_owner=?""",
+                        (time.time(),row['attempt_id'],owner))
 
 
 class OrderService:
@@ -2057,8 +2113,10 @@ class Store:
             WHERE state IN ('RESERVED','REQUESTING','RECONCILIATION_REQUIRED','PENDING_RECONCILIATION')
             AND NOT EXISTS (SELECT 1 FROM sosmed_orders o WHERE o.attempt_id=a.attempt_id)""")
         totals.update(held_count=held["count"],held_amount=held["amount"])
-        totals["refund_notifications_pending"] = self.repo.one("SELECT COUNT(*) n FROM sosmed_notifications WHERE status='PENDING'")["n"]
-        totals["refund_notifications_failed"] = self.repo.one("SELECT COUNT(*) n FROM sosmed_notifications WHERE status='FAILED'")["n"]
+        for status in ('PENDING','FAILED'):
+            totals['refund_notifications_'+status.lower()] = self.repo.one("""SELECT
+                (SELECT COUNT(*) FROM sosmed_notifications WHERE status=?)+
+                (SELECT COUNT(*) FROM sosmed_hold_cancellations WHERE notification_status=?) n""",(status,status))['n']
         # Refunds reduce both user revenue and confirmed provider cost.
         confirmed = self.repo.one("SELECT COALESCE(SUM(provider_amount),0) AS amount FROM sosmed_refunds WHERE status='CREDITED'")["amount"]
         totals["gross_profit"] += confirmed
@@ -2090,6 +2148,68 @@ class Store:
         self.require_owner(user)
         proof = self.proof(proof_ref)
         self.purchase.release(str(attempt_id), "OWNER_PROOF_NO_ORDER", proof=proof, actor=user)
+
+    @staticmethod
+    def _held_refund(conn, attempt_id):
+        """Read and verify the actual reservation, never a UI-supplied balance."""
+        if not isinstance(attempt_id,str) or not 1<=len(attempt_id)<=128 or '\x00' in attempt_id:
+            raise StoreError('INPUT')
+        row = conn.execute("""SELECT a.*,q.sale FROM sosmed_purchase_attempts a
+            JOIN sosmed_quotes q ON q.quote_id=a.quote_id AND q.user_id=a.user_id
+            WHERE a.attempt_id=?""", (attempt_id,)).fetchone()
+        if not row:
+            raise StoreError('NOT_FOUND')
+        item = dict(row)
+        if (item['state'] not in {'RECONCILIATION_REQUIRED','PENDING_RECONCILIATION','CANCELED'}
+                or item['provider_order_id'] is not None
+                or conn.execute('SELECT 1 FROM sosmed_orders WHERE attempt_id=?',(attempt_id,)).fetchone()):
+            raise StoreError('HOLD_CANCEL')
+        hold = conn.execute("SELECT amount FROM wallet_ledger WHERE user_id=? AND type='SOSMED_HOLD' AND reference=?",
+                            (item['user_id'],attempt_id)).fetchall()
+        release = conn.execute("SELECT id,amount FROM wallet_ledger WHERE user_id=? AND type='SOSMED_RELEASE' AND reference=?",
+                               (item['user_id'],attempt_id)).fetchall()
+        cancellation = conn.execute('SELECT * FROM sosmed_hold_cancellations WHERE attempt_id=?',(attempt_id,)).fetchone()
+        captured = conn.execute("SELECT 1 FROM wallet_ledger WHERE type='SOSMED_CAPTURE' AND reference=?",(attempt_id,)).fetchone()
+        if len(hold)!=1 or hold[0]['amount']!=-item['hold_amount'] or item['sale']!=item['hold_amount'] or captured:
+            raise StoreError('HOLD_CHANGED')
+        if item['state']=='CANCELED':
+            if (not cancellation or len(release)!=1 or release[0]['amount']!=item['hold_amount']
+                    or cancellation['amount']!=item['hold_amount'] or cancellation['wallet_transaction_id']!=release[0]['id']):
+                raise StoreError('HOLD_CHANGED')
+        elif release or cancellation:
+            raise StoreError('HOLD_CHANGED')
+        return item
+
+    def hold_refund_preview(self, user, attempt_id):
+        self.require_owner(user)
+        with self.repo.connection() as conn:
+            return self._held_refund(conn,attempt_id)
+
+    def admin_cancel_hold(self, user, attempt_id, buyer_user_id, amount):
+        """Owner-funded local cancellation; no provider cancellation is assumed."""
+        self.require_owner(user)
+        buyer, amount = number(buyer_user_id,1), number(amount,1)
+        now = time.time()
+        with self.repo.connection(True) as conn:
+            item = self._held_refund(conn,attempt_id)
+            if item['user_id']!=buyer or item['hold_amount']!=amount:
+                raise StoreError('HOLD_CHANGED')
+            if item['state']=='CANCELED':
+                return {**item,'already_refunded':True}
+            if not WalletAdapter.change(conn,buyer,'SOSMED_RELEASE',amount,attempt_id,'Batal & refund saldo Sosmed oleh owner'):
+                raise StoreError('HOLD_CHANGED')
+            ledger = conn.execute("SELECT id FROM wallet_ledger WHERE user_id=? AND type='SOSMED_RELEASE' AND reference=?",
+                                  (buyer,attempt_id)).fetchone()['id']
+            conn.execute("INSERT INTO sosmed_hold_cancellations(attempt_id,actor,wallet_transaction_id,amount,created_at) VALUES(?,?,?,?,?)",
+                         (attempt_id,user,ledger,amount,now))
+            conn.execute("""UPDATE sosmed_purchase_attempts SET state='CANCELED',reconciliation_status='CANCELED_REFUNDED',
+                error_code='OWNER_CANCEL_REFUND',updated_at=? WHERE attempt_id=?""", (now,attempt_id))
+            conn.execute("UPDATE sosmed_quotes SET state='CANCELED' WHERE quote_id=?",(item['quote_id'],))
+            conn.execute("INSERT INTO sosmed_audit(actor,action,payload,created_at) VALUES(?,?,?,?)",
+                         (user,'hold_cancel_refund',encoded({'attempt':attempt_id,'user':buyer,'wallet_amount':amount,
+                                                           'ledger':ledger,'provider_cancellation':False}),now))
+        return {**item,'state':'CANCELED','reconciliation_status':'CANCELED_REFUNDED',
+                'error_code':'OWNER_CANCEL_REFUND','updated_at':now,'already_refunded':False}
 
     async def admin_refund(self, user, order_id, provider_refund_idr, proof_ref):
         self.require_owner(user)

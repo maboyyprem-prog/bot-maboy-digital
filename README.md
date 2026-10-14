@@ -1,4 +1,4 @@
-# MaboyyDigital v17.04
+# MaboyyDigital v17.05
 
 Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -29,6 +29,18 @@ Riwayat, dengan ID transaksi `T-`, nominal ditahan, waktu WIB dan tombol detail.
 Penolakan pembelian definitif masuk Riwayat dengan saldo yang sudah dilepas.
 Timeout/status belum pasti tetap direkonsiliasi; bot tidak membeli ulang otomatis.
 
+Owner: buka **/sosmed → Semua Pesanan atau Rekonsiliasi → pilih transaksi T- →
+Batalkan & Refund Saldo → Konfirmasi**. Nominal ditahan dikembalikan penuh ke wallet
+user dengan ledger atomik; double click tidak menambah saldo dua kali. Status menjadi
+**Dibatalkan**, masuk Riwayat, dan bot tidak membuat order, menangkap saldo, atau
+melampirkan hasil provider kembali untuk transaksi itu, termasuk setelah restart.
+User menerima notifikasi privat dengan retry; retry hanya mengirim pemberitahuan.
+Tombol hanya tersedia pada owner untuk transaksi belum pasti tanpa ID order yang
+tercatat. Permintaan yang masih berjalan harus ditunggu hingga selesai/timeout.
+Pembatalan ini berlaku di bot: API provider belum mendokumentasikan cancel,
+sehingga pesanan yang sudah diterima provider dapat tetap berjalan dan modalnya
+menjadi tanggungan toko. Tidak perlu command refund tambahan atau variabel baru.
+
 **Refund saldo Sosmed otomatis** saat API mengonfirmasi gagal (`Error/Failed`):
 harga yang dibayar dikembalikan penuh. Untuk `Partial`, refund = harga dibayar ×
 jumlah belum terpenuhi (`remains`) ÷ jumlah pesanan, dibulatkan ke bawah.
@@ -37,7 +49,8 @@ harga order, ledger idempotent dan notifikasi privat dengan retry setelah restar
 Refund saldo toko tidak menunggu refund provider. Modal provider yang belum
 dikembalikan tetap menjadi biaya toko; profit tidak menganggap kredit provider
 sukses hanya dari status/charge. Bukti kredit provider owner dicatat terpisah tanpa
-menambah saldo user dua kali. Pembatalan yang belum didukung tetap mengikuti alur lama.
+menambah saldo user dua kali. Pembatalan langsung di provider tetap memerlukan
+dukungan API; Batalkan & Refund pada transaksi ditahan menutup transaksi lokal bot.
 
 ## Harga dan layanan Sosmed
 
@@ -152,7 +165,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.04; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.05; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.

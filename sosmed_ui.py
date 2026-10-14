@@ -546,8 +546,9 @@ class UIBuilder:
             if order["kind"] == "ATTEMPT":
                 label = "T-"+order["attempt_id"][:12]
                 name = self.provider_label(order["service_name_snapshot"])[:90] if admin else self.public_label(order["service_name_snapshot"],90)
-                amount = order["released_amount"] if order["state"] == "FAILED" else order["hold_amount"]
-                funds = "Saldo dikembalikan" if order["state"] == "FAILED" and amount else "Dana transaksi" if order["state"] == "FAILED" else "Saldo ditahan"
+                settled = order["state"] in {"FAILED","CANCELED"}
+                amount = order["released_amount"] if settled else order["hold_amount"]
+                funds = "Saldo dikembalikan" if settled and amount else "Dana transaksi" if settled else "Saldo ditahan"
                 lines.append(f"<b>#{esc(label)} {esc(name,200)}</b>\n{esc(UserFormatter.status(order['state']))} • {funds}: {core.money(amount)}\n"
                              f"🕒 {instant(order['created_at'])}")
                 rows.append([(f"#{label} {name}"[:60],"admin_attempt" if admin else "attempt",
@@ -560,7 +561,7 @@ class UIBuilder:
                 summary += "\n↩️ Refund saldo: "+core.money(order["refund_amount"])
             lines.append(summary)
             rows.append([(f"#{oid} {name}"[:60], "admin_check" if admin else "check", {"id": oid})])
-        if any(order["kind"] == "ATTEMPT" and order["state"] != "FAILED" for order in orders):
+        if any(order["kind"] == "ATTEMPT" and order["state"] not in {"FAILED","CANCELED"} for order in orders):
             lines.append("Dana transaksi yang belum pasti tetap ditahan. Jangan membeli ulang; owner akan memeriksanya.")
         rows += self.pages(user, action, {}, page, total)
         rows.append([("⬅️ Kembali", "admin_menu" if admin else "home", {})])
@@ -569,6 +570,9 @@ class UIBuilder:
                         + ("\n\n".join(lines) if lines else "Belum ada pesanan."), self.keyboard(user, rows))
 
     async def attempt(self, message, user, ident, payload=None, *, admin=False):
+        if admin:
+            self.store.require_owner(user)
+            self.store.purchase.recover()
         item = self.store.repo.attempt(user,ident,admin=admin)
         order = self.store.repo.one("SELECT * FROM sosmed_orders WHERE attempt_id=?", (ident,))
         if order:
@@ -578,17 +582,26 @@ class UIBuilder:
                 f"📱 {esc(name,600)}\n🔗 Target: <code>{esc(item['target'],1000)}</code>\n"
                 f"🔢 Jumlah: {item['quantity']}\n📊 Status: {esc(UserFormatter.status(item['state']))}\n"
                 f"💰 Harga: {core.money(item['sale'])}\n🕒 Beli: {instant(item['created_at'])}\n")
-        if item["state"] == "FAILED":
+        if item["state"] in {"FAILED","CANCELED"}:
             text += f"↩️ Saldo dikembalikan: {core.money(item['released_amount'])}\n"
+            if item["state"] == "CANCELED":
+                text += "🔒 Transaksi ditutup. Bot tidak memproses ulang pesanan ini.\n"
         else:
             text += f"⏳ Saldo ditahan: {core.money(item['hold_amount'])}\nHasil pembelian belum pasti. Jangan membeli ulang; owner akan memeriksanya.\n"
         if admin:
             text += f"\nUser: {item['user_id']}\nAttempt: <code>{esc(ident)}</code>\nModal: {core.money(item['cost'])}\n"
         action = "admin_attempt" if admin else "attempt"
         history = (payload or {}).get("history") is True
-        rows = [[("🔄 Refresh Transaksi",action,{"id":ident,"history":history})],
-                [("⬅️ Kembali","admin_orders" if admin else "history" if history else "orders",{}),
-                 ("🏠 Menu Awal","admin_menu" if admin else "home",{})]]
+        rows = [[("🔄 Refresh Transaksi",action,{"id":ident,"history":history})]]
+        if admin and item['state'] in {'RECONCILIATION_REQUIRED','PENDING_RECONCILIATION'}:
+            try:
+                self.store.hold_refund_preview(user,ident)
+            except core.StoreError:
+                pass
+            else:
+                rows.append([("❌ Batalkan & Refund Saldo","admin_cancel_hold",{"id":ident})])
+        rows.append([("⬅️ Kembali","admin_orders" if admin else "history" if history else "orders",{}),
+                     ("🏠 Menu Awal","admin_menu" if admin else "home",{})])
         await self.send(message,text,self.keyboard(user,rows))
 
 
@@ -599,6 +612,21 @@ class AdminHandler:
     def authorize(self, user):
         if not self.store.owner(user):
             raise core.StoreError("FORBIDDEN", "Menu ini hanya untuk owner.")
+
+    async def cancel_hold(self, message, user, payload):
+        self.authorize(user)
+        item = self.store.hold_refund_preview(user,payload['id'])
+        if item['state']=='CANCELED':
+            return await self.ui.attempt(message,user,item['attempt_id'],admin=True)
+        text = ("❌ <b>KONFIRMASI BATALKAN &amp; REFUND</b>\n"
+                f"Transaksi: T-{esc(item['attempt_id'][:12])}\nUser: {item['user_id']}\n"
+                f"↩️ Refund saldo: <b>{core.money(item['hold_amount'])}</b>\n\n"
+                "Saldo dikembalikan penuh ke wallet user dan transaksi ditutup. Bot tidak memproses ulang pesanan ini.\n\n"
+                "Pembatalan berlaku di bot. Pesanan yang sudah terkirim dapat tetap diproses oleh provider; biayanya menjadi tanggungan toko.")
+        rows = [[('✅ Batalkan & Refund','admin_cancel_hold_confirm',{'id':item['attempt_id'],
+                  'buyer':item['user_id'],'amount':item['hold_amount']})],
+                [('⬅️ Kembali','admin_attempt',{'id':item['attempt_id']}),('🏠 Menu Awal','admin_menu',{})]]
+        await self.ui.send(message,text,self.ui.keyboard(user,rows))
 
     async def form(self, message, user, payload):
         self.authorize(user)
@@ -888,17 +916,22 @@ class AdminHandler:
                     "Refund saldo toko tidak menunggu kredit provider. Bukti kredit provider dicatat terpisah untuk profit, tanpa kredit saldo ganda.\n"
                     "Command: /sosmed admin refund &lt;order&gt; &lt;refund_modal_idr&gt; &lt;referensi_bukti&gt;")
         else:
+            self.store.purchase.recover()
             rows = self.store.repo.all("""SELECT * FROM sosmed_purchase_attempts
                 WHERE state IN ('RESERVED','REQUESTING','RECONCILIATION_REQUIRED','PENDING_RECONCILIATION')
+                AND NOT EXISTS (SELECT 1 FROM sosmed_orders o WHERE o.attempt_id=sosmed_purchase_attempts.attempt_id)
                 ORDER BY created_at DESC LIMIT 8 OFFSET ?""", (page*PAGE_SIZE,))
             count = self.store.repo.one("""SELECT COUNT(*) n FROM sosmed_purchase_attempts
-                WHERE state IN ('RESERVED','REQUESTING','RECONCILIATION_REQUIRED','PENDING_RECONCILIATION')""")["n"]
+                WHERE state IN ('RESERVED','REQUESTING','RECONCILIATION_REQUIRED','PENDING_RECONCILIATION')
+                AND NOT EXISTS (SELECT 1 FROM sosmed_orders o WHERE o.attempt_id=sosmed_purchase_attempts.attempt_id)""")["n"]
             lines = [f"<code>{esc(row['attempt_id'])}</code>\nUser {row['user_id']} • {esc(row['state'])}" for row in rows]
-            note = ("Periksa dashboard resmi sebelum melampirkan hasil atau melepas dana. Tidak ada pembelian ulang otomatis.\n\n"
-                    "/sosmed admin reconcile &lt;attempt&gt; &lt;provider_order&gt; &lt;referensi_bukti&gt;\n"
-                    "/sosmed admin release &lt;attempt&gt; &lt;referensi_bukti_tidak_ada_order&gt;")
+            note = ("Pilih transaksi untuk memeriksa saldo ditahan atau memakai Batalkan &amp; Refund Saldo.\n"
+                    "Pembatalan menutup transaksi di bot; bot tidak membeli atau memprosesnya ulang.\n"
+                    "Periksa pesanan yang mungkin sudah diterima pada dashboard provider.")
         action = "admin_refunds" if refunds else "admin_pending"
-        keyboard_rows = self.ui.pages(user, action, {}, page, count)+[[('⬅️ Kembali', 'admin_menu', {})]]
+        keyboard_rows = ([[(f"T-{row['attempt_id'][:12]} • {core.money(row['hold_amount'])}",
+                           'admin_attempt',{'id':row['attempt_id']})] for row in rows] if not refunds else [])
+        keyboard_rows += self.ui.pages(user, action, {}, page, count)+[[('⬅️ Kembali', 'admin_menu', {})]]
         await self.ui.send(message, ("↩️ <b>REFUND PERLU DIPERIKSA</b>\n\n" if refunds else "⏳ <b>REKONSILIASI PEMBELIAN</b>\n\n")
                            + ("\n\n".join(lines) if lines else "Tidak ada transaksi menunggu.")+"\n\n"+note,
                            self.ui.keyboard(user, keyboard_rows))
@@ -1031,6 +1064,11 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await ui.check(message, user, number(payload["id"], 1))
     if action in {"attempt","admin_attempt"}:
         return await ui.attempt(message,user,payload["id"],payload,admin=action=="admin_attempt")
+    if action == 'admin_cancel_hold':
+        return await admin.cancel_hold(message,user,payload)
+    if action == 'admin_cancel_hold_confirm':
+        store.admin_cancel_hold(user,payload['id'],payload['buyer'],payload['amount'])
+        return await ui.attempt(message,user,payload['id'],admin=True)
     if action in {'search','admin_search'}:
         is_admin_search = action=='admin_search'
         context = {key:payload[key] for key in ('category','platform','query','filters','view','page','category_query','category_page') if key in payload}
@@ -1091,6 +1129,8 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
             return
         if result.get("state") in {"FAILED", "RELEASED"}:
             return await ui.send(message, "❌ Pesanan tidak berhasil dibuat. Dana transaksi yang ditahan telah dilepas.", ui.navigation(user))
+        if result.get('state')=='CANCELED':
+            return await ui.attempt(message,user,result['attempt_id'],{'history':True})
         return await ui.send(message, "⏳ Hasil pesanan belum pasti. Dana transaksi ini tetap ditahan. "
                              "Jangan membeli ulang; periksa Pesanan Saya atau hubungi owner.",
                              ui.keyboard(user, [[("📦 Pesanan Saya", "orders", {})], [("🏠 Menu Awal", "home", {})]]))
