@@ -1,4 +1,4 @@
-# MaboyyDigital v17.05
+# MaboyyDigital v17.06
 
 Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -105,6 +105,20 @@ User memilih rekening aktif ketika deposit/checkout. Invoice menyimpan rekening
 dan nomor salin sendiri; perubahan rekening tidak mengubah snapshot invoice.
 Tidak ada variabel baru atau wallet baru untuk multi-rekening.
 
+## Hapus stok owner
+
+**/owner → Produk & Stok → Hapus Stok → Produk → Varian → Jumlah → Konfirmasi**.
+Tombol juga tersedia di **Atur Stok → Varian**. Pilih 1/5/10, jumlah custom,
+atau semua stok bebas (maksimal 10.000 per proses). Pilihan produk/varian memakai
+8 item per halaman. Kembali/Batal tersedia; custom input mengganti pesan form.
+Stok terbaru yang ditambahkan dipilih. Akun yang terjual/dialokasikan, akun
+terhubung ke order, dan jumlah reservasi aktif dilindungi. Konfirmasi menyimpan
+ID akun dan berlaku 10 menit; perubahan stok/reservasi memerlukan konfirmasi ulang.
+Klik ganda/restart tidak menghapus akun lain. Akun ditandai `removed`, dikeluarkan
+dari penjualan, dan dicatat pada Riwayat Stok/audit tanpa menghapus riwayat order.
+Fitur ini khusus stok akun ready; alur slot Pre-Order/Famhead tetap memakai
+pengaturan existing. Wallet, pembayaran dan alur OTP/Sosmed tidak diubah.
+
 ## Variabel
 
 Isi `BOT_TOKEN` dan `ADMIN_ID` numerik melalui Railway Variables; daftar contoh ada di `.env.example`.
@@ -165,7 +179,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.05; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.06; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.

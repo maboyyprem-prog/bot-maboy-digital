@@ -229,8 +229,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.05"
-SCHEMA_VERSION = 195
+BOT_VERSION = "17.06"
+SCHEMA_VERSION = 196
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -840,6 +840,22 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owner_stock_deletions (
+            token TEXT PRIMARY KEY,
+            owner_id INTEGER NOT NULL,
+            variant_id INTEGER NOT NULL,
+            item_ids TEXT NOT NULL,
+            quantity INTEGER NOT NULL CHECK(quantity>0),
+            state TEXT NOT NULL DEFAULT 'PENDING',
+            expires_at REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL DEFAULT '',
+            result TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_owner_stock_delete_owner ON owner_stock_deletions(owner_id,state)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS voucher_usage (
@@ -9643,6 +9659,7 @@ class OwnerState(StatesGroup):
     stock_duplicate_content = State()
     stock_bulk_unique_count = State()
     stock_bulk_unique_collect = State()
+    stock_delete_quantity = State()
     set_price = State()
     mark_popular = State()
     mark_flash = State()
@@ -10794,7 +10811,8 @@ def duplicate_inventory_items(conn, variant_id: int, content: str, qty: int):
 def owner_stock_variant_actions(variant_id: int):
     conn=db()
     row=conn.execute(
-        """SELECT v.id,v.name,v.stock,v.reserved_stock,p.id AS product_id,p.name AS product_name
+        """SELECT v.id,v.name,v.stock,v.reserved_stock,p.id AS product_id,p.name AS product_name,
+                  p.fulfillment_mode,p.product_type
            FROM product_variants v
            JOIN products p ON p.id=v.product_id
            WHERE v.id=? AND v.active=1 AND p.active=1""",
@@ -10813,6 +10831,8 @@ def owner_stock_variant_actions(variant_id: int):
         text="➕ Tambah Akun",
         callback_data=f"ownerstockadd:{variant_id}"
     )
+    if not product_is_preorder(row) and not product_is_famhead(row):
+        kb.button(text="🗑 Hapus Stok",callback_data=f"ownerstockdeletevar:{variant_id}")
     kb.button(
         text="📚 Riwayat Stok",
         callback_data="owner:inventory_log"
@@ -10827,6 +10847,112 @@ def owner_stock_variant_actions(variant_id: int):
 
 
 
+
+
+def owner_stock_delete_snapshot(conn, variant_id: int):
+    """Read removable accounts; active-order reservations stay protected."""
+    if type(variant_id) is not int or not 0<variant_id<=9223372036854775807:
+        raise ValueError("Varian tidak valid.")
+    row=conn.execute(
+        """SELECT v.*,p.name AS product_name,p.fulfillment_mode,p.product_type
+           FROM product_variants v JOIN products p ON p.id=v.product_id
+           WHERE v.id=? AND v.active=1 AND p.active=1""",(variant_id,)
+    ).fetchone()
+    if not row or product_is_preorder(row) or product_is_famhead(row):
+        raise ValueError("Hapus Stok ini khusus akun ready-stock. Pilih varian yang sesuai.")
+    eligible=int(conn.execute(
+        """SELECT COUNT(*) n FROM inventory_items WHERE variant_id=? AND status='available'
+           AND inventory_mode IN ('unique','sharing') AND COALESCE(order_id,0)=0
+           AND COALESCE(delivered_at,'')=''""",(variant_id,)
+    ).fetchone()['n'])
+    protected=max(0,int(row['reserved_stock'] or 0),reserved_qty_for_variant(conn,variant_id))
+    return {**dict(row),'eligible':eligible,'protected':protected,'removable':max(0,eligible-protected)}
+
+
+def owner_stock_delete_preview(owner_id: int, variant_id: int, quantity: int | None = None):
+    if not is_owner(owner_id):raise PermissionError("Fitur ini khusus owner.")
+    if quantity is not None and (type(quantity) is not int or not 1<=quantity<=10000):
+        raise ValueError("Jumlah harus 1–10.000.")
+    conn=db()
+    try:
+        with conn:
+            begin_immediate_retry(conn)
+            snapshot=owner_stock_delete_snapshot(conn,variant_id)
+            qty=snapshot['removable'] if quantity is None else quantity
+            if not 1<=qty<=min(10000,snapshot['removable']):
+                raise ValueError("Jumlah melebihi stok yang boleh dihapus. Maksimal 10.000 per proses.")
+            ids=[int(row['id']) for row in conn.execute(
+                """SELECT id FROM inventory_items WHERE variant_id=? AND status='available'
+                   AND inventory_mode IN ('unique','sharing') AND COALESCE(order_id,0)=0
+                   AND COALESCE(delivered_at,'')='' ORDER BY id DESC LIMIT ?""",(variant_id,qty)
+            )]
+            if len(ids)!=qty:raise ValueError("Stok berubah. Buka Hapus Stok kembali.")
+            token=secrets.token_hex(12)
+            result={'product_name':snapshot['product_name'],'variant_name':snapshot['name'],
+                    'variant_id':variant_id,'quantity':qty,'available_before':snapshot['eligible'],
+                    'protected':snapshot['protected'],'remaining':snapshot['eligible']-qty}
+            conn.execute("UPDATE owner_stock_deletions SET state='CANCELED' WHERE owner_id=? AND state='PENDING'",(owner_id,))
+            conn.execute("""INSERT INTO owner_stock_deletions(token,owner_id,variant_id,item_ids,quantity,
+                expires_at,created_at,result) VALUES(?,?,?,?,?,?,?,?)""",
+                (token,owner_id,variant_id,json.dumps(ids),qty,time.time()+600,
+                 datetime.now().isoformat(timespec='seconds'),json.dumps(result)))
+        return {**result,'token':token}
+    finally:conn.close()
+
+
+def owner_stock_delete_execute(owner_id: int, token: str):
+    if not is_owner(owner_id):raise PermissionError("Fitur ini khusus owner.")
+    if not isinstance(token,str) or not re.fullmatch(r'[0-9a-f]{24}',token):
+        raise ValueError("Konfirmasi tidak valid. Buka Hapus Stok kembali.")
+    conn=db()
+    try:
+        with conn:
+            begin_immediate_retry(conn)
+            session=conn.execute("SELECT * FROM owner_stock_deletions WHERE token=? AND owner_id=?",(token,owner_id)).fetchone()
+            if not session:raise ValueError("Konfirmasi bukan milik kamu atau sudah tidak tersedia.")
+            if session['state']=='DONE':return {**json.loads(session['result']),'already_done':True}
+            if session['state']!='PENDING' or session['expires_at']<=time.time():
+                raise ValueError("Konfirmasi dibatalkan/kedaluwarsa. Buka Hapus Stok kembali.")
+            snapshot=owner_stock_delete_snapshot(conn,int(session['variant_id']))
+            ids=json.loads(session['item_ids']);qty=int(session['quantity'])
+            if (not isinstance(ids,list) or len(ids)!=qty
+                    or any(type(ident) is not int or not 0<ident<=9223372036854775807 for ident in ids)
+                    or len(set(ids))!=qty or qty>snapshot['removable']):
+                raise ValueError("Stok atau reservasi berubah. Pilih jumlah dan konfirmasi kembali.")
+            removed=0
+            for offset in range(0,len(ids),400):
+                batch=ids[offset:offset+400];placeholders=','.join('?' for _ in batch)
+                removed+=conn.execute(
+                    "UPDATE inventory_items SET status='removed' WHERE variant_id=? AND status='available' "
+                    "AND inventory_mode IN ('unique','sharing') AND COALESCE(order_id,0)=0 "
+                    "AND COALESCE(delivered_at,'')='' AND id IN ("+placeholders+")",
+                    (session['variant_id'],*batch)
+                ).rowcount
+            if removed!=qty:raise ValueError("Akun telah dipakai atau stok berubah. Konfirmasi ulang.")
+            sync_variant_stock_from_inventory(conn,int(session['variant_id']))
+            now=datetime.now().isoformat(timespec='seconds')
+            result={**json.loads(session['result']),'remaining':snapshot['eligible']-qty,'protected':snapshot['protected']}
+            conn.execute("INSERT INTO inventory_logs(variant_id,action,qty,reference,note,created_at) VALUES(?,?,?,?,?,?)",
+                         (session['variant_id'],'DELETE_STOCK',-qty,'OWNER:'+token,'Hapus stok tersedia; riwayat akun dipertahankan',now))
+            conn.execute("INSERT INTO owner_audit_logs(owner_id,action,status,detail,created_at) VALUES(?,?,?,?,?)",
+                         (owner_id,'DELETE_STOCK','ok',f"variant={session['variant_id']} qty={qty} token={token}",now))
+            conn.execute("UPDATE owner_stock_deletions SET state='DONE',completed_at=?,result=? WHERE token=?",
+                         (now,json.dumps(result),token))
+        return {**result,'already_done':False}
+    finally:conn.close()
+
+
+def owner_stock_delete_cancel(owner_id: int, token: str):
+    if not is_owner(owner_id):raise PermissionError("Fitur ini khusus owner.")
+    conn=db()
+    try:
+        with conn:
+            begin_immediate_retry(conn)
+            session=conn.execute("SELECT variant_id FROM owner_stock_deletions WHERE token=? AND owner_id=?",(token,owner_id)).fetchone()
+            if not session:raise ValueError("Konfirmasi tidak tersedia.")
+            conn.execute("UPDATE owner_stock_deletions SET state='CANCELED' WHERE token=? AND state='PENDING'",(token,))
+        return int(session['variant_id'])
+    finally:conn.close()
 
 
 def owner_free_qty_keyboard(variant_id: int, available: int, sharing: bool):
@@ -10865,12 +10991,13 @@ def owner_products_menu():
     kb.button(text="🔎 Cari Produk", callback_data="owner:search_products")
     kb.button(text="⚙️ Atur Produk", callback_data="owner:manage_products")
     kb.button(text="📦 Atur Stok", callback_data="owner:set_stock")
+    kb.button(text="🗑 Hapus Stok", callback_data="owner:delete_stock")
     kb.button(text="💰 Atur Harga", callback_data="owner:set_price")
     kb.button(text="📊 Dashboard Stok", callback_data="owner:stock_dashboard")
     kb.button(text="📚 Akun Terjual", callback_data="owner:sold_accounts")
     kb.button(text="🧰 Lainnya", callback_data="owner:products_more")
     kb.button(text="⬅️ Kembali", callback_data="owner:panel")
-    kb.adjust(2, 2, 2, 2, 1)
+    kb.adjust(2, 2, 2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -31138,6 +31265,202 @@ async def owner_auto_recovery_now(call: CallbackQuery, bot: Bot):
         await owner_system_error_view(call, "Auto Recovery", exc)
 
 
+async def render_owner_stock_delete_catalog(call: CallbackQuery, state: FSMContext, *, product_id=0, page=1):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    await state.clear()
+    clear_owner_input_session(call.from_user.id)
+    page=max(1,min(100000,int(page)));conn=db()
+    try:
+        if product_id:
+            rows=conn.execute("""SELECT v.id,v.name FROM product_variants v JOIN products p ON p.id=v.product_id
+                WHERE p.id=? AND p.active=1 AND v.active=1 AND LOWER(COALESCE(p.fulfillment_mode,'ready'))!='preorder'
+                AND LOWER(COALESCE(p.product_type,'standard'))!='famhead' ORDER BY v.id""",(product_id,)).fetchall()
+            action='ownerstockdeletevariants:'+str(product_id)+':'
+            pick='ownerstockdeletevar:';title='Pilih varian';back='owner:delete_stock'
+        else:
+            rows=conn.execute("""SELECT p.id,p.name FROM products p WHERE p.active=1
+                AND LOWER(COALESCE(p.fulfillment_mode,'ready'))!='preorder'
+                AND LOWER(COALESCE(p.product_type,'standard'))!='famhead'
+                AND EXISTS(SELECT 1 FROM product_variants v WHERE v.product_id=p.id AND v.active=1) ORDER BY p.id""").fetchall()
+            action='ownerstockdeleteproducts:';pick='ownerstockdeleteproduct:';title='Pilih produk';back='owner:back_products'
+    finally:conn.close()
+    pages=max(1,(len(rows)+7)//8);page=min(page,pages)
+    buttons=[[InlineKeyboardButton(text=str(row['name'])[:55],callback_data=pick+str(row['id']))]
+             for row in rows[(page-1)*8:page*8]]
+    navigation=[]
+    if page>1:navigation.append(InlineKeyboardButton(text='⬅️ Sebelumnya',callback_data=action+str(page-1)))
+    if page<pages:navigation.append(InlineKeyboardButton(text='Berikutnya ➡️',callback_data=action+str(page+1)))
+    if navigation:buttons.append(navigation)
+    buttons.append([InlineKeyboardButton(text='⬅️ Kembali',callback_data=back)])
+    await safe_edit_or_answer(call,f"🗑 <b>HAPUS STOK</b>\nHalaman {page}/{pages}\n\n"
+        +(title+" yang ingin dikurangi." if rows else "Belum ada stok akun ready-stock untuk dikelola.")+"\n"
+        "Akun terjual, dialokasikan dan reservasi pesanan tetap dilindungi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),parse_mode='HTML')
+    await safe_callback_notice(call)
+
+
+async def render_owner_stock_delete_variant(call: CallbackQuery, state: FSMContext, variant_id: int):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    conn=db()
+    try:
+        snapshot=owner_stock_delete_snapshot(conn,variant_id)
+    except ValueError as exc:
+        return await safe_callback_notice(call,str(exc),show_alert=True)
+    finally:conn.close()
+    await state.clear()
+    clear_owner_input_session(call.from_user.id)
+    available=snapshot['removable'];buttons=[]
+    choices=[InlineKeyboardButton(text=f'Hapus {qty}',callback_data=f'ownerstockdeleteqty:{variant_id}:{qty}')
+             for qty in (1,5,10) if qty<=available]
+    if choices:buttons.append(choices)
+    if available:
+        buttons.append([InlineKeyboardButton(text='✏️ Jumlah Custom',callback_data=f'ownerstockdeletecustom:{variant_id}')])
+        if available<=10000:
+            buttons.append([InlineKeyboardButton(text=f'🗑 Semua Stok Tersedia ({available})',callback_data=f'ownerstockdeleteqty:{variant_id}:all')])
+    buttons.append([InlineKeyboardButton(text='⬅️ Kembali',callback_data=f"ownerstockdeleteproduct:{snapshot['product_id']}"),
+                    InlineKeyboardButton(text='👑 Menu Owner',callback_data='owner:panel')])
+    await safe_edit_or_answer(call,"🗑 <b>HAPUS STOK</b>\n\n"
+        f"📦 {html.escape(str(snapshot['product_name'])[:150])}\n🧩 {html.escape(str(snapshot['name'])[:150])}\n"
+        f"✅ Bisa dihapus: <b>{available}</b>\n🔒 Reservasi dilindungi: <b>{snapshot['protected']}</b>\n\n"
+        +( "Pilih jumlah. Stok terakhir yang ditambahkan akan dipilih, lalu kamu diminta konfirmasi." if available else "Tidak ada stok bebas yang dapat dihapus."),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),parse_mode='HTML')
+    await safe_callback_notice(call)
+
+
+async def render_owner_stock_delete_confirmation(target, preview):
+    keyboard=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Hapus {preview['quantity']} Stok",callback_data='ownerstockdeleteconfirm:'+preview['token'])],
+        [InlineKeyboardButton(text='❌ Batal / Kembali',callback_data='ownerstockdeletecancel:'+preview['token'])]])
+    text=("🗑 <b>KONFIRMASI HAPUS STOK</b>\n\n"
+        f"📦 {html.escape(str(preview['product_name'])[:150])}\n🧩 {html.escape(str(preview['variant_name'])[:150])}\n"
+        f"Hapus: <b>{preview['quantity']} stok</b>\nSisa akun tersedia: <b>{preview['remaining']}</b>\n"
+        f"🔒 Reservasi dilindungi: <b>{preview['protected']}</b>\n\n"
+        "Akun dikeluarkan dari penjualan; catatan riwayat tetap disimpan. Konfirmasi berlaku 10 menit.")
+    if isinstance(target,CallbackQuery):
+        await safe_edit_or_answer(target,text,reply_markup=keyboard,parse_mode='HTML')
+        await safe_callback_notice(target)
+    else:await target.answer(text,reply_markup=keyboard,parse_mode='HTML')
+
+
+@router.callback_query(F.data == 'owner:delete_stock')
+async def owner_delete_stock_menu(call: CallbackQuery,state: FSMContext):
+    await render_owner_stock_delete_catalog(call,state)
+
+
+@router.callback_query(F.data.startswith('ownerstockdeleteproducts:'))
+async def owner_delete_stock_products_page(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    values=callback_positive_numbers(call.data,'ownerstockdeleteproducts')
+    if not values:return await safe_callback_notice(call,'Halaman tidak valid.',show_alert=True)
+    await render_owner_stock_delete_catalog(call,state,page=values[0])
+
+
+@router.callback_query(F.data.startswith('ownerstockdeleteproduct:'))
+async def owner_delete_stock_product(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    values=callback_positive_numbers(call.data,'ownerstockdeleteproduct')
+    if not values:return await safe_callback_notice(call,'Produk tidak valid.',show_alert=True)
+    await render_owner_stock_delete_catalog(call,state,product_id=values[0])
+
+
+@router.callback_query(F.data.startswith('ownerstockdeletevariants:'))
+async def owner_delete_stock_variants_page(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    values=callback_positive_numbers(call.data,'ownerstockdeletevariants',2)
+    if not values:return await safe_callback_notice(call,'Halaman tidak valid.',show_alert=True)
+    await render_owner_stock_delete_catalog(call,state,product_id=values[0],page=values[1])
+
+
+@router.callback_query(F.data.startswith('ownerstockdeletevar:'))
+async def owner_delete_stock_variant(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    values=callback_positive_numbers(call.data,'ownerstockdeletevar')
+    if not values:return await safe_callback_notice(call,'Varian tidak valid.',show_alert=True)
+    await render_owner_stock_delete_variant(call,state,values[0])
+
+
+@router.callback_query(F.data.startswith('ownerstockdeleteqty:'))
+async def owner_delete_stock_quantity(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    parts=str(call.data or '').split(':')
+    values=callback_positive_numbers(':'.join(parts[:2]),'ownerstockdeleteqty')
+    if len(parts)!=3 or not values:return await safe_callback_notice(call,'Jumlah tidak valid.',show_alert=True)
+    if parts[2]=='all':qty=None
+    elif re.fullmatch(r'[0-9]{1,5}',parts[2]):qty=int(parts[2])
+    else:return await safe_callback_notice(call,'Jumlah tidak valid.',show_alert=True)
+    try:preview=owner_stock_delete_preview(call.from_user.id,values[0],qty)
+    except ValueError as exc:return await safe_callback_notice(call,str(exc),show_alert=True)
+    except sqlite3.Error:return await safe_callback_notice(call,'Database belum dapat menyimpan konfirmasi. Coba kembali.',show_alert=True)
+    await state.clear()
+    await render_owner_stock_delete_confirmation(call,preview)
+
+
+@router.callback_query(F.data.startswith('ownerstockdeletecustom:'))
+async def owner_delete_stock_custom(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    values=callback_positive_numbers(call.data,'ownerstockdeletecustom')
+    if not values:return await safe_callback_notice(call,'Varian tidak valid.',show_alert=True)
+    conn=db()
+    try:snapshot=owner_stock_delete_snapshot(conn,values[0])
+    except ValueError as exc:return await safe_callback_notice(call,str(exc),show_alert=True)
+    finally:conn.close()
+    if not snapshot['removable']:
+        return await safe_callback_notice(call,'Tidak ada stok bebas yang dapat dihapus.',show_alert=True)
+    clear_owner_input_session(call.from_user.id)
+    await state.clear()
+    await state.set_state(OwnerState.stock_delete_quantity)
+    await state.update_data(stock_delete_variant_id=values[0],stock_delete_message_id=call.message.message_id)
+    await safe_edit_or_answer(call,"✏️ <b>JUMLAH STOK YANG DIHAPUS</b>\n\n"
+        f"Kirim angka 1–{min(10000,snapshot['removable'])}. Contoh: <code>2</code>.\n"
+        "Stok belum dihapus sampai kamu mengonfirmasi.",
+        reply_markup=back_owner(f'ownerstockdeletevar:{values[0]}'),parse_mode='HTML')
+    await safe_callback_notice(call)
+
+
+@router.message(OwnerState.stock_delete_quantity,F.text,~F.text.startswith('/'))
+async def owner_delete_stock_quantity_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id):return
+    data=await state.get_data()
+    target=otp_smscode.MenuMessage(message,message_id=data.get('stock_delete_message_id'))
+    raw=(message.text or '').strip();variant_id=data.get('stock_delete_variant_id')
+    if not re.fullmatch(r'[0-9]{1,5}',raw) or not 1<=int(raw)<=10000:
+        return await target.answer('❌ Jumlah harus angka 1–10.000. Contoh: 2.',reply_markup=back_owner(f'ownerstockdeletevar:{variant_id}'))
+    try:preview=owner_stock_delete_preview(message.from_user.id,variant_id,int(raw))
+    except ValueError as exc:
+        return await target.answer('❌ '+str(exc),reply_markup=back_owner(f'ownerstockdeletevar:{variant_id}'))
+    except sqlite3.Error:
+        return await target.answer('⚠️ Database belum dapat menyimpan konfirmasi. Coba kembali.',reply_markup=back_owner(f'ownerstockdeletevar:{variant_id}'))
+    await state.clear()
+    await render_owner_stock_delete_confirmation(target,preview)
+
+
+@router.callback_query(F.data.startswith('ownerstockdeleteconfirm:'))
+async def owner_delete_stock_confirm(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    try:result=owner_stock_delete_execute(call.from_user.id,str(call.data).removeprefix('ownerstockdeleteconfirm:'))
+    except ValueError as exc:return await safe_callback_notice(call,str(exc),show_alert=True)
+    except sqlite3.Error:return await safe_callback_notice(call,'Perubahan belum dapat disimpan. Periksa transaksi dan coba kembali.',show_alert=True)
+    await state.clear()
+    await safe_edit_or_answer(call,"✅ <b>STOK DIHAPUS</b>\n\n"
+        f"📦 {html.escape(str(result['product_name'])[:150])}\n🧩 {html.escape(str(result['variant_name'])[:150])}\n"
+        f"Jumlah: <b>{result['quantity']}</b>\nSisa saat penghapusan: <b>{result['remaining']}</b>\n"
+        "Riwayat akun dan pesanan tetap tersimpan.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='⬅️ Kembali',callback_data=f"ownerstockdeletevar:{result['variant_id']}")],
+            [InlineKeyboardButton(text='📦 Atur Stok',callback_data=f"ownerstockvar:{result['variant_id']}")],
+            [InlineKeyboardButton(text='👑 Menu Owner',callback_data='owner:panel')]]),parse_mode='HTML')
+    await safe_callback_notice(call,'Sudah diproses.' if result['already_done'] else 'Stok berhasil dihapus.')
+
+
+@router.callback_query(F.data.startswith('ownerstockdeletecancel:'))
+async def owner_delete_stock_cancel(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id):return await deny_owner_callback(call)
+    try:variant_id=owner_stock_delete_cancel(call.from_user.id,str(call.data).removeprefix('ownerstockdeletecancel:'))
+    except ValueError as exc:return await safe_callback_notice(call,str(exc),show_alert=True)
+    except sqlite3.Error:return await safe_callback_notice(call,'Database belum tersedia. Coba kembali.',show_alert=True)
+    await render_owner_stock_delete_variant(call,state,variant_id)
+
+
 @router.callback_query(F.data.startswith("ownerstock:"))
 async def owner_stock_product_pick(call: CallbackQuery):
     if not is_owner(call.from_user.id):
@@ -31175,7 +31498,7 @@ async def render_owner_stock_variant(call: CallbackQuery, state: FSMContext, var
     try:
         row=conn.execute(
             """SELECT v.id,v.name,v.stock,v.reserved_stock,v.sharing_mode,
-                      p.name AS product_name,p.fulfillment_mode
+                      p.name AS product_name,p.fulfillment_mode,p.product_type
                FROM product_variants v
                JOIN products p ON p.id=v.product_id
                WHERE v.id=? AND v.active=1 AND p.active=1""",
@@ -31230,6 +31553,8 @@ async def render_owner_stock_variant(call: CallbackQuery, state: FSMContext, var
                 text="🔁 Duplikat Akun Sharing",
                 callback_data=f"ownerstockdup:{variant_id}"
             )],
+            *([[InlineKeyboardButton(text="🗑 Hapus Stok",callback_data=f"ownerstockdeletevar:{variant_id}")]]
+              if not product_is_famhead(row) else []),
             [InlineKeyboardButton(
                 text="⬅️ Kembali",
                 callback_data="owner:set_stock"
@@ -34529,7 +34854,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.05"
+EXPECTED_SOURCE_VERSION = "17.06"
 
 
 def source_integrity_self_test():
