@@ -1,4 +1,4 @@
-# MaboyyDigital v17.03
+# MaboyyDigital v17.04
 
 Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -23,6 +23,21 @@ Pembelian baru **/otp dan /sosmed hanya memakai saldo bot**. OTP memakai
 QRIS/payment gateway tetap tersedia untuk isi saldo dan checkout produk existing.
 Invoice QRIS OTP yang sudah dibuat sebelum pembaruan tetap direkonsiliasi dengan
 aturan lama; tombol QRIS lama tidak bisa membuat invoice pembelian baru.
+
+Sosmed: transaksi **hold/pending tanpa ID provider** ikut tampil pada Pesanan dan
+Riwayat, dengan ID transaksi `T-`, nominal ditahan, waktu WIB dan tombol detail.
+Penolakan pembelian definitif masuk Riwayat dengan saldo yang sudah dilepas.
+Timeout/status belum pasti tetap direkonsiliasi; bot tidak membeli ulang otomatis.
+
+**Refund saldo Sosmed otomatis** saat API mengonfirmasi gagal (`Error/Failed`):
+harga yang dibayar dikembalikan penuh. Untuk `Partial`, refund = harga dibayar ×
+jumlah belum terpenuhi (`remains`) ÷ jumlah pesanan, dibulatkan ke bawah.
+Jumlah partial yang hilang/invalid diperiksa dahulu. Refund menggunakan snapshot
+harga order, ledger idempotent dan notifikasi privat dengan retry setelah restart.
+Refund saldo toko tidak menunggu refund provider. Modal provider yang belum
+dikembalikan tetap menjadi biaya toko; profit tidak menganggap kredit provider
+sukses hanya dari status/charge. Bukti kredit provider owner dicatat terpisah tanpa
+menambah saldo user dua kali. Pembatalan yang belum didukung tetap mengikuti alur lama.
 
 ## Harga dan layanan Sosmed
 
@@ -103,7 +118,7 @@ Field pribadi pada Profile tidak ditampilkan dalam panel.
 Katalog standar `id/price/note` tanpa `type` memakai form target + jumlah sesuai API;
 catatan `note` tampil sebagai panduan username/URL. Layanan khusus yang belum jelas
 bisa diatur owner: Modal & Jual → pilih layanan → **Tipe/Input** → konfirmasi.
-Status `Success` berarti selesai, `Error` berarti gagal; refund tetap perlu bukti.
+Status `Success` berarti selesai; `Error` berarti gagal dengan refund saldo otomatis.
 Daftar layanan user/owner berisi **6 pilihan per halaman**, dengan Sebelumnya,
 Berikutnya, detail, dan **Refresh Layanan**. Refresh memperbarui harga, min/max,
 catatan dan ketersediaan dari API; katalog juga diperbarui mengikuti TTL existing.
@@ -137,7 +152,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.03; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.04; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.

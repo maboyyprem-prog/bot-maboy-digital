@@ -38,6 +38,7 @@ NAVIGATION_ACTIONS = {
     "admin_form", "admin_units", "admin_catalog", "popular",
     "admin_price_categories", "admin_price_breakdown", "admin_search",
     "category_search", "admin_category_search",
+    "attempt", "admin_attempt",
 }
 
 
@@ -504,6 +505,8 @@ class UIBuilder:
             text += f"↩️ Refund masuk saldo: {core.money(order['refund_amount'])}\n"
         elif order.get("refund_state") == "AWAITING_PROVIDER_PROOF":
             text += "↩️ Refund sedang diperiksa; saldo belum dikreditkan.\n"
+        if order.get("refund_state") == "AWAITING_REMAINS":
+            text += "↩️ Jumlah yang belum terpenuhi masih diperiksa untuk menghitung refund.\n"
         if admin:
             text += (f"\nUser: {esc(order['user_id'])}\nProvider order: {esc(order.get('provider_order_id') or '-')}\n"
                      f"Modal: {core.money(order['provider_cost'])}\nProfit kotor: {core.money(order['gross_profit'])}\n"
@@ -533,30 +536,60 @@ class UIBuilder:
     async def orders(self, message, user, payload=None, *, history=False, admin=False):
         payload = payload or {}
         page = number(payload.get("page", 0), 0, 100000)
-        orders, total = self.store.repo.orders(user, page=page, history=history, admin=admin)
+        orders, total = self.store.repo.transactions(user, page=page, history=history or admin, admin=admin)
         if total and page*PAGE_SIZE >= total:
             page = (total-1)//PAGE_SIZE
-            orders, total = self.store.repo.orders(user, page=page, history=history, admin=admin)
+            orders, total = self.store.repo.transactions(user, page=page, history=history or admin, admin=admin)
         action = "admin_orders" if admin else "history" if history else "orders"
         rows, lines = [], []
         for order in orders:
+            if order["kind"] == "ATTEMPT":
+                label = "T-"+order["attempt_id"][:12]
+                name = self.provider_label(order["service_name_snapshot"])[:90] if admin else self.public_label(order["service_name_snapshot"],90)
+                amount = order["released_amount"] if order["state"] == "FAILED" else order["hold_amount"]
+                funds = "Saldo dikembalikan" if order["state"] == "FAILED" and amount else "Dana transaksi" if order["state"] == "FAILED" else "Saldo ditahan"
+                lines.append(f"<b>#{esc(label)} {esc(name,200)}</b>\n{esc(UserFormatter.status(order['state']))} • {funds}: {core.money(amount)}\n"
+                             f"🕒 {instant(order['created_at'])}")
+                rows.append([(f"#{label} {name}"[:60],"admin_attempt" if admin else "attempt",
+                              {"id":order["attempt_id"],"history":history})])
+                continue
             oid = order.get("id", order.get("internal_order_id"))
             name = self.provider_label(order["service_name_snapshot"])[:100] if admin else self.public_label(order["service_name_snapshot"], 100)
-            lines.append(f"<b>#{esc(oid)} {esc(name)}</b>\n{esc(UserFormatter.status(order['status']))} • {core.money(order['selling_price'])}")
+            summary = f"<b>#{esc(oid)} {esc(name,200)}</b>\n{esc(UserFormatter.status(order['status']))} • {core.money(order['selling_price'])}"
+            if order.get("refund_amount"):
+                summary += "\n↩️ Refund saldo: "+core.money(order["refund_amount"])
+            lines.append(summary)
             rows.append([(f"#{oid} {name}"[:60], "admin_check" if admin else "check", {"id": oid})])
-        # Uncertain purchases may have no provider/local order yet. Keep them
-        # visible to the buyer rather than inviting a second purchase.
-        pending = [] if history or admin else self.store.repo.all("""SELECT attempt_id,state FROM sosmed_purchase_attempts
-            WHERE user_id=? AND state IN ('RESERVED','REQUESTING','RECONCILIATION_REQUIRED','PENDING_RECONCILIATION')
-            ORDER BY created_at DESC LIMIT 5""", (user,))
-        if pending:
-            lines += ["⏳ Pembelian "+esc(row["attempt_id"][:12])+": "+esc(UserFormatter.status(row["state"])) for row in pending]
+        if any(order["kind"] == "ATTEMPT" and order["state"] != "FAILED" for order in orders):
             lines.append("Dana transaksi yang belum pasti tetap ditahan. Jangan membeli ulang; owner akan memeriksanya.")
         rows += self.pages(user, action, {}, page, total)
         rows.append([("⬅️ Kembali", "admin_menu" if admin else "home", {})])
         title = "SEMUA PESANAN" if admin else "RIWAYAT PEMBELIAN" if history else "PESANAN SAYA"
         await self.send(message, f"📦 <b>{title}</b>\nHalaman {page+1}/{max(1, math.ceil(total/PAGE_SIZE))}\n\n"
                         + ("\n\n".join(lines) if lines else "Belum ada pesanan."), self.keyboard(user, rows))
+
+    async def attempt(self, message, user, ident, payload=None, *, admin=False):
+        item = self.store.repo.attempt(user,ident,admin=admin)
+        order = self.store.repo.one("SELECT * FROM sosmed_orders WHERE attempt_id=?", (ident,))
+        if order:
+            return await self.check(message,user,order["id"],admin=admin)
+        name = self.provider_label(item["service_name_snapshot"]) if admin else self.public_label(item["service_name_snapshot"],220)
+        text = ("📦 <b>TRANSAKSI SOSMED</b>\n🆔 T-"+esc(ident[:12])+"\n"
+                f"📱 {esc(name,600)}\n🔗 Target: <code>{esc(item['target'],1000)}</code>\n"
+                f"🔢 Jumlah: {item['quantity']}\n📊 Status: {esc(UserFormatter.status(item['state']))}\n"
+                f"💰 Harga: {core.money(item['sale'])}\n🕒 Beli: {instant(item['created_at'])}\n")
+        if item["state"] == "FAILED":
+            text += f"↩️ Saldo dikembalikan: {core.money(item['released_amount'])}\n"
+        else:
+            text += f"⏳ Saldo ditahan: {core.money(item['hold_amount'])}\nHasil pembelian belum pasti. Jangan membeli ulang; owner akan memeriksanya.\n"
+        if admin:
+            text += f"\nUser: {item['user_id']}\nAttempt: <code>{esc(ident)}</code>\nModal: {core.money(item['cost'])}\n"
+        action = "admin_attempt" if admin else "attempt"
+        history = (payload or {}).get("history") is True
+        rows = [[("🔄 Refresh Transaksi",action,{"id":ident,"history":history})],
+                [("⬅️ Kembali","admin_orders" if admin else "history" if history else "orders",{}),
+                 ("🏠 Menu Awal","admin_menu" if admin else "home",{})]]
+        await self.send(message,text,self.keyboard(user,rows))
 
 
 class AdminHandler:
@@ -602,6 +635,7 @@ class AdminHandler:
         if not balance_only:
             text += (f"\n🛍️ Toko: {'ON' if settings['enabled'] else 'OFF'}\n"
                      f"📦 Total order: {stats.get('total', 0)}\n"
+                     f"⏳ Transaksi hold: {stats.get('held_count',0)} • {core.money(stats.get('held_amount',0))}\n"
                      f"⏳ Pending: {stats.get('pending', 0)} • 🔄 Diproses: {stats.get('processing', 0)}\n"
                      f"✅ Selesai: {stats.get('completed', 0)} • ⚠️ Partial: {stats.get('partial', 0)}\n"
                      f"❌ Dibatalkan: {stats.get('canceled', 0)} • Gagal: {stats.get('failed', 0)}\n"
@@ -627,6 +661,8 @@ class AdminHandler:
                  f"Partial: {stats.get('partial', 0)}\nCanceled: {stats.get('canceled', 0)} • Failed: {stats.get('failed', 0)}\n"
                  f"Omzet setelah refund: {core.money(stats.get('revenue', 0))}\n"
                  f"Profit kotor sementara: {core.money(stats.get('gross_profit', 0))}\n\n"
+                 f"Transaksi hold: {stats.get('held_count',0)} • {core.money(stats.get('held_amount',0))}\n"
+                 f"Notifikasi refund menunggu/gagal: {stats.get('refund_notifications_pending',0)}/{stats.get('refund_notifications_failed',0)}\n\n"
                  "Transaksi yang belum pasti tidak dianggap penjualan selesai. "
                  "Refund yang belum terkonfirmasi perlu rekonsiliasi.")
         await self.ui.send(message, text, self.ui.navigation(user, "admin_menu", admin=True))
@@ -845,10 +881,11 @@ class AdminHandler:
         self.authorize(user)
         page = number((payload or {}).get("page", 0), 0, 100000)
         if refunds:
-            rows = self.store.repo.all("SELECT * FROM sosmed_orders WHERE refund_state='AWAITING_PROVIDER_PROOF' ORDER BY id DESC LIMIT 8 OFFSET ?", (page*PAGE_SIZE,))
-            count = self.store.repo.one("SELECT COUNT(*) n FROM sosmed_orders WHERE refund_state='AWAITING_PROVIDER_PROOF'")["n"]
+            rows = self.store.repo.all("SELECT * FROM sosmed_orders WHERE refund_state IN ('AWAITING_PROVIDER_PROOF','AWAITING_REMAINS') ORDER BY id DESC LIMIT 8 OFFSET ?", (page*PAGE_SIZE,))
+            count = self.store.repo.one("SELECT COUNT(*) n FROM sosmed_orders WHERE refund_state IN ('AWAITING_PROVIDER_PROOF','AWAITING_REMAINS')")["n"]
             lines = [f"Order #{row['id']} • {esc(row['refund_state'])}" for row in rows]
-            note = ("Kredit saldo hanya setelah bukti refund resmi diperiksa.\n"
+            note = ("Gagal: refund saldo penuh. Partial: proporsional jumlah belum terpenuhi; jumlah yang belum tersedia perlu diperiksa.\n"
+                    "Refund saldo toko tidak menunggu kredit provider. Bukti kredit provider dicatat terpisah untuk profit, tanpa kredit saldo ganda.\n"
                     "Command: /sosmed admin refund &lt;order&gt; &lt;refund_modal_idr&gt; &lt;referensi_bukti&gt;")
         else:
             rows = self.store.repo.all("""SELECT * FROM sosmed_purchase_attempts
@@ -992,6 +1029,8 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await ui.orders(message, user, payload, history=action == "history")
     if action == "check":
         return await ui.check(message, user, number(payload["id"], 1))
+    if action in {"attempt","admin_attempt"}:
+        return await ui.attempt(message,user,payload["id"],payload,admin=action=="admin_attempt")
     if action in {'search','admin_search'}:
         is_admin_search = action=='admin_search'
         context = {key:payload[key] for key in ('category','platform','query','filters','view','page','category_query','category_page') if key in payload}
@@ -1020,7 +1059,8 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         text = ("❓ <b>PANDUAN SOSMED</b>\n\nPilih kategori dan layanan, baca detail, isi parameter, lalu konfirmasi pembayaran saldo.\n"
                 "Saldo dipakai bersama fitur belanja dan OTP. Isi Saldo memakai pembayaran bot yang sudah tersedia.\n"
                 "Jika hasil pembelian belum pasti, jangan membeli ulang. Cek Pesanan Saya dan hubungi owner.\n"
-                "Refill/pembatalan hanya tersedia sesuai layanan. Refund menunggu bukti pengembalian dana terkonfirmasi.\n\n"
+                "Gagal terkonfirmasi: harga dibayar kembali penuh ke saldo. Partial: harga dibayar × jumlah belum terpenuhi ÷ jumlah pesanan, dibulatkan ke bawah.\n"
+                "Jumlah partial yang belum tersedia diperiksa dahulu. Pembelian yang hasilnya belum pasti tetap terlihat di Pesanan dan Riwayat dengan saldo ditahan.\n\n"
                 "/sosmed beli • kategori • layanan • cari &lt;nama&gt;\n"
                 "/sosmed detail &lt;id layanan&gt;\n/sosmed saldo • pesanan • riwayat • favorit\n"
                 "/sosmed cek &lt;id order bot&gt;\n/sosmed refill &lt;id order bot&gt;\n/sosmed batal &lt;id order bot&gt;\n\n"

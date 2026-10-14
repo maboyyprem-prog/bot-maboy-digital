@@ -323,6 +323,10 @@ def init_schema(conn):
           wallet_transaction_id INTEGER,amount INTEGER NOT NULL,provider_amount INTEGER NOT NULL,
           proof_reference TEXT NOT NULL UNIQUE,status TEXT NOT NULL,created_at REAL NOT NULL,
           FOREIGN KEY(order_id) REFERENCES sosmed_orders(id))""",
+        """CREATE TABLE IF NOT EXISTS sosmed_notifications(notification_id TEXT PRIMARY KEY,
+          refund_id TEXT NOT NULL UNIQUE,status TEXT NOT NULL DEFAULT 'PENDING',attempts INTEGER NOT NULL DEFAULT 0,
+          next_retry_at REAL NOT NULL DEFAULT 0,lease_owner TEXT,lease_until REAL NOT NULL DEFAULT 0,
+          sent_at REAL,error_code TEXT NOT NULL DEFAULT '',FOREIGN KEY(refund_id) REFERENCES sosmed_refunds(refund_id))""",
         """CREATE TABLE IF NOT EXISTS sosmed_favorites(user_id INTEGER NOT NULL,service_id INTEGER NOT NULL,
           created_at REAL NOT NULL,PRIMARY KEY(user_id,service_id))""",
         """CREATE TABLE IF NOT EXISTS sosmed_callback_tokens(token TEXT PRIMARY KEY,user_id INTEGER NOT NULL,
@@ -339,6 +343,8 @@ def init_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_sosmed_order_user ON sosmed_orders(user_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_order_poll ON sosmed_orders(status,next_poll_at)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_attempt_state ON sosmed_purchase_attempts(state)",
+        "CREATE INDEX IF NOT EXISTS idx_sosmed_attempt_user ON sosmed_purchase_attempts(user_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sosmed_notification_due ON sosmed_notifications(status,next_retry_at,lease_until)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_services_category ON sosmed_services(category,enabled)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_callback_expiry ON sosmed_callback_tokens(expires_at)",
     ]
@@ -401,6 +407,53 @@ class Repository:
         where = " WHERE " + " AND ".join(terms) if terms else ""
         total = self.one("SELECT COUNT(*) AS count FROM sosmed_orders" + where, args)["count"]
         return self.all("SELECT * FROM sosmed_orders" + where + " ORDER BY id DESC LIMIT ? OFFSET ?", (*args, PAGE_SIZE, page*PAGE_SIZE)), total
+
+    def attempt(self, user, ident, *, admin=False):
+        if admin and not self.host.is_owner(user):
+            raise StoreError("FORBIDDEN")
+        if not isinstance(ident, str) or not 1 <= len(ident) <= 128 or "\x00" in ident:
+            raise StoreError("INPUT")
+        row = self.one("""SELECT a.*,q.service_snapshot,q.target,q.quantity,q.cost,q.sale
+            FROM sosmed_purchase_attempts a JOIN sosmed_quotes q ON q.quote_id=a.quote_id AND q.user_id=a.user_id
+            WHERE a.attempt_id=?"""+ ("" if admin else " AND a.user_id=?"), (ident,) if admin else (ident,user))
+        if not row:
+            raise StoreError("NOT_FOUND")
+        row["service_name_snapshot"] = json.loads(row.pop("service_snapshot")).get("name", "Layanan Sosmed")
+        row["released_amount"] = self.one("""SELECT COALESCE(SUM(amount),0) amount FROM wallet_ledger
+            WHERE user_id=? AND type='SOSMED_RELEASE' AND reference=?""", (row["user_id"],ident))["amount"]
+        return row
+
+    def transactions(self, user, page=0, history=False, admin=False):
+        """One paginated list of orders and unmatched attempts, with no duplicates."""
+        if admin and not self.host.is_owner(user):
+            raise StoreError("FORBIDDEN")
+        page = number(page, 0, 100000)
+        order_terms, attempt_terms, args = [], ["NOT EXISTS (SELECT 1 FROM sosmed_orders o WHERE o.attempt_id=a.attempt_id)"], []
+        if not admin:
+            order_terms.append("user_id=?")
+            args.append(user)
+        if not history:
+            order_terms.append("status NOT IN ('COMPLETED','PARTIAL','CANCELED','FAILED')")
+        order_where = " WHERE "+" AND ".join(order_terms) if order_terms else ""
+        if not admin:
+            attempt_terms.append("a.user_id=?")
+            args.append(user)
+        if not history:
+            attempt_terms.append("a.state!='FAILED'")
+        union = ("SELECT 'ORDER' kind,CAST(id AS TEXT) ident,created_at FROM sosmed_orders"+order_where+
+                 " UNION ALL SELECT 'ATTEMPT' kind,attempt_id ident,created_at FROM sosmed_purchase_attempts a WHERE "+" AND ".join(attempt_terms))
+        with self.connection() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM ("+union+")", args).fetchone()[0]
+            selected = conn.execute("SELECT * FROM ("+union+") ORDER BY created_at DESC,kind,CAST(ident AS INTEGER) DESC,ident DESC LIMIT ? OFFSET ?",
+                                    (*args,PAGE_SIZE,page*PAGE_SIZE)).fetchall()
+            result = []
+            for item in selected:
+                if item["kind"] == "ORDER":
+                    row = conn.execute("SELECT * FROM sosmed_orders WHERE id=?", (item["ident"],)).fetchone()
+                    result.append({**dict(row),"kind":"ORDER"})
+                else:
+                    result.append({**self.attempt(user,item["ident"],admin=admin),"kind":"ATTEMPT"})
+        return result,total
 
     def rate(self, user, action, count=10, seconds=60):
         now = time.time()
@@ -1433,6 +1486,87 @@ class PurchaseService:
             conn.execute("UPDATE sosmed_purchase_attempts SET state='RECONCILIATION_REQUIRED',reconciliation_status='OWNER_REVIEW',error_code='INTERRUPTED',updated_at=? WHERE state='REQUESTING' AND updated_at<?", (time.time(), time.time()-self.store.config.timeout-10))
 
 
+class RefundService:
+    """Shop-wallet refunds do not imply a provider account refund."""
+    def __init__(self, store):
+        self.store = store
+
+    @staticmethod
+    def queue(conn, refund_id):
+        conn.execute("INSERT OR IGNORE INTO sosmed_notifications(notification_id,refund_id) VALUES(?,?)", (refund_id,refund_id))
+
+    def automatic(self, conn, order):
+        status = order["status"]
+        if status not in {"FAILED","PARTIAL"}:
+            return
+        sale, paid = order["selling_price"], order["refund_amount"]
+        if status == "FAILED":
+            target = sale
+        elif order["remains"] is None or not 0 <= order["remains"] <= order["quantity"]:
+            conn.execute("UPDATE sosmed_orders SET refund_state='AWAITING_REMAINS' WHERE id=?", (order["id"],))
+            return
+        else:
+            target = sale*order["remains"]//order["quantity"]
+        total = max(paid,target)
+        state = "FULL" if total == sale else "PARTIAL" if total else "NO_REFUND"
+        amount = total-paid
+        if amount:
+            reference = f"SHOP-AUTO:{order['id']}:{total}"
+            ident = secrets.token_hex(12)
+            WalletAdapter.change(conn,order["user_id"],"SOSMED_REFUND",amount,reference,"Refund otomatis saldo Sosmed")
+            ledger = conn.execute("SELECT id FROM wallet_ledger WHERE user_id=? AND type='SOSMED_REFUND' AND reference=?",
+                                  (order["user_id"],reference)).fetchone()[0]
+            # provider_amount=0 is deliberate: no provider refund is assumed.
+            conn.execute("INSERT INTO sosmed_refunds VALUES(?,?,?,?,?,?,?,?)",
+                         (ident,order["id"],ledger,amount,0,reference,"CREDITED",time.time()))
+            self.queue(conn,ident)
+            conn.execute("INSERT INTO sosmed_audit(actor,action,payload,created_at) VALUES(0,'shop_auto_refund',?,?)",
+                         (encoded({"order":order["id"],"status":status,"remains":order["remains"],"wallet_amount":amount,
+                                   "provider_amount":0}),time.time()))
+        conn.execute("UPDATE sosmed_orders SET refund_amount=?,refund_state=? WHERE id=?", (total,state,order["id"]))
+
+    async def deliver(self, bot):
+        if bot is None:
+            return
+        now, owner = time.time(), secrets.token_hex(12)
+        jobs = self.store.repo.all("""SELECT notification_id FROM sosmed_notifications WHERE status='PENDING'
+            AND next_retry_at<=? AND lease_until<=? ORDER BY rowid LIMIT 20""", (now,now))
+        for job in jobs:
+            with self.store.repo.connection(True) as conn:
+                changed = conn.execute("""UPDATE sosmed_notifications SET lease_owner=?,lease_until=?
+                    WHERE notification_id=? AND status='PENDING' AND next_retry_at<=? AND lease_until<=?""",
+                    (owner,now+60,job["notification_id"],now,now)).rowcount
+                if not changed:
+                    continue
+                row = dict(conn.execute("""SELECT n.*,r.amount,o.id order_id,o.user_id,o.service_name_snapshot
+                    FROM sosmed_notifications n JOIN sosmed_refunds r ON r.refund_id=n.refund_id
+                    JOIN sosmed_orders o ON o.id=r.order_id WHERE n.notification_id=?""", (job["notification_id"],)).fetchone())
+            try:
+                from sosmed_ui import UserFormatter, esc
+                name = row["service_name_snapshot"]
+                for field in ("token","secret"):
+                    name = name.replace(getattr(self.store.config,field,"") or "\x00", "")
+                name = UserFormatter.label(name)
+                await bot.send_message(row["user_id"], "↩️ <b>REFUND SALDO SOSMED</b>\n"
+                    f"Order #{row['order_id']} • {esc(name,500)}\n"
+                    f"Saldo dikembalikan: <b>{money(row['amount'])}</b>\n"
+                    "Lihat Riwayat pada /sosmed untuk rincian.", parse_mode="HTML")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempts = row["attempts"]+1
+                with self.store.repo.connection(True) as conn:
+                    conn.execute("""UPDATE sosmed_notifications SET attempts=?,status=?,next_retry_at=?,
+                        lease_owner=NULL,lease_until=0,error_code=? WHERE notification_id=? AND lease_owner=?""",
+                        (attempts,"FAILED" if attempts>=8 else "PENDING",time.time()+min(3600,10*2**min(attempts,8)),
+                         type(exc).__name__,row["notification_id"],owner))
+            else:
+                with self.store.repo.connection(True) as conn:
+                    conn.execute("""UPDATE sosmed_notifications SET status='SENT',sent_at=?,lease_owner=NULL,
+                        lease_until=0,error_code='' WHERE notification_id=? AND lease_owner=?""",
+                        (time.time(),row["notification_id"],owner))
+
+
 class OrderService:
     def __init__(self, store):
         self.store = store
@@ -1463,11 +1597,22 @@ class OrderService:
         status = self.mapped(response["status"])
         start, remains, charge = None, None, None
         if response.get("start_count") not in (None, ""):
-            start = number(response["start_count"])
+            try:
+                start = number(response["start_count"])
+            except StoreError:
+                pass  # Optional display data does not determine a refund.
         if response.get("remains") not in (None, ""):
-            remains = number(response["remains"])
+            try:
+                remains = number(response["remains"],0,row["quantity"])
+            except StoreError:
+                # The confirmed status is still usable. Partial refunds need
+                # valid remaining quantity; failed refunds use the paid price.
+                remains = None
         if response.get("charge") not in (None, ""):
-            charge = str(decimal(response["charge"]))
+            try:
+                charge = str(decimal(response["charge"]))
+            except StoreError:
+                pass  # Neither an absent nor a malformed charge proves a refund.
         now = time.time()
         with self.store.repo.connection(True) as conn:
             current = conn.execute("SELECT status FROM sosmed_orders WHERE id=?", (row["id"],)).fetchone()
@@ -1475,6 +1620,8 @@ class OrderService:
             # response, and keep UNKNOWN visible instead of guessing success.
             conn.execute("UPDATE sosmed_orders SET status=?,raw_provider_status=?,start_count=?,remains=?,provider_charge=?,updated_at=?,next_poll_at=?,terminal_at=?,refund_state=CASE WHEN ? IN ('PARTIAL','CANCELED','FAILED') AND refund_amount=0 THEN 'AWAITING_PROVIDER_PROOF' ELSE refund_state END WHERE id=?",
                          (status, response["status"][:100], start, remains, charge, now, now+self.store.settings()["poll_seconds"], now if status in TERMINAL else None, status, row["id"]))
+            updated = dict(conn.execute("SELECT * FROM sosmed_orders WHERE id=?", (row["id"],)).fetchone())
+            self.store.refunds.automatic(conn,updated)
         result = self.store.repo.one("SELECT * FROM sosmed_orders WHERE id=?", (row["id"],))
         result["internal_order_id"] = result["id"]
         return result
@@ -1540,7 +1687,10 @@ class OrderService:
     async def poll_once(self):
         now = time.time()
         self.store.purchase.recover()
-        rows = self.store.repo.all("SELECT * FROM sosmed_orders WHERE status NOT IN ('COMPLETED','PARTIAL','CANCELED','FAILED') AND next_poll_at<=? ORDER BY next_poll_at LIMIT 20", (now,))
+        rows = self.store.repo.all("""SELECT * FROM sosmed_orders WHERE
+            (status NOT IN ('COMPLETED','PARTIAL','CANCELED','FAILED') OR
+             status IN ('FAILED','PARTIAL') AND refund_state IN ('NONE','AWAITING_PROVIDER_PROOF','AWAITING_REMAINS'))
+            AND next_poll_at<=? ORDER BY next_poll_at LIMIT 20""", (now,))
         for row in rows:
             try:
                 await self._refresh(row)
@@ -1572,6 +1722,7 @@ class Store:
         self.api.contract_validator = self.purchase_contract_verified
         self.catalog, self.pricing = CatalogService(self), PricingService(self)
         self.purchase, self.orders = PurchaseService(self), OrderService(self)
+        self.refunds = RefundService(self)
         self._tasks, self._bot, self._owner_token = [], None, secrets.token_hex(12)
         self._started = False
         self._last_check = None
@@ -1900,8 +2051,14 @@ class Store:
                        "failed": states.get('FAILED',0),
                        "completed": states.get("COMPLETED",0), "partial": states.get("PARTIAL",0), "canceled": states.get("CANCELED",0),
                        "reconciliation": self.repo.one("SELECT COUNT(*) AS count FROM sosmed_purchase_attempts WHERE state='RECONCILIATION_REQUIRED'")["count"],
-                       "refund_pending": self.repo.one("SELECT COUNT(*) AS count FROM sosmed_orders WHERE refund_state='AWAITING_PROVIDER_PROOF'")["count"],
+                       "refund_pending": self.repo.one("SELECT COUNT(*) AS count FROM sosmed_orders WHERE refund_state IN ('AWAITING_PROVIDER_PROOF','AWAITING_REMAINS')")["count"],
                        "refill_pending": self.repo.one("SELECT COUNT(*) AS count FROM sosmed_refills WHERE status IN('PENDING','REQUESTING','UNKNOWN')")["count"]})
+        held = self.repo.one("""SELECT COUNT(*) count,COALESCE(SUM(hold_amount),0) amount FROM sosmed_purchase_attempts a
+            WHERE state IN ('RESERVED','REQUESTING','RECONCILIATION_REQUIRED','PENDING_RECONCILIATION')
+            AND NOT EXISTS (SELECT 1 FROM sosmed_orders o WHERE o.attempt_id=a.attempt_id)""")
+        totals.update(held_count=held["count"],held_amount=held["amount"])
+        totals["refund_notifications_pending"] = self.repo.one("SELECT COUNT(*) n FROM sosmed_notifications WHERE status='PENDING'")["n"]
+        totals["refund_notifications_failed"] = self.repo.one("SELECT COUNT(*) n FROM sosmed_notifications WHERE status='FAILED'")["n"]
         # Refunds reduce both user revenue and confirmed provider cost.
         confirmed = self.repo.one("SELECT COALESCE(SUM(provider_amount),0) AS amount FROM sosmed_refunds WHERE status='CREDITED'")["amount"]
         totals["gross_profit"] += confirmed
@@ -1955,15 +2112,20 @@ class Store:
             if already_provider+provider_amount>current["provider_cost"]:
                 raise StoreError("PROOF")
             cumulative = current["selling_price"] if already_provider+provider_amount==current["provider_cost"] else int((Decimal(current["selling_price"])*Decimal(already_provider+provider_amount)/Decimal(current["provider_cost"])).to_integral_value(rounding=ROUND_FLOOR))
+            # A shop refund can precede the provider receipt. Record real
+            # provider credits for profit accounting without crediting twice.
+            cumulative = max(cumulative,current["refund_amount"])
             amount = cumulative-current["refund_amount"]
-            if amount<0:
-                raise StoreError("PROOF")
             ident = secrets.token_hex(12)
-            WalletAdapter.change(conn, current["user_id"], "SOSMED_REFUND", amount, ident, "Refund SOSMED terverifikasi owner")
-            ledger = conn.execute("SELECT id FROM wallet_ledger WHERE user_id=? AND type='SOSMED_REFUND' AND reference=?", (current["user_id"],ident)).fetchone()[0]
+            ledger = None
+            if amount:
+                WalletAdapter.change(conn, current["user_id"], "SOSMED_REFUND", amount, ident, "Refund SOSMED terverifikasi owner")
+                ledger = conn.execute("SELECT id FROM wallet_ledger WHERE user_id=? AND type='SOSMED_REFUND' AND reference=?", (current["user_id"],ident)).fetchone()[0]
             conn.execute("INSERT INTO sosmed_refunds VALUES(?,?,?,?,?,?,?,?)", (ident,current["id"],ledger,amount,provider_amount,proof,"CREDITED",time.time()))
             conn.execute("UPDATE sosmed_orders SET refund_amount=?,refund_state=?,updated_at=? WHERE id=?", (cumulative, "FULL" if cumulative==current["selling_price"] else "PARTIAL", time.time(), current["id"]))
             conn.execute("INSERT INTO sosmed_audit(actor,action,payload,created_at) VALUES(?,?,?,?)", (user,"refund_proof",encoded({"order":current["id"],"proof":proof,"provider_amount":provider_amount,"wallet_amount":amount}),time.time()))
+            if amount:
+                self.refunds.queue(conn,ident)
         return self.repo.one("SELECT * FROM sosmed_refunds WHERE refund_id=?", (ident,))
 
     def lease(self, name, seconds):
@@ -1977,6 +2139,7 @@ class Store:
 
     async def _batch(self):
         await self.orders.poll_once()
+        await self.refunds.deliver(self._bot)
         if self.settings()["enabled"] and self.config.token:
             try:
                 await self.catalog.sync(return_rows=False)
