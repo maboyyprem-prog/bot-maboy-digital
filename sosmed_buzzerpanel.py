@@ -38,6 +38,7 @@ API_RESPONSE_BYTES = 8*1024*1024
 CATALOG_RESPONSE_BYTES = 64*1024*1024
 JSON_SPOOL_BYTES = 1024*1024
 MAX_MONEY = 10**12
+REFILL_CONTRACT = 'json.php-refill-status_refill-v1'
 
 
 def encoded(value):
@@ -156,6 +157,18 @@ def catalog_value_label(value):
 
 def flag(value):
     return value is True or value == 1 or (isinstance(value, str) and value.lower() in {"true", "yes", "1"})
+
+
+def refill_capability(service):
+    """Missing capability is unknown, never a promise or an explicit refusal."""
+    raw = service.get('raw_catalog', {})
+    try:
+        raw = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return False
+    if isinstance(raw, dict) and 'refill' in raw:
+        return flag(raw['refill'])
+    return True if service.get('refill_supported') else None
 
 
 def service_available(raw):
@@ -362,6 +375,18 @@ def init_schema(conn):
     ]
     for statement in statements:
         conn.execute(statement)
+    # Additive migration for existing refill rows; no requests are replayed.
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(sosmed_refills)')}
+    for name, definition in (
+        ('raw_provider_status', "TEXT NOT NULL DEFAULT ''"),
+        ('last_error', "TEXT NOT NULL DEFAULT ''"),
+        ('last_checked_at', 'REAL NOT NULL DEFAULT 0'),
+        ('next_poll_at', 'REAL NOT NULL DEFAULT 0'),
+    ):
+        if name not in columns:
+            conn.execute('ALTER TABLE sosmed_refills ADD COLUMN '+name+' '+definition)
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_sosmed_refill_due ON sosmed_refills(status,next_poll_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_sosmed_refill_order ON sosmed_refills(order_id,id)')
 
 
 class Repository:
@@ -521,6 +546,7 @@ class APIClient:
         self.config = config
         self.session = None
         self.contract_validator = None
+        self.refill_validator = None
         self.checked_at, self.last_ok, self.error, self.cooldown_until = 0, False, "", 0
         self.last_action, self.http_status, self.detail = "", None, ""
 
@@ -620,11 +646,11 @@ class APIClient:
                     else self.config.contract_verified)
         if write and not verified:
             raise StoreError("CONFIG")
-        if wire_action=="refill" and not self.config.refill_verified:
+        if wire_action=="refill" and not (self.refill_validator() if self.refill_validator else self.config.refill_verified):
             raise StoreError("REFILL")
         wire_parameters = dict(parameters)
         if wire_action in {"status", "refill", "status_refill"}:
-            source = "refill" if action=="refill_status" else "order"
+            source = "refill" if wire_action=="status_refill" else "order"
             if source in wire_parameters:
                 if "id" in wire_parameters:
                     raise StoreError("INPUT")
@@ -684,6 +710,11 @@ class APIClient:
                 if type(success) is not bool:
                     raise problem('Field status tidak dikenali; diperlukan status true/false dan data.')
                 if success is not True:
+                    if wire_action=='refill' and isinstance(envelope.get('data'), dict) and isinstance(envelope['data'].get('msg'), str) and envelope['data']['msg'].strip():
+                        # The supplied refill contract explicitly documents
+                        # status:false/data.msg as rejection. Paid order
+                        # uncertainty and its wallet hold policy are unchanged.
+                        raise StoreError('REFILL_REJECTED', detail='Pengajuan refill ditolak sesuai ketentuan pesanan.', stage='refill')
                     # The observed auth rejection belongs to a READ services
                     # request. No paid-order rejection semantics were supplied;
                     # never infer that an unsuccessful order envelope proves
@@ -1682,9 +1713,28 @@ class OrderService:
         result["internal_order_id"] = result["id"]
         return result
 
+    def refill_capability(self, order):
+        if order.get('refill_supported'):
+            return True
+        quote = self.store.repo.one('''SELECT q.service_snapshot FROM sosmed_quotes q
+            JOIN sosmed_purchase_attempts a ON a.quote_id=q.quote_id WHERE a.attempt_id=?''',
+            (order['attempt_id'],))
+        try:
+            snapshot = json.loads(quote['service_snapshot']) if quote else None
+        except (TypeError, ValueError):
+            return False
+        # A legacy zero without its original catalog is not permission to
+        # submit. A documented catalog with no refill flag is conditional;
+        # the provider decides eligibility when explicitly requested.
+        return None if isinstance(snapshot, dict) and refill_capability(snapshot) is None else False
+
     async def refill(self, user, order_id):
+        row = self.store.repo.order(user, order_id)
+        pending = self.store.repo.one("SELECT * FROM sosmed_refills WHERE order_id=? AND status IN ('REQUESTING','PENDING','UNKNOWN','In progress') ORDER BY id DESC LIMIT 1", (row['id'],))
+        if pending:
+            return pending
         row = await self.refresh(user, order_id)
-        if not self.store.purchase_contract_verified() or not self.store.config.refill_verified or not row["refill_supported"] or row["status"]!="COMPLETED":
+        if not self.store.purchase_contract_verified() or not self.store.refill_contract_verified() or self.refill_capability(row) is False or row["status"]!="COMPLETED":
             raise StoreError("REFILL")
         self.store.repo.rate(user, "refill", 3, 3600)
         now = time.time()
@@ -1692,6 +1742,9 @@ class OrderService:
             pending = conn.execute("SELECT * FROM sosmed_refills WHERE order_id=? AND status IN ('REQUESTING','PENDING','UNKNOWN','In progress') ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
             if pending:
                 return dict(pending)
+            current = conn.execute('SELECT status,refund_amount FROM sosmed_orders WHERE id=? AND user_id=?', (row['id'],user)).fetchone()
+            if not current or current['status']!='COMPLETED' or current['refund_amount'] or not self.store.refill_contract_verified():
+                raise StoreError('REFILL')
             cur = conn.execute("INSERT INTO sosmed_refills(order_id,status,created_at,updated_at) VALUES(?,'REQUESTING',?,?)", (row["id"], now, now))
             ident = cur.lastrowid
         try:
@@ -1711,14 +1764,27 @@ class OrderService:
             raise
         except Exception:
             provider_id, state = None, "UNKNOWN"
-        with self.store.repo.connection(True) as conn:
-            conn.execute("UPDATE sosmed_refills SET provider_refill_id=?,status=?,updated_at=? WHERE id=?", (provider_id, state, time.time(), ident))
+        try:
+            with self.store.repo.connection(True) as conn:
+                conn.execute("UPDATE sosmed_refills SET provider_refill_id=?,status=?,updated_at=?,next_poll_at=? WHERE id=?",
+                    (provider_id, state, time.time(), time.time()+self.store.settings()['poll_seconds'], ident))
+        except sqlite3.IntegrityError:
+            # A provider ID already attached elsewhere must never be reassigned
+            # to this buyer, nor justify another non-idempotent submission.
+            with self.store.repo.connection(True) as conn:
+                conn.execute("UPDATE sosmed_refills SET status='UNKNOWN',last_error='ID_CONFLICT',updated_at=? WHERE id=?", (time.time(), ident))
         return self.store.repo.one("SELECT * FROM sosmed_refills WHERE id=?", (ident,))
 
-    async def refill_status(self, user, order_id):
-        self.store.repo.order(user, order_id)
-        if not self.store.config.refill_verified:
-            raise StoreError("REFILL")
+    async def refill_status(self, user, order_id, *, admin=False):
+        if admin:
+            self.store.require_owner(user)
+            if not self.store.repo.one('SELECT id FROM sosmed_orders WHERE id=?', (number(order_id, 1),)):
+                raise StoreError('NOT_FOUND')
+        else:
+            self.store.repo.order(user, order_id)
+        # Reading an existing request stays available with new refill requests
+        # disabled or the store OFF. A status check never submits a refill.
+        self.store.repo.rate(user, 'refill_status', 30, 60)
         row = self.store.repo.one("SELECT * FROM sosmed_refills WHERE order_id=? ORDER BY id DESC LIMIT 1", (order_id,))
         if not row:
             raise StoreError("REFILL")
@@ -1727,13 +1793,26 @@ class OrderService:
         return await self._refill_status(row)
 
     async def _refill_status(self, row):
-        response = await self.store.api.request("refill_status", refill=row["provider_refill_id"])
-        if not isinstance(response, dict) or not isinstance(response.get("status"), str):
-            raise StoreError("PROVIDER")
+        try:
+            response = await self.store.api.request("refill_status", refill=row["provider_refill_id"])
+            if not isinstance(response, dict) or not isinstance(response.get("status"), str) or not response['status'].strip():
+                raise StoreError("PROVIDER")
+        except StoreError as exc:
+            with self.store.repo.connection(True) as conn:
+                conn.execute('''UPDATE sosmed_refills SET last_error=?,last_checked_at=?,next_poll_at=? WHERE id=?''',
+                    (exc.code, time.time(), time.time()+max(self.store.settings()['poll_seconds'],exc.retry_after),row['id']))
+            raise
         raw = response["status"].strip().lower()
-        state = {"completed": "COMPLETED", "success": "COMPLETED", "rejected": "REJECTED", "failed": "FAILED", "error": "FAILED", "pending": "PENDING", "processing": "PENDING", "in progress": "PENDING"}.get(raw, "UNKNOWN")
+        state = {"completed": "COMPLETED", "success": "COMPLETED", "rejected": "REJECTED", "failed": "FAILED", "error": "FAILED", "pending": "PENDING", "processing": "PENDING", "in progress": "PENDING", "in_progress":"PENDING"}.get(raw, "UNKNOWN")
+        safe_raw = response['status'].strip()
+        for secret in (self.store.config.token, self.store.config.secret):
+            if secret:
+                safe_raw = safe_raw.replace(secret, '[redacted]')
+        safe_raw = safe_raw[:64]
         with self.store.repo.connection(True) as conn:
-            conn.execute("UPDATE sosmed_refills SET status=?,updated_at=? WHERE id=?", (state, time.time(), row["id"]))
+            conn.execute("""UPDATE sosmed_refills SET status=?,raw_provider_status=?,last_error='',
+                last_checked_at=?,updated_at=?,next_poll_at=? WHERE id=?""",
+                (state, safe_raw, time.time(), time.time(),time.time()+self.store.settings()['poll_seconds'],row['id']))
         return self.store.repo.one("SELECT * FROM sosmed_refills WHERE id=?", (row["id"],))
 
     async def cancel(self, user, order_id, confirmed=False):
@@ -1759,9 +1838,12 @@ class OrderService:
                 # Isolate one bad row/API/DB failure from other orders; no
                 # provider errors or user target data are written to logs.
                 continue
-        for row in self.store.repo.all("SELECT * FROM sosmed_refills WHERE status IN('PENDING','UNKNOWN') AND provider_refill_id IS NOT NULL AND updated_at<? ORDER BY updated_at LIMIT 10", (now-self.store.settings()["poll_seconds"],)):
+        for row in self.store.repo.all("SELECT * FROM sosmed_refills WHERE status IN('PENDING','UNKNOWN') AND provider_refill_id IS NOT NULL AND next_poll_at<=? ORDER BY next_poll_at LIMIT 10", (now,)):
             try:
                 await self._refill_status(row)
+            except StoreError as exc:
+                if exc.code=='RATE_LIMIT':
+                    break
             except Exception:
                 continue
         # A crash during non-idempotent actions does not justify a replay.
@@ -1776,6 +1858,7 @@ class Store:
         self.repo = Repository(host)
         self.api = APIClient(self.config)
         self.api.contract_validator = self.purchase_contract_verified
+        self.api.refill_validator = self.refill_contract_verified
         self.catalog, self.pricing = CatalogService(self), PricingService(self)
         self.purchase, self.orders = PurchaseService(self), OrderService(self)
         self.refunds = RefundService(self)
@@ -1880,6 +1963,45 @@ class Store:
         except (sqlite3.OperationalError, ValueError, TypeError):
             return False
 
+    def refill_contract_verified(self):
+        if self.configuration_issues():
+            return False
+        try:
+            row = self.repo.one("SELECT value FROM sosmed_settings WHERE key='verified_refill_contract'")
+            proof = json.loads(row['value']) if row else {}
+            if proof.get('fingerprint') == self.account_fingerprint() and proof.get('contract') == REFILL_CONTRACT:
+                return proof.get('enabled') is True
+        except (sqlite3.OperationalError, ValueError, TypeError, AttributeError):
+            return False
+        return bool(self.config.refill_verified)
+
+    def set_refill_contract(self, actor, enabled, *, automatic=False):
+        self.require_owner(actor)
+        if type(enabled) is not bool or self.configuration_issues():
+            raise StoreError('CONFIG')
+        now = time.time()
+        with self.repo.connection(True) as conn:
+            current = conn.execute("SELECT value FROM sosmed_settings WHERE key='verified_refill_contract'").fetchone()
+            if automatic and current:
+                try:
+                    proof = json.loads(current['value'])
+                    if proof.get('fingerprint')==self.account_fingerprint() and proof.get('contract')==REFILL_CONTRACT:
+                        return  # Preserve an owner's explicit pause across checks/restarts.
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            proof = {'enabled':enabled,'contract':REFILL_CONTRACT,'fingerprint':self.account_fingerprint(),
+                     'actor':actor,'checked_at':now}
+            conn.execute('INSERT OR REPLACE INTO sosmed_settings VALUES(?,?,?)',('verified_refill_contract',encoded(proof),now))
+            conn.execute('INSERT INTO sosmed_audit(actor,action,payload,created_at) VALUES(?,?,?,?)',
+                         (actor,'refill_contract',encoded({'enabled':enabled,'automatic':automatic,'contract':REFILL_CONTRACT}),now))
+
+    def refill_health(self):
+        last = self.repo.one('SELECT * FROM sosmed_refills ORDER BY last_checked_at DESC,id DESC LIMIT 1')
+        counts = self.repo.one("""SELECT COUNT(*) total,
+            COALESCE(SUM(status IN ('PENDING','REQUESTING','UNKNOWN','In progress')),0) pending,
+            COALESCE(SUM(status='COMPLETED'),0) completed FROM sosmed_refills""")
+        return {'enabled':self.refill_contract_verified(),'last':last,**counts}
+
     async def check_provider(self, actor):
         self.require_owner(actor)
         issues = self.configuration_issues()
@@ -1909,6 +2031,10 @@ class Store:
             raise StoreError("CONFIG", "Konfigurasi berubah selama pemeriksaan. Periksa koneksi kembali.")
         check.update(connected=True, checked_at=time.time(), stage='complete',
                      http_status=getattr(self.api, 'http_status', None))
+        # Both actions/response schemas are now supplied in the official
+        # documentation. An owner read-only profile/catalog check binds that
+        # protocol to this account; it does not create a test refill.
+        self.set_refill_contract(actor, True, automatic=True)
         return {"profile": self.catalog.last_profile, "services": rows, "fingerprint": fingerprint}
 
     def catalogue_issues(self, rows=None, profile=None):
@@ -2072,7 +2198,7 @@ class Store:
                 "configured": not bool(self.configuration_issues()),
                 "configuration_issues": self.configuration_issues(),
                 "contract_verified": self.purchase_contract_verified(),
-                "refill_verified": bool(self.config.refill_verified),
+                "refill_verified": self.refill_contract_verified(),
                 "cancel_verified": False,
                 "cancel_supported": False,
                 "catalog_synced_at": row["stamp"] if row else 0}

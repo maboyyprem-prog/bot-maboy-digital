@@ -39,6 +39,7 @@ NAVIGATION_ACTIONS = {
     "admin_price_categories", "admin_price_breakdown", "admin_search",
     "category_search", "admin_category_search",
     "attempt", "admin_attempt",
+    "confirm_refill", "refill_check", "admin_refill_check", "admin_refills",
 }
 
 
@@ -66,6 +67,21 @@ def number(value, low=0, high=10**12):
 
 def instant(value):
     return payment_receipts.format_wib(value, compact=True, missing="Belum tersedia")
+
+
+def refill_label(state):
+    return {"PENDING":"Sedang diproses", "REQUESTING":"Sedang diajukan",
+            "COMPLETED":"Selesai", "REJECTED":"Ditolak", "FAILED":"Gagal",
+            "UNKNOWN":"Menunggu kepastian"}.get(state, "Menunggu kepastian")
+
+
+def refill_offer_label(service, enabled):
+    if not enabled:
+        return 'Belum tersedia di toko'
+    capability = core.refill_capability(service)
+    if capability is None:
+        return 'Kelayakan diperiksa saat pengajuan'
+    return 'Tersedia sesuai ketentuan layanan' if capability else 'Tidak disediakan layanan'
 
 
 def provider_money(value):
@@ -429,7 +445,7 @@ class UIBuilder:
                 f"Status: {'Tersedia' if service.get('enabled') else 'Tidak tersedia'}\n"
                 f"💰 Harga jual / {unit}: <b>{core.money(sale) if price_ready else 'Belum tersedia'}</b>\n"
                 "Total sesuai jumlah ditampilkan sebelum pembayaran.\n"
-                f"🔄 Refill: {'Tersedia sesuai ketentuan layanan' if service.get('refill_supported') and getattr(self.store.config, 'refill_verified', False) else 'Belum tersedia di toko'}\n"
+                f"🔄 Refill: {refill_offer_label(service,self.store.refill_contract_verified())}\n"
                 "❌ Pembatalan: Belum tersedia di toko\n\n"
                 f"📋 Input:\n{esc(core.FormAdapter.instructions(service), 400)}")
         rows = []
@@ -517,20 +533,51 @@ class UIBuilder:
         oid = order.get("id", order.get("internal_order_id"))
         rows = [[("🔄 REFRESH STATUS", "admin_check" if admin else "check", {"id": oid})]]
         # Admin views do not grant ownership of buyers' order actions.
+        refill = self.store.repo.one('SELECT status FROM sosmed_refills WHERE order_id=? ORDER BY id DESC LIMIT 1',(oid,))
+        if refill:
+            rows.append([('🔎 CEK STATUS REFILL','admin_refill_check' if admin else 'refill_check',{'id':oid})])
         if not admin:
-            if order.get("refill_supported") and order["status"] == "COMPLETED" and getattr(self.store.config, "refill_verified", False):
-                rows.append([("🔄 REQUEST REFILL", "refill", {"id": oid})])
+            if self.store.orders.refill_capability(order) is not False and order["status"] == "COMPLETED" and not order.get('refund_amount') and self.store.refill_contract_verified() and (not refill or refill['status'] in {'COMPLETED','REJECTED','FAILED'}):
+                rows.append([("🔄 REQUEST REFILL", "confirm_refill", {"id": oid})])
         rows.append([("⬅️ Kembali", "admin_orders" if admin else "orders", {}),
                      ("🏠 Menu Awal", "admin_menu" if admin else "home", {})])
         return self.keyboard(user, rows)
 
-    async def check(self, message, user, order_id, *, admin=False, refresh=True):
-        order = await self.store.orders.refresh(user, order_id, admin=admin) if refresh else self.store.repo.order(user, order_id)
+    def refill_text(self, refill, *, admin=False):
+        text = '\n\n🔄 <b>REFILL</b>\nStatus: '+esc(refill_label(refill['status']))
+        text += '\nDiajukan: '+instant(refill['created_at'])
+        if refill.get('last_checked_at'):
+            text += '\nDiperiksa: '+instant(refill['last_checked_at'])
+        if refill.get('last_error'):
+            text += '\n⚠️ Pemeriksaan belum berhasil; status terakhir dipertahankan.'
+        if refill['status']=='UNKNOWN' and not refill.get('provider_refill_id'):
+            text += '\nHasil pengajuan belum pasti. Jangan mengajukan ulang; hubungi owner.'
+        if admin:
+            text += '\nID refill provider: '+esc(refill.get('provider_refill_id') or 'Belum diterima')
+            text += '\nStatus asli: '+esc(self.provider_label(refill.get('raw_provider_status') or '-'),80)
+            if refill.get('last_error'):
+                text += '\nKode pemeriksaan: '+esc(refill['last_error'],40)
+        return text
+
+    async def check(self, message, user, order_id, *, admin=False, refresh=True, refresh_refill=False):
+        if refresh:
+            order = await self.store.orders.refresh(user, order_id, admin=admin)
+        elif admin:
+            self.store.require_owner(user)
+            order = self.store.repo.one('SELECT * FROM sosmed_orders WHERE id=?',(order_id,))
+            if not order:
+                raise core.StoreError('NOT_FOUND')
+        else:
+            order = self.store.repo.order(user, order_id)
         text = self.order_text(order, admin=admin)
-        refill = self.store.repo.one("SELECT status FROM sosmed_refills WHERE order_id=? ORDER BY id DESC LIMIT 1", (order_id,))
+        refill = self.store.repo.one("SELECT * FROM sosmed_refills WHERE order_id=? ORDER BY id DESC LIMIT 1", (order_id,))
+        if refill and (refresh or refresh_refill):
+            try:
+                refill = await self.store.orders.refill_status(user,order_id,admin=admin)
+            except core.StoreError:
+                refill = self.store.repo.one('SELECT * FROM sosmed_refills WHERE id=?',(refill['id'],))
         if refill:
-            text += "\n🔄 Refill: "+esc({"PENDING": "Menunggu hasil", "REQUESTING": "Sedang diajukan", "COMPLETED": "Selesai",
-                                           "REJECTED": "Ditolak", "FAILED": "Gagal", "UNKNOWN": "Sedang diperiksa"}.get(refill["status"], "Sedang diperiksa"))
+            text += self.refill_text(refill,admin=admin)
         await self.send(message, text, self.order_keyboard(user, order, admin=admin))
 
     async def orders(self, message, user, payload=None, *, history=False, admin=False):
@@ -778,7 +825,7 @@ class AdminHandler:
                 f"Limit order aktif: {esc(settings['max_active'])}/user\n"
                 f"Limit jumlah: {esc(settings['max_quantity'])}\nPolling: {esc(settings['poll_seconds'])} detik\n\n"
                 f"Pembelian: {'Terverifikasi' if self.store.purchase_contract_verified() else 'Perlu pemeriksaan'}\n"
-                f"Refill API: {'Terverifikasi' if getattr(self.store.config, 'refill_verified', False) else 'Belum diverifikasi'} • "
+                f"Refill API: {'Aktif' if self.store.refill_contract_verified() else 'Nonaktif; periksa Status API'} • "
                 "Cancel API: Tidak didokumentasikan; dinonaktifkan\n\n"
                 "Buka Toko memeriksa profil, katalog, mata uang, dan harga tanpa membeli layanan. "
                 "Hasil pemeriksaan tersimpan; flag verifikasi manual tidak wajib.\n"
@@ -789,6 +836,8 @@ class AdminHandler:
                 [("⏱️ Polling", "admin_input", {"setting": "poll_seconds"}),
                  ("📂 Kategori", "admin_categories", {})],
                 [("💱 Mata Uang & Satuan", "admin_units", {})],
+                [("🔄 Status Refill", "admin_refills", {})],
+                [("⏸ Jeda Refill" if self.store.refill_contract_verified() else "▶️ Aktifkan Refill", "admin_refill_toggle", {"enabled": not self.store.refill_contract_verified()})],
                 [("⬅️ Kembali", "admin_menu", {})]]
         await self.ui.send(message, text, self.ui.keyboard(user, rows))
 
@@ -821,6 +870,18 @@ class AdminHandler:
             issues.extend(self.store.catalogue_issues(result["services"], result["profile"]))
         except core.StoreError as exc:
             issues.append(exc.public)
+        latest = self.store.repo.one('SELECT order_id FROM sosmed_refills WHERE provider_refill_id IS NOT NULL ORDER BY id DESC LIMIT 1')
+        if latest:
+            try:
+                await self.store.orders.refill_status(user,latest['order_id'],admin=True)
+            except core.StoreError:
+                pass  # Refill health is separate from the profile/catalog check.
+        refill_health = self.store.refill_health()
+        last_refill = refill_health['last']
+        refill_check = ('Belum ada pengajuan' if not last_refill else
+                        'Belum ada ID refill; perlu pemeriksaan owner' if not last_refill['provider_refill_id'] else
+                        'Pemeriksaan belum berhasil; lihat Status Refill' if last_refill['last_error'] else
+                        'Status terakhir '+refill_label(last_refill['status']))
         health = self.store.health()
         verified = health.get("contract_verified", False)
         if not verified:
@@ -866,14 +927,45 @@ class AdminHandler:
                 f"Kode gangguan: {esc(health.get('error') or '-')}\n\n"
                 f"Verifikasi pembelian: {verification}\n"
                 f"{explanation}\n\n"
-                "Refill memerlukan verifikasi terpisah; cancel belum didokumentasikan.\n"
+                f"Refill API: {'Aktif' if refill_health['enabled'] else 'Nonaktif'} • Kontrak refill/status_refill tersedia\n"
+                f"Refill: {refill_health['total']} • Menunggu: {refill_health['pending']} • Selesai: {refill_health['completed']}\n"
+                f"Cek refill: {refill_check}\n"
+                "Kelayakan refill mengikuti layanan/pesanan. Cancel belum didokumentasikan.\n"
                 "Timeout pembelian tidak dikirim ulang otomatis. Periksa menu Rekonsiliasi untuk transaksi yang belum pasti.")
         keyboard = self.ui.navigation(user, "admin_menu", admin=True)
         keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="📋 Rincian Katalog", callback_data=self.store.token(user,"admin_catalog",ttl=86400))])
+        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="🔄 Status Refill", callback_data=self.store.token(user,'admin_refills'))])
         keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="💱 Mata Uang & Satuan", callback_data=self.store.token(user, "admin_units", ttl=86400))])
         if not verified or not self.store.settings()["enabled"]:
             keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text="🟢 Periksa & Buka Toko", callback_data=self.store.token(user, "admin_toggle", {"enabled": True, "back": "admin_menu"}))])
         await self.ui.send(message, text, keyboard)
+
+    async def refills(self, message, user, payload=None):
+        self.authorize(user)
+        payload = payload or {}
+        health = self.store.refill_health()
+        size = 4
+        page = min(number(payload.get('page',0),0,100000),max(0,math.ceil(health['total']/size)-1))
+        rows = self.store.repo.all('''SELECT r.*,o.service_name_snapshot FROM sosmed_refills r
+            JOIN sosmed_orders o ON o.id=r.order_id ORDER BY r.id DESC LIMIT ? OFFSET ?''',(size,page*size))
+        text = ('🔄 <b>STATUS REFILL SOSMED</b>\n\n'
+                f"Pengajuan: {'Aktif' if health['enabled'] else 'Nonaktif'} • Kontrak API tersedia\n"
+                f"Total: {health['total']} • Menunggu: {health['pending']} • Selesai: {health['completed']}\n"
+                f"Halaman {page+1}/{max(1,math.ceil(health['total']/size))}\n\n")
+        controls = []
+        for refill in rows:
+            text += f"#{refill['order_id']} • "+esc(self.ui.provider_label(refill['service_name_snapshot']),140)
+            text += self.ui.refill_text(refill,admin=True)+'\n\n'
+            controls.append([(f"🔎 Order #{refill['order_id']}",'admin_refill_check',{'id':refill['order_id']})])
+        if not rows:
+            text += 'Belum ada pengajuan refill. Pemeriksaan ini tidak membuat refill percobaan.\n'
+        nav=[]
+        if page:nav.append(('⬅️ Sebelumnya','admin_refills',{'page':page-1}))
+        if (page+1)*size<health['total']:nav.append(('Berikutnya ➡️','admin_refills',{'page':page+1}))
+        if nav:controls.append(nav)
+        controls.append([('⏸ Jeda Refill' if health['enabled'] else '▶️ Aktifkan Refill','admin_refill_toggle',{'enabled':not health['enabled']})])
+        controls.append([('⬅️ Kembali','admin_status',{}),('🏠 Menu Awal','admin_menu',{})])
+        await self.ui.send(message,text,self.ui.keyboard(user,controls))
 
     async def catalog_report(self, message, user, payload=None):
         self.authorize(user)
@@ -1062,6 +1154,17 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await ui.orders(message, user, payload, history=action == "history")
     if action == "check":
         return await ui.check(message, user, number(payload["id"], 1))
+    if action in {'refill_check','admin_refill_check'}:
+        return await ui.check(message,user,number(payload['id'],1),admin=action=='admin_refill_check',refresh=False,refresh_refill=True)
+    if action == 'confirm_refill':
+        order=store.repo.order(user,number(payload['id'],1))
+        if not store.refill_contract_verified() or order['status']!='COMPLETED' or store.orders.refill_capability(order) is False:
+            raise core.StoreError('REFILL')
+        text=('🔄 <b>KONFIRMASI PENGAJUAN REFILL</b>\n'
+              f"Order #{order['id']}\n\nKelayakan dan hasil mengikuti ketentuan layanan/pesanan. "
+              'Pengajuan refill tidak memotong saldo bot. Jangan mengajukan ulang bila hasil belum pasti.')
+        return await ui.send(message,text,ui.keyboard(user,[[('✅ Ajukan Refill','refill',{'id':order['id']})],
+            [('⬅️ Kembali','check',{'id':order['id']})]]))
     if action in {"attempt","admin_attempt"}:
         return await ui.attempt(message,user,payload["id"],payload,admin=action=="admin_attempt")
     if action == 'admin_cancel_hold':
@@ -1168,6 +1271,15 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await admin.statistics(message, user, profit=action == "admin_profit")
     if action == "admin_status":
         return await admin.health(message, user)
+    if action == 'admin_refills':
+        return await admin.refills(message,user,payload)
+    if action == 'admin_refill_toggle':
+        if type(payload.get('enabled')) is not bool:
+            raise core.StoreError('INPUT')
+        if payload['enabled']:
+            await store.check_provider(user)
+        store.set_refill_contract(user,payload['enabled'])
+        return await admin.refills(message,user)
     if action == "admin_catalog":
         return await admin.catalog_report(message,user,payload)
     if action == "admin_units":

@@ -1,4 +1,4 @@
-# MaboyyDigital v17.08
+# MaboyyDigital v17.09
 
 Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
@@ -177,7 +177,9 @@ Verifikasi berhasil tersimpan di database dan bertahan setelah restart;
 `SOSMED_API_CONTRACT_VERIFIED=true` tidak wajib untuk alur tombol ON ini.
 
 Default `SOSMED_ENABLED=false` hanya untuk kondisi awal; pengaturan ON owner yang
-tersimpan diprioritaskan. `SOSMED_REFILL_API_VERIFIED=false` tetap terpisah.
+tersimpan diprioritaskan. Kontrak refill/status_refill mengikuti pemeriksaan akun
+pada tombol Status API; flag legacy `SOSMED_REFILL_API_VERIFIED=false` tidak
+mengalahkan hasil verifikasi tersimpan atau keputusan Jeda Refill owner.
 Jika Profile tidak menyebut mata uang, buka **Status API → Mata Uang & Satuan**:
 konfirmasi **IDR** setelah saldo akun bertanda Rp, dan **/ 1.000** setelah kolom
 harga layanan menyatakan tarif per 1.000. Kedua konfirmasi terpisah, tersimpan,
@@ -201,7 +203,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.08; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.09; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -209,5 +211,20 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.08: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.09: **Maboyy Digital • Since 2020**.
 Susunan menu, tombol, pembayaran dan seluruh fitur existing tetap sama.
+
+## Refill Sosmed
+
+Owner membuka **/sosmed → Status API**: pemeriksaan profile/katalog berhasil
+menyimpan kontrak `refill`/`status_refill` untuk akun yang sama. Buka **Status Refill**
+untuk daftar 4 pengajuan per halaman, cek status, atau Jeda/Aktifkan Refill.
+Tidak ada command/Variables baru dan pemeriksaan ini tidak membuat refill percobaan.
+User membuka pesanan selesai → **Request Refill → Ajukan Refill**. Jika katalog
+tidak memberi flag refill, kelayakan ditentukan saat pengajuan; flag tidak mendukung
+tetap ditolak. Refill mengikuti ketentuan layanan dan tidak memotong saldo bot.
+Tombol **Cek Status Refill**/Refresh Pesanan serta worker memperbarui status
+melalui ID refill yang benar, termasuk saat toko/pengajuan baru dijeda.
+Timeout/hasil tidak pasti tidak diajukan ulang otomatis. Tanpa ID refill, owner
+perlu memeriksa pengajuan di akun provider sebelum mengambil tindakan lanjutan.
+Kegagalan refill tidak mengubah order asli atau menambah refund saldo.
