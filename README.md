@@ -1,6 +1,6 @@
-# MaboyyDigital v17.09
+# MaboyyDigital v17.10
 
-Paket ringkas: **14 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
 ## Jalankan
 
@@ -195,15 +195,15 @@ OTP tetap memakai Variables existing; jika webhook digunakan, alamatnya
 
 ## Isi paket
 
-Delapan file Python aktif: `main.py`, `bot.py`, `otp_smscode.py`,
+Sembilan file Python aktif: `main.py`, `bot.py`, `otp_smscode.py`,
 `sosmed_buzzerpanel.py`, `sosmed_ui.py`, `project_backup.py`, `bank_accounts.py`,
-`payment_receipts.py`.
+`payment_receipts.py`, `klikqris_gateway.py`.
 File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 `.python-version`, `railway.json`.
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.09; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.10; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -211,8 +211,8 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.09: **Maboyy Digital • Since 2020**.
-Susunan menu, tombol, pembayaran dan seluruh fitur existing tetap sama.
+Footer toko pada v17.10: **Maboyy Digital • Since 2020**.
+Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed
 
@@ -228,3 +228,31 @@ melalui ID refill yang benar, termasuk saat toko/pengajuan baru dijeda.
 Timeout/hasil tidak pasti tidak diajukan ulang otomatis. Tanpa ID refill, owner
 perlu memeriksa pengajuan di akun provider sebelum mengambil tindakan lanjutan.
 Kegagalan refill tidak mengubah order asli atau menambah refund saldo.
+
+
+## QRIS Otomatis KlikQRIS
+
+Variables baru: `KLIKQRIS_API_KEY`, `KLIKQRIS_MERCHANT_ID`; mode awal
+`KLIKQRIS_MODE=gateway`, `KLIKQRIS_ENABLED=false`, `KLIKQRIS_SANDBOX=false`.
+Buka **/owner → Pengaturan Pembayaran → QRIS Otomatis → Cek Koneksi → Aktifkan**.
+Pemeriksaan koneksi membaca API, tanpa membuat transaksi. QRIS manual, transfer
+rekening dan ShopeePay existing dipertahankan. User hanya melihat **⚡ QRIS Otomatis**.
+Webhook: `https://DOMAIN_BOT_ANDA/webhooks/klikqris`; atur pada dashboard KlikQRIS.
+Opsional `KLIKQRIS_WEBHOOK_URL`; bila kosong memakai PUBLIC_BASE_URL existing.
+Polling tetap memantau pembayaran bila webhook terlambat. Provider `total_amount`
+menjadi total final; kode unik manual tidak ditambahkan. Fee/penyesuaian ditampilkan.
+Signature callback dicocokkan dengan signature invoice. Pembukuan selalu memerlukan
+status, referensi dan nominal dari API resmi; polling memakai pemeriksaan API yang
+sama. Screenshot tidak dapat menyetujui pembayaran otomatis.
+
+MY PG tetap nonaktif sampai merchant terhubung. Pemilihan mode MY PG meminta ID
+transaksi MY PG yang sudah ada untuk pemeriksaan API read-only; tidak memakai
+session/cookie Shopee. API publik tidak menyediakan endpoint status koneksi merchant
+khusus. Tanpa bukti tersebut, gunakan gateway biasa/manual.
+Sandbox hanya untuk pengujian terisolasi; tidak dapat mengkredit wallet/produk nyata.
+Jika create timeout, invoice tidak dibuat ulang otomatis. Gunakan Cek Status atau
+Rekonsiliasi owner. Pembayaran setelah pembatalan masuk pemeriksaan owner; pilihan
+Pindahkan ke Saldo memerlukan konfirmasi, bukti API dan ledger idempotent.
+Pembayaran normal dan pemindahan tersebut memakai antrean invoice foto existing.
+Tidak ada endpoint cancel/refund provider yang dikarang. Backup helper lama tetap
+mencakup seluruh project; jangan upload database, .env, kunci atau backup ke GitHub.

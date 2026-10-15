@@ -17,7 +17,7 @@ from aiogram.types import BufferedInputFile
 from PIL import Image, ImageDraw, ImageFont
 
 WIB = ZoneInfo("Asia/Jakarta")
-SOURCES = ("order", "topup", "otp_payment", "otp_order", "sosmed")
+SOURCES = ("order", "topup", "otp_payment", "otp_order", "sosmed", "qris_review")
 
 
 def display_datetime(value):
@@ -65,10 +65,11 @@ def rupiah(value):
 
 def method_label(value):
     return {"QRIS_MANUAL": "QRIS", "AUTO_QRIS": "QRIS Otomatis",
+            "KLIKQRIS_AUTO": "⚡ QRIS Otomatis",
             "QRIS": "QRIS", "BALANCE": "Saldo Bot", "SALDO": "Saldo Bot",
             "WALLET": "Saldo Bot", "BANK": "Transfer Bank", "TRANSFER": "Transfer Bank",
             "BANK_TRANSFER": "Transfer Bank",
-            "SHOPEEPAY": "ShopeePay"}.get(str(value or "").upper(), public_text(value, 80))
+            "SHOPEEPAY": "QRIS Otomatis"}.get(str(value or "").upper(), public_text(value, 80))
 
 
 def font(size, bold=False):
@@ -124,6 +125,8 @@ def render_invoice(snapshot, *, simulation=False):
         rows.append(("Diskon", "-"+rupiah(value["discount"])))
     if value.get("unique_code"):
         rows.append(("Kode unik", "+"+str(int(value["unique_code"]))))
+    if value.get("qris_adjustment"):
+        rows.append(("Biaya/penyesuaian QRIS", rupiah(value['qris_adjustment'])))
     if value.get("credit"):
         rows.append(("Saldo masuk", rupiah(value["credit"])))
     measured = [(label, wrapped(probe, data, face, 540)) for label, data in rows]
@@ -204,6 +207,7 @@ class ReceiptService:
             "otp_payment": "SELECT p.payment_id AS entity_id FROM otp_payments p WHERE p.paid_at IS NOT NULL",
             "otp_order": "SELECT o.id AS entity_id FROM otp_orders o JOIN otp_purchase_attempts a ON a.attempt_id=o.attempt_id WHERE a.state='CAPTURED' AND NOT EXISTS(SELECT 1 FROM otp_payments p WHERE p.attempt_id=o.attempt_id AND p.paid_at IS NOT NULL)",
             "sosmed": "SELECT o.id AS entity_id FROM sosmed_orders o JOIN sosmed_purchase_attempts a ON a.attempt_id=o.attempt_id WHERE a.state='SUCCESS'",
+            "qris_review": "SELECT t.id AS entity_id FROM klikqris_transactions t JOIN wallet_ledger w ON w.id=t.review_ledger_id WHERE t.state='SETTLED_BALANCE' AND t.sandbox=0 AND w.user_id=t.user_id AND w.amount=t.amount AND w.type='TOPUP' AND w.reference='AQ-REVIEW-'||t.id",
         }[source]
 
     @staticmethod
@@ -227,6 +231,8 @@ class ReceiptService:
                 discount=row["discount_amount"], unique_code=row["unique_code"], method=row["payment_method"],
                 paid_at=row["payment_verified_at"] or row["completed_at"] or row["created_at"])
             result["customer"] = self.customer(conn, user, row["username"])
+            if row['payment_method']=='KLIKQRIS_AUTO':
+                result['qris_adjustment']=max(0,int(result['amount'])-int(row['total'])+int(row['discount_amount'] or 0))
         elif source == "topup":
             row = dict(conn.execute("SELECT * FROM topups WHERE id=?", (entity_id,)).fetchone())
             user = row["user_id"]
@@ -234,6 +240,15 @@ class ReceiptService:
                 quantity=1, amount=row["payment_total"] or row["amount"], credit=row["amount"],
                 unique_code=row["unique_code"], method=row["payment_method"], paid_at=row["verified_at"] or row["updated_at"] or row["created_at"])
             result["customer"] = self.customer(conn, user, row["username"])
+            if row['payment_method']=='KLIKQRIS_AUTO':
+                result['qris_adjustment']=max(0,int(result['amount'])-int(row['amount']))
+        elif source == 'qris_review':
+            row=dict(conn.execute('SELECT * FROM klikqris_transactions WHERE id=?',(entity_id,)).fetchone())
+            user=row['user_id']
+            result=dict(reference=self.host.topup_invoice(row['entity_id']) if row['purpose']=='topup' else self.host.invoice(row['entity_id']),
+                category='Isi Saldo',item='Pembayaran QRIS dipindahkan ke saldo',quantity=1,
+                amount=row['total_amount'],credit=row['amount'],qris_adjustment=row['total_amount']-row['amount'],
+                method='KLIKQRIS_AUTO',paid_at=row['api_verified_at'])
         elif source == "otp_payment":
             row = dict(conn.execute("SELECT p.*,q.product FROM otp_payments p JOIN otp_quotes q ON q.quote_id=p.quote_id WHERE p.payment_id=?", (entity_id,)).fetchone())
             product = json.loads(row["product"])

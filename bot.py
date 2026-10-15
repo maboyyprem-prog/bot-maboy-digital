@@ -229,8 +229,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.09"
-SCHEMA_VERSION = 198
+BOT_VERSION = "17.10"
+SCHEMA_VERSION = 199
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -317,6 +317,8 @@ import bank_accounts
 BANK_ACCOUNTS = bank_accounts.register(router, bank_accounts.Manager(_otp_sys.modules[__name__]))
 import payment_receipts
 PAYMENT_RECEIPTS = payment_receipts.ReceiptService(_otp_sys.modules[__name__])
+import klikqris_gateway
+KLIKQRIS_GATEWAY = klikqris_gateway.register(router, klikqris_gateway.Gateway(_otp_sys.modules[__name__]))
 START_TIME = time.time()
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
@@ -1557,6 +1559,7 @@ def init_db():
     sosmed_buzzerpanel.init_schema(conn)
     bank_accounts.init_schema(conn)
     payment_receipts.init_schema(conn)
+    klikqris_gateway.init_schema(conn)
     reconcile_all_inventory_stock(conn)
     sync_all_product_sold_from_history(conn)
     conn.commit()
@@ -3183,7 +3186,7 @@ async def prepare_preorder_paid_order(order_id: int, bot: Bot) -> bool:
     first_transition=not bool(str(row["preorder_status"] or "").strip())
     if first_transition:
         qty=max(1,int(row["qty"] or 1))
-        if manual_confirmation_required(row) and int(row['stock_reserved'] or 0)!=1:
+        if (manual_confirmation_required(row) or row['payment_method']==klikqris_gateway.METHOD) and int(row['stock_reserved'] or 0)!=1:
             if not reserve_stock_for_order(conn,int(row['variant_id']),qty):
                 conn.rollback();conn.close()
                 return False
@@ -3280,6 +3283,10 @@ async def prepare_preorder_paid_order(order_id: int, bot: Bot) -> bool:
 
 
 async def fulfill_order(order_id: int, bot: Bot) -> bool:
+    return await KLIKQRIS_GATEWAY.fulfill_once(order_id,bot,_fulfill_order_impl)
+
+
+async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
     payment_receipts.queue(_otp_sys.modules[__name__], "order", order_id)
     """
     Safe fulfillment:
@@ -3348,7 +3355,7 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
         # Historical manual invoices may be confirmed after their old hold was
         # released. Reserve free stock before allocation, preserving other
         # buyers' pending orders. Already allocated credentials are reused above.
-        if manual_confirmation_required(order) and int(order['stock_reserved'] or 0)!=1:
+        if (manual_confirmation_required(order) or order['payment_method']==klikqris_gateway.METHOD) and int(order['stock_reserved'] or 0)!=1:
             sync_variant_stock_from_inventory(conn,int(order['variant_id']))
             if not reserve_stock_for_order(conn,int(order['variant_id']),qty):
                 conn.rollback();conn.close()
@@ -3884,7 +3891,7 @@ def timed_payment_sql(alias: str = '') -> str:
     """Fixed payment-method predicate for expiry/retention queries only."""
     if alias and not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',alias):raise ValueError('Invalid SQL alias')
     field=(alias+'.' if alias else '')+'payment_method'
-    return "UPPER(TRIM(COALESCE("+field+",''))) NOT IN ('QRIS','QRIS_MANUAL','BANK_TRANSFER')"
+    return "UPPER(TRIM(COALESCE("+field+",''))) NOT IN ('QRIS','QRIS_MANUAL','BANK_TRANSFER','KLIKQRIS_AUTO')"
 
 
 def owner_confirmable_expired_manual(row) -> bool:
@@ -4261,6 +4268,8 @@ def checkout_transaction_keyboard(variant_id: int, qty: int):
 
 
 def transaction_pending_keyboard(order_id: int, include_proof: bool = True):
+    automatic=KLIKQRIS_GATEWAY.linked('order',order_id)
+    if automatic:return KLIKQRIS_GATEWAY.user_keyboard(automatic)
     rows=[]
     if include_proof:
         rows.append([InlineKeyboardButton(text="📤 Kirim Bukti",callback_data=f"proofsubmit:order:{order_id}")])
@@ -4330,7 +4339,7 @@ def payment_method_keyboard(variant_id: int, qty: int):
             )
         ])
 
-    if shopeepay_ready():
+    if auto_payment_ready():
         rows.append([
             InlineKeyboardButton(
                 text="⚡ QRIS Otomatis",
@@ -5443,6 +5452,8 @@ def verify_topup_atomic(topup_id: int, actor_id: int):
         row = conn.execute("SELECT * FROM topups WHERE id=?", (topup_id,)).fetchone()
         if not row:
             return None, "not_found"
+        if row['payment_method']==klikqris_gateway.METHOD and not KLIKQRIS_GATEWAY.payment_authorized(conn,'topup',topup_id):
+            return None,'provider_unverified'
         if manual_confirmation_required(row) and not is_owner(actor_id):
             return None,"owner_required"
         wallet = conn.execute(
@@ -5749,6 +5760,8 @@ def topup_payment_method_keyboard(amount: int):
             callback_data=f"topupmethod:qris:{amount}"
         )]
     ]
+    if KLIKQRIS_GATEWAY.ready():
+        rows.insert(0,[InlineKeyboardButton(text=klikqris_gateway.LABEL,callback_data=f'topupmethod:auto:{amount}')])
     if bank_transfer_ready():
         rows.append([
             InlineKeyboardButton(
@@ -7608,7 +7621,7 @@ async def launch_readiness_report(bot: Bot):
     # Payment configuration
     qris_ready = bool(get_setting("qris_file_id", ""))
     bank_ready = bank_transfer_ready()
-    auto_ready = shopeepay_ready()
+    auto_ready = auto_payment_ready()
     payment_ok = qris_ready or bank_ready or auto_ready
     methods = []
     if qris_ready:
@@ -8287,6 +8300,10 @@ async def process_payment_proof_message(
             conn.close()
             return False, "Invoice tidak ditemukan."
 
+        if row['payment_method']==klikqris_gateway.METHOD:
+            conn.close()
+            return False,'QRIS Otomatis diperiksa otomatis; gunakan Cek Status.'
+
         if proof_locked_status(row):
             conn.close()
             clear_payment_proof_session(message.from_user.id)
@@ -8383,7 +8400,7 @@ def order_payment_terminal(order) -> bool:
 def order_reservation_expired(order) -> bool:
     if not order:
         return True
-    if manual_confirmation_required(order):return False
+    if manual_confirmation_required(order) or klikqris_gateway.managed(order):return False
     expiry = str(order["reserved_until"] or "").strip()
     if not expiry:
         return False
@@ -8396,7 +8413,7 @@ def order_reservation_expired(order) -> bool:
 def topup_reservation_expired(row) -> bool:
     if not row:
         return True
-    if manual_confirmation_required(row):return False
+    if manual_confirmation_required(row) or klikqris_gateway.managed(row):return False
     keys = set(row.keys()) if hasattr(row, "keys") else set()
     raw = str(row["expires_at"] or "").strip() if "expires_at" in keys else ""
     if not raw:
@@ -8411,6 +8428,8 @@ def topup_reservation_expired(row) -> bool:
 
 
 def topup_payment_input_error(row) -> str:
+    if row and row['payment_method']==klikqris_gateway.METHOD:
+        return 'QRIS Otomatis diverifikasi otomatis; gunakan Cek Status tanpa mengirim bukti.'
     if not row:
         return "Invoice top up tidak ditemukan."
     if topup_payment_terminal(row):
@@ -8482,6 +8501,8 @@ async def clear_matching_topup_proof_context(user_id: int, entity_id: int, state
 
 
 def topup_status_view(row):
+    if row['payment_method']==klikqris_gateway.METHOD and KLIKQRIS_GATEWAY.linked('topup',row['id']):
+        return KLIKQRIS_GATEWAY.native_status('topup',row['id'])
     entity_id = int(row["id"])
     raw_status = str(row["status"] or "pending")
     status = {
@@ -8528,6 +8549,8 @@ def payment_method_label(value: str) -> str:
     labels={
         "QRIS": "QRIS Manual",
         "AUTO_QRIS": "QRIS Otomatis",
+        "KLIKQRIS_AUTO": "⚡ QRIS Otomatis",
+        "SHOPEEPAY": "QRIS Otomatis",
         "BANK_TRANSFER": "Transfer Rekening",
         "WALLET": "Saldo",
         "OWNER_FREE": "Owner Free",
@@ -8681,6 +8704,9 @@ def order_has_review(order_id: int) -> bool:
 
 
 def order_detail_keyboard(order, *, include_history: bool = True):
+    if order['payment_method']==klikqris_gateway.METHOD and order['payment_status']!='paid':
+        automatic=KLIKQRIS_GATEWAY.linked('order',order['id'])
+        if automatic:return KLIKQRIS_GATEWAY.user_keyboard(automatic)
     rows=[]
     status=str(order["status"] or "")
     payment_status=str(order["payment_status"] or "")
@@ -8980,6 +9006,7 @@ PROJECT_BACKUP_REQUIRED_FILES = (
     "sosmed_ui.py",
     "bank_accounts.py",
     "payment_receipts.py",
+    "klikqris_gateway.py",
 )
 
 PROJECT_BACKUP_OPTIONAL_FILES = (
@@ -9351,6 +9378,10 @@ def unique_code_for_order(conn=None):
 
 
 
+def auto_payment_ready():
+    return KLIKQRIS_GATEWAY.ready() or shopeepay_ready()
+
+
 def shopeepay_ready():
     required = [
         SHOPEEPAY_BASE_URL,
@@ -9566,7 +9597,9 @@ def confirm_order_payment_atomic(order_id: int, paid_amount: int | None = None, 
             order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
             if not order:return None,False
             if manual_confirmation_required(order) and not is_owner(verified_by):return None,False
-            recovered=owner_confirmable_expired_manual(order) and is_owner(verified_by)
+            gateway_verified=order['payment_method']==klikqris_gateway.METHOD and KLIKQRIS_GATEWAY.payment_authorized(conn,'order',order_id)
+            if order['payment_method']==klikqris_gateway.METHOD and not gateway_verified:return None,False
+            recovered=(owner_confirmable_expired_manual(order) and is_owner(verified_by)) or (gateway_verified and order['status']=='expired')
             if order_payment_terminal(order) and not recovered:return None,False
             if order_reservation_expired(order):
                 release_order_reservation(conn,order)
@@ -11241,6 +11274,7 @@ def purge_paid_pending_orders(conn, product_id: int | None = None):
     """
     where = """
         payment_status='paid'
+        AND COALESCE(payment_method,'')!='KLIKQRIS_AUTO'
         AND (
             fulfillment_status!='delivered'
             OR status='paid_pending_delivery'
@@ -11356,11 +11390,13 @@ def cleanup_data_counts():
             "pending_orders": count(
                 """SELECT COUNT(*) AS n FROM orders
                    WHERE payment_status!='paid'
+                     AND COALESCE(payment_method,'')!='KLIKQRIS_AUTO'
                      AND status IN ('pending','pending_payment','waiting_payment')"""
             ),
             "paid_pending_orders": count(
                 """SELECT COUNT(*) AS n FROM orders
                    WHERE payment_status='paid'
+                     AND COALESCE(payment_method,'')!='KLIKQRIS_AUTO'
                      AND (
                         fulfillment_status!='delivered'
                         OR status='paid_pending_delivery'
@@ -11867,6 +11903,7 @@ def cleanup_execute(kind: str):
                 """SELECT id,variant_id,qty,stock_reserved
                    FROM orders
                    WHERE payment_status!='paid'
+                     AND COALESCE(payment_method,'')!='KLIKQRIS_AUTO'
                      AND status IN ('pending','pending_payment','waiting_payment')"""
             ).fetchall()
 
@@ -12219,7 +12256,8 @@ def qris_settings_menu():
         text=f"⚡ Mode: {'AUTO' if mode == 'auto' else 'MANUAL'}",
         callback_data="owner:qris_toggle_mode"
     )
-    kb.button(text="🔌 Status Payment Gateway", callback_data="owner:shopeepay_status")
+    kb.button(text="⚡ QRIS Otomatis", callback_data="owner:auto_qris")
+    kb.button(text="🔌 Status Gateway Existing", callback_data="owner:shopeepay_status")
     kb.button(text="⬅️ Pembayaran", callback_data="owner:back_payments")
     kb.adjust(2, 2, 2, 1, 1)
     return kb.as_markup()
@@ -13394,6 +13432,9 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
 
     if not row:
         return await call.answer("Invoice tidak ditemukan.", show_alert=True)
+
+    if row['payment_method']==klikqris_gateway.METHOD:
+        return await safe_callback_notice(call,'QRIS Otomatis diperiksa otomatis. Gunakan Cek Status tanpa mengirim bukti.',show_alert=True)
 
     if entity == "order":
         if order_payment_terminal(row):
@@ -21632,7 +21673,7 @@ async def payment_select(call: CallbackQuery):
         return await call.answer("Produk tidak tersedia.", show_alert=True)
 
     mode = get_setting("payment_mode", "manual")
-    auto_ready = shopeepay_ready()
+    auto_ready = auto_payment_ready()
 
     kb = InlineKeyboardBuilder()
 
@@ -21659,14 +21700,14 @@ async def payment_select(call: CallbackQuery):
     kb.adjust(1)
 
     auto_status = "✅ Siap" if auto_ready else "⚪ Belum dikonfigurasi"
-    preferred = "Payment Gateway Otomatis" if mode == "auto" else "QRIS Manual"
+    preferred = "QRIS Otomatis" if mode == "auto" else "QRIS Manual"
 
     await safe_edit_or_answer(call, 
         "💳 <b>PILIH METODE PEMBAYARAN</b>\n\n"
         f"🟡 QRIS pribadi: <b>Aktif</b>\n"
-        f"⚡ Payment Gateway otomatis: <b>{auto_status}</b>\n"
+        f"⚡ QRIS Otomatis: <b>{auto_status}</b>\n"
         f"⭐ Mode utama owner: <b>{preferred}</b>\n\n"
-        "Jika Payment Gateway otomatis belum siap, pembayaran manual tetap dapat digunakan.",
+        "Jika QRIS Otomatis belum siap, pembayaran manual tetap dapat digunakan.",
         reply_markup=kb.as_markup(),
         parse_mode="HTML"
     )
@@ -22493,6 +22534,14 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         )
     if maintenance_enabled() and not is_owner(call.from_user.id):
         return await call.answer("Toko sedang maintenance. Silakan coba kembali nanti.", show_alert=True)
+    if KLIKQRIS_GATEWAY.ready():
+        try:
+            return await KLIKQRIS_GATEWAY.checkout(call,bot,state,variant_id,requested_qty)
+        except klikqris_gateway.GatewayError as exc:
+            text='Stok tidak mencukupi.' if exc.code=='STOCK' else 'QRIS Otomatis belum dapat diproses. Cek status atau hubungi owner.'
+            return await safe_callback_notice(call,text,show_alert=True)
+        except sqlite3.Error:
+            return await safe_callback_notice(call,'Pembayaran belum dapat diproses; periksa status sebelum mencoba kembali.',show_alert=True)
     if not shopeepay_ready():
         return await call.answer(
             "QRIS otomatis belum dikonfigurasi lengkap.",
@@ -22632,7 +22681,7 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             release_order_reservation(conn, order)
             conn.execute(
                 "UPDATE orders SET status='payment_error', payment_status='error', note=? WHERE id=?",
-                (str(e)[:250], order_id)
+                ("QRIS Otomatis belum berhasil dibuat.", order_id)
             )
             conn.commit()
             conn.close()
@@ -22697,13 +22746,13 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             except Exception:
                 await bot.send_message(
                     call.from_user.id,
-                    caption + f"\n\nQR URL:\n{qr['qr_url']}",
+                    caption + "\n\nGambar QRIS belum dapat ditampilkan. Cek status atau hubungi owner; jangan membayar sebelum QRIS tersedia.",
                     reply_markup=kb,
                     parse_mode="HTML"
                 )
         else:
             await safe_edit_or_answer(call, 
-                caption + "\n\nQR image URL tidak tersedia.",
+                caption + "\n\nGambar QRIS belum tersedia. Hubungi owner sebelum melakukan pembayaran.",
                 reply_markup=kb,
                 parse_mode="HTML"
             )
@@ -23004,6 +23053,11 @@ async def user_check_transaction_status(call: CallbackQuery):
     if not row:
         return await call.answer("Transaksi tidak ditemukan.",show_alert=True)
 
+    if row['payment_method']==klikqris_gateway.METHOD:
+        automatic=KLIKQRIS_GATEWAY.linked(entity,entity_id)
+        if automatic:
+            await KLIKQRIS_GATEWAY.show_status(call,automatic['id'])
+            return await safe_callback_notice(call)
     if entity=="order":
         try:
             await safe_edit_or_answer(call,
@@ -24314,7 +24368,7 @@ async def owner_qris_settings(call: CallbackQuery, state: FSMContext):
     low = get_setting("unique_code_min", "1")
     high = get_setting("unique_code_max", "500")
     qris_status = "✅ Sudah dipasang" if get_setting("qris_file_id", "") else "❌ Belum dipasang"
-    auto_status = "✅ Siap" if shopeepay_ready() else "⚪ Belum siap"
+    auto_status = "✅ Siap" if auto_payment_ready() else "⚪ Belum siap"
     mode = get_setting("payment_mode", "manual")
 
     await safe_edit_or_answer(call, 
@@ -24341,7 +24395,7 @@ async def owner_qris_toggle_mode(call: CallbackQuery):
     current = get_setting("payment_mode", "manual")
     target = "auto" if current == "manual" else "manual"
 
-    if target == "auto" and not shopeepay_ready():
+    if target == "auto" and not auto_payment_ready():
         return await call.answer(
             "QRIS otomatis belum siap. Lengkapi credential Railway dulu.",
             show_alert=True
@@ -24357,7 +24411,7 @@ async def owner_qris_toggle_mode(call: CallbackQuery):
     low = get_setting("unique_code_min", "1")
     high = get_setting("unique_code_max", "500")
     qris_status = "✅ Sudah dipasang" if get_setting("qris_file_id", "") else "❌ Belum dipasang"
-    auto_status = "✅ Siap" if shopeepay_ready() else "⚪ Belum siap"
+    auto_status = "✅ Siap" if auto_payment_ready() else "⚪ Belum siap"
 
     await safe_edit_or_answer(call, 
         "💳 <b>PENGATURAN PEMBAYARAN</b>\n\n"
@@ -34861,6 +34915,7 @@ async def start_web_server(bot: Bot):
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_post("/shopeepay/callback", shopeepay_callback)
+    app.router.add_post("/webhooks/klikqris", KLIKQRIS_GATEWAY.webhook)
     app.router.add_post("/webhooks/smscode/otp", OTP_STORE.webhook.handle)
 
     runner = web.AppRunner(app)
@@ -34914,7 +34969,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.09"
+EXPECTED_SOURCE_VERSION = "17.10"
 
 
 def source_integrity_self_test():
@@ -35038,6 +35093,11 @@ async def main():
         logging.warning("SOSMED worker startup failed: %s", type(exc).__name__)
 
     try:
+        background_tasks.extend(await KLIKQRIS_GATEWAY.start(bot))
+    except Exception as exc:
+        logging.warning("Automatic payment worker startup failed: %s",type(exc).__name__)
+
+    try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(
             bot,
@@ -35081,6 +35141,11 @@ async def main():
             await SOSMED_STORE.close()
         except Exception:
             logging.warning("SOSMED client cleanup failed.")
+
+        try:
+            await KLIKQRIS_GATEWAY.close()
+        except Exception:
+            logging.warning("Automatic payment client cleanup failed.")
 
         try:
             await runner.cleanup()
