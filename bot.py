@@ -229,8 +229,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.10"
-SCHEMA_VERSION = 199
+BOT_VERSION = "17.11"
+SCHEMA_VERSION = 200
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1560,6 +1560,7 @@ def init_db():
     bank_accounts.init_schema(conn)
     payment_receipts.init_schema(conn)
     klikqris_gateway.init_schema(conn)
+    init_purchase_rating_schema(conn)
     reconcile_all_inventory_stock(conn)
     sync_all_product_sold_from_history(conn)
     conn.commit()
@@ -2891,7 +2892,228 @@ def user_delivery_actions_keyboard(order_id: int):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def init_purchase_rating_schema(conn):
+    """Queue new success transitions atomically, without backfilling old sales."""
+    conn.execute('''CREATE TABLE IF NOT EXISTS purchase_rating_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,source TEXT NOT NULL,
+        entity_key TEXT NOT NULL,user_id INTEGER NOT NULL CHECK(user_id>0),
+        reference TEXT NOT NULL,item_name TEXT NOT NULL,
+        rating INTEGER CHECK(rating BETWEEN 1 AND 5),rated_at TEXT,
+        created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%f','now')),
+        notified_at REAL NOT NULL DEFAULT 0,message_id INTEGER,
+        attempts INTEGER NOT NULL DEFAULT 0,next_retry_at REAL NOT NULL DEFAULT 0,
+        lease_owner TEXT,lease_until REAL NOT NULL DEFAULT 0,UNIQUE(source,entity_key))''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_purchase_rating_user ON purchase_rating_requests(user_id,rating,id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_purchase_rating_due ON purchase_rating_requests(notified_at,next_retry_at,lease_until)')
+    conn.execute('''CREATE VIEW IF NOT EXISTS purchase_rating_pending AS
+        SELECT r.* FROM purchase_rating_requests r WHERE r.rating IS NULL AND (
+          (r.source='order' AND EXISTS(SELECT 1 FROM orders o WHERE CAST(o.id AS TEXT)=r.entity_key
+            AND o.user_id=r.user_id AND o.status='completed' AND o.fulfillment_status='delivered'
+            AND o.payment_status='paid' AND o.payment_method!='OWNER_FREE'
+            AND NOT EXISTS(SELECT 1 FROM reviews v WHERE v.order_id=o.id))) OR
+          (r.source='otp' AND EXISTS(SELECT 1 FROM otp_orders o JOIN otp_purchase_attempts a ON a.attempt_id=o.attempt_id
+            WHERE CAST(o.id AS TEXT)=r.entity_key AND o.buyer_user_id=r.user_id AND o.last_sms_revision>0
+            AND o.status IN ('OTP_RECEIVED','COMPLETED') AND o.refund_idr=0 AND a.state='CAPTURED'
+            AND EXISTS(SELECT 1 FROM otp_notifications n WHERE n.order_id=o.id AND n.kind='SMS' AND n.status='SENT'))) OR
+          (r.source='sosmed' AND EXISTS(SELECT 1 FROM sosmed_orders o JOIN sosmed_purchase_attempts a ON a.attempt_id=o.attempt_id
+            WHERE CAST(o.id AS TEXT)=r.entity_key AND o.user_id=r.user_id AND o.status='COMPLETED'
+            AND o.refund_amount=0 AND a.state='SUCCESS')) OR
+          (r.source='tools' AND EXISTS(SELECT 1 FROM tool_provider_flows f
+            JOIN tool_activity_logs a ON a.id=f.apply_activity_id AND a.owner_id=f.owner_id
+              AND a.target_email=f.target_email AND a.action='apply_premium' AND a.status='success'
+            JOIN tools_user_access u ON u.user_id=f.owner_id AND u.enabled=1
+            WHERE f.correlation_id=r.entity_key AND f.owner_id=r.user_id AND f.stage='apply_premium'
+              AND f.status='success' AND COALESCE(f.apply_started_at,'')!=''
+              AND NOT EXISTS(SELECT 1 FROM tools_user_reviews v WHERE v.correlation_id=f.correlation_id)))
+        )''')
+    def trigger(name,table,event,condition,body):
+        conn.execute(f'CREATE TRIGGER IF NOT EXISTS {name} AFTER {event} ON {table} WHEN {condition} BEGIN {body}; END')
+    order_ok="NEW.status='completed' AND NEW.fulfillment_status='delivered' AND NEW.payment_status='paid' AND NEW.payment_method!='OWNER_FREE'"
+    order_insert="""INSERT OR IGNORE INTO purchase_rating_requests(source,entity_key,user_id,reference,item_name)
+        SELECT 'order',CAST(NEW.id AS TEXT),NEW.user_id,printf('MBY-%06d',NEW.id),
+          COALESCE((SELECT name FROM products WHERE id=NEW.product_id),'Produk Digital')
+        WHERE NOT EXISTS(SELECT 1 FROM reviews WHERE order_id=NEW.id)"""
+    trigger('purchase_rating_order_insert','orders','INSERT',order_ok,order_insert)
+    trigger('purchase_rating_order_complete','orders','UPDATE',order_ok+
+        " AND NOT(OLD.status='completed' AND OLD.fulfillment_status='delivered' AND OLD.payment_status='paid')",order_insert)
+    smm_ok="NEW.status='COMPLETED' AND NEW.refund_amount=0"
+    smm_insert="""INSERT OR IGNORE INTO purchase_rating_requests(source,entity_key,user_id,reference,item_name)
+        SELECT 'sosmed',CAST(NEW.id AS TEXT),NEW.user_id,printf('SMM-%06d',NEW.id),NEW.service_name_snapshot
+        WHERE EXISTS(SELECT 1 FROM sosmed_purchase_attempts WHERE attempt_id=NEW.attempt_id AND state='SUCCESS')"""
+    trigger('purchase_rating_smm_insert','sosmed_orders','INSERT',smm_ok,smm_insert)
+    trigger('purchase_rating_smm_complete','sosmed_orders','UPDATE',smm_ok+" AND OLD.status!='COMPLETED'",smm_insert)
+    otp_select="""INSERT OR IGNORE INTO purchase_rating_requests(source,entity_key,user_id,reference,item_name)
+        SELECT 'otp',CAST(o.id AS TEXT),o.buyer_user_id,printf('OTP-%d',o.id),o.platform_name
+        FROM otp_orders o JOIN otp_purchase_attempts a ON a.attempt_id=o.attempt_id
+        WHERE {which} AND o.last_sms_revision>0 AND o.status IN ('OTP_RECEIVED','COMPLETED')
+          AND o.refund_idr=0 AND a.state='CAPTURED'
+          AND EXISTS(SELECT 1 FROM otp_notifications n WHERE n.order_id=o.id AND n.kind='SMS' AND n.status='SENT')"""
+    sms_ok="NEW.kind='SMS' AND NEW.status='SENT'"
+    trigger('purchase_rating_sms_insert','otp_notifications','INSERT',sms_ok,otp_select.format(which='o.id=NEW.order_id'))
+    trigger('purchase_rating_sms_sent','otp_notifications','UPDATE',sms_ok+" AND OLD.status!='SENT'",otp_select.format(which='o.id=NEW.order_id'))
+    trigger('purchase_rating_otp_complete','otp_orders','UPDATE',"NEW.status='COMPLETED' AND OLD.status!='COMPLETED'",otp_select.format(which='o.id=NEW.id'))
+    tools_insert="""INSERT OR IGNORE INTO purchase_rating_requests(source,entity_key,user_id,reference,item_name)
+        SELECT 'tools',f.correlation_id,f.owner_id,'AM-'||f.correlation_id,'Magic Link · Apply Premium'
+        FROM tool_provider_flows f JOIN tool_activity_logs a ON a.id=f.apply_activity_id
+          AND a.owner_id=f.owner_id AND a.target_email=f.target_email
+        WHERE {which} AND f.stage='apply_premium' AND f.status='success'
+          AND COALESCE(f.apply_started_at,'')!='' AND a.action='apply_premium' AND a.status='success'
+          AND NOT EXISTS(SELECT 1 FROM tools_user_reviews v WHERE v.correlation_id=f.correlation_id)"""
+    flow_ok="NEW.stage='apply_premium' AND NEW.status='success'"
+    trigger('purchase_rating_tools_insert','tool_provider_flows','INSERT',flow_ok,tools_insert.format(which='f.correlation_id=NEW.correlation_id'))
+    trigger('purchase_rating_tools_complete','tool_provider_flows','UPDATE',flow_ok+
+        " AND NOT(OLD.stage='apply_premium' AND OLD.status='success')",tools_insert.format(which='f.correlation_id=NEW.correlation_id'))
+    trigger('purchase_rating_tools_activity','tool_activity_logs','UPDATE',
+        "NEW.action='apply_premium' AND NEW.status='success' AND OLD.status!='success'",tools_insert.format(which='a.id=NEW.id'))
+    for table,source,key in [('reviews','order','CAST(NEW.order_id AS TEXT)'),('tools_user_reviews','tools','NEW.correlation_id')]:
+        for event in ('INSERT','UPDATE'):
+            trigger('purchase_rating_saved_'+source+'_'+event.lower(),table,event,'NEW.rating BETWEEN 1 AND 5',
+                f"UPDATE purchase_rating_requests SET rating=NEW.rating,rated_at=NEW.created_at,lease_owner=NULL,lease_until=0 WHERE source='{source}' AND entity_key={key} AND user_id=NEW.user_id AND rating IS NULL")
+
+
+def pending_purchase_rating(user_id):
+    conn=db()
+    try:
+        row=conn.execute('SELECT * FROM purchase_rating_pending WHERE user_id=? ORDER BY id LIMIT 1',(user_id,)).fetchone()
+        return dict(row) if row else None
+    finally:conn.close()
+
+
+def purchase_rating_keyboard(request):
+    source,key=request['source'],request['entity_key']
+    prefix=('rate:'+key if source=='order' else 'utools:rate:'+key if source=='tools' else 'purchaserate:'+str(request['id']))
+    choices=[InlineKeyboardButton(text=f'{stars} ⭐',callback_data=prefix+':'+str(stars)) for stars in range(1,6)]
+    rows=[choices[:3],choices[3:]]
+    if source=='order':
+        rows.append([InlineKeyboardButton(text='🆘 Bantuan Pesanan',callback_data='orderdetail:'+key)])
+    elif source=='otp':
+        token=OTP_STORE.ui.keyboard(request['user_id'],[[('🔐 Pesanan & Kode OTP','check',{'id':int(key)})]])
+        rows.extend(token.inline_keyboard)
+    elif source=='sosmed':
+        token=SOSMED_STORE.ui.keyboard(request['user_id'],[[('📦 Status Pesanan','check',{'id':int(key)})]])
+        rows.extend(token.inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def purchase_rating_text(request):
+    value=request['item_name']
+    if request['source']=='sosmed':value=SOSMED_STORE.ui.public_label(value,180)
+    elif request['source']=='otp':value=otp_smscode.UserFormatter.label(value)
+    item=payment_receipts.public_text(value,180)
+    return ('⭐ <b>RATING PEMBELIAN</b>\n<b>Maboyy Digital</b>\n\n'
+        + '🧾 '+html.escape(request['reference'])+'\n📦 '+html.escape(item)+'\n\n'
+        + 'Pembelian sudah selesai atau layanan sudah diterima.\n'
+        + 'Pilih bintang <b>1–5</b> untuk melanjutkan fitur lainnya.\n'
+        + 'Komentar tertulis opsional.\n\n'+rating_scale_text())
+
+
+async def render_purchase_rating(event,request):
+    text=purchase_rating_text(request);keyboard=purchase_rating_keyboard(request)
+    if isinstance(event,CallbackQuery) or (getattr(event,'message',None) is not None and getattr(event,'data',None) is not None):
+        await hide_shop_keyboard_for_callback(event)
+        sent=await safe_edit_or_answer(event,text,reply_markup=keyboard,parse_mode='HTML')
+        await safe_callback_notice(event,'Pilih rating pembelian terlebih dahulu.' if isinstance(event,CallbackQuery) else '')
+    else:
+        sent=None
+        shown=False
+        if request['message_id']:
+            try:
+                sent=await event.bot.edit_message_text(text,chat_id=request['user_id'],message_id=request['message_id'],reply_markup=keyboard,parse_mode='HTML')
+            except TelegramBadRequest as exc:
+                shown='message is not modified' in str(exc).lower()
+            except Exception:pass
+        if sent is None and not shown:
+            target=event if isinstance(event,CommandMenuMessage) else CommandMenuMessage.wrap(event) if isinstance(event,Message) else event
+            sent=await target.answer(text,reply_markup=keyboard,parse_mode='HTML')
+    conn=db()
+    try:
+        message_id=getattr(sent,'message_id',None)
+        conn.execute('UPDATE purchase_rating_requests SET message_id=COALESCE(?,message_id),notified_at=? WHERE id=?',
+            (message_id,time.time(),request['id']))
+        conn.commit()
+    finally:conn.close()
+    return sent
+
+
+async def send_purchase_rating_if_needed(bot,request):
+    token=secrets.token_hex(12);conn=db()
+    try:
+        with conn:
+            begin_immediate_retry(conn)
+            changed=conn.execute('''UPDATE purchase_rating_requests SET lease_owner=?,lease_until=?
+                WHERE id=? AND notified_at=0 AND next_retry_at<=? AND lease_until<=?
+                AND id IN (SELECT id FROM purchase_rating_pending)''',
+                (token,time.time()+120,request['id'],time.time(),time.time())).rowcount
+        if not changed:return False
+    finally:conn.close()
+    try:
+        message=await asyncio.wait_for(bot.send_message(request['user_id'],purchase_rating_text(request),
+            reply_markup=purchase_rating_keyboard(request),parse_mode='HTML'),timeout=40)
+        ident=getattr(message,'message_id',None)
+        if type(ident) is not int or ident<=0:raise ValueError('Rating prompt not acknowledged')
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        conn=db()
+        try:
+            with conn:conn.execute('''UPDATE purchase_rating_requests SET attempts=attempts+1,
+                next_retry_at=?,lease_owner=NULL,lease_until=0 WHERE id=? AND lease_owner=?''',
+                (time.time()+min(3600,20*2**min(request['attempts'],7)),request['id'],token))
+        finally:conn.close()
+        return False
+    else:
+        conn=db()
+        try:
+            with conn:conn.execute('''UPDATE purchase_rating_requests SET message_id=?,notified_at=?,lease_owner=NULL,lease_until=0
+                WHERE id=? AND lease_owner=?''',(ident,time.time(),request['id'],token))
+        finally:conn.close()
+        return True
+    finally:
+        conn=db()
+        try:
+            with conn:conn.execute('UPDATE purchase_rating_requests SET lease_owner=NULL,lease_until=0 WHERE id=? AND lease_owner=?',(request['id'],token))
+        finally:conn.close()
+
+
+async def deliver_purchase_rating_prompts(bot):
+    conn=db()
+    try:
+        rows=[dict(row) for row in conn.execute('''SELECT r.* FROM purchase_rating_pending r WHERE notified_at=0
+            AND next_retry_at<=? AND lease_until<=? AND NOT EXISTS(SELECT 1 FROM purchase_rating_pending older
+            WHERE older.user_id=r.user_id AND older.id<r.id) ORDER BY id LIMIT 20''',(time.time(),time.time()))]
+    finally:conn.close()
+    for row in rows:await send_purchase_rating_if_needed(bot,row)
+
+
+async def purchase_rating_loop(bot):
+    while True:
+        try:await deliver_purchase_rating_prompts(bot)
+        except asyncio.CancelledError:raise
+        except Exception:logging.warning('Purchase rating prompts deferred; transaction processing remains active.')
+        await asyncio.sleep(15)
+
+
+def save_purchase_rating(user_id,request_id,stars):
+    if any(type(value) is not int or value<=0 or value>9223372036854775807 for value in (user_id,request_id)) or type(stars) is not int or stars not in range(1,6):
+        raise ValueError('Pilih 1–5 bintang yang valid.')
+    conn=db()
+    try:
+        with conn:
+            begin_immediate_retry(conn)
+            row=conn.execute("SELECT * FROM purchase_rating_requests WHERE id=? AND user_id=? AND source IN ('otp','sosmed')",(request_id,user_id)).fetchone()
+            if not row:raise ValueError('Penilaian tidak tersedia untuk akun ini.')
+            if row['rating'] is not None:return int(row['rating']),False
+            if not conn.execute('SELECT 1 FROM purchase_rating_pending WHERE id=? AND user_id=?',(request_id,user_id)).fetchone():
+                raise ValueError('Penilaian tersedia setelah layanan Anda selesai atau diterima.')
+            conn.execute('UPDATE purchase_rating_requests SET rating=?,rated_at=?,lease_owner=NULL,lease_until=0 WHERE id=? AND rating IS NULL',
+                (stars,datetime.now().isoformat(timespec='seconds'),request_id))
+        return stars,True
+    finally:conn.close()
+
+
 def rating_keyboard(order_id: int):
+    pending=pending_purchase_rating_for_order(order_id)
+    if pending:return purchase_rating_keyboard(pending)
     keyboard=rating_choice_keyboard(f"rate:{int(order_id)}", "my_orders", "🧾 Riwayat")
     conn=None;row=None
     try:
@@ -2907,6 +3129,14 @@ def rating_keyboard(order_id: int):
     if not row or not product_is_famhead(row):
         keyboard.inline_keyboard.insert(-1,[user_complaint_button(order_id)])
     return keyboard
+
+
+def pending_purchase_rating_for_order(order_id):
+    conn=db()
+    try:
+        row=conn.execute("SELECT * FROM purchase_rating_pending WHERE source='order' AND entity_key=?",(str(order_id),)).fetchone()
+        return dict(row) if row else None
+    finally:conn.close()
 
 
 def review_after_rating_keyboard(order_id: int):
@@ -3017,12 +3247,15 @@ def store_rating_summary(conn=None):
                    SELECT rating,comment FROM reviews
                    UNION ALL
                    SELECT rating,'' AS comment FROM tools_user_reviews
+                   UNION ALL
+                   SELECT rating,'' AS comment FROM purchase_rating_requests WHERE source IN ('otp','sosmed')
                ) WHERE rating IN (1,2,3,4,5)"""
         ).fetchone()
         buckets=conn.execute(
             """SELECT rating,COUNT(*) AS n FROM (
                    SELECT rating FROM reviews UNION ALL
                    SELECT rating FROM tools_user_reviews
+                   UNION ALL SELECT rating FROM purchase_rating_requests WHERE source IN ('otp','sosmed')
                ) WHERE rating IN (1,2,3,4,5) GROUP BY rating"""
         ).fetchall()
         distribution={stars:0 for stars in range(1,6)}
@@ -3063,6 +3296,11 @@ def store_recent_ratings(conn, limit: int=30, offset: int=0):
                   r.created_at,v.username,r.correlation_id
            FROM tools_user_reviews r LEFT JOIN verified_users v ON v.user_id=r.user_id
            WHERE r.rating IN (1,2,3,4,5)
+           UNION ALL
+           SELECT r.user_id,NULL,r.rating,'',CASE r.source WHEN 'otp' THEN 'Nomor OTP' ELSE 'Layanan Sosmed' END,'',
+                  r.rated_at,v.username,'purchase:'||r.id
+           FROM purchase_rating_requests r LEFT JOIN verified_users v ON v.user_id=r.user_id
+           WHERE r.source IN ('otp','sosmed') AND r.rating IN (1,2,3,4,5)
            ) ORDER BY created_at DESC,order_id DESC,user_id DESC,review_key DESC
            LIMIT ? OFFSET ?""",
         (max(1,min(100,int(limit))),max(0,int(offset)))
@@ -3094,6 +3332,8 @@ def review_order_snapshot(order_id: int, user_id: int | None = None):
 
 
 def review_prompt_text(order):
+    pending=pending_purchase_rating_for_order(order['id'])
+    if pending:return purchase_rating_text(pending)
     return (
         "⭐ <b>RATING TOKO</b>\n"
         "Maboyy Digital\n\n"
@@ -3116,6 +3356,11 @@ async def send_review_prompt_if_needed(bot: Bot, order_id: int) -> bool:
         row=review_order_snapshot(order_id)
         if not row or row["status"]!="completed" or row["fulfillment_status"]!="delivered":
             return False
+        pending=pending_purchase_rating_for_order(order_id)
+        if pending:
+            oldest=pending_purchase_rating(int(row['user_id']))
+            if oldest and oldest['id']!=pending['id']:return True
+            return await send_purchase_rating_if_needed(bot,pending)
         already_done=(str(row["payment_method"] or "")=="OWNER_FREE"
                       or bool(row["reviewed"]) or int(row["review_prompt_sent"] or 0)==1)
         if not already_done:
@@ -10501,7 +10746,8 @@ class CommandKeyboardMiddleware(BaseMiddleware):
                     r"am_mail_[1-9][0-9]{0,9}",str(command.args or "").strip())):
                 return await handler(CommandMenuMessage.wrap(event),data)
         elif isinstance(event,CallbackQuery) and (str(event.data or "").startswith(
-                (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,bank_accounts.PREFIX,"owner:","tools:","utools:","toolsaccess","tm:"))
+                (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,bank_accounts.PREFIX,klikqris_gateway.PREFIX,
+                 "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","toolsaccess","tm:"))
                 or getattr(getattr(data.get("handler"),"callback",None),"__name__","").startswith(
                     ("owner_","user_tools_"))):
             main_menu=False
@@ -10520,6 +10766,84 @@ class CommandKeyboardMiddleware(BaseMiddleware):
 # listener, extra command, state reset or financial action is introduced.
 router.message.middleware(CommandKeyboardMiddleware())
 router.callback_query.middleware(CommandKeyboardMiddleware())
+
+
+class PurchaseRatingMiddleware(BaseMiddleware):
+    """Prioritize ratings only after a real success; payment recovery stays open."""
+    async def __call__(self,handler,event,data):
+        message=event if isinstance(event,Message) else getattr(event,'message',None)
+        user=getattr(getattr(event,'from_user',None),'id',None)
+        command=data.get('command')
+        owner_context=(getattr(command,'command','') in {'owner','tools'}
+            or str(getattr(event,'data','') or '').startswith(('owner:','tools:','toolsaccess','bankacct:','aqris:a:'))
+            or str(data.get('raw_state') or '').startswith('OwnerState:')
+            or str(getattr(getattr(data.get('handler'),'callback',None),'__name__','')).startswith('owner_'))
+        if user and is_owner(user) and owner_context and (message is None or str(message.chat.type)!='private' or message.chat.id!=user):
+            text='Gunakan menu owner melalui chat privat bot.'
+            if isinstance(event,CallbackQuery):return await safe_callback_notice(event,text,show_alert=True)
+            return await event.answer(text)
+        if isinstance(event,CallbackQuery) and str(event.data or '').startswith(('rate:','reviewopen:','reviewcomment:','reviewskip:','purchaserate:','utools:rate:','utools:rating:')) and (
+            message is None or str(message.chat.type)!='private' or message.chat.id!=user
+        ):
+            return await safe_callback_notice(event,'Gunakan rating melalui chat privat Anda.',show_alert=True)
+        if not user or is_owner(user) or message is None or str(message.chat.type)!='private' or message.chat.id!=user:
+            return await handler(event,data)
+        unavailable=False
+        try:
+            pending=pending_purchase_rating(user)
+        except sqlite3.Error:
+            # A rating queue failure must never interrupt payment confirmation,
+            # access to SMS, refunds, or the existing handler's own safeguards.
+            logging.warning('Rating navigation check deferred due to database availability.')
+            pending=None;unavailable=True
+        if not pending and not unavailable:return await handler(event,data)
+        allowed=False
+        if isinstance(event,CallbackQuery):
+            value=str(event.data or '')
+            allowed=value.startswith(('rate:','reviewopen:','reviewcomment:','reviewskip:','purchaserate:',
+                'utools:rating:','utools:rate:','orderdetail:','myorderspage:','statuscheck:',
+                'usercancel:','topupcancel:','proofsubmit:','userproofback:','proofback:',
+                'resendorder:','loginproof:','usercomplaint:','usercomplaintcancel:',
+                'preorderdetail:','aqris:u:check:','aqris:u:qr:','aqris:u:cancel:')) or value in {'my_orders','verify_join','contact_owner'}
+            try:
+                if value.startswith(otp_smscode.PREFIX):
+                    action,_=OTP_STORE.read_token(user,value[len(otp_smscode.PREFIX):])
+                    allowed=action in {'orders','history','check','confirm_cancel','cancel','confirm_finish','finish',
+                        'resend','payment_status','payment_cancel','topup_status','topup_proof','topup_back','topup_cancel','help','help_commands'}
+                elif value.startswith(sosmed_buzzerpanel.PREFIX):
+                    action,_=SOSMED_STORE.resolve(user,value)
+                    allowed=action in {'orders','history','check','attempt','refill_check','confirm_cancel','cancel','help'}
+            except (otp_smscode.StoreError,sosmed_buzzerpanel.StoreError,sqlite3.Error,ValueError):
+                # Let the original handler reject invalid/expired/foreign tokens.
+                allowed=True
+        elif isinstance(event,Message):
+            command=data.get('command')
+            raw=str(event.text or '')
+            if command is not None or raw.startswith('/'):
+                parts=raw.split();name=parts[0].split('@',1)[0].lower() if parts else ''
+                section=parts[1].lower() if len(parts)>1 else ''
+                allowed=(name=='/otp' and section in {'pesanan','riwayat','cek','kode','sms','cancel','batal','selesai','finish','resend','ulang','bantuan'}) or (
+                    name=='/sosmed' and section in {'pesanan','riwayat','cek','batal','bantuan'})
+            else:
+                context=data.get('state');current=await context.get_state() if context is not None else None
+                allowed=current in {CheckoutState.waiting_payment_proof.state,
+                    otp_smscode.OTPState.topup_proof.state,LoginProofState.waiting_photo.state,
+                    UserComplaintState.waiting_reason.state,FamilySupportState.waiting_issue_reason.state,
+                    ReviewState.waiting_comment.state}
+        if allowed:return await handler(event,data)
+        if unavailable:
+            text='Penilaian pembelian belum dapat diperiksa. Coba lagi sebentar; pembayaran dan pesanan berjalan tetap dapat diperiksa.'
+            if isinstance(event,CallbackQuery):return await safe_callback_notice(event,text,show_alert=True)
+            return await event.answer(text)
+        try:return await render_purchase_rating(event,pending)
+        except sqlite3.Error:
+            logging.warning('Rating prompt could not be rendered; request retained for retry.')
+            if isinstance(event,CallbackQuery):return await safe_callback_notice(event,'Rating belum dapat dibuka. Coba lagi sebentar.',show_alert=True)
+            return await event.answer('Rating belum dapat dibuka. Coba lagi sebentar.')
+
+
+router.message.middleware(PurchaseRatingMiddleware())
+router.callback_query.middleware(PurchaseRatingMiddleware())
 
 
 async def refresh_catalog_reply_keyboard(target,view,product_ids):
@@ -17245,6 +17569,10 @@ async def render_tools_user_result(call: CallbackQuery,state: FSMContext):
     data=await state.get_data()
     key=str(data.get("tools_correlation_id") or "")
     success=tools_user_success_flow(call.from_user.id,key) if key else None
+    if success and not success['rating']:
+        pending=pending_purchase_rating(call.from_user.id)
+        if pending and not is_owner(call.from_user.id):
+            return await render_purchase_rating(call,pending)
     email=str(data.get("tools_target_email") or "")
     parsed=dict(data.get("tools_provider_apply_premium_result") or {})
     if success:
@@ -17551,6 +17879,9 @@ async def user_tools_rate_submit(call: CallbackQuery,state: FSMContext):
     except sqlite3.Error:
         return await safe_callback_notice(call,"Rating belum tersimpan. Coba lagi sebentar.",show_alert=True)
     await rating_finish_session(state,flow_key=parts[2])
+    pending=pending_purchase_rating(call.from_user.id)
+    if pending and not is_owner(call.from_user.id):
+        return await render_purchase_rating(call,pending)
     text=rating_receipt_text(stars,subtitle=("Terima kasih atas penilaian Anda." if created else
                                            "Penilaian Anda sebelumnya sudah tersimpan."))
     if not created:text=text.replace("RATING TOKO TERSIMPAN","RATING TOKO ANDA")
@@ -28877,6 +29208,30 @@ async def reply_menu_owner_contact(message: Message, state: FSMContext = None):
 
 
 
+@router.callback_query(F.data.startswith('purchaserate:'))
+async def submit_purchase_rating(call: CallbackQuery,state: FSMContext):
+    values=callback_positive_numbers(call.data,'purchaserate',2)
+    if not values or values[1] not in range(1,6):
+        return await safe_callback_notice(call,'Pilih 1–5 bintang yang valid.',show_alert=True)
+    if not call.message or str(call.message.chat.type)!='private' or call.message.chat.id!=call.from_user.id:
+        return await safe_callback_notice(call,'Gunakan rating melalui chat privat Anda.',show_alert=True)
+    try:
+        stars,created=save_purchase_rating(call.from_user.id,values[0],values[1])
+    except ValueError as exc:
+        return await safe_callback_notice(call,str(exc),show_alert=True)
+    except sqlite3.Error:
+        return await safe_callback_notice(call,'Rating belum tersimpan. Coba lagi sebentar.',show_alert=True)
+    # Do not clear another feature's checkout/proof state just to save a rating.
+    pending=pending_purchase_rating(call.from_user.id)
+    if pending:
+        return await render_purchase_rating(call,pending)
+    await safe_edit_or_answer(call,rating_receipt_text(stars,subtitle=(
+        'Terima kasih. Anda sudah dapat menggunakan fitur lainnya.' if created else
+        'Rating sebelumnya sudah tersimpan. Anda dapat melanjutkan.')),
+        reply_markup=review_done_keyboard(),parse_mode='HTML')
+    await safe_callback_notice(call,'Rating tersimpan.' if created else 'Rating sudah tersimpan.')
+
+
 @router.callback_query(F.data.startswith("reviewopen:"))
 async def review_open(call: CallbackQuery):
     values=callback_positive_numbers(call.data,"reviewopen")
@@ -28947,6 +29302,9 @@ async def submit_rating(call: CallbackQuery, state: FSMContext):
         if conn is not None:
             conn.close()
     await rating_finish_session(state,order_id=order_id)
+    pending=pending_purchase_rating(call.from_user.id)
+    if pending and not is_owner(call.from_user.id):
+        return await render_purchase_rating(call,pending)
     if existing:
         stars=int(existing["rating"] or 0)
         comment=(existing["comment"] or "").strip()
@@ -34969,7 +35327,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.10"
+EXPECTED_SOURCE_VERSION = "17.11"
 
 
 def source_integrity_self_test():
@@ -35079,6 +35437,7 @@ async def main():
         asyncio.create_task(periodic_operations_loop(bot), name="periodic_operations_loop"),
         asyncio.create_task(periodic_safe_cleanup_loop(), name="periodic_safe_cleanup_loop"),
         asyncio.create_task(smart_owner_alert_loop(bot), name="smart_owner_alert_loop"),
+        asyncio.create_task(purchase_rating_loop(bot), name="purchase_rating_prompts"),
     ]
     background_tasks.extend(PAYMENT_RECEIPTS.start(bot))
     try:

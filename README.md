@@ -1,6 +1,24 @@
-# MaboyyDigital v17.10
+# MaboyyDigital v17.11
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+
+## Prioritas rating pembelian
+
+Setelah produk dikirim, SMS OTP diterima, Sosmed selesai, atau aktivasi /tools
+berhasil, user memilih **1–5 bintang** sebelum membuka fitur lain atau membeli lagi.
+Rating rendah tetap diterima; komentar tertulis opsional. Jika ada beberapa transaksi
+yang selesai, rating ditampilkan bergantian. Antrean tersimpan setelah restart;
+transaksi lama yang sudah selesai sebelum update tidak dipaksa rating ulang.
+
+Status pembayaran, bukti bayar invoice berjalan, kode OTP/resend/selesai, pembatalan,
+riwayat pesanan dan bantuan tetap dapat diakses. Webhook, polling, kredit saldo,
+refund dan pengiriman berjalan tanpa menunggu rating. Order pending/gagal/partial
+dan isi saldo tidak memicu kewajiban rating. Panel administrasi owner tetap bisa
+digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol admin.
+
+Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
+rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
+untuk fitur rating; gunakan seluruh 15 file rilis v17.11 yang konsisten.
 
 ## Jalankan
 
@@ -203,7 +221,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.10; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.11; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -211,7 +229,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.10: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.11: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed
