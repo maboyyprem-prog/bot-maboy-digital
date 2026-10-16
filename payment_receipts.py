@@ -338,7 +338,8 @@ class ReceiptService:
                     conn.execute("UPDATE orders SET invoice_sent=1 WHERE id=?", (row["entity_id"],))
             else:
                 delay = max(float(retry_after or 0), min(3600, 10*2**min(row["attempts"], 8)))
-                conn.execute("""UPDATE payment_receipts SET status='PENDING',next_retry_at=?,lease_token=NULL,lease_until=0,error_code=?
+                conn.execute("""UPDATE payment_receipts SET status=CASE WHEN status='UNKNOWN' THEN 'UNKNOWN' ELSE 'PENDING' END,
+                    next_retry_at=?,lease_token=NULL,lease_until=0,error_code=CASE WHEN error_code='QRIS_EDIT' THEN error_code ELSE ? END
                     WHERE source=? AND entity_id=? AND lease_token=?""", (time.time()+delay, str(error)[:80], row["source"], row["entity_id"], row["lease_token"]))
             conn.commit()
         finally:
@@ -362,11 +363,23 @@ class ReceiptService:
                        f"🧾 {html.escape(data['reference'])}\n"
                        f"💰 Total: <b>{rupiah(data['amount'])}</b>\n"
                        f"🕒 {format_wib(data['paid_at'], seconds=True)}")
-            message = await asyncio.wait_for(bot.send_photo(row["user_id"], photo, caption=caption, parse_mode="HTML"), timeout=40)
+            gateway = getattr(self.host, "KLIKQRIS_GATEWAY", None)
+            linked = gateway.receipt_transaction(source, entity) if gateway is not None else None
+            if linked:
+                message = await asyncio.wait_for(gateway.deliver_receipt_photo(bot, row, photo, caption), timeout=40)
+            else:
+                message = await asyncio.wait_for(bot.send_photo(row["user_id"], photo, caption=caption, parse_mode="HTML"), timeout=40)
             message_id = getattr(message, "message_id", None)
             if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id <= 0:
                 raise ValueError("Photo delivery not acknowledged")
             self.finish(row, message_id=message_id)
+            if linked:
+                try:
+                    await gateway.retire_paid_messages(bot, linked['id'])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logging.warning("QRIS cleanup deferred type=%s", type(exc).__name__)
             return True
         except asyncio.CancelledError:
             self.finish(row, error="CANCELLED")

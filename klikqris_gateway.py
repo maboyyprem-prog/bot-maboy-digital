@@ -30,8 +30,10 @@ from aiohttp import web
 from Crypto.Cipher import AES
 from PIL import Image
 from aiogram import F
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from types import SimpleNamespace
 from otp_smscode import TEXT_MENU_ACTIONS
 
 LABEL = '⚡ QRIS Otomatis'
@@ -188,6 +190,25 @@ def init_schema(conn):
     conn.execute('CREATE INDEX IF NOT EXISTS idx_klikqris_due ON klikqris_transactions(state,next_poll_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_klikqris_buyer ON klikqris_transactions(user_id,created_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_klikqris_notice ON klikqris_notifications(status,next_retry_at)')
+    conn.execute('''CREATE TABLE IF NOT EXISTS klikqris_payment_messages(
+        transaction_id TEXT NOT NULL,chat_id INTEGER NOT NULL,message_id INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'QR',attempts INTEGER NOT NULL DEFAULT 0,
+        next_retry_at REAL NOT NULL DEFAULT 0,created_at REAL NOT NULL,
+        PRIMARY KEY(transaction_id,message_id),
+        FOREIGN KEY(transaction_id) REFERENCES klikqris_transactions(id))''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_klikqris_message_cleanup ON klikqris_payment_messages(kind,next_retry_at)')
+    # Earlier topups already saved QR message IDs; preserve them on upgrade.
+    for transaction_id,user_id,saved_messages in conn.execute('''SELECT t.id,t.user_id,n.payment_message_ids FROM klikqris_transactions t
+        JOIN topups n ON t.purpose='topup' AND n.id=t.entity_id AND n.user_id=t.user_id
+        WHERE n.payment_method=?''',(METHOD,)).fetchall():
+        try:ids=json.loads(saved_messages or '[]')
+        except (TypeError,ValueError):continue
+        if not isinstance(ids,list):continue
+        for ident in ids:
+            if isinstance(ident,int) and not isinstance(ident,bool) and 0<ident<=9223372036854775807:
+                conn.execute('''INSERT OR IGNORE INTO klikqris_payment_messages
+                    (transaction_id,chat_id,message_id,created_at) VALUES(?,?,?,?)''',
+                    (transaction_id,user_id,ident,time.time()))
 
 
 class Client:
@@ -489,6 +510,136 @@ class Gateway:
     def linked(self,purpose,entity_id):
         return self.one('SELECT * FROM klikqris_transactions WHERE purpose=? AND entity_id=?',(purpose,entity_id))
 
+    def receipt_transaction(self,source,entity):
+        if source in {'order','topup'}:return self.linked(source,entity)
+        if source=='qris_review':return self.one('SELECT * FROM klikqris_transactions WHERE id=?',(str(entity),))
+        return None
+
+    def protected_receipt_message(self,user,message_id):
+        return bool(self.one('''SELECT 1 FROM payment_receipts r WHERE r.user_id=? AND r.message_id=?
+            AND (r.status='SENT' OR r.error_code='QRIS_EDIT') AND EXISTS(
+                SELECT 1 FROM klikqris_transactions t WHERE t.user_id=r.user_id AND
+                ((r.source=t.purpose AND r.entity_id=CAST(t.entity_id AS TEXT)) OR
+                 (r.source='qris_review' AND r.entity_id=t.id)))''',(user,message_id)))
+
+    @staticmethod
+    def receipt_key(row):
+        return ('qris_review',row['id']) if row['state']=='SETTLED_BALANCE' else (row['purpose'],str(row['entity_id']))
+
+    def receipt_payment_confirmed(self,row):
+        if row['sandbox'] or not row['api_verified_at'] or row['verified_total']!=row['total_amount']:
+            return False
+        if row['state']=='SETTLED_BALANCE':
+            return bool(self.one('''SELECT id FROM wallet_ledger WHERE id=? AND user_id=? AND type='TOPUP'
+                AND amount=? AND reference=?''',(row['review_ledger_id'],row['user_id'],row['amount'],'AQ-REVIEW-'+row['id'])))
+        table='topups' if row['purpose']=='topup' else 'orders'
+        native=self.one('SELECT * FROM '+table+' WHERE id=? AND user_id=? AND payment_method=?',
+                        (row['entity_id'],row['user_id'],METHOD))
+        return bool(native and (native['status']=='completed' if row['purpose']=='topup' else native['payment_status']=='paid'))
+
+    def remember_payment_message(self,ident,user,message_id):
+        if isinstance(message_id,bool) or not isinstance(message_id,int) or not 0<message_id<=9223372036854775807:
+            raise GatewayError('INPUT')
+        row=self.transaction(ident,user)
+        with self.connection(True) as conn:
+            conn.execute('''INSERT OR IGNORE INTO klikqris_payment_messages
+                (transaction_id,chat_id,message_id,created_at) VALUES(?,?,?,?)''',
+                (ident,row['user_id'],message_id,time.time()))
+
+    def remember_callback_message(self,call,row):
+        message=getattr(call,'message',None)
+        body=getattr(message,'caption',None) or getattr(message,'text',None) or ''
+        invoice=self.host.topup_invoice(row['entity_id']) if row['purpose']=='topup' else self.host.invoice(row['entity_id'])
+        if (message and message.chat.id==row['user_id']==call.from_user.id and body.startswith(LABEL)
+                and re.search(r'(?m)^🧾 '+re.escape(invoice)+r'\s*$',body)):
+            self.remember_payment_message(row['id'],row['user_id'],message.message_id)
+
+    async def retire_paid_messages(self,bot,ident=None):
+        if bot is None:return
+        if ident is None:
+            with self.connection() as conn:
+                ids=[r[0] for r in conn.execute('''SELECT DISTINCT m.transaction_id FROM klikqris_payment_messages m
+                    JOIN klikqris_transactions t ON t.id=m.transaction_id WHERE m.kind='QR' AND m.next_retry_at<=?
+                    AND t.api_verified_at>0 AND t.state IN ('PAID_VERIFIED','SETTLED','SETTLED_BALANCE') LIMIT 20''',(time.time(),))]
+            for value in ids:await self.retire_paid_messages(bot,value)
+            return
+        row=self.transaction(ident)
+        if not self.receipt_payment_confirmed(row):return
+        source,entity=self.receipt_key(row)
+        receipt=self.one('SELECT * FROM payment_receipts WHERE source=? AND entity_id=?',(source,str(entity)))
+        if not receipt or receipt['status'] not in {'SENT','LEGACY','UNKNOWN'}:return
+        with self.connection() as conn:
+            messages=[dict(r) for r in conn.execute('''SELECT * FROM klikqris_payment_messages
+                WHERE transaction_id=? AND kind='QR' AND next_retry_at<=?''',(ident,time.time()))]
+        for message in messages:
+            if receipt['message_id']==message['message_id'] and receipt['status']=='SENT':
+                with self.connection(True) as conn:
+                    conn.execute("UPDATE klikqris_payment_messages SET kind='INVOICE' WHERE transaction_id=? AND message_id=?",(ident,message['message_id']))
+                continue
+            deleted=False
+            try:
+                await bot.delete_message(chat_id=message['chat_id'],message_id=message['message_id'])
+                deleted=True
+            except TelegramBadRequest as exc:
+                deleted='message to delete not found' in str(exc).lower()
+            except asyncio.CancelledError:raise
+            except Exception:pass
+            if not deleted:
+                try:
+                    await bot.edit_message_caption(chat_id=message['chat_id'],message_id=message['message_id'],
+                        caption='✅ Pembayaran sudah diterima. QRIS ini tidak aktif; jangan bayar lagi.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+                except asyncio.CancelledError:raise
+                except Exception:pass
+            with self.connection(True) as conn:
+                conn.execute('''UPDATE klikqris_payment_messages SET kind=?,attempts=attempts+1,next_retry_at=?
+                    WHERE transaction_id=? AND message_id=? AND kind='QR' ''',
+                    ('REMOVED' if deleted else 'QR',0 if deleted else time.time()+min(3600,10*2**min(message['attempts'],8)),ident,message['message_id']))
+
+    async def deliver_receipt_photo(self,bot,receipt,photo,caption):
+        row=self.receipt_transaction(receipt['source'],receipt['entity_id'])
+        if not row or not self.receipt_payment_confirmed(row):raise GatewayError('NOT_READY')
+        # Editing a durable message ID is safe to retry even when Telegram's
+        # acknowledgement is lost. It replaces the QR itself with the invoice.
+        anchor=receipt['message_id'] if receipt['error_code']=='QRIS_EDIT' else None
+        if not anchor:
+            existing=self.one('''SELECT message_id FROM klikqris_payment_messages
+                WHERE transaction_id=? AND kind='QR' ORDER BY created_at DESC,message_id DESC LIMIT 1''',(row['id'],))
+            anchor=existing['message_id'] if existing else None
+        if anchor:
+            with self.connection(True) as conn:
+                changed=conn.execute('''UPDATE payment_receipts SET message_id=?,error_code='QRIS_EDIT'
+                    WHERE source=? AND entity_id=? AND lease_token=?''',
+                    (anchor,receipt['source'],receipt['entity_id'],receipt['lease_token'])).rowcount
+            if changed!=1:raise GatewayError('STORAGE')
+            try:
+                await bot.edit_message_media(chat_id=row['user_id'],message_id=anchor,
+                    media=InputMediaPhoto(media=photo,caption=caption,parse_mode='HTML'),reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+            except TelegramBadRequest as exc:
+                detail=str(exc).lower()
+                if 'message is not modified' in detail:pass
+                elif 'message to edit not found' in detail or "message can't be edited" in detail:
+                    if 'message to edit not found' in detail:
+                        with self.connection(True) as conn:
+                            conn.execute("UPDATE klikqris_payment_messages SET kind='REMOVED' WHERE transaction_id=? AND message_id=?",(row['id'],anchor))
+                    anchor=None
+                else:raise
+            if anchor:
+                with self.connection(True) as conn:
+                    conn.execute("UPDATE klikqris_payment_messages SET kind='INVOICE' WHERE transaction_id=? AND message_id=?",(row['id'],anchor))
+                return SimpleNamespace(message_id=anchor)
+        # Legacy/unseen QR: reserve one send before the network request. If its
+        # result is unknown, do not replay sendPhoto after timeout or restart.
+        with self.connection(True) as conn:
+            changed=conn.execute('''UPDATE payment_receipts SET status='UNKNOWN',message_id=NULL,error_code='QRIS_SEND_STARTED'
+                WHERE source=? AND entity_id=? AND lease_token=?''',
+                (receipt['source'],receipt['entity_id'],receipt['lease_token'])).rowcount
+        if changed!=1:raise GatewayError('STORAGE')
+        try:return await bot.send_photo(row['user_id'],photo,caption=caption,parse_mode='HTML')
+        except (TelegramBadRequest,TelegramForbiddenError,TelegramRetryAfter):
+            with self.connection(True) as conn:
+                conn.execute("UPDATE payment_receipts SET status='SENDING' WHERE source=? AND entity_id=? AND lease_token=?",(receipt['source'],receipt['entity_id'],receipt['lease_token']))
+            raise
+
     def payment_authorized(self,conn,purpose,entity_id):
         row=conn.execute('SELECT * FROM klikqris_transactions WHERE purpose=? AND entity_id=?',(purpose,entity_id)).fetchone()
         if not row:return False
@@ -775,7 +926,9 @@ class Gateway:
             except Exception:
                 with self.connection(True) as conn:
                     conn.execute("UPDATE klikqris_transactions SET error='STORAGE',next_poll_at=? WHERE id=?",(time.time()+60,row['id']))
-        if self.bot is not None:await self.deliver_notices()
+        if self.bot is not None:
+            await self.deliver_notices()
+            await self.retire_paid_messages(self.bot)
 
     async def deliver_notices(self):
         with self.connection() as conn:
@@ -785,14 +938,20 @@ class Gateway:
             with self.connection(True) as conn:
                 if conn.execute("UPDATE klikqris_notifications SET lease_owner=?,lease_until=? WHERE id=? AND status='PENDING' AND lease_until<=?",(token,time.time()+60,job['id'],time.time())).rowcount!=1:continue
             row=self.transaction(job['transaction_id'])
-            invoice=self.host.topup_invoice(row['entity_id']) if row['purpose']=='topup' else self.host.invoice(row['entity_id'])
-            label={'PAID':'✅ PEMBAYARAN BERHASIL','EXPIRED':'⏳ PEMBAYARAN KEDALUWARSA','FAILED':'❌ PEMBAYARAN TIDAK BERHASIL','REVIEW':'⏳ PEMBAYARAN SEDANG DIPERIKSA','BALANCE':'✅ PEMBAYARAN MASUK KE SALDO'}[job['event']]
-            text=label+'\n'+LABEL+'\n\n'+html.escape(invoice)+'\n'
             if job['event'] in {'PAID','BALANCE'}:
-                text+='Nominal: '+self.host.rupiah(row['amount'])+'\n'
-                if row['purpose']=='topup' or job['event']=='BALANCE':text+='Saldo Kamu: '+self.host.rupiah(self.host.get_balance(row['user_id']))+'\n'
-                else:text+='Pembayaran diterima; pesanan mengikuti proses pengiriman.\n'
-            elif job['event']=='REVIEW':text+='Pembayaran diterima setelah invoice tidak aktif. Owner akan memeriksanya.\n'
+                source,entity=self.receipt_key(row)
+                if not self.host.payment_receipts.queue(self.host,source,entity):
+                    with self.connection(True) as conn:
+                        conn.execute("UPDATE klikqris_notifications SET next_retry_at=?,lease_owner=NULL,lease_until=0 WHERE id=? AND lease_owner=?",(time.time()+30,job['id'],token))
+                    continue
+                # The existing image outbox is the sole success notification.
+                with self.connection(True) as conn:
+                    conn.execute("UPDATE klikqris_notifications SET status='PHOTO_QUEUED',sent_at=?,lease_owner=NULL,lease_until=0 WHERE id=? AND lease_owner=?",(time.time(),job['id'],token))
+                continue
+            invoice=self.host.topup_invoice(row['entity_id']) if row['purpose']=='topup' else self.host.invoice(row['entity_id'])
+            label={'EXPIRED':'⏳ PEMBAYARAN KEDALUWARSA','FAILED':'❌ PEMBAYARAN TIDAK BERHASIL','REVIEW':'⏳ PEMBAYARAN SEDANG DIPERIKSA'}[job['event']]
+            text=label+'\n'+LABEL+'\n\n'+html.escape(invoice)+'\n'
+            if job['event']=='REVIEW':text+='Pembayaran diterima setelah invoice tidak aktif. Owner akan memeriksanya.\n'
             else:text+='Invoice tidak dapat dibayar lagi. Buat pembayaran baru jika diperlukan.\n'
             try:
                 await self.bot.send_message(row['user_id'],text)
@@ -940,10 +1099,16 @@ class Gateway:
     async def show_status(self,call,ident,*,refresh=True,admin=False):
         row=self.transaction(ident,call.from_user.id,admin=admin)
         self.bot=call.bot
+        if not admin:self.remember_callback_message(call,row)
         if refresh:
             try:row=await self.refresh(ident)
             except GatewayError:row=self.transaction(ident,call.from_user.id,admin=admin)
         if admin:return await self.owner_detail(call,ident)
+        if row['state'] in {'SETTLED','SETTLED_BALANCE'}:
+            source,entity=self.receipt_key(row)
+            await self.host.payment_receipts.notify(self.host,call.bot,source,entity)
+            await self.retire_paid_messages(call.bot,ident)
+            return
         # Include the original QR when reopening or recovering a pending invoice.
         # This only displays stored payment data; it never creates another invoice.
         if row['state']=='PENDING' and row['qr_image'] and (not row['expires_at'] or row['expires_at']>time.time()):
@@ -962,10 +1127,15 @@ class Gateway:
         except Exception:
             # Never fall back to a provider URL, dashboard or report link.
             return await self.host.safe_edit_or_answer(call,self.status_text(row)+'\nGambar QRIS belum dapat ditampilkan. Jangan membayar sebelum QRIS tersedia.',reply_markup=self.user_keyboard(row),parse_mode='HTML')
+        self.remember_payment_message(ident,row['user_id'],sent.message_id)
         if row['purpose']=='topup':
             if not self.host.save_topup_payment_message(row['entity_id'],row['user_id'],sent.message_id):
                 await self.host.retire_topup_payment_message(call.bot,row['user_id'],sent.message_id)
-        try:await call.message.delete()
+        await self.retire_paid_messages(call.bot,ident)
+        source,entity=self.receipt_key(self.transaction(ident))
+        receipt=self.one('SELECT message_id FROM payment_receipts WHERE source=? AND entity_id=?',(source,str(entity)))
+        try:
+            if not receipt or receipt['message_id']!=call.message.message_id:await call.message.delete()
         except Exception:pass
 
     async def cancel(self,call,ident):
@@ -1052,6 +1222,10 @@ class Gateway:
     async def owner_detail(self,call,ident,*,confirm_credit=False):
         row=self.transaction(ident,call.from_user.id,admin=True)
         text=self.status_text(row)+'\n\nProvider: KlikQRIS\nRef: '+html.escape(row['reference'])+'\nMode: '+row['mode']+'\nUser: '+str(row['user_id'])+'\nKode: '+html.escape(row['error'] or '-')
+        source,entity=self.receipt_key(row)
+        receipt=self.one('SELECT status FROM payment_receipts WHERE source=? AND entity_id=?',(source,str(entity)))
+        if receipt and receipt['status']=='UNKNOWN':
+            text+='\n\nPengiriman invoice belum dapat dipastikan. Periksa chat penerima; gambar tidak dikirim ulang otomatis agar tidak ganda. Saldo dan pembayaran tidak diulang.'
         controls=[[('🔄 Rekonsiliasi Status','check',ident)]]
         if row['state']=='REVIEW':
             if confirm_credit:

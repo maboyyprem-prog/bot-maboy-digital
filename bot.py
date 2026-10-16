@@ -229,8 +229,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.15"
-SCHEMA_VERSION = 200
+BOT_VERSION = "17.16"
+SCHEMA_VERSION = 201
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -5898,6 +5898,8 @@ def save_topup_payment_message(topup_id: int, user_id: int, message_id: int) -> 
 
 
 async def retire_topup_payment_message(bot: Bot, user_id: int, message_id: int) -> bool:
+    if KLIKQRIS_GATEWAY.protected_receipt_message(user_id, message_id):
+        return True  # The former QR message is now the successful photo invoice.
     try:
         await bot.delete_message(chat_id=user_id, message_id=message_id)
         return True
@@ -9895,7 +9897,7 @@ async def mark_order_paid(
             conn=db()
             product=conn.execute("SELECT * FROM products WHERE id=?",(int(order["product_id"]),)).fetchone()
             conn.close()
-            if not product_is_preorder(product):
+            if not product_is_preorder(product) and not klikqris_gateway.managed(order):
                 await bot.send_message(
                     int(order["user_id"]),
                     "✅ <b>PEMBAYARAN DIKONFIRMASI</b>\n\n"
@@ -35327,7 +35329,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.15"
+EXPECTED_SOURCE_VERSION = "17.16"
 
 
 def source_integrity_self_test():
