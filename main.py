@@ -2,7 +2,7 @@ import asyncio
 import os
 import sys
 
-EXPECTED_VERSION = "17.12"
+EXPECTED_VERSION = "17.13"
 
 import bot
 
