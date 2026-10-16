@@ -1,6 +1,16 @@
-# MaboyyDigital v17.14
+# MaboyyDigital v17.15
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+
+## QRIS langsung bersama invoice
+
+Saat user memilih **⚡ QRIS Otomatis** untuk isi saldo atau checkout, gambar QRIS
+langsung dikirim bersama nomor invoice, nominal, biaya, total dan waktu WIB.
+Tombol **Tampilkan QRIS** dihapus. **Cek Status** juga menampilkan kembali QRIS
+invoice yang sama selama masih menunggu pembayaran, termasuk setelah pemulihan
+invoice tertunda atau kegagalan pengiriman gambar. Tidak membuat tagihan baru.
+Invoice selesai, kedaluwarsa atau dibatalkan hanya menampilkan status.
+Tidak ada Variables atau perubahan database baru.
 
 ## Pemeriksaan gateway untuk akun baru
 
@@ -44,7 +54,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.14 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.15 yang konsisten.
 
 ## Jalankan
 
@@ -247,7 +257,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.14; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.15; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -255,7 +265,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.14: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.15: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed

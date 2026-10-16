@@ -908,7 +908,6 @@ class Gateway:
     def user_keyboard(self,row):
         rows=[[InlineKeyboardButton(text='🔄 Cek Status',callback_data=PREFIX+'u:check:'+row['id'])]]
         if row['state'] in {'NEW','REQUESTING','CREATE_UNKNOWN','PENDING'}:
-            if row['qr_image']:rows.append([InlineKeyboardButton(text='📷 Tampilkan QRIS',callback_data=PREFIX+'u:qr:'+row['id'])])
             rows.append([InlineKeyboardButton(text='❌ Batalkan',callback_data=PREFIX+'u:cancel:'+row['id'])])
         rows.append([InlineKeyboardButton(text='🏠 Menu Awal',callback_data='home')])
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -945,6 +944,10 @@ class Gateway:
             try:row=await self.refresh(ident)
             except GatewayError:row=self.transaction(ident,call.from_user.id,admin=admin)
         if admin:return await self.owner_detail(call,ident)
+        # Include the original QR when reopening or recovering a pending invoice.
+        # This only displays stored payment data; it never creates another invoice.
+        if row['state']=='PENDING' and row['qr_image'] and (not row['expires_at'] or row['expires_at']>time.time()):
+            return await self.show_payment(call,ident)
         await self.host.safe_edit_or_answer(call,self.status_text(row),reply_markup=self.user_keyboard(row),parse_mode='HTML')
 
     async def show_payment(self,call,ident):
