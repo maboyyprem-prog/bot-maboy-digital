@@ -81,6 +81,18 @@ def encoded(value):
     return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False)
 
 
+def environment_value(name,default=''):
+    """Accept a single pasted NAME=value without treating it as a credential/URL."""
+    raw=os.getenv(name,default).strip()
+    value=raw
+    for _ in range(2):
+        if len(value)>=2 and value[0]==value[-1] and value[0] in {'"',"'"}:
+            value=value[1:-1].strip()
+        if value.startswith(name+'='):
+            value=value[len(name)+1:].strip()
+    return value,value!=raw
+
+
 class GatewayError(Exception):
     def __init__(self, code, *, uncertain=False, retry_after=0):
         super().__init__(code)
@@ -99,33 +111,51 @@ class Config:
     timeout: int = 15
     poll_seconds: int = 15
     error: str = ''
+    issues: tuple = ()
+    normalized: tuple = ()
+
+    def problems(self):
+        problems=[]
+        for value,name in [(self.key,'KLIKQRIS_API_KEY'),(self.merchant,'KLIKQRIS_MERCHANT_ID')]:
+            if not value:problems.append(name+' belum diisi.')
+        problems.extend(self.issues)
+        if self.error and not self.issues:problems.append('Konfigurasi KlikQRIS tidak valid; periksa Railway Variables.')
+        return problems
 
     @classmethod
     def environment(cls,host):
         c=cls()
+        issues=[];normalized=[]
+        def read(name,default=''):
+            value,changed=environment_value(name,default)
+            if changed:normalized.append(name)
+            return value
+        c.key=read('KLIKQRIS_API_KEY')
+        c.merchant=read('KLIKQRIS_MERCHANT_ID')
+        if c.key and (len(c.key)>4096 or any(x in c.key for x in '\r\n')):
+            issues.append('KLIKQRIS_API_KEY harus satu nilai tanpa baris baru.')
         try:
-            c.key=os.getenv('KLIKQRIS_API_KEY','').strip()
-            c.merchant=os.getenv('KLIKQRIS_MERCHANT_ID','').strip()
-            for field,name in [('enabled','KLIKQRIS_ENABLED'),('sandbox','KLIKQRIS_SANDBOX')]:
-                raw=os.getenv(name,'false').strip().lower()
-                if raw not in {'true','false','1','0'}:raise ValueError
-                setattr(c,field,raw in {'true','1'})
-            c.mode=os.getenv('KLIKQRIS_MODE','gateway').strip().lower()
-            if c.mode not in {'gateway','my_pg'}:raise ValueError
-            c.webhook_url=os.getenv('KLIKQRIS_WEBHOOK_URL','').strip() or (str(getattr(host,'PUBLIC_BASE_URL','') or '').rstrip('/')+'/webhooks/klikqris' if getattr(host,'PUBLIC_BASE_URL','') else '')
-            for field,name,low,high in [('timeout','KLIKQRIS_HTTP_TIMEOUT_SECONDS',3,60),('poll_seconds','KLIKQRIS_POLL_INTERVAL_SECONDS',10,300)]:
-                value=os.getenv(name,str(getattr(c,field)))
-                if not re.fullmatch(r'[0-9]{1,3}',value):raise ValueError
-                number=int(value)
-                if not low<=number<=high:raise ValueError
-                setattr(c,field,number)
-            if c.key and (len(c.key)>4096 or any(x in c.key for x in '\r\n')):raise ValueError
             if c.merchant:reference(c.merchant)
-            if c.webhook_url:
+        except GatewayError:issues.append('KLIKQRIS_MERCHANT_ID tidak valid; isi Merchant ID saja.')
+        for field,name in [('enabled','KLIKQRIS_ENABLED'),('sandbox','KLIKQRIS_SANDBOX')]:
+            raw=read(name,'false').lower()
+            if raw not in {'true','false','1','0'}:issues.append(name+' harus true atau false.')
+            else:setattr(c,field,raw in {'true','1'})
+        c.mode=read('KLIKQRIS_MODE','gateway').lower()
+        if c.mode not in {'gateway','my_pg'}:issues.append('KLIKQRIS_MODE harus gateway atau my_pg.')
+        c.webhook_url=read('KLIKQRIS_WEBHOOK_URL') or (str(getattr(host,'PUBLIC_BASE_URL','') or '').rstrip('/')+'/webhooks/klikqris' if getattr(host,'PUBLIC_BASE_URL','') else '')
+        if c.webhook_url:
+            try:
                 url=urlparse(c.webhook_url)
-                if url.scheme!='https' or not url.hostname or url.username or url.password or url.fragment or url.query:raise ValueError
-        except (ValueError,GatewayError):
-            c.error='CONFIG'
+                if url.scheme!='https' or not url.hostname or url.username or url.password or url.fragment or url.query or url.port not in {None,443} or any(x.isspace() for x in c.webhook_url):raise ValueError
+            except ValueError:issues.append('KLIKQRIS_WEBHOOK_URL harus URL HTTPS saja, tanpa nama variabel atau tanda sama dengan.')
+        for field,name,low,high in [('timeout','KLIKQRIS_HTTP_TIMEOUT_SECONDS',3,60),('poll_seconds','KLIKQRIS_POLL_INTERVAL_SECONDS',10,300)]:
+            value=read(name,str(getattr(c,field)))
+            if not re.fullmatch(r'[0-9]{1,3}',value) or not low<=int(value)<=high:
+                issues.append(name+f' harus angka {low}–{high}.')
+            else:setattr(c,field,int(value))
+        c.issues=tuple(issues);c.normalized=tuple(normalized)
+        if issues:c.error='CONFIG'
         return c
 
 
@@ -336,21 +366,33 @@ class Gateway:
 
     async def check_connection(self,actor,*,my_pg_reference=None):
         self.require_owner(actor)
-        if not self.configured():raise GatewayError('CONFIG')
-        if my_pg_reference is None:
-            await self.api.history()
-            mode='gateway'
-        else:
-            data=await self.api.status(reference(my_pg_reference),'my_pg')
-            if data.get('order_id')!=my_pg_reference or str(data.get('status','')).upper() not in {'PENDING','PAID','SUCCESS','EXPIRED'}:
-                raise GatewayError('SCHEMA')
-            money(data.get('total_amount'),positive=True)
-            mode='my_pg'
+        mode='gateway' if my_pg_reference is None else 'my_pg'
+        try:
+            if not self.configured():raise GatewayError('CONFIG')
+            if mode=='gateway':await self.api.history()
+            else:
+                data=await self.api.status(reference(my_pg_reference),'my_pg')
+                if data.get('order_id')!=my_pg_reference or str(data.get('status','')).upper() not in {'PENDING','PAID','SUCCESS','EXPIRED'}:
+                    raise GatewayError('SCHEMA')
+                money(data.get('total_amount'),positive=True)
+        except GatewayError as exc:
+            with self.connection(True) as conn:
+                proof={'fingerprint':self.fingerprint(),'verified':False,'checked_at':time.time(),'actor':actor,'error':exc.code}
+                conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',('verified_'+mode,encoded(proof),time.time()))
+                self.audit(conn,actor,'connection_failed',detail=encoded({'mode':mode,'code':exc.code}))
+            raise
         with self.connection(True) as conn:
             proof={'fingerprint':self.fingerprint(),'verified':True,'checked_at':time.time(),'actor':actor}
             conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',('verified_'+mode,encoded(proof),time.time()))
             self.audit(conn,actor,'connection',detail=mode)
         return mode
+
+    async def activate(self,actor):
+        self.require_owner(actor)
+        if not self.configured():raise GatewayError('CONFIG')
+        if self.config.sandbox:raise GatewayError('SANDBOX')
+        if self.settings()['mode']=='gateway':await self.check_connection(actor)
+        self.change(actor,'enabled',True)
 
     def change(self,actor,key,value):
         self.require_owner(actor)
@@ -864,27 +906,40 @@ class Gateway:
     async def owner_panel(self,call,*,note=''):
         self.require_owner(call.from_user.id)
         settings=self.settings()
-        proof=self.one('SELECT value FROM klikqris_settings WHERE key=?',('verified_'+settings['mode'],))
-        stamp=0
-        if proof:
-            try:stamp=json.loads(proof['value']).get('checked_at',0)
-            except (ValueError,TypeError,AttributeError):pass
+        record=self.one('SELECT value FROM klikqris_settings WHERE key=?',('verified_'+settings['mode'],))
+        proof={};stamp=0
+        if record:
+            try:
+                proof=json.loads(record['value'])
+                if not isinstance(proof,dict) or proof.get('fingerprint')!=self.fingerprint():proof={}
+                stamp=proof.get('checked_at',0)
+                if not isinstance(stamp,(int,float)) or not 0<stamp<253402300800:stamp=0
+            except (ValueError,TypeError):proof={}
         verified=self.verified(settings['mode'])
+        ready=self.ready()
+        api_status='Terakhir terverifikasi' if verified else ('Pemeriksaan gagal ('+str(proof['error'])+')' if proof.get('error') else 'Belum terverifikasi')
+        problems=self.config.problems()
+        webhook=self.config.webhook_url if not any('KLIKQRIS_WEBHOOK_URL' in issue for issue in self.config.issues) else 'Perlu diperbaiki di Railway Variables.'
         text=('👑 <b>PENGATURAN QRIS OTOMATIS</b>\n\nProvider: KlikQRIS\n'
               f"Mode: {'MY PG' if settings['mode']=='my_pg' else 'Gateway biasa'}\n"
-              f"Pembelian baru: {'AKTIF' if self.ready() else 'NONAKTIF / belum siap'}\n"
-              f"Status API: {'Terakhir terverifikasi' if verified else 'Belum terverifikasi'}\n"
+              f"Pembelian baru: {'AKTIF' if ready else 'NONAKTIF / belum siap'}\n"
+              f"Status API: {html.escape(api_status)}\n"
               f"Diperiksa: {self.host.payment_receipts.format_wib(stamp,compact=True) if stamp else '-'}\n"
-              f"Konfigurasi: {'Tersedia' if self.configured() else 'Isi KLIKQRIS_API_KEY dan KLIKQRIS_MERCHANT_ID di Railway'}\n"
+              f"API Key: {'Terisi' if self.config.key else 'Belum diisi'} • Merchant ID: {'Terisi' if self.config.merchant else 'Belum diisi'}\n"
+              f"Konfigurasi: {'Tersedia' if self.configured() else 'Perlu diperbaiki'}\n"
               f"Sandbox: {'ON; saldo/produk nyata diblokir' if self.config.sandbox else 'OFF'}\n\n"
               'Saldo merchant tidak disediakan endpoint dokumentasi.\n'
-              'Webhook: '+html.escape(self.config.webhook_url or 'Atur URL webhook pada dashboard; polling tetap tersedia.')+'\n')
+              'Webhook: '+html.escape(webhook or 'Atur URL webhook pada dashboard; polling tetap tersedia.')+'\n')
+        if problems:text+='\n⚠️ '+html.escape('\n'.join(problems))+'\n'
+        if self.config.normalized:
+            text+='\nℹ️ Format tempelan dinormalisasi: '+html.escape(', '.join(self.config.normalized))+'. Di kolom Value Railway, cukup isi nilainya saja.\n'
         if note:text+='\n'+html.escape(note)+'\n'
         rows=[[('🔌 Cek Koneksi','connect',None),('⚙️ Pilih Mode','modes',None)],
-              [('🔴 Nonaktifkan' if settings['enabled'] else '🟢 Aktifkan','toggle','off' if settings['enabled'] else 'on')],
+              [('🔴 Nonaktifkan' if ready else '🟢 Periksa & Aktifkan KlikQRIS','toggle','off' if ready else 'on')],
               [('📊 Riwayat Transaksi','history',0),('⏳ Transaksi Pending','pending',0)],
               [('🔄 Rekonsiliasi','reconcile',None)],
               [('⬅️ Pengaturan Pembayaran','back',None)]]
+        if settings['enabled'] and not ready:rows.insert(2,[('🔴 Nonaktifkan','toggle','off')])
         await self.host.safe_edit_or_answer(call,text,reply_markup=self.owner_keyboard(rows),parse_mode='HTML')
 
     async def owner_list(self,call,*,pending=False,page=0):
@@ -925,9 +980,13 @@ def register(router,gateway):
     host=gateway.host
 
     async def failure(call,exc,*,owner=False):
-        codes={'CONFIG':'Isi API Key/Merchant ID di Railway dengan nilai akun yang benar.',
+        codes={'CONFIG':'Periksa Railway Variables yang ditandai pada panel KlikQRIS.',
                'AUTH':'Autentikasi ditolak. Periksa API Key/Merchant ID dan izin akun.',
-               'NOT_READY':'Periksa koneksi terlebih dahulu; MY PG memerlukan merchant terhubung dan transaksi existing untuk verifikasi.',
+               'NOT_READY':'Periksa koneksi mode yang dipilih. Gateway biasa dapat diaktifkan langsung lewat Periksa & Aktifkan KlikQRIS; MY PG memerlukan verifikasi merchant terhubung.',
+               'SANDBOX':'Sandbox sedang ON. Atur KLIKQRIS_SANDBOX=false dan redeploy sebelum mengaktifkan pembayaran nyata.',
+               'REJECTED':'API menolak pemeriksaan. Periksa status aktivasi gateway, API Key, Merchant ID, dan izin akun di dashboard KlikQRIS.',
+               'SCHEMA':'Bentuk respons API tidak sesuai dokumentasi; koneksi belum dinyatakan berhasil.',
+               'HTTP':'API mengembalikan status HTTP yang belum didukung; koneksi belum dinyatakan berhasil.',
                'NOT_FOUND':'Transaksi belum ditemukan. Jangan membuat invoice pengganti untuk transaksi yang masih belum pasti.',
                'NETWORK':'Koneksi API belum berhasil. Coba Cek Koneksi kembali.',
                'MISMATCH':'Referensi atau nominal tidak sesuai; saldo/produk belum diproses.',
@@ -935,7 +994,11 @@ def register(router,gateway):
                'STOCK':'Stok tidak mencukupi.', 'RATE_LIMIT':'Terlalu banyak permintaan. Tunggu sebelum mencoba kembali.',
                'FORBIDDEN':'Akses ditolak.'}
         text=codes.get(getattr(exc,'code',''),'Pembayaran belum dapat diproses; data transaksi tetap disimpan untuk pemeriksaan.') if owner else ('Stok tidak mencukupi.' if getattr(exc,'code','')=='STOCK' else 'QRIS Otomatis belum dapat diproses. Cek status atau hubungi owner.')
-        await host.safe_callback_notice(call,text,show_alert=True)
+        if owner and getattr(exc,'code','')!='FORBIDDEN' and host.is_owner(call.from_user.id) and call.message and str(call.message.chat.type)=='private' and call.message.chat.id==call.from_user.id:
+            try:await gateway.owner_panel(call,note='❌ '+text)
+            except sqlite3.Error:
+                await host.safe_edit_or_answer(call,'⚠️ Pengaturan KlikQRIS belum dapat dibaca dari database. Coba kembali; transaksi tersimpan tetap dipertahankan.',reply_markup=gateway.owner_keyboard([[('⬅️ Kembali','back',None)]]))
+        await host.safe_callback_notice(call,text[:190],show_alert=True)
 
     @router.callback_query(F.data=='owner:auto_qris')
     async def owner_entry(call,state):
@@ -988,12 +1051,11 @@ def register(router,gateway):
                 await gateway.owner_panel(call,note='Pemeriksaan gateway biasa berhasil; tidak ada transaksi dibuat.')
             elif action=='toggle':
                 if value not in {'on','off'}:raise GatewayError('INPUT')
-                if value=='on' and gateway.settings()['mode']=='gateway' and not gateway.verified('gateway'):
-                    await gateway.check_connection(call.from_user.id)
-                gateway.change(call.from_user.id,'enabled',value=='on')
-                await gateway.owner_panel(call)
+                if value=='on':await gateway.activate(call.from_user.id)
+                else:gateway.change(call.from_user.id,'enabled',False)
+                await gateway.owner_panel(call,note='KlikQRIS berhasil diaktifkan.' if value=='on' else 'KlikQRIS dinonaktifkan untuk pembayaran baru; transaksi berjalan tetap diperiksa.')
             elif action=='modes':
-                await host.safe_edit_or_answer(call,'Pilih mode. Gateway biasa digunakan sebagai awal. MY PG hanya dapat dipilih setelah merchant terhubung dan transaksi existing berhasil diperiksa.',reply_markup=gateway.owner_keyboard([[('Gateway biasa','mode','gateway')],[('MY PG • verifikasi merchant','my_pg_input',None)],[('⬅️ Kembali','menu',None)]]))
+                await host.safe_edit_or_answer(call,'Pilih PG KlikQRIS untuk gateway biasa. Setelah pemeriksaan API berhasil, tekan Periksa & Aktifkan KlikQRIS. MY PG memerlukan merchant terhubung dan transaksi existing yang berhasil diverifikasi.',reply_markup=gateway.owner_keyboard([[('PG KlikQRIS • Gateway biasa','mode','gateway')],[('MY PG • verifikasi merchant','my_pg_input',None)],[('⬅️ Kembali','menu',None)]]))
             elif action=='mode':
                 if value!='gateway':raise GatewayError('INPUT')
                 if not gateway.verified('gateway'):await gateway.check_connection(call.from_user.id)

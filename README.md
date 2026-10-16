@@ -1,6 +1,19 @@
-# MaboyyDigital v17.11
+# MaboyyDigital v17.12
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+
+## Perbaikan aktivasi KlikQRIS
+
+Di Railway, kolom **Name** diisi `KLIKQRIS_WEBHOOK_URL`; kolom **Value** cukup URL:
+`https://DOMAIN_BOT_ANDA/webhooks/klikqris`. Jangan menempelkan `NAMA_VARIABEL=`
+di kolom Value. Format tempelan seperti pada laporan sebelumnya kini dikenali,
+termasuk kutip pembungkus. API Key/Merchant ID tetap tidak ditampilkan di Telegram.
+
+Buka **/owner → Pengaturan Pembayaran → QRIS Otomatis → Periksa & Aktifkan KlikQRIS**.
+Gateway biasa diperiksa lewat riwayat API tanpa membuat tagihan percobaan.
+Error konfigurasi menyebut variabel yang perlu diperbaiki, dan kegagalan API
+tetap terlihat di panel. Tidak ada Variables, file runtime atau migration baru;
+schema tetap 200. Mode MY PG tetap memerlukan merchant terhubung yang terverifikasi.
 
 ## Prioritas rating pembelian
 
@@ -18,7 +31,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.11 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.12 yang konsisten.
 
 ## Jalankan
 
@@ -221,7 +234,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.11; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.12; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -229,7 +242,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.11: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.12: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed
@@ -252,7 +265,7 @@ Kegagalan refill tidak mengubah order asli atau menambah refund saldo.
 
 Variables baru: `KLIKQRIS_API_KEY`, `KLIKQRIS_MERCHANT_ID`; mode awal
 `KLIKQRIS_MODE=gateway`, `KLIKQRIS_ENABLED=false`, `KLIKQRIS_SANDBOX=false`.
-Buka **/owner → Pengaturan Pembayaran → QRIS Otomatis → Cek Koneksi → Aktifkan**.
+Buka **/owner → Pengaturan Pembayaran → QRIS Otomatis → Periksa & Aktifkan KlikQRIS**.
 Pemeriksaan koneksi membaca API, tanpa membuat transaksi. QRIS manual, transfer
 rekening dan ShopeePay existing dipertahankan. User hanya melihat **⚡ QRIS Otomatis**.
 Webhook: `https://DOMAIN_BOT_ANDA/webhooks/klikqris`; atur pada dashboard KlikQRIS.
