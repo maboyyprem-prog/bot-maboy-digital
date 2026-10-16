@@ -1,6 +1,7 @@
 import aiohttp
 import socket
 import ipaddress
+import calendar
 from collections.abc import Mapping
 import os
 import re
@@ -229,8 +230,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.16"
-SCHEMA_VERSION = 201
+BOT_VERSION = "17.17"
+SCHEMA_VERSION = 202
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1122,6 +1123,16 @@ def init_db():
             updated_at TEXT NOT NULL
         )
     """)
+    add_column_if_missing(conn,"tools_user_access","vip_expires_at","REAL DEFAULT NULL")
+    add_column_if_missing(conn,"tools_user_access","vip_source","TEXT NOT NULL DEFAULT 'owner'")
+    cur.execute('''CREATE TABLE IF NOT EXISTS tools_vip_purchases(
+        id TEXT PRIMARY KEY,user_id INTEGER NOT NULL CHECK(user_id>0),
+        price_idr INTEGER NOT NULL CHECK(price_idr=20000),
+        order_id INTEGER UNIQUE,payment_method TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT 'QUOTED',quote_expires_at REAL NOT NULL,
+        activated_at REAL,access_expires_at REAL,created_at REAL NOT NULL,updated_at REAL NOT NULL,
+        FOREIGN KEY(order_id) REFERENCES orders(id))''')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_tools_vip_buyer ON tools_vip_purchases(user_id,created_at)')
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tools_user_reviews (
             correlation_id TEXT PRIMARY KEY,
@@ -3532,6 +3543,8 @@ async def fulfill_order(order_id: int, bot: Bot) -> bool:
 
 
 async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
+    vip_result=await fulfill_tools_vip_order(order_id,bot)
+    if vip_result is not None:return vip_result
     payment_receipts.queue(_otp_sys.modules[__name__], "order", order_id)
     """
     Safe fulfillment:
@@ -4646,6 +4659,7 @@ async def purge_stale_invoice_data():
                WHERE created_at < ?
                  AND status IN ('expired','cancelled')
                  AND (status!='expired' OR {timed_payment_sql()})
+                 AND NOT EXISTS(SELECT 1 FROM tools_vip_purchases v WHERE v.order_id=orders.id)
                  AND payment_status!='paid'""",
             (cutoff,)
         ).fetchall()
@@ -5581,6 +5595,7 @@ async def periodic_operations_loop(bot: Bot):
 
     while True:
         try:
+            retire_expired_tools_vip()
             await recover_stuck_orders(bot)
 
             if get_setting("auto_repair_inventory","1") == "1":
@@ -12634,6 +12649,9 @@ def product_is_available(product, now_ts: int | None = None) -> bool:
     if not product:
         return False
     try:
+        if product['product_type']=='tools_vip':return False
+    except (KeyError,IndexError,TypeError):pass
+    try:
         return bool(int(product['active'] or 0)==1 and (
             (int(product['is_flash_sale'] or 0)==0 and int(product['flash_sale_until_ts'] or 0)<=0)
             or flash_sale_is_active(product,now_ts)
@@ -17284,14 +17302,278 @@ def update_tool_log(log_id: int, *, status: str,http_status: int=0,reference: st
     conn.commit(); conn.close()
 
 
+TOOLS_VIP_PRICE_IDR=20000
+TOOLS_VIP_QUOTE_SECONDS=300
+
+
+def tools_vip_next_month(value: float) -> float:
+    moment=datetime.fromtimestamp(float(value),payment_receipts.WIB)
+    year=moment.year+(moment.month==12)
+    month=1 if moment.month==12 else moment.month+1
+    return moment.replace(year=year,month=month,day=min(moment.day,calendar.monthrange(year,month)[1])).timestamp()
+
+
+def retire_expired_tools_vip() -> int:
+    conn=db()
+    try:
+        changed=conn.execute('''UPDATE tools_user_access SET enabled=0,updated_at=?
+            WHERE enabled=1 AND vip_expires_at IS NOT NULL AND vip_expires_at<=?''',
+            (datetime.now().isoformat(timespec='seconds'),time.time())).rowcount
+        conn.commit()
+        return changed
+    finally:conn.close()
+
+
+def tools_vip_access(user_id: int):
+    conn=db()
+    try:
+        row=conn.execute('SELECT * FROM tools_user_access WHERE user_id=?',(user_id,)).fetchone()
+        if row and row['enabled'] and row['vip_expires_at'] is not None and row['vip_expires_at']<=time.time():
+            conn.execute('''UPDATE tools_user_access SET enabled=0,updated_at=? WHERE user_id=?
+                AND enabled=1 AND vip_expires_at IS NOT NULL AND vip_expires_at<=?''',
+                (datetime.now().isoformat(timespec='seconds'),user_id,time.time()))
+            conn.commit()
+            row=conn.execute('SELECT * FROM tools_user_access WHERE user_id=?',(user_id,)).fetchone()
+        return dict(row) if row else None
+    finally:conn.close()
+
+
+def tools_vip_status_text(user_id: int) -> str:
+    row=tools_vip_access(user_id)
+    if row and row['vip_expires_at'] is not None and row['vip_expires_at']<=time.time():
+        return 'Kedaluwarsa '+payment_receipts.format_wib(row['vip_expires_at'])
+    if not row or not row['enabled']:return 'Belum aktif'
+    if row['vip_expires_at'] is None:return 'Aktif • akses dari owner'
+    label='Aktif hingga ' if row['vip_expires_at']>time.time() else 'Berakhir '
+    return label+payment_receipts.format_wib(row['vip_expires_at'])
+
+
+def tools_vip_catalog(conn):
+    # Internal service metadata only. Inactive records never enter /start's
+    # active catalog, and no account inventory is created/reserved for VIP.
+    product=conn.execute("SELECT id FROM products WHERE product_type='tools_vip' ORDER BY id LIMIT 1").fetchone()
+    if product:product_id=product['id']
+    else:
+        product_id=conn.execute('''INSERT INTO products(name,description,price,stock,active,product_type,fulfillment_mode)
+            VALUES('VIP /tools','Akses VIP /tools selama 1 bulan.',?,0,0,'tools_vip','ready')''',(TOOLS_VIP_PRICE_IDR,)).lastrowid
+    variant=conn.execute("SELECT id FROM product_variants WHERE product_id=? AND code='__tools_vip_monthly__' ORDER BY id LIMIT 1",(product_id,)).fetchone()
+    if variant:variant_id=variant['id']
+    else:
+        variant_id=conn.execute('''INSERT INTO product_variants(product_id,name,code,price,stock,active)
+            VALUES(?,'1 bulan','__tools_vip_monthly__',?,0,0)''',(product_id,TOOLS_VIP_PRICE_IDR)).lastrowid
+    return product_id,variant_id
+
+
+def tools_vip_quote(user_id: int):
+    now=time.time()
+    conn=db()
+    try:
+        begin_immediate_retry(conn)
+        row=conn.execute('''SELECT p.* FROM tools_vip_purchases p LEFT JOIN orders o ON o.id=p.order_id
+            WHERE p.user_id=? AND ((p.order_id IS NULL AND p.quote_expires_at>? AND p.state='QUOTED')
+                OR (p.activated_at IS NULL AND o.status IN ('pending','paid_pending_delivery') AND o.payment_status NOT IN ('cancelled','expired')))
+            ORDER BY p.created_at DESC LIMIT 1''',(user_id,now)).fetchone()
+        if not row:
+            ident=secrets.token_hex(10)
+            conn.execute('''INSERT INTO tools_vip_purchases
+                (id,user_id,price_idr,quote_expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?)''',
+                (ident,user_id,TOOLS_VIP_PRICE_IDR,now+TOOLS_VIP_QUOTE_SECONDS,now,now))
+            row=conn.execute('SELECT * FROM tools_vip_purchases WHERE id=?',(ident,)).fetchone()
+        conn.commit()
+        return dict(row)
+    except Exception:
+        conn.rollback();raise
+    finally:conn.close()
+
+
+def tools_vip_purchase_row(ident: str,user_id: int):
+    if not re.fullmatch(r'[0-9a-f]{20}',str(ident or '')):raise ValueError('Pembelian VIP tidak valid.')
+    conn=db()
+    try:
+        row=conn.execute('SELECT * FROM tools_vip_purchases WHERE id=? AND user_id=?',(ident,user_id)).fetchone()
+        if not row:raise ValueError('Pembelian VIP tidak ditemukan.')
+        return dict(row)
+    finally:conn.close()
+
+
+def tools_vip_activate(conn,purchase,order):
+    if purchase['activated_at'] is not None:return
+    if (order['user_id']!=purchase['user_id'] or order['payment_status']!='paid'
+            or order['status'] in {'cancelled','expired'} or order['qty']!=1
+            or order['total']!=TOOLS_VIP_PRICE_IDR or order['discount_amount'] or purchase['price_idr']!=TOOLS_VIP_PRICE_IDR):
+        raise ValueError('Pembayaran VIP belum terverifikasi.')
+    if order['payment_method']=='WALLET':
+        verified=conn.execute("SELECT 1 FROM wallet_ledger WHERE user_id=? AND type='PURCHASE' AND reference=? AND amount=?",(order['user_id'],invoice(order['id']),-TOOLS_VIP_PRICE_IDR)).fetchone()
+    elif order['payment_method']==klikqris_gateway.METHOD:
+        verified=conn.execute('''SELECT 1 FROM klikqris_transactions WHERE purpose='order' AND entity_id=?
+            AND user_id=? AND amount=? AND total_amount=? AND verified_total=total_amount
+            AND api_verified_at>0 AND sandbox=0 AND provider_status IN ('SUCCESS','PAID')
+            AND state IN ('PAID_VERIFIED','SETTLED')''',(order['id'],order['user_id'],TOOLS_VIP_PRICE_IDR,order['payment_total'])).fetchone()
+    else:verified=None
+    if not verified:raise ValueError('Pembayaran VIP belum terverifikasi.')
+    now=time.time();stamp=datetime.now().isoformat(timespec='seconds')
+    access=conn.execute('SELECT * FROM tools_user_access WHERE user_id=?',(purchase['user_id'],)).fetchone()
+    permanent=bool(access and access['enabled'] and access['vip_expires_at'] is None)
+    until=None if permanent else tools_vip_next_month(max(now,float(access['vip_expires_at'] or 0) if access and access['enabled'] else 0))
+    if not permanent:
+        conn.execute('''INSERT INTO tools_user_access(user_id,enabled,granted_by,created_at,updated_at,vip_expires_at,vip_source)
+            VALUES(?,1,0,?,?,?,'purchase') ON CONFLICT(user_id) DO UPDATE SET enabled=1,
+            granted_by=0,updated_at=excluded.updated_at,vip_expires_at=excluded.vip_expires_at,vip_source='purchase' ''',
+            (purchase['user_id'],stamp,stamp,until))
+    detail='VIP /tools aktif '+('dari owner.' if until is None else 'hingga '+payment_receipts.format_wib(until)+'.')
+    conn.execute("UPDATE tools_vip_purchases SET state='ACTIVE',activated_at=?,access_expires_at=?,updated_at=? WHERE id=? AND activated_at IS NULL",(now,until,now,purchase['id']))
+    conn.execute('''UPDATE orders SET status='completed',fulfillment_status='delivered',account_sent=1,
+        stock_reserved=0,reserved_until='',completed_at=?,delivery_text=?,last_delivery_error=''
+        WHERE id=? AND payment_status='paid' ''',(stamp,detail,order['id']))
+
+
+async def fulfill_tools_vip_order(order_id: int,bot: Bot):
+    conn=db()
+    try:
+        begin_immediate_retry(conn)
+        purchase=conn.execute('SELECT * FROM tools_vip_purchases WHERE order_id=?',(order_id,)).fetchone()
+        if not purchase:
+            conn.rollback();return None
+        order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+        if not order or order['payment_status']!='paid':
+            conn.rollback();return False
+        tools_vip_activate(conn,purchase,order)
+        conn.commit()
+    except Exception:
+        conn.rollback();raise
+    finally:conn.close()
+    await payment_receipts.notify(_otp_sys.modules[__name__],bot,'order',order_id)
+    try:await send_review_prompt_if_needed(bot,order_id)
+    except asyncio.CancelledError:raise
+    except Exception:logging.exception('VIP review prompt deferred order=%s',order_id)
+    return True
+
+
+async def tools_vip_public_guard(event) -> bool:
+    chat=getattr(event,'chat',None) or getattr(getattr(event,'message',None),'chat',None)
+    if not chat or str(chat.type)!='private' or chat.id!=event.from_user.id or security_blocked(event.from_user.id):
+        if isinstance(event,CallbackQuery):await safe_callback_notice(event,'Buka /tools melalui chat pribadi dengan akun Anda.',show_alert=True)
+        else:await event.answer('Buka /tools melalui chat pribadi dengan akun Anda.')
+        return False
+    return True
+
+
+async def render_tools_vip_menu(call: CallbackQuery):
+    access=tools_vip_access(call.from_user.id)
+    text=('👑 <b>VIP /TOOLS</b>\n\nHarga: <b>Rp20.000 / bulan</b>\n'
+          'Masa aktif: <b>1 bulan</b>\n'
+          f"VIP Anda: <b>{html.escape(tools_vip_status_text(call.from_user.id))}</b>\n"
+          f"Saldo Kamu: <b>{rupiah(get_balance(call.from_user.id))}</b>\n\n"
+          'Akses Magic Link dan aktivasi premium AM mengikuti batas penggunaan /tools.\n'
+          'Perpanjangan dibayar saat Anda memilih membelinya.')
+    if access and access['enabled'] and access['vip_expires_at'] is None:
+        return await safe_edit_or_answer(call,text+'\n\nAkses dari owner sudah aktif; tidak perlu membeli VIP.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ /tools',callback_data='utools:home')]]),parse_mode='HTML')
+    purchase=tools_vip_quote(call.from_user.id)
+    if purchase['order_id']:
+        gateway=KLIKQRIS_GATEWAY.linked('order',purchase['order_id'])
+        if gateway:return await KLIKQRIS_GATEWAY.show_payment(call,gateway['id'])
+    ident=purchase['id']
+    await safe_edit_or_answer(call,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='💰 Bayar Saldo',callback_data='utools:vip:method:w:'+ident)],
+        [InlineKeyboardButton(text='⚡ QRIS Otomatis',callback_data='utools:vip:method:q:'+ident)],
+        [InlineKeyboardButton(text='⬅️ /tools',callback_data='utools:home')]]),parse_mode='HTML')
+
+
+@router.callback_query((F.data=='utools:vip') | F.data.startswith('utools:vip:'))
+async def user_tools_vip_purchase(call: CallbackQuery,state: FSMContext):
+    if not await tools_vip_public_guard(call):return
+    if is_owner(call.from_user.id):return await safe_callback_notice(call,'Owner sudah memiliki akses penuh /tools.',show_alert=True)
+    await safe_callback_notice(call)
+    parts=str(call.data or '').split(':')
+    try:
+        if parts==['utools','vip']:
+            await state.set_state(None)
+            return await render_tools_vip_menu(call)
+        if len(parts)!=5 or parts[2] not in {'method','pay'} or parts[3] not in {'w','q'}:raise ValueError('Pilihan VIP tidak valid.')
+        purchase=tools_vip_purchase_row(parts[4],call.from_user.id)
+        if purchase['activated_at'] is not None:
+            return await payment_receipts.notify(_otp_sys.modules[__name__],call.bot,'order',purchase['order_id'])
+        if not purchase['order_id'] and purchase['quote_expires_at']<=time.time():raise ValueError('Pilihan VIP sudah kedaluwarsa. Buka VIP dari /tools lagi.')
+        if parts[2]=='method':
+            label='Saldo Bot' if parts[3]=='w' else '⚡ QRIS Otomatis'
+            text=('👑 <b>KONFIRMASI VIP /TOOLS</b>\n\nHarga: <b>Rp20.000</b>\n'
+                  'Masa aktif: <b>1 bulan</b>\nMetode: <b>'+label+'</b>\n'
+                  f'Saldo Kamu: <b>{rupiah(get_balance(call.from_user.id))}</b>\n\n'
+                  +('Biaya/penyesuaian QRIS dari sistem ditampilkan pada invoice sebelum dibayar.' if parts[3]=='q' else 'Saldo berkurang tepat Rp20.000 setelah Anda konfirmasi.'))
+            return await safe_edit_or_answer(call,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='✅ Bayar & Aktifkan VIP' if parts[3]=='w' else '✅ Buat QRIS VIP',callback_data='utools:vip:pay:'+parts[3]+':'+purchase['id'])],
+                [InlineKeyboardButton(text='⬅️ Kembali',callback_data='utools:vip')]]),parse_mode='HTML')
+        if safe_mode_enabled() or maintenance_enabled():raise ValueError('Pembelian sementara belum tersedia. Coba kembali nanti.')
+        if not tools_provider_ready():raise ValueError('Pembelian VIP belum tersedia. Hubungi owner.')
+        if not await is_channel_member(call.bot,call.from_user.id):raise ValueError('Gabung channel toko sebelum membeli VIP.')
+        ok,_=persistent_rate_limit(call.from_user.id,'tools_vip_purchase',limit=5,window_seconds=60)
+        if not ok:raise ValueError('Terlalu banyak percobaan. Coba kembali sebentar lagi.')
+        method='WALLET' if parts[3]=='w' else klikqris_gateway.METHOD
+        if method==klikqris_gateway.METHOD and not KLIKQRIS_GATEWAY.ready():raise ValueError('QRIS Otomatis belum tersedia. Pilih saldo atau hubungi owner.')
+        async with purchase_lock(call.from_user.id):
+            conn=db()
+            try:
+                begin_immediate_retry(conn)
+                purchase=conn.execute('SELECT * FROM tools_vip_purchases WHERE id=? AND user_id=?',(parts[4],call.from_user.id)).fetchone()
+                if not purchase:raise ValueError('Pembelian VIP tidak ditemukan.')
+                if purchase['order_id']:
+                    order=conn.execute('SELECT * FROM orders WHERE id=?',(purchase['order_id'],)).fetchone()
+                    if not order or order['payment_method']!=method:raise ValueError('Invoice VIP sudah dibuat dengan metode lain. Selesaikan atau batalkan invoice tersebut.')
+                    if order['status'] in {'cancelled','expired'}:raise ValueError('Invoice VIP sudah tidak aktif. Buka VIP dari /tools untuk membeli lagi.')
+                else:
+                    if purchase['quote_expires_at']<=time.time():raise ValueError('Pilihan VIP kedaluwarsa. Buka VIP kembali.')
+                    access=conn.execute('SELECT * FROM tools_user_access WHERE user_id=?',(call.from_user.id,)).fetchone()
+                    if access and access['enabled'] and access['vip_expires_at'] is None:raise ValueError('VIP dari owner sudah aktif; tidak perlu membeli lagi.')
+                    wallet=conn.execute('SELECT balance FROM wallets WHERE user_id=?',(call.from_user.id,)).fetchone()
+                    if method=='WALLET' and (int(wallet['balance']) if wallet else 0)<TOOLS_VIP_PRICE_IDR:raise ValueError('Saldo tidak cukup. Isi saldo atau pilih QRIS Otomatis.')
+                    product_id,variant_id=tools_vip_catalog(conn)
+                    stamp=datetime.now().isoformat(timespec='seconds')
+                    order_id=conn.execute('''INSERT INTO orders(user_id,username,product_id,variant_id,qty,unit_price,total,
+                        status,payment_method,payment_status,note,payment_total,stock_reserved,reserved_until,created_at)
+                        VALUES(?,?,?,?,1,?,?,'pending',?,'unpaid','VIP /tools • 1 bulan',?,0,'',?)''',
+                        (call.from_user.id,call.from_user.username or '',product_id,variant_id,TOOLS_VIP_PRICE_IDR,TOOLS_VIP_PRICE_IDR,method,TOOLS_VIP_PRICE_IDR,stamp)).lastrowid
+                    conn.execute("UPDATE tools_vip_purchases SET order_id=?,payment_method=?,state='PAYMENT_PENDING',updated_at=? WHERE id=?",(order_id,method,time.time(),purchase['id']))
+                    if method=='WALLET':
+                        changed=conn.execute('UPDATE wallets SET balance=balance-?,updated_at=? WHERE user_id=? AND balance>=?',(TOOLS_VIP_PRICE_IDR,stamp,call.from_user.id,TOOLS_VIP_PRICE_IDR)).rowcount
+                        if changed!=1:raise ValueError('Saldo tidak cukup. Saldo tidak berubah.')
+                        balance=conn.execute('SELECT balance FROM wallets WHERE user_id=?',(call.from_user.id,)).fetchone()[0]
+                        conn.execute("INSERT INTO wallet_ledger(user_id,type,amount,balance_after,reference,note,created_at) VALUES(?,'PURCHASE',?,?,?,'VIP /tools • 1 bulan',?)",(call.from_user.id,-TOOLS_VIP_PRICE_IDR,balance,invoice(order_id),stamp))
+                        conn.execute("UPDATE orders SET payment_status='paid',status='paid_pending_delivery',payment_verified_at=? WHERE id=?",(stamp,order_id))
+                        conn.execute("INSERT OR IGNORE INTO payment_events(entity_type,entity_id,event_type,amount,actor_id,detail,created_at) VALUES('order',?,'paid',?,?,'method=WALLET; vip=tools',?)",(order_id,TOOLS_VIP_PRICE_IDR,call.from_user.id,stamp))
+                        purchase=conn.execute('SELECT * FROM tools_vip_purchases WHERE id=?',(purchase['id'],)).fetchone()
+                        order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+                        tools_vip_activate(conn,purchase,order)
+                    else:KLIKQRIS_GATEWAY.reserve(conn,'order',order_id,call.from_user.id,TOOLS_VIP_PRICE_IDR)
+                    order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+                conn.commit()
+            except Exception:
+                conn.rollback();raise
+            finally:conn.close()
+            await state.set_state(None)
+            if method=='WALLET':await fulfill_order(order['id'],call.bot)
+            else:
+                gateway=KLIKQRIS_GATEWAY.linked('order',order['id'])
+                KLIKQRIS_GATEWAY.bot=call.bot
+                await KLIKQRIS_GATEWAY.issue(gateway['id'])
+                await KLIKQRIS_GATEWAY.show_payment(call,gateway['id'])
+    except (ValueError,klikqris_gateway.GatewayError) as exc:
+        text=str(exc) if isinstance(exc,ValueError) else 'QRIS Otomatis belum dapat diproses. Cek invoice VIP atau hubungi owner.'
+        await safe_edit_or_answer(call,html.escape(text),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ VIP /tools',callback_data='utools:vip')]]),parse_mode='HTML')
+    except sqlite3.Error:
+        logging.exception('VIP checkout storage deferred user=%s',call.from_user.id)
+        await safe_edit_or_answer(call,'Proses VIP belum dapat dipastikan. Buka menu VIP untuk memeriksa invoice; jangan membayar dua kali.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ VIP /tools',callback_data='utools:vip')]]))
+
+
 def tools_user_allowed(user_id: int) -> bool:
+    tools_vip_access(user_id)  # Retire the paid VIP flag when its deadline passes.
     conn=db()
     try:
         return bool(conn.execute(
             """SELECT 1 FROM tools_user_access a
                LEFT JOIN user_security s ON s.user_id=a.user_id
-               WHERE a.user_id=? AND a.enabled=1 AND COALESCE(s.blocked,0)=0""",
-            (int(user_id),)
+               WHERE a.user_id=? AND a.enabled=1 AND COALESCE(s.blocked,0)=0
+                 AND (a.vip_expires_at IS NULL OR a.vip_expires_at>?)""",
+            (int(user_id),time.time())
         ).fetchone())
     finally:
         conn.close()
@@ -17308,7 +17590,8 @@ def set_tools_user_access(user_id: int, enabled: bool, actor_id: int):
         conn.execute(
             """INSERT INTO tools_user_access(user_id,enabled,granted_by,created_at,updated_at)
                VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
-               enabled=excluded.enabled,granted_by=excluded.granted_by,updated_at=excluded.updated_at""",
+               enabled=excluded.enabled,granted_by=excluded.granted_by,updated_at=excluded.updated_at,
+               vip_expires_at=NULL,vip_source='owner'""",
             (user_id,int(enabled),actor_id,now,now)
         )
         conn.commit()
@@ -17320,7 +17603,7 @@ async def render_tools_access_user(call: CallbackQuery, user_id: int):
     conn=db()
     try:
         row=conn.execute(
-            """SELECT a.enabled,v.username,COALESCE(s.blocked,0) AS blocked
+            """SELECT a.enabled,a.vip_expires_at,v.username,COALESCE(s.blocked,0) AS blocked
                FROM (SELECT ? AS user_id) u
                LEFT JOIN tools_user_access a ON a.user_id=u.user_id
                LEFT JOIN verified_users v ON v.user_id=u.user_id
@@ -17328,12 +17611,12 @@ async def render_tools_access_user(call: CallbackQuery, user_id: int):
         ).fetchone()
     finally:
         conn.close()
-    enabled=bool(row and row["enabled"])
+    enabled=bool(row and row["enabled"] and (row['vip_expires_at'] is None or row['vip_expires_at']>time.time()))
     label=("@"+str(row["username"])) if row and row["username"] else str(user_id)
     status="👑 VIP /tools AKTIF" if enabled else "🚫 VIP /tools TIDAK AKTIF"
     text=("👤 <b>VIP KHUSUS /TOOLS</b>\n\n"
           f"User: <b>{html.escape(label)}</b>\nID: <code>{user_id}</code>\n"
-          f"Akses: <b>{status}</b>\n\n"
+          f"Akses: <b>{status}</b>\nMasa aktif: <b>{html.escape(tools_vip_status_text(user_id))}</b>\n\n"
           "VIP ini khusus untuk /tools. User mendapat menu Magic Link dan Rating Toko "
           "setelah Apply Premium sukses. Akses command lain tetap mengikuti aturan toko.")
     if row and row["blocked"]:
@@ -17350,13 +17633,14 @@ async def render_tools_access_list(call: CallbackQuery, page: int=1, *, candidat
     try:
         source=("verified_users v LEFT JOIN tools_user_access a ON a.user_id=v.user_id" if candidates else
                 "tools_user_access a LEFT JOIN verified_users v ON v.user_id=a.user_id")
-        where="v.active=1 AND v.user_id!=?" if candidates else "a.enabled=1 AND a.user_id!=?"
+        live=f"a.enabled=1 AND (a.vip_expires_at IS NULL OR a.vip_expires_at>{int(time.time())})"
+        where="v.active=1 AND v.user_id!=?" if candidates else live+" AND a.user_id!=?"
         total=int(conn.execute(f"SELECT COUNT(*) FROM {source} WHERE {where}",(ADMIN_ID,)).fetchone()[0])
         pages=max(1,(total+9)//10)
         page=max(1,min(page,pages))
         id_column="v.user_id" if candidates else "a.user_id"
         rows=conn.execute(
-            f"SELECT {id_column} AS user_id,v.username,COALESCE(a.enabled,0) AS enabled "
+            f"SELECT {id_column} AS user_id,v.username,CASE WHEN {live} THEN 1 ELSE 0 END AS enabled "
             f"FROM {source} WHERE {where} ORDER BY {id_column} LIMIT 10 OFFSET ?",
             (ADMIN_ID,(page-1)*10)
         ).fetchall()
@@ -17480,10 +17764,12 @@ def tools_user_success_flow(user_id: int, correlation_id: str=""):
 
 
 def tools_user_menu(user_id: int):
-    rows=[
-        [InlineKeyboardButton(text="📧 Magic Link",callback_data="utools:magic")],
-        [InlineKeyboardButton(text="📖 Panduan Login AM via Email",callback_data="utools:login_guide")],
-    ]
+    rows=[[InlineKeyboardButton(text='👑 VIP • Rp20.000 / bulan',callback_data='utools:vip')]]
+    if tools_user_allowed(user_id):
+        rows[0:0]=[
+            [InlineKeyboardButton(text="📧 Magic Link",callback_data="utools:magic")],
+            [InlineKeyboardButton(text="📖 Panduan Login AM via Email",callback_data="utools:login_guide")],
+        ]
     success=tools_user_success_flow(user_id)
     if success:
         rows.append([InlineKeyboardButton(text="⭐ Rating Toko",callback_data=f"utools:rating:{success['correlation_id']}")])
@@ -17524,8 +17810,15 @@ async def tools_message_action(message, data):
 
 
 def tools_user_welcome_text(user_id: int = 0) -> str:
+    vip=(f"👑 VIP: <b>{html.escape(tools_vip_status_text(user_id))}</b>\n"
+         f"💰 Harga: <b>Rp20.000 / bulan</b>\n💵 Saldo Kamu: <b>{rupiah(get_balance(user_id))}</b>\n\n")
+    if not tools_user_allowed(user_id):
+        return ('🧰 <b>TOOLS MABOYY DIGITAL</b>\n\n'+vip+
+                'Pilih VIP untuk membeli akses Magic Link dan aktivasi premium AM selama satu bulan.\n'
+                'Pembayaran tersedia melalui saldo bot atau ⚡ QRIS Otomatis.')
     stats=tools_stats_snapshot(user_id)
     return ("👑 <b>VIP KHUSUS /TOOLS</b>\n\n"
+            +vip+
             f"📊 Aktivasi premium: <b>{stats['used_accounts']}/{stats['hourly_limit']} akun/jam</b>\n"
             f"Reset: <b>{stats['reset_at']}</b>\n\n"
             "Gunakan fitur dengan bijak. Pastikan email dan link yang Anda kirim sudah benar.\n\n"
@@ -17547,8 +17840,8 @@ async def require_tools_user(event, state: FSMContext) -> bool:
     allowed=private and tools_user_allowed(event.from_user.id)
     if allowed:return True
     text=("Gunakan /tools di chat pribadi dengan bot." if not private else
-          "🔒 /tools hanya tersedia untuk owner dan user VIP yang dipilih owner. "
-          "Akses VIP Anda belum aktif atau sudah dicabut. Hubungi owner.")
+          "🔒 Akses VIP /tools belum aktif atau sudah berakhir. "
+          "Buka /tools → VIP untuk membeli Rp20.000/bulan, atau hubungi owner.")
     if private:
         data=await state.get_data()
         current=await state.get_state()
@@ -17560,7 +17853,7 @@ async def require_tools_user(event, state: FSMContext) -> bool:
 
 
 async def user_tools_command(message: Message,state: FSMContext):
-    if not await require_tools_user(message,state):return
+    if not await tools_vip_public_guard(message):return
     await state.set_state(None)
     await message.answer(tools_user_welcome_text(message.from_user.id),
                          reply_markup=tools_user_menu(message.from_user.id),parse_mode="HTML")
@@ -17626,7 +17919,7 @@ async def tools_user_bound_flow(call: CallbackQuery,state: FSMContext,action: st
 
 @router.callback_query(F.data == "utools:home")
 async def user_tools_home(call: CallbackQuery,state: FSMContext):
-    if not await require_tools_user(call,state):return
+    if not await tools_vip_public_guard(call):return
     await state.set_state(None)
     await safe_edit_or_answer(call,tools_user_welcome_text(call.from_user.id),
         reply_markup=tools_user_menu(call.from_user.id),parse_mode="HTML")
@@ -17645,7 +17938,7 @@ async def user_tools_login_guide(call: CallbackQuery,state: FSMContext):
 
 @router.callback_query(F.data == "utools:login_guide_back")
 async def user_tools_login_guide_back(call: CallbackQuery,state: FSMContext):
-    if not await require_tools_user(call,state):return
+    if not await tools_vip_public_guard(call):return
     await safe_edit_or_answer(call,tools_user_welcome_text(call.from_user.id),
         reply_markup=tools_user_menu(call.from_user.id),parse_mode="HTML")
     await safe_callback_notice(call)
@@ -35329,7 +35622,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.16"
+EXPECTED_SOURCE_VERSION = "17.17"
 
 
 def source_integrity_self_test():

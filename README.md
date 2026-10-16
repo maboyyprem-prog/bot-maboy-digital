@@ -1,6 +1,23 @@
-# MaboyyDigital v17.16
+# MaboyyDigital v17.17
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+
+## VIP /tools Rp20.000 per bulan
+
+User membuka **/tools → VIP → Bayar Saldo atau QRIS Otomatis**, lalu konfirmasi.
+Saldo memakai wallet bot existing; QRIS memakai gateway existing dan biaya akhirnya
+terlihat sebelum dibayar. VIP aktif setelah pembayaran terverifikasi, mendapat
+invoice gambar sekali, lalu mengikuti rating pembelian existing.
+
+Masa aktif **satu bulan kalender dalam WIB**. Setelah habis, akses otomatis kembali
+normal, termasuk ketika user sedang menjalankan form /tools. Tidak ada perpanjangan
+atau potongan saldo otomatis. Membeli perpanjangan sebelum habis menambah satu bulan
+dari tanggal berakhir; membeli setelah habis dihitung dari waktu aktivasi baru.
+Akses permanen yang diberikan owner sebelumnya tetap mengikuti pengaturan owner.
+
+Schema **202** menambah riwayat pembelian VIP dan masa aktif secara additive.
+Harga tetap Rp20.000; tidak ada Variables atau file runtime baru. Pertahankan
+database, Volume, konfigurasi /tools, serta gateway existing saat redeploy.
 
 ## Setelah QRIS berhasil dibayar
 
@@ -11,7 +28,7 @@ ID pesan dan antrean invoice tersimpan agar webhook berulang/restart tidak
 menggandakan invoice. Jika hasil kirim gambar baru tidak pasti, bot tidak mengirim
 ulang otomatis; owner dapat memeriksanya di rincian Riwayat Transaksi.
 
-Schema **201** menambah tabel pencatatan pesan QRIS; data wallet/invoice lama
+Schema **201** pada rilis sebelumnya menambah tabel pencatatan pesan QRIS; data wallet/invoice lama
 dipertahankan. Tidak ada Variables baru. Untuk QRIS checkout dari versi lama yang
 belum menyimpan ID pesan, tekan **Cek Status** pada pesan tersebut satu kali setelah
 update agar bot mengenali dan membersihkannya. Pesan sukses lama yang sebelumnya
@@ -50,7 +67,7 @@ termasuk kutip pembungkus. API Key/Merchant ID tetap tidak ditampilkan di Telegr
 Buka **/owner → Pengaturan Pembayaran → QRIS Otomatis → Aktifkan KlikQRIS**.
 API gateway dibuktikan melalui invoice nyata. Aktivasi tidak membuat tagihan percobaan.
 Error konfigurasi menyebut variabel yang perlu diperbaiki, dan kegagalan API
-tetap terlihat di panel. Tidak ada Variables atau file runtime baru; schema 201
+tetap terlihat di panel. Tidak ada Variables atau file runtime baru; schema 201 sebelumnya
 menambahkan pencatatan pesan QRIS. Mode MY PG tetap memerlukan merchant terhubung
 yang terverifikasi.
 
@@ -70,7 +87,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.16 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.17 yang konsisten.
 
 ## Jalankan
 
@@ -273,7 +290,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.16; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.17; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -281,7 +298,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.16: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.17: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed

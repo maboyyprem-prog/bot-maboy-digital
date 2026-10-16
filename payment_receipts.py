@@ -119,6 +119,8 @@ def render_invoice(snapshot, *, simulation=False):
             ("Metode", method_label(value.get("method")))]
     if value.get("variant"):
         rows.insert(5, ("Variasi", public_text(value["variant"], 180)))
+    if value.get('vip_until'):
+        rows.append(('VIP aktif hingga',format_wib(value['vip_until'])))
     if value.get("subtotal"):
         rows.append(("Subtotal", rupiah(value["subtotal"])))
     if value.get("discount"):
@@ -202,7 +204,7 @@ class ReceiptService:
         # All selectors require durable confirmed payment state. Pending holds,
         # canceled invoices, failed purchases and unknown outcomes are excluded.
         return {
-            "order": "SELECT o.id AS entity_id FROM orders o WHERE o.payment_status='paid' AND o.payment_method!='OWNER_FREE' AND COALESCE(NULLIF(o.payment_total,0),o.total)>0",
+            "order": "SELECT o.id AS entity_id FROM orders o WHERE o.payment_status='paid' AND o.payment_method!='OWNER_FREE' AND COALESCE(NULLIF(o.payment_total,0),o.total)>0 AND NOT EXISTS(SELECT 1 FROM tools_vip_purchases v WHERE v.order_id=o.id AND v.activated_at IS NULL)",
             "topup": "SELECT t.id AS entity_id FROM topups t WHERE t.status='completed' AND NOT EXISTS(SELECT 1 FROM otp_payments p WHERE p.topup_id=t.id)",
             "otp_payment": "SELECT p.payment_id AS entity_id FROM otp_payments p WHERE p.paid_at IS NOT NULL",
             "otp_order": "SELECT o.id AS entity_id FROM otp_orders o JOIN otp_purchase_attempts a ON a.attempt_id=o.attempt_id WHERE a.state='CAPTURED' AND NOT EXISTS(SELECT 1 FROM otp_payments p WHERE p.attempt_id=o.attempt_id AND p.paid_at IS NOT NULL)",
@@ -231,6 +233,9 @@ class ReceiptService:
                 discount=row["discount_amount"], unique_code=row["unique_code"], method=row["payment_method"],
                 paid_at=row["payment_verified_at"] or row["completed_at"] or row["created_at"])
             result["customer"] = self.customer(conn, user, row["username"])
+            vip=conn.execute('SELECT access_expires_at FROM tools_vip_purchases WHERE order_id=? AND activated_at IS NOT NULL',(row['id'],)).fetchone()
+            if vip:
+                result.update(category='VIP /tools',item='VIP /tools',variant='1 bulan',vip_until=vip['access_expires_at'])
             if row['payment_method']=='KLIKQRIS_AUTO':
                 result['qris_adjustment']=max(0,int(result['amount'])-int(row['total'])+int(row['discount_amount'] or 0))
         elif source == "topup":
@@ -363,6 +368,8 @@ class ReceiptService:
                        f"🧾 {html.escape(data['reference'])}\n"
                        f"💰 Total: <b>{rupiah(data['amount'])}</b>\n"
                        f"🕒 {format_wib(data['paid_at'], seconds=True)}")
+            if data.get('vip_until'):
+                caption+='\n👑 VIP aktif hingga '+format_wib(data['vip_until'])
             gateway = getattr(self.host, "KLIKQRIS_GATEWAY", None)
             linked = gateway.receipt_transaction(source, entity) if gateway is not None else None
             if linked:
