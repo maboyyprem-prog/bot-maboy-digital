@@ -213,18 +213,16 @@ class Client:
             return 'GET '+path.split('/status/',1)[0]+'/status/'+('{id_merchant}/' if path.startswith('/qrisv2/') else '')+'{order_id}'
         return ('POST ' if path.endswith('/create') else 'GET ')+path
 
-    async def request(self,verb,path,body=None,*,authenticate=True):
+    async def request(self,verb,path,body=None):
         if self.config.error or not self.config.key or not self.config.merchant:raise GatewayError('CONFIG')
         if self.cooldown_until>time.time():raise GatewayError('RATE_LIMIT',retry_after=int(self.cooldown_until-time.time())+1)
         if not re.fullmatch(r'/(?:sandbox/)?qris(?:v2)?/(?:create|history|status/[A-Za-z0-9_/-]+)',path):raise GatewayError('CONFIG')
-        if not authenticate and (verb!='GET' or '/status/MBY-CHECK-' not in path):raise GatewayError('CONFIG')
         write=verb=='POST'
         endpoint=self.endpoint_label(path)
         try:
             if self.session is None or self.session.closed:
                 self.session=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.config.timeout),trust_env=True)
-            headers={'x-api-key':self.config.key if authenticate else 'maboyy-invalid-'+secrets.token_hex(24),
-                     'id_merchant':self.config.merchant,'Accept':'application/json'}
+            headers={'x-api-key':self.config.key,'id_merchant':self.config.merchant,'Accept':'application/json'}
             options={'headers':headers,'allow_redirects':False}
             if body is not None:options['json']=body
             async with self.session.request(verb,'https://klikqris.com/api'+path,**options) as response:
@@ -277,36 +275,14 @@ class Client:
         return result
 
     async def connection_evidence(self):
-        """Verify an empty account without creating an invoice or trusting a bare 404."""
+        """A missing optional history API is neutral, never authentication evidence."""
         try:
             await self.history()
-            return {'source':'history','http_status':200,'endpoint':self.endpoint_label(self.path('gateway','history'))}
+            return {'verified':True,'source':'history','http_status':200,'endpoint':self.endpoint_label(self.path('gateway','history'))}
         except GatewayError as exc:
             if exc.code!='HISTORY_UNAVAILABLE':raise
-        probe='MBY-CHECK-'+secrets.token_hex(16)
-        path=self.path('gateway','status',probe)
-        endpoint=self.endpoint_label(path)
-        try:
-            # Compare the same route/merchant with an intentionally invalid key.
-            # Authentication must reject it before an unknown ID can prove access.
-            try:await self.request('GET',path,authenticate=False)
-            except GatewayError as control:
-                if control.code!='AUTH' or control.http_status!=401:
-                    raise GatewayError('CONNECTION_UNVERIFIED',http_status=control.http_status,endpoint=endpoint) from None
-            else:raise GatewayError('CONNECTION_UNVERIFIED',http_status=200,endpoint=endpoint)
-            try:await self.request('GET',path)
-            except GatewayError as result:
-                if result.code=='NOT_FOUND' and result.http_status in {200,404} and result.transaction_missing:
-                    return {'source':'status_auth_probe','http_status':result.http_status,'endpoint':endpoint,
-                            'history_http_status':404,'negative_control_http_status':401}
-                if result.code=='NOT_FOUND':
-                    raise GatewayError('CONNECTION_UNVERIFIED',http_status=result.http_status,endpoint=endpoint) from None
-                raise
-            # A random, unregistered ID must not unexpectedly resolve to an order.
-            raise GatewayError('CONNECTION_UNVERIFIED',http_status=200,endpoint=endpoint)
-        except GatewayError as exc:
-            exc.history_http_status=404
-            raise
+        return {'verified':False,'source':'awaiting_first_invoice','http_status':404,
+                'endpoint':self.endpoint_label(self.path('gateway','history')),'history_http_status':404}
 
     @staticmethod
     def image_valid(raw):
@@ -403,18 +379,46 @@ class Gateway:
     def configured(self):
         return not self.config.error and bool(self.config.key and self.config.merchant)
 
-    def verified(self,mode):
+    def connection_proof(self,mode):
         row=self.one('SELECT value FROM klikqris_settings WHERE key=?',('verified_'+mode,))
         try:
             proof=json.loads(row['value']) if row else {}
-            return self.configured() and proof.get('fingerprint')==self.fingerprint() and proof.get('verified') is True
-        except (ValueError,TypeError,AttributeError):return False
+            if not isinstance(proof,dict) or proof.get('fingerprint')!=self.fingerprint():return {}
+            if mode=='gateway' and (proof.get('source')=='status_auth_probe' or proof.get('error')=='CONNECTION_UNVERIFIED'):
+                return {'fingerprint':self.fingerprint(),'verified':False,'source':'awaiting_first_invoice',
+                        'checked_at':0,'history_http_status':proof.get('history_http_status',0)}
+            return proof
+        except (ValueError,TypeError):return {}
+
+    def verified(self,mode):
+        return self.configured() and self.connection_proof(mode).get('verified') is True
+
+    def account_authorized(self):
+        row=self.one('SELECT value FROM klikqris_settings WHERE key=?',('account_fingerprint',))
+        try:
+            if row:return json.loads(row['value'])==self.fingerprint()
+            legacy=self.one('SELECT value FROM klikqris_settings WHERE key=?',('verified_gateway',))
+            proof=json.loads(legacy['value']) if legacy else {}
+            bound=proof.get('fingerprint') if isinstance(proof,dict) else None
+            return not bound or bound==self.fingerprint()
+        except (ValueError,TypeError):return False
 
     def ready(self):
+        """Permission to create an invoice; payment authorization is separate."""
         try:
             settings=self.settings()
-            return self.configured() and not self.config.sandbox and settings['enabled'] is True and self.verified(settings['mode'])
+            return (self.configured() and not self.config.sandbox and settings['enabled'] is True
+                    and settings['mode'] in {'gateway','my_pg'}
+                    and (self.account_authorized() if settings['mode']=='gateway' else self.verified('my_pg')))
         except sqlite3.Error:return False
+
+    def save_api_evidence(self,conn,mode,*,verified,source,actor=0,error='',http_status=0,endpoint='',history_http_status=0,checked_at=None):
+        conn.execute('INSERT OR IGNORE INTO klikqris_settings VALUES(?,?,?)',
+                     ('account_fingerprint',encoded(self.fingerprint()),time.time()))
+        proof={'fingerprint':self.fingerprint(),'verified':bool(verified),'source':source,
+               'checked_at':time.time() if checked_at is None else checked_at,'actor':actor,
+               'error':error,'http_status':http_status,'endpoint':endpoint,'history_http_status':history_http_status}
+        conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',('verified_'+mode,encoded(proof),time.time()))
 
     def audit(self,conn,actor,action,tx='',detail=''):
         conn.execute('INSERT INTO klikqris_audit(actor,action,transaction_id,detail,created_at) VALUES(?,?,?,?,?)',(actor,action,tx,detail,time.time()))
@@ -424,24 +428,30 @@ class Gateway:
         mode='gateway' if my_pg_reference is None else 'my_pg'
         try:
             if not self.configured():raise GatewayError('CONFIG')
-            if mode=='gateway':evidence=await self.api.connection_evidence()
+            if mode=='gateway':
+                actual=self.one('''SELECT * FROM klikqris_transactions WHERE mode='gateway' AND fingerprint=?
+                    AND signature IS NOT NULL ORDER BY created_at DESC LIMIT 1''',(self.fingerprint(),))
+                if actual:
+                    data=await self.api.status(actual['reference'],'gateway')
+                    self.validate(actual,data)
+                    evidence={'verified':True,'source':'existing_gateway_order','http_status':200,
+                              'endpoint':self.api.endpoint_label(self.api.path('gateway','status',actual['reference']))}
+                else:evidence=await self.api.connection_evidence()
             else:
                 data=await self.api.status(reference(my_pg_reference),'my_pg')
                 if data.get('order_id')!=my_pg_reference or str(data.get('status','')).upper() not in {'PENDING','PAID','SUCCESS','EXPIRED'}:
                     raise GatewayError('SCHEMA')
                 money(data.get('total_amount'),positive=True)
-                evidence={'source':'existing_my_pg_order','http_status':200,
+                evidence={'verified':True,'source':'existing_my_pg_order','http_status':200,
                           'endpoint':self.api.endpoint_label(self.api.path('my_pg','status',my_pg_reference))}
         except GatewayError as exc:
             with self.connection(True) as conn:
-                proof={'fingerprint':self.fingerprint(),'verified':False,'checked_at':time.time(),'actor':actor,'error':exc.code,
-                       'http_status':exc.http_status,'endpoint':exc.endpoint,'history_http_status':exc.history_http_status}
-                conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',('verified_'+mode,encoded(proof),time.time()))
+                self.save_api_evidence(conn,mode,verified=False,source='connection_error',actor=actor,error=exc.code,
+                                       http_status=exc.http_status,endpoint=exc.endpoint,history_http_status=exc.history_http_status)
                 self.audit(conn,actor,'connection_failed',detail=encoded({'mode':mode,'code':exc.code}))
             raise
         with self.connection(True) as conn:
-            proof={'fingerprint':self.fingerprint(),'verified':True,'checked_at':time.time(),'actor':actor,**evidence}
-            conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',('verified_'+mode,encoded(proof),time.time()))
+            self.save_api_evidence(conn,mode,actor=actor,**evidence)
             self.audit(conn,actor,'connection',detail=mode)
         return mode
 
@@ -449,19 +459,24 @@ class Gateway:
         self.require_owner(actor)
         if not self.configured():raise GatewayError('CONFIG')
         if self.config.sandbox:raise GatewayError('SANDBOX')
-        if self.settings()['mode']=='gateway':await self.check_connection(actor)
         self.change(actor,'enabled',True)
 
     def change(self,actor,key,value):
         self.require_owner(actor)
         if key=='enabled':
             if type(value) is not bool:raise GatewayError('INPUT')
-            if value and (self.config.sandbox or not self.verified(self.settings()['mode'])):raise GatewayError('NOT_READY')
+            if value and (not self.configured() or self.config.sandbox):raise GatewayError('NOT_READY')
+            if value and self.settings()['mode']=='my_pg' and not self.verified('my_pg'):raise GatewayError('NOT_READY')
         elif key=='mode':
             if value not in {'gateway','my_pg'}:raise GatewayError('INPUT')
-            if not self.verified(value):raise GatewayError('NOT_READY')
+            if value=='my_pg' and not self.verified(value):raise GatewayError('NOT_READY')
         else:raise GatewayError('INPUT')
         with self.connection(True) as conn:
+            if key=='enabled' and value:
+                conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',
+                             ('account_fingerprint',encoded(self.fingerprint()),time.time()))
+            if key=='enabled' and value and self.settings()['mode']=='gateway' and not self.verified('gateway'):
+                self.save_api_evidence(conn,'gateway',verified=False,source='awaiting_first_invoice',actor=actor,checked_at=0)
             conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',(key,encoded(value),time.time()))
             self.audit(conn,actor,'setting',detail=encoded({key:value}))
 
@@ -543,6 +558,8 @@ class Gateway:
                     expires_at=?,next_poll_at=?,error='',lease_owner=NULL,lease_until=0 WHERE id=? AND lease_owner=?''',
                     (total,self.crypt(data['signature'].encode()),status,until,time.time()+self.config.poll_seconds,ident,token))
                 self.save_invoice(conn,row,total,until)
+                self.save_api_evidence(conn,row['mode'],verified=True,source='invoice_created',http_status=200,
+                                       endpoint=self.api.endpoint_label(self.api.path(row['mode'],'create')))
             try:
                 image=await self.api.image(data)
                 with self.connection(True) as conn:
@@ -562,6 +579,9 @@ class Gateway:
                 conn.execute("""UPDATE klikqris_transactions SET state='CREATE_UNKNOWN',error=?,next_poll_at=?,
                     lease_owner=NULL,lease_until=0 WHERE id=? AND state='REQUESTING'""",
                     (code,time.time()+max(self.config.poll_seconds,getattr(exc,'retry_after',0)),ident))
+                if isinstance(exc,GatewayError):
+                    self.save_api_evidence(conn,row['mode'],verified=False,source='invoice_create_error',error=exc.code,
+                                           http_status=exc.http_status,endpoint=exc.endpoint or self.api.endpoint_label(self.api.path(row['mode'],'create')))
         return self.transaction(ident)
 
     def notice(self,conn,row,event):
@@ -964,21 +984,18 @@ class Gateway:
     async def owner_panel(self,call,*,note=''):
         self.require_owner(call.from_user.id)
         settings=self.settings()
-        record=self.one('SELECT value FROM klikqris_settings WHERE key=?',('verified_'+settings['mode'],))
-        proof={};stamp=0
-        if record:
-            try:
-                proof=json.loads(record['value'])
-                if not isinstance(proof,dict) or proof.get('fingerprint')!=self.fingerprint():proof={}
-                stamp=proof.get('checked_at',0)
-                if not isinstance(stamp,(int,float)) or not 0<stamp<253402300800:stamp=0
-            except (ValueError,TypeError):proof={}
+        proof=self.connection_proof(settings['mode'])
+        stamp=proof.get('checked_at',0)
+        if not isinstance(stamp,(int,float)) or not 0<stamp<253402300800:stamp=0
         verified=self.verified(settings['mode'])
         ready=self.ready()
-        api_status='Terakhir terverifikasi' if verified else ('Pemeriksaan gagal ('+str(proof['error'])+')' if proof.get('error') else 'Belum terverifikasi')
+        api_status='Terakhir terverifikasi' if verified else (
+            ('Gagal membuat QRIS (' if proof.get('source')=='invoice_create_error' else 'Pemeriksaan gagal (')+str(proof['error'])+')'
+            if proof.get('error') else 'Menunggu invoice pertama')
         problems=self.config.problems()
         webhook=self.config.webhook_url if not any('KLIKQRIS_WEBHOOK_URL' in issue for issue in self.config.issues) else 'Perlu diperbaiki di Railway Variables.'
         text=('👑 <b>PENGATURAN QRIS OTOMATIS</b>\n\nProvider: KlikQRIS\n'
+              f"Versi bot: {html.escape(str(self.host.BOT_VERSION))}\n"
               f"Mode: {'MY PG' if settings['mode']=='my_pg' else 'Gateway biasa'}\n"
               f"Pembelian baru: {'AKTIF' if ready else 'NONAKTIF / belum siap'}\n"
               f"Status API: {html.escape(api_status)}\n"
@@ -986,21 +1003,22 @@ class Gateway:
               f"API Key: {'Terisi' if self.config.key else 'Belum diisi'} • Merchant ID: {'Terisi' if self.config.merchant else 'Belum diisi'}\n"
               f"Konfigurasi: {'Tersedia' if self.configured() else 'Perlu diperbaiki'}\n"
               f"Sandbox: {'ON; saldo/produk nyata diblokir' if self.config.sandbox else 'OFF'}\n\n"
-              'Saldo merchant tidak disediakan endpoint dokumentasi.\n'
               'Webhook: '+html.escape(webhook or 'Atur URL webhook pada dashboard; polling tetap tersedia.')+'\n')
         if problems:text+='\n⚠️ '+html.escape('\n'.join(problems))+'\n'
         if proof.get('endpoint'):
             text+='Pemeriksaan: '+html.escape(str(proof['endpoint']))+'\n'
-            if proof.get('http_status'):text+='HTTP: '+str(int(proof['http_status']))+(' • ID uji baca tidak terdaftar' if verified and proof.get('source')=='status_auth_probe' else '')+'\n'
+            if proof.get('http_status'):text+='HTTP: '+str(int(proof['http_status']))+'\n'
         if proof.get('history_http_status')==404:
-            text+='Riwayat API: Tidak tersedia (HTTP 404).\n'
-        if verified and proof.get('source')=='status_auth_probe':
-            text+='Autentikasi terverifikasi melalui endpoint status; akun tidak perlu mempunyai transaksi sebelumnya. Pemeriksaan tidak membuat invoice.\n'
+            text+='ℹ️ Riwayat API belum tersedia; aktivasi gateway tetap dapat dilakukan.\n'
+        if not verified and settings['mode']=='gateway' and not problems and not proof.get('error'):
+            text+='API akan diverifikasi saat invoice pembayaran dibuat. Saldo masuk setelah pembayaran sah.\n'
+        if verified and proof.get('source') in {'invoice_created','existing_gateway_order'}:
+            text+='Verifikasi API memakai invoice nyata.\n'
         if self.config.normalized:
-            text+='\nℹ️ Format tempelan dinormalisasi: '+html.escape(', '.join(self.config.normalized))+'. Di kolom Value Railway, cukup isi nilainya saja.\n'
+            text+='\nℹ️ Format Value Railway dibaca otomatis; cukup isi nilainya saja.\n'
         if note:text+='\n'+html.escape(note)+'\n'
         rows=[[('🔌 Cek Koneksi','connect',None),('⚙️ Pilih Mode','modes',None)],
-              [('🔴 Nonaktifkan' if ready else '🟢 Periksa & Aktifkan KlikQRIS','toggle','off' if ready else 'on')],
+              [('🔴 Nonaktifkan' if ready else '🟢 Aktifkan KlikQRIS','toggle','off' if ready else 'on')],
               [('📊 Riwayat Transaksi','history',0),('⏳ Transaksi Pending','pending',0)],
               [('🔄 Rekonsiliasi','reconcile',None)],
               [('⬅️ Pengaturan Pembayaran','back',None)]]
@@ -1047,7 +1065,7 @@ def register(router,gateway):
     async def failure(call,exc,*,owner=False):
         codes={'CONFIG':'Periksa Railway Variables yang ditandai pada panel KlikQRIS.',
                'AUTH':'Autentikasi ditolak. Periksa API Key/Merchant ID dan izin akun.',
-               'NOT_READY':'Periksa koneksi mode yang dipilih. Gateway biasa dapat diaktifkan langsung lewat Periksa & Aktifkan KlikQRIS; MY PG memerlukan verifikasi merchant terhubung.',
+               'NOT_READY':'Lengkapi konfigurasi dan matikan sandbox. Gateway biasa memakai Aktifkan KlikQRIS; MY PG memerlukan verifikasi merchant terhubung.',
                'SANDBOX':'Sandbox sedang ON. Atur KLIKQRIS_SANDBOX=false dan redeploy sebelum mengaktifkan pembayaran nyata.',
                'REJECTED':'API menolak pemeriksaan. Periksa status aktivasi gateway, API Key, Merchant ID, dan izin akun di dashboard KlikQRIS.',
                'SCHEMA':'Bentuk respons API tidak sesuai dokumentasi; koneksi belum dinyatakan berhasil.',
@@ -1118,17 +1136,16 @@ def register(router,gateway):
                     await state.set_state(AutoQRISAdminState.merchant_reference)
                     return await host.safe_edit_or_answer(call,'Kirim ID transaksi MY PG yang sudah ada pada merchant terhubung. Pemeriksaan hanya membaca API; tidak membuat tagihan percobaan. Jangan kirim token sesi atau cookie.',reply_markup=gateway.owner_keyboard([[('⬅️ Batal','menu',None)]]))
                 await gateway.check_connection(call.from_user.id)
-                await gateway.owner_panel(call,note='Pemeriksaan gateway biasa berhasil; tidak ada transaksi dibuat.')
+                await gateway.owner_panel(call,note='Pemeriksaan selesai; tidak ada transaksi dibuat. Aktivasi gateway tidak memerlukan riwayat atau ID transaksi uji.')
             elif action=='toggle':
                 if value not in {'on','off'}:raise GatewayError('INPUT')
                 if value=='on':await gateway.activate(call.from_user.id)
                 else:gateway.change(call.from_user.id,'enabled',False)
-                await gateway.owner_panel(call,note='KlikQRIS berhasil diaktifkan.' if value=='on' else 'KlikQRIS dinonaktifkan untuk pembayaran baru; transaksi berjalan tetap diperiksa.')
+                await gateway.owner_panel(call,note='KlikQRIS berhasil diaktifkan untuk membuat invoice pembayaran.' if value=='on' else 'KlikQRIS dinonaktifkan untuk pembayaran baru; transaksi berjalan tetap diperiksa.')
             elif action=='modes':
-                await host.safe_edit_or_answer(call,'Pilih PG KlikQRIS untuk gateway biasa. Setelah pemeriksaan API berhasil, tekan Periksa & Aktifkan KlikQRIS. MY PG memerlukan merchant terhubung dan transaksi existing yang berhasil diverifikasi.',reply_markup=gateway.owner_keyboard([[('PG KlikQRIS • Gateway biasa','mode','gateway')],[('MY PG • verifikasi merchant','my_pg_input',None)],[('⬅️ Kembali','menu',None)]]))
+                await host.safe_edit_or_answer(call,'Pilih PG KlikQRIS untuk gateway biasa, lalu Aktifkan KlikQRIS. API dibuktikan melalui invoice pembayaran nyata. MY PG memerlukan merchant terhubung dan transaksi existing yang berhasil diverifikasi.',reply_markup=gateway.owner_keyboard([[('PG KlikQRIS • Gateway biasa','mode','gateway')],[('MY PG • verifikasi merchant','my_pg_input',None)],[('⬅️ Kembali','menu',None)]]))
             elif action=='mode':
                 if value!='gateway':raise GatewayError('INPUT')
-                if not gateway.verified('gateway'):await gateway.check_connection(call.from_user.id)
                 gateway.change(call.from_user.id,'mode',value)
                 await gateway.owner_panel(call)
             elif action=='my_pg_input':

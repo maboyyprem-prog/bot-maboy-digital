@@ -1,18 +1,19 @@
-# MaboyyDigital v17.13
+# MaboyyDigital v17.14
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
 ## Pemeriksaan gateway untuk akun baru
 
-Endpoint riwayat KlikQRIS mengembalikan HTTP 404 pada pemeriksaan aktual.
-Rilis ini memakai pemeriksaan autentikasi melalui endpoint status bila riwayat
-tidak tersedia. Akun gateway biasa tidak perlu mempunyai transaksi lama, dan
-pemeriksaan tidak membuat invoice. API Key salah, 404 umum, respons HTML atau
-timeout tetap ditolak; HTTP 404 saja bukan bukti koneksi berhasil.
+Gunakan **/owner → Pengaturan Pembayaran → QRIS Otomatis → Aktifkan KlikQRIS**.
+Aktivasi gateway biasa mengizinkan pembuatan invoice pertama dengan konfigurasi
+yang sudah diisi. Tidak perlu riwayat, ID uji atau transaksi percobaan. Status API
+awal **Menunggu invoice pertama**; API dinyatakan terverifikasi setelah respons
+pembuatan QRIS nyata lolos pemeriksaan referensi, nominal dan signature.
 
-Gunakan **/owner → Pengaturan Pembayaran → QRIS Otomatis → Periksa & Aktifkan KlikQRIS**.
-Saldo baru masuk setelah status invoice asli dan nominalnya diverifikasi API;
-hasil pemeriksaan koneksi tidak dapat mengkredit saldo. Tidak ada Variables baru.
+User memilih /start → Isi Saldo → ⚡ QRIS Otomatis. Saldo masuk setelah pembayaran
+invoice asli dan nominalnya diverifikasi melalui API; membuat QRIS tidak menambah
+saldo. Cek Koneksi memakai invoice nyata yang tersimpan atau riwayat bila tersedia.
+Riwayat HTTP 404 tidak menghalangi aktivasi. Tidak ada Variables baru.
 
 ## Perbaikan aktivasi KlikQRIS
 
@@ -21,8 +22,8 @@ Di Railway, kolom **Name** diisi `KLIKQRIS_WEBHOOK_URL`; kolom **Value** cukup U
 di kolom Value. Format tempelan seperti pada laporan sebelumnya kini dikenali,
 termasuk kutip pembungkus. API Key/Merchant ID tetap tidak ditampilkan di Telegram.
 
-Buka **/owner → Pengaturan Pembayaran → QRIS Otomatis → Periksa & Aktifkan KlikQRIS**.
-Gateway biasa diperiksa lewat riwayat atau autentikasi endpoint status tanpa membuat tagihan percobaan.
+Buka **/owner → Pengaturan Pembayaran → QRIS Otomatis → Aktifkan KlikQRIS**.
+API gateway dibuktikan melalui invoice nyata. Aktivasi tidak membuat tagihan percobaan.
 Error konfigurasi menyebut variabel yang perlu diperbaiki, dan kegagalan API
 tetap terlihat di panel. Tidak ada Variables, file runtime atau migration baru;
 schema tetap 200. Mode MY PG tetap memerlukan merchant terhubung yang terverifikasi.
@@ -43,7 +44,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.13 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.14 yang konsisten.
 
 ## Jalankan
 
@@ -246,7 +247,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.13; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.14; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -254,7 +255,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.13: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.14: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed
@@ -277,7 +278,7 @@ Kegagalan refill tidak mengubah order asli atau menambah refund saldo.
 
 Variables baru: `KLIKQRIS_API_KEY`, `KLIKQRIS_MERCHANT_ID`; mode awal
 `KLIKQRIS_MODE=gateway`, `KLIKQRIS_ENABLED=false`, `KLIKQRIS_SANDBOX=false`.
-Buka **/owner → Pengaturan Pembayaran → QRIS Otomatis → Periksa & Aktifkan KlikQRIS**.
+Buka **/owner → Pengaturan Pembayaran → QRIS Otomatis → Aktifkan KlikQRIS**.
 Pemeriksaan koneksi membaca API, tanpa membuat transaksi. QRIS manual, transfer
 rekening dan ShopeePay existing dipertahankan. User hanya melihat **⚡ QRIS Otomatis**.
 Webhook: `https://DOMAIN_BOT_ANDA/webhooks/klikqris`; atur pada dashboard KlikQRIS.
