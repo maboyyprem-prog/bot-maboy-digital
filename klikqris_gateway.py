@@ -1051,7 +1051,9 @@ class Gateway:
                         raise GatewayError('FAMILY_GMAIL')
                     unit=self.host.effective_unit_price(variant,qty)
                     subtotal=unit*qty
-                    voucher,discount=self.host.checkout_discount_from_state(data,call.from_user.id,product['id'],variant_id,subtotal)
+                    voucher,discount=self.host.checkout_discount_from_state(data,call.from_user.id,product['id'],variant_id,subtotal,conn=conn)
+                    if subtotal-discount<=0:
+                        raise self.host.VoucherCheckoutError('Voucher menutup seluruh tagihan. Selesaikan dengan saldo bot tanpa potongan saldo.',wallet_only=True)
                     amount=money(subtotal-discount,positive=True)
                     if not self.host.reserve_stock_for_order(conn,variant_id,qty):raise GatewayError('STOCK')
                     ident=conn.execute('''INSERT INTO orders(user_id,username,product_id,variant_id,qty,unit_price,total,

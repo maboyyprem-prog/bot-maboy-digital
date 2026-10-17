@@ -230,7 +230,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.18"
+BOT_VERSION = "17.19"
 SCHEMA_VERSION = 202
 
 CHECKOUT_TERMS_SHORT = (
@@ -5003,109 +5003,127 @@ def inventory_log(variant_id: int, action: str, qty: int, reference: str = "", n
     conn.close()
 
 
-def voucher_validate(code: str, user_id: int, product_id: int, variant_id: int, subtotal: int):
-    code = (code or "").strip().upper()
-    if not code:
-        return None, 0, "Kode voucher kosong."
-
-    conn = db()
-    voucher = conn.execute(
-        "SELECT * FROM vouchers WHERE code=? AND active=1",
-        (code,)
-    ).fetchone()
-
-    if not voucher:
-        conn.close()
-        return None, 0, "Voucher tidak ditemukan / tidak aktif."
-
-    if voucher["expires_at"]:
-        try:
-            if datetime.fromisoformat(voucher["expires_at"]) < datetime.now():
-                conn.close()
-                return None, 0, "Voucher sudah kedaluwarsa."
-        except Exception:
-            pass
-
-    if int(voucher["min_spend"] or 0) > subtotal:
-        minimum = int(voucher["min_spend"] or 0)
-        conn.close()
-        return None, 0, f"Minimum transaksi voucher {rupiah(minimum)}."
-
-    if int(voucher["product_id"] or 0) not in (0, product_id):
-        conn.close()
-        return None, 0, "Voucher tidak berlaku untuk produk ini."
-
-    if int(voucher["variant_id"] or 0) not in (0, variant_id):
-        conn.close()
-        return None, 0, "Voucher tidak berlaku untuk variasi ini."
-
-    usage_limit = int(voucher["usage_limit"] or 0)
-    if usage_limit > 0 and int(voucher["used"] or 0) >= usage_limit:
-        conn.close()
-        return None, 0, "Kuota voucher sudah habis."
-
-    per_user = max(1, int(voucher["per_user_limit"] or 1))
-    user_used = conn.execute(
-        "SELECT COUNT(*) AS n FROM voucher_usage WHERE voucher_id=? AND user_id=?",
-        (voucher["id"], user_id)
-    ).fetchone()["n"]
-    if int(user_used or 0) >= per_user:
-        conn.close()
-        return None, 0, "Batas pemakaian voucher Anda sudah tercapai."
-
-    if int(voucher["new_user_only"] or 0) == 1:
-        completed = conn.execute(
-            "SELECT COUNT(*) AS n FROM orders WHERE user_id=? AND status='completed'",
-            (user_id,)
-        ).fetchone()["n"]
-        if int(completed or 0) > 0:
-            conn.close()
-            return None, 0, "Voucher hanya untuk pelanggan baru."
-
-    conn.close()
-
-    discount = max(0, int(voucher["discount"] or 0))
-    max_discount = int(voucher["max_discount"] or 0)
-    if max_discount > 0:
-        discount = min(discount, max_discount)
-    discount = min(discount, subtotal)
-
-    return voucher, discount, ""
+class VoucherCheckoutError(ValueError):
+    def __init__(self,message,*,wallet_only=False):
+        super().__init__(message)
+        self.wallet_only=wallet_only
 
 
-def checkout_discount_from_state(data: dict, user_id: int, product_id: int, variant_id: int, subtotal: int):
-    code = str(data.get("checkout_voucher_code", "") or "").strip().upper()
-    if not code:
-        return "", 0
-    voucher, discount, _ = voucher_validate(code, user_id, product_id, variant_id, subtotal)
-    if not voucher:
-        return "", 0
-    return code, discount
+def voucher_deadline(value):
+    if not str(value or '').strip():return None
+    deadline=datetime.fromisoformat(str(value).strip().replace('Z','+00:00'))
+    return deadline.replace(tzinfo=timezone.utc) if deadline.tzinfo is None else deadline
 
 
-def record_voucher_usage(code: str, user_id: int, order_id: int, discount_amount: int):
-    if not code or discount_amount <= 0:
-        return
-    conn = db()
-    voucher = conn.execute("SELECT * FROM vouchers WHERE code=?", (code,)).fetchone()
-    if not voucher:
-        conn.close()
-        return
+def voucher_usage_totals(conn,voucher,user_id=0):
+    recorded=conn.execute('SELECT COUNT(*) total,SUM(CASE WHEN user_id=? THEN 1 ELSE 0 END) own FROM voucher_usage WHERE voucher_id=?',
+                          (user_id,voucher['id'])).fetchone()
+    total=max(int(voucher['used'] or 0),int(recorded['total'] or 0));own=int(recorded['own'] or 0)
+    # Existing orders are the durable reservation: no second wallet/deposit or
+    # coupon balance is introduced. Paid rows without usage also survive a crash.
+    pending=conn.execute("""SELECT o.* FROM orders o WHERE o.voucher_code=? AND o.discount_amount>0
+        AND (o.payment_status='paid' OR (o.status IN ('pending','pending_payment','waiting_payment','paid_pending_delivery')
+             AND o.payment_status NOT IN ('cancelled','expired','rejected')))
+        AND NOT EXISTS(SELECT 1 FROM voucher_usage u WHERE u.voucher_id=? AND u.order_id=o.id)""",
+        (voucher['code'],voucher['id'])).fetchall()
+    for order in pending:
+        if order['payment_status']!='paid' and order_reservation_expired(order):continue
+        total+=1
+        if order['user_id']==user_id:own+=1
+    return total,own
+
+
+def voucher_validate(code: str,user_id: int,product_id: int,variant_id: int,subtotal: int,*,conn=None):
+    code=str(code or '').strip().upper()
+    if not code:return None,0,'Kode voucher kosong.'
+    owned=conn is None
+    conn=db() if owned else conn
     try:
-        conn.execute(
-            """INSERT INTO voucher_usage
-               (voucher_id, user_id, order_id, discount_amount, created_at)
-               VALUES(?,?,?,?,?)""",
-            (
-                voucher["id"], user_id, order_id, discount_amount,
-                datetime.now().isoformat(timespec="seconds")
-            )
-        )
-        conn.execute("UPDATE vouchers SET used=used+1 WHERE id=?", (voucher["id"],))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.rollback()
-    conn.close()
+        voucher=conn.execute('SELECT * FROM vouchers WHERE code=? AND active=1',(code,)).fetchone()
+        if not voucher:return None,0,'Voucher tidak ditemukan / tidak aktif.'
+        product=conn.execute('SELECT * FROM products WHERE id=?',(product_id,)).fetchone()
+        variant=conn.execute('SELECT product_id,active FROM product_variants WHERE id=?',(variant_id,)).fetchone()
+        if not product_is_available(product) or not variant or not variant['active'] or variant['product_id']!=product_id:
+            return None,0,'Produk atau variasi voucher tidak tersedia.'
+        if int(voucher['product_id'] or 0) not in (0,product_id):
+            target=conn.execute('SELECT name FROM products WHERE id=?',(voucher['product_id'],)).fetchone()
+            return None,0,('Voucher hanya berlaku untuk produk '+str(target['name'])+'.') if target else 'Produk tujuan voucher sudah tidak tersedia.'
+        if int(voucher['variant_id'] or 0) not in (0,variant_id):
+            return None,0,'Voucher tidak berlaku untuk variasi ini.'
+        try:deadline=voucher_deadline(voucher['expires_at'])
+        except (ValueError,TypeError,OverflowError):return None,0,'Masa aktif voucher tidak valid. Hubungi owner.'
+        if deadline and deadline<=datetime.now(timezone.utc):return None,0,'Voucher sudah kedaluwarsa.'
+        if subtotal<0:return None,0,'Nominal transaksi tidak valid.'
+        minimum=int(voucher['min_spend'] or 0)
+        if minimum>subtotal:return None,0,f'Minimum transaksi voucher {rupiah(minimum)}.'
+        used,own=voucher_usage_totals(conn,voucher,user_id)
+        limit=int(voucher['usage_limit'] or 0)
+        if limit>0 and used>=limit:return None,0,'Kuota voucher habis atau sedang dipakai pada invoice lain.'
+        if own>=max(1,int(voucher['per_user_limit'] or 1)):
+            return None,0,'Batas pemakaian voucher Anda tercapai atau masih ada invoice voucher yang belum selesai.'
+        if int(voucher['new_user_only'] or 0)==1 and conn.execute(
+            "SELECT 1 FROM orders WHERE user_id=? AND (payment_status='paid' OR status='completed') LIMIT 1",(user_id,)).fetchone():
+            return None,0,'Voucher hanya untuk pelanggan baru.'
+        discount=max(0,int(voucher['discount'] or 0));maximum=int(voucher['max_discount'] or 0)
+        if maximum>0:discount=min(discount,maximum)
+        discount=min(discount,subtotal)
+        if discount<=0:return None,0,'Voucher tidak memberikan potongan untuk transaksi ini.'
+        return voucher,discount,''
+    finally:
+        if owned:conn.close()
+
+
+def checkout_discount_from_state(data: dict,user_id: int,product_id: int,variant_id: int,subtotal: int,*,conn=None):
+    if data.get('checkout_voucher_rejected'):
+        raise VoucherCheckoutError(str(data.get('checkout_voucher_error') or 'Voucher ditolak. Pilih voucher lain atau lanjut tanpa voucher.'))
+    code=str(data.get('checkout_voucher_code','') or '').strip().upper()
+    if not code:return '',0
+    voucher,discount,error=voucher_validate(code,user_id,product_id,variant_id,subtotal,conn=conn)
+    if not voucher:raise VoucherCheckoutError(error)
+    previous=data.get('checkout_voucher_discount')
+    applied=data.get('checkout_voucher_variant_id')
+    if previous is not None and (int(previous)!=discount or int(applied or 0)!=variant_id):
+        raise VoucherCheckoutError('Ketentuan atau pilihan voucher berubah. Terapkan kembali voucher sebelum membayar.')
+    return code,discount
+
+
+async def reject_checkout_voucher(call,state,variant_id,error):
+    if not getattr(error,'wallet_only',False):
+        await state.update_data(checkout_voucher_code='',checkout_voucher_discount=None,checkout_voucher_variant_id=0,
+                                checkout_voucher_rejected=True,checkout_voucher_error=str(error))
+    await state.set_state(None)
+    buttons=([[InlineKeyboardButton(text='💰 Selesaikan dengan Saldo Rp0',callback_data=f'paywallet:{variant_id}:1')]]
+        if getattr(error,'wallet_only',False) else [
+        [InlineKeyboardButton(text='🎟️ Ganti Voucher',callback_data=f'checkoutvoucher:{variant_id}:1')],
+        [InlineKeyboardButton(text='💳 Lanjut Tanpa Voucher',callback_data=f'checkoutvoucherclear:{variant_id}:1')]])
+    buttons.append([InlineKeyboardButton(text='⬅️ Ringkasan',callback_data=f'confirm:{variant_id}:1')])
+    await safe_edit_or_answer(call,('🎟️ <b>TOTAL PEMBAYARAN Rp0</b>' if getattr(error,'wallet_only',False) else '❌ <b>VOUCHER DITOLAK</b>')
+        +'\n\n'+html.escape(str(error))+'\n\nPembayaran belum dibuat; saldo tidak dipotong.',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),parse_mode='HTML')
+    await safe_callback_notice(call)
+
+
+def record_voucher_usage(code: str,user_id: int,order_id: int,discount_amount: int,*,conn=None):
+    if not code or discount_amount<=0:return
+    owned=conn is None
+    conn=db() if owned else conn
+    try:
+        if owned:begin_immediate_retry(conn)
+        order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+        voucher=conn.execute('SELECT * FROM vouchers WHERE code=?',(str(code).upper(),)).fetchone()
+        if not voucher or not order:return
+        if (order['user_id']!=user_id or order['payment_status']!='paid'
+                or str(order['voucher_code'] or '').upper()!=str(code).upper() or order['discount_amount']!=discount_amount):
+            raise ValueError('Pemakaian voucher belum memiliki pembayaran yang sesuai.')
+        changed=conn.execute("""INSERT OR IGNORE INTO voucher_usage(voucher_id,user_id,order_id,discount_amount,created_at)
+            VALUES(?,?,?,?,?)""",(voucher['id'],user_id,order_id,discount_amount,datetime.now().isoformat(timespec='seconds'))).rowcount
+        if changed:conn.execute('UPDATE vouchers SET used=used+1 WHERE id=?',(voucher['id'],))
+        if owned:conn.commit()
+    except Exception:
+        if owned:conn.rollback()
+        raise
+    finally:
+        if owned:conn.close()
 
 
 def low_stock_threshold() -> int:
@@ -9879,6 +9897,8 @@ def confirm_order_payment_atomic(order_id: int, paid_amount: int | None = None, 
                   AND (status!='expired' OR ?)""",
                 (now,int(verified_by or 0),manual_confirmation_required(order),order_id,recovered)).rowcount
             if changed!=1:return None,False
+            record_voucher_usage(order['voucher_code'] or '',order['user_id'],order_id,
+                                 int(order['discount_amount'] or 0),conn=conn)
             amount=int(paid_amount or order['payment_total'] or order['total'])
             conn.execute("""INSERT OR IGNORE INTO payment_events
                 (entity_type,entity_id,event_type,amount,actor_id,detail,created_at)
@@ -11474,7 +11494,7 @@ def owner_customers_menu():
 
 def owner_promo_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🎁 Voucher", callback_data="owner:add_voucher")
+    kb.button(text="🎁 Voucher", callback_data="owner:vouchers")
     kb.button(text="👥 Segmentasi", callback_data="owner:segments")
     kb.button(text="🎯 Promo Otomatis", callback_data="owner:auto_promo")
     kb.button(text="⬅️ Pelanggan", callback_data="owner:menu_customers")
@@ -22001,6 +22021,8 @@ async def confirm_order(call: CallbackQuery, state: FSMContext):
             checkout_qty=qty,
             checkout_note="",
             checkout_voucher_code="",
+            checkout_voucher_rejected=False,
+            checkout_voucher_error='',
             family_gmail=""
         )
 
@@ -22084,6 +22106,10 @@ async def checkout_go_payment(call: CallbackQuery, state: FSMContext):
         )
         return await safe_callback_notice(call)
 
+    try:
+        checkout_discount_from_state(data,call.from_user.id,product['id'],variant_id,effective_unit_price(variant,qty)*qty)
+    except VoucherCheckoutError as exc:
+        return await reject_checkout_voucher(call,state,variant_id,exc)
     note=get_checkout_note_from_state(data)
     voucher=str(data.get("checkout_voucher_code","") or "").strip().upper()
 
@@ -22430,9 +22456,13 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
 
         unit = effective_unit_price(variant, qty)
         subtotal = unit * qty
-        voucher_code, discount_amount = checkout_discount_from_state(
-            checkout_data, call.from_user.id, product["id"], variant_id, subtotal
-        )
+        try:
+            voucher_code, discount_amount = checkout_discount_from_state(
+                checkout_data, call.from_user.id, product["id"], variant_id, subtotal, conn=conn
+            )
+        except VoucherCheckoutError as exc:
+            conn.rollback(); conn.close()
+            return await reject_checkout_voucher(call,state,variant_id,exc)
         total = max(0, subtotal - discount_amount)
 
         if balance < total:
@@ -22533,14 +22563,19 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
                 datetime.now().isoformat(timespec="seconds")
             )
         )
-        conn.commit()
+        try:
+            record_voucher_usage(voucher_code,call.from_user.id,order_id,discount_amount,conn=conn)
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback(); conn.close()
+            logging.exception('Voucher wallet checkout storage failed user=%s',call.from_user.id)
+            return await safe_callback_notice(call,'Pembayaran belum diproses; saldo tidak dipotong. Coba kembali nanti.',show_alert=True)
         conn.close()
 
         record_payment_event(
             "order", order_id, "paid",
             total, call.from_user.id, "method=WALLET"
         )
-        record_voucher_usage(voucher_code, call.from_user.id, order_id, discount_amount)
 
         delivered = await fulfill_order(order_id, bot)
         is_preorder=product_is_preorder(product) or product_is_famhead(product)
@@ -22611,6 +22646,17 @@ async def checkout_voucher_prompt(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@router.callback_query(F.data.startswith('checkoutvoucherclear:'))
+async def checkout_voucher_clear(call: CallbackQuery,state: FSMContext):
+    numbers=callback_positive_numbers(call.data,'checkoutvoucherclear',2)
+    if not numbers or not checkout_variant_is_active(numbers[0]):
+        return await safe_callback_notice(call,'Produk tidak tersedia.',show_alert=True)
+    await state.update_data(checkout_voucher_code='',checkout_voucher_discount=None,checkout_voucher_variant_id=0,
+                            checkout_voucher_rejected=False,checkout_voucher_error='')
+    await state.set_state(None)
+    return await checkout_go_payment(call.model_copy(update={'data':f'checkoutpay:{numbers[0]}:1'}),state)
+
+
 @router.message(CheckoutState.waiting_voucher)
 async def checkout_voucher_input(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -22619,7 +22665,8 @@ async def checkout_voucher_input(message: Message, state: FSMContext):
     code = (message.text or "").strip().upper()
 
     if code == "RESET":
-        await state.update_data(checkout_qty=1, checkout_voucher_code="")
+        await state.update_data(checkout_qty=1, checkout_voucher_code="",checkout_voucher_discount=None,checkout_voucher_variant_id=0,
+                                checkout_voucher_rejected=False,checkout_voucher_error='')
         await state.set_state(None)
         return await message.answer(
             "✅ Voucher dilepas.",
@@ -22643,9 +22690,13 @@ async def checkout_voucher_input(message: Message, state: FSMContext):
         code, message.from_user.id, product["id"], variant_id, subtotal
     )
     if not voucher:
-        return await message.answer(f"❌ {error}\n\nKirim kode lain atau RESET.")
+        await state.update_data(checkout_voucher_code='',checkout_voucher_discount=None,checkout_voucher_variant_id=0,
+                                checkout_voucher_rejected=True,checkout_voucher_error=error)
+        return await message.answer(f"❌ {html.escape(error)}\n\nKirim kode lain atau RESET.",parse_mode='HTML')
 
-    await state.update_data(checkout_qty=1, checkout_voucher_code=code)
+    await state.update_data(checkout_qty=1, checkout_voucher_code=code,
+                            checkout_voucher_discount=discount,checkout_voucher_variant_id=variant_id,
+                            checkout_voucher_rejected=False,checkout_voucher_error='')
     await state.set_state(None)
 
     await message.answer(
@@ -22764,13 +22815,19 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext, b
 
         unit = effective_unit_price(variant, qty)
         subtotal = unit * qty
-        voucher_code, discount_amount = checkout_discount_from_state(
-            checkout_data,
-            call.from_user.id,
-            product["id"],
-            variant_id,
-            subtotal
-        )
+        try:
+            voucher_code, discount_amount = checkout_discount_from_state(
+                checkout_data,
+                call.from_user.id,
+                product["id"],
+                variant_id,
+                subtotal, conn=conn
+            )
+            if subtotal-discount_amount<=0:
+                raise VoucherCheckoutError('Voucher menutup seluruh tagihan. Selesaikan dengan saldo bot tanpa potongan saldo.',wallet_only=True)
+        except VoucherCheckoutError as exc:
+            conn.rollback(); conn.close()
+            return await reject_checkout_voucher(call,state,variant_id,exc)
 
         total = subtotal
         unique_code = unique_code_for_order(conn)
@@ -22989,9 +23046,15 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
 
         unit = effective_unit_price(variant, qty)
         subtotal = unit * qty
-        voucher_code, discount_amount = checkout_discount_from_state(
-            checkout_data, call.from_user.id, product["id"], variant_id, subtotal
-        )
+        try:
+            voucher_code, discount_amount = checkout_discount_from_state(
+                checkout_data, call.from_user.id, product["id"], variant_id, subtotal, conn=conn
+            )
+            if subtotal-discount_amount<=0:
+                raise VoucherCheckoutError('Voucher menutup seluruh tagihan. Selesaikan dengan saldo bot tanpa potongan saldo.',wallet_only=True)
+        except VoucherCheckoutError as exc:
+            conn.rollback(); conn.close()
+            return await reject_checkout_voucher(call,state,variant_id,exc)
         total = subtotal
         unique_code = unique_code_for_order(conn)
         payment_total = max(0, subtotal - discount_amount) + unique_code
@@ -23165,6 +23228,8 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
     if KLIKQRIS_GATEWAY.ready():
         try:
             return await KLIKQRIS_GATEWAY.checkout(call,bot,state,variant_id,requested_qty)
+        except VoucherCheckoutError as exc:
+            return await reject_checkout_voucher(call,state,variant_id,exc)
         except klikqris_gateway.GatewayError as exc:
             text='Stok tidak mencukupi.' if exc.code=='STOCK' else 'QRIS Otomatis belum dapat diproses. Cek status atau hubungi owner.'
             return await safe_callback_notice(call,text,show_alert=True)
@@ -23242,9 +23307,15 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
 
         unit = effective_unit_price(variant, qty)
         subtotal = unit * qty
-        voucher_code, discount_amount = checkout_discount_from_state(
-            checkout_data, call.from_user.id, product["id"], variant_id, subtotal
-        )
+        try:
+            voucher_code, discount_amount = checkout_discount_from_state(
+                checkout_data, call.from_user.id, product["id"], variant_id, subtotal, conn=conn
+            )
+            if subtotal-discount_amount<=0:
+                raise VoucherCheckoutError('Voucher menutup seluruh tagihan. Selesaikan dengan saldo bot tanpa potongan saldo.',wallet_only=True)
+        except VoucherCheckoutError as exc:
+            conn.rollback(); conn.close()
+            return await reject_checkout_voucher(call,state,variant_id,exc)
         total = max(0, subtotal - discount_amount)
 
         if not reserve_stock_for_order(conn, variant_id, qty):
@@ -23922,40 +23993,56 @@ async def stock_report(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data == "voucher_info")
-async def voucher_info(call: CallbackQuery):
-    conn = db()
-    rows = conn.execute(
-        """SELECT * FROM vouchers
-           WHERE active=1
-           ORDER BY id DESC LIMIT 15"""
-    ).fetchall()
-    conn.close()
-
-    lines = ["🎁 <b>VOUCHER AKTIF</b>", ""]
-    if not rows:
-        lines.append("Belum ada voucher aktif.")
-    else:
+def voucher_public_page(page=1):
+    conn=db()
+    try:
+        rows=conn.execute("""SELECT * FROM vouchers WHERE active=1 AND discount>0
+            AND (TRIM(COALESCE(expires_at,''))='' OR julianday(expires_at)>julianday(?))
+            ORDER BY code COLLATE NOCASE,id""",(datetime.now(timezone.utc).isoformat(),)).fetchall()
+        usable=[]
         for row in rows:
-            quota = (
-                f"{max(0, int(row['usage_limit'])-int(row['used']))} tersisa"
-                if int(row["usage_limit"] or 0) > 0 else "tanpa batas"
-            )
-            lines.append(
-                f"🎟️ <code>{html.escape(row['code'])}</code>\n"
-                f"Diskon {rupiah(row['discount'])}"
-                + (f" • Min {rupiah(row['min_spend'])}" if int(row["min_spend"] or 0) else "")
-                + f" • {quota}"
-            )
+            if row['product_id']:
+                try:voucher_product_row(conn,row['product_id'])
+                except ValueError:continue
+            if row['variant_id']:
+                variant=conn.execute('SELECT active,product_id FROM product_variants WHERE id=?',(row['variant_id'],)).fetchone()
+                if not variant or not variant['active'] or (row['product_id'] and variant['product_id']!=row['product_id']):continue
+                if not row['product_id']:
+                    try:voucher_product_row(conn,variant['product_id'])
+                    except ValueError:continue
+            used,_=voucher_usage_totals(conn,row)
+            if row['usage_limit']>0 and used>=row['usage_limit']:continue
+            usable.append((row,voucher_scope_text(conn,row),used))
+        pages=max(1,(len(usable)+7)//8);page=max(1,min(int(page),pages))
+        lines=[f'🎁 <b>VOUCHER AKTIF</b> • {page}/{pages}','']
+        for row,scope,used in usable[(page-1)*8:page*8]:
+            quota=f"{max(0,row['usage_limit']-used)} tersisa" if row['usage_limit']>0 else 'Tanpa batas'
+            lines.append(f"🎟️ <code>{html.escape(str(row['code'])[:30])}</code> • {rupiah(row['discount'])}\n"
+                         f"📦 {html.escape(scope[:90])}\nMinimum {rupiah(row['min_spend'])} • {quota}")
+        if not usable:lines.append('Belum ada voucher aktif yang tersedia.')
+        lines.append('\nPilih produk yang sesuai, lalu gunakan tombol Voucher saat checkout.')
+    finally:conn.close()
+    buttons=[];nav=[]
+    if page>1:nav.append(InlineKeyboardButton(text='⬅️',callback_data=f'voucherpage:{page-1}'))
+    if page<pages:nav.append(InlineKeyboardButton(text='➡️',callback_data=f'voucherpage:{page+1}'))
+    if nav:buttons.append(nav)
+    buttons.extend([[InlineKeyboardButton(text='🏷️ Lihat Produk',callback_data='products')],
+                    [InlineKeyboardButton(text='🏠 Menu Awal',callback_data='home')]])
+    return '\n\n'.join(lines),InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    lines.append("\nGunakan tombol 🎟️ Pakai Voucher saat checkout.")
 
-    await safe_edit_or_answer(call, 
-        "\n\n".join(lines) + f"\n\n<i>{STORE_FOOTER}</i>",
-        reply_markup=back_home(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+@router.callback_query((F.data=='voucher_info') | F.data.startswith('voucherpage:'))
+async def voucher_info(call: CallbackQuery):
+    if not await is_channel_member(call.bot,call.from_user.id):return await safe_callback_notice(call,'Gabung channel toko terlebih dahulu.',show_alert=True)
+    if call.data=='voucher_info':page=1
+    else:
+        numbers=callback_positive_numbers(call.data,'voucherpage')
+        if not numbers:return await safe_callback_notice(call,'Halaman voucher tidak valid.',show_alert=True)
+        page=numbers[0]
+    text,keyboard=voucher_public_page(page)
+    await safe_edit_or_answer(call,text,reply_markup=keyboard,parse_mode='HTML')
+    await safe_callback_notice(call)
+
 
 # =========================
 # WALLET USER
@@ -28694,313 +28781,335 @@ async def owner_mark_flash_input(message: Message, state: FSMContext):
 
 
 
-@router.callback_query(F.data == "owner:add_voucher")
-async def owner_add_voucher(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("Akses ditolak.", show_alert=True)
+VOUCHER_WIZARD_SECONDS=1800
 
+
+async def voucher_owner_guard(event):
+    message=event if isinstance(event,Message) else getattr(event,'message',None)
+    if (not is_owner(event.from_user.id) or not message or str(message.chat.type)!='private'
+            or message.chat.id!=event.from_user.id):
+        if isinstance(event,CallbackQuery):await deny_owner_callback(event)
+        return False
+    return True
+
+
+def voucher_product_row(conn,product_id):
+    row=conn.execute('SELECT * FROM products WHERE id=?',(product_id,)).fetchone()
+    if not product_is_available(row) or not conn.execute(
+        'SELECT 1 FROM product_variants WHERE product_id=? AND active=1 LIMIT 1',(product_id,)).fetchone():
+        raise ValueError('Produk tidak tersedia atau belum memiliki varian aktif.')
+    return row
+
+
+def voucher_scope_text(conn,row):
+    if not int(row['product_id'] or 0) and not int(row['variant_id'] or 0):return 'Semua produk (voucher lama)'
+    product_id=int(row['product_id'] or 0)
+    if not product_id:
+        variant=conn.execute('SELECT product_id FROM product_variants WHERE id=?',(row['variant_id'],)).fetchone()
+        product_id=variant['product_id'] if variant else 0
+    product=conn.execute('SELECT name,active FROM products WHERE id=?',(product_id,)).fetchone()
+    if not product:return f"Produk #{row['product_id']} tidak tersedia"
+    label=str(product['name'])+(' • nonaktif' if not product['active'] else '')
+    if row['variant_id']:
+        variant=conn.execute('SELECT name FROM product_variants WHERE id=?',(row['variant_id'],)).fetchone()
+        label+=' / '+(str(variant['name']) if variant else 'varian tidak tersedia')
+    return label
+
+
+async def voucher_wizard_data(event,state,step=None,token=None):
+    if not await voucher_owner_guard(event):return None
+    data=await state.get_data()
+    if (not data.get('voucher_nonce') or time.time()-float(data.get('voucher_started_at',0))>VOUCHER_WIZARD_SECONDS
+            or (token is not None and token!=data.get('voucher_nonce'))
+            or (step is not None and data.get('voucher_step')!=step)):
+        text='Form voucher sudah berubah atau kedaluwarsa. Buka Buat Voucher kembali.'
+        if isinstance(event,CallbackQuery):await safe_callback_notice(event,text,show_alert=True)
+        else:await event.answer(text,reply_markup=back_owner('owner:vouchers'))
+        return None
+    return data
+
+
+async def voucher_wizard_menu(event,state,page=1):
+    data=await state.get_data();step=data['voucher_step'];nonce=data['voucher_nonce']
+    buttons=[];product_name=''
+    if data.get('voucher_product_id'):
+        conn=db()
+        try:product_name=voucher_product_row(conn,data['voucher_product_id'])['name']
+        finally:conn.close()
+    label=lambda action,value:f'vbuild:{action}:{value}:{nonce}'
+    if step=='product':
+        conn=db()
+        try:
+            where="active=1 AND COALESCE(product_type,'standard')!='tools_vip'"
+            count=conn.execute('SELECT COUNT(*) FROM products WHERE '+where).fetchone()[0]
+            pages=max(1,(count+7)//8);page=max(1,min(int(page),pages))
+            rows=conn.execute('SELECT id,name FROM products WHERE '+where+f' ORDER BY {product_list_order_sql(conn)} LIMIT 8 OFFSET ?',((page-1)*8,)).fetchall()
+        finally:conn.close()
+        buttons=[[InlineKeyboardButton(text=str(row['name'])[:55],callback_data=label('pick',row['id']))] for row in rows]
+        nav=[]
+        if page>1:nav.append(InlineKeyboardButton(text='⬅️ Sebelumnya',callback_data=label('products',page-1)))
+        if page<pages:nav.append(InlineKeyboardButton(text='Berikutnya ➡️',callback_data=label('products',page+1)))
+        if nav:buttons.append(nav)
+        text=f'Langkah 1/8 • Halaman {page}/{pages}\nPilih produk tujuan voucher.\nProduk lain otomatis ditolak.'
+        if not rows:text+='\n\nBelum ada produk aktif. Tambahkan produk terlebih dahulu.'
+    elif step=='code':
+        text='Langkah 2/8\nKirim kode voucher, misalnya <code>HEMAT10</code>.\nGunakan huruf/angka, tanda - atau _, maksimal 30 karakter.'
+        await state.set_state(OwnerState.voucher_code)
+    elif step in {'discount','min','quota','peruser','days','new'}:
+        options={
+            'discount':('Langkah 3/8\nPilih nominal diskon.',[(5000,'Rp5.000'),(10000,'Rp10.000'),(20000,'Rp20.000'),(50000,'Rp50.000'),('custom','✏️ Nominal Lain')]),
+            'min':('Langkah 4/8\nPilih minimum transaksi.',[(0,'Tanpa Minimum'),(25000,'Rp25.000'),(50000,'Rp50.000'),(100000,'Rp100.000'),('custom','✏️ Minimum Lain')]),
+            'quota':('Langkah 5/8\nPilih kuota voucher.',[(0,'Tanpa Batas'),(10,'10x'),(25,'25x'),(50,'50x'),(100,'100x'),('custom','✏️ Kuota Lain')]),
+            'peruser':('Langkah 6/8\nPilih batas per user.',[(1,'1x / User'),(2,'2x / User'),(3,'3x / User'),(5,'5x / User')]),
+            'days':('Langkah 7/8\nPilih masa aktif.',[(7,'7 Hari'),(30,'30 Hari'),(90,'90 Hari'),(0,'Tanpa Kedaluwarsa')]),
+            'new':('Langkah 8/8\nPilih target pelanggan.',[(0,'👥 Semua Pelanggan'),(1,'🆕 Pelanggan Baru')]),
+        }
+        text,choices=options[step]
+        buttons=[[InlineKeyboardButton(text=title,callback_data=label(step,value))] for value,title in choices]
+    elif step=='confirm':
+        until=data.get('voucher_expires_at','')
+        text=('Periksa sebelum menyimpan.\n\n'
+              f"Kode: <code>{html.escape(data['voucher_code'])}</code>\n"
+              f"Diskon: <b>{rupiah(data['voucher_discount'])}</b>\n"
+              f"Minimum: {rupiah(data['voucher_min_spend'])}\n"
+              f"Kuota: {data['voucher_quota'] or 'Tanpa batas'}\n"
+              f"Per user: {data['voucher_per_user']}x\n"
+              f"Berakhir: {payment_receipts.format_wib(until) if until else 'Tanpa kedaluwarsa'}\n"
+              f"Target: {'Pelanggan baru' if data['voucher_new_only'] else 'Semua pelanggan'}\n\n"
+              'Berlaku pada semua varian produk terpilih. Produk lain ditolak.')
+        buttons=[[InlineKeyboardButton(text='✅ Simpan Voucher',callback_data=label('save',1))],
+                 [InlineKeyboardButton(text='🔄 Ulangi',callback_data='owner:add_voucher')]]
+    else:raise ValueError('Form voucher tidak valid.')
+    prefix='🎁 <b>BUAT VOUCHER PRODUK</b>\n\n'
+    if product_name:prefix+='📦 <b>'+html.escape(str(product_name))+'</b>\n\n'
+    buttons.append([InlineKeyboardButton(text='❌ Batal / Menu Voucher',callback_data='owner:vouchers')])
+    markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    if isinstance(event,CallbackQuery):await safe_edit_or_answer(event,prefix+text,reply_markup=markup,parse_mode='HTML')
+    else:await event.answer(prefix+text,reply_markup=markup,parse_mode='HTML')
+
+
+@router.callback_query(F.data=='owner:add_voucher')
+async def owner_add_voucher(call: CallbackQuery,state: FSMContext):
+    if not await voucher_owner_guard(call):return
+    clear_owner_input_session(call.from_user.id)
     await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 Rp5.000", callback_data="vbuild:discount:5000"),
-         InlineKeyboardButton(text="💵 Rp10.000", callback_data="vbuild:discount:10000")],
-        [InlineKeyboardButton(text="💵 Rp20.000", callback_data="vbuild:discount:20000"),
-         InlineKeyboardButton(text="💵 Rp50.000", callback_data="vbuild:discount:50000")],
-        [InlineKeyboardButton(text="✏️ Nominal Lain", callback_data="vbuild:discount:custom")],
-        [InlineKeyboardButton(text="⬅️ Promo & Voucher", callback_data="owner:promo_menu")]
-    ])
-    await state.set_state(OwnerState.voucher_code)
-    await safe_edit_or_answer(call, 
-        "🎁 <b>BUAT VOUCHER</b>\n\n"
-        "Langkah 1 dari 7\n"
-        "Kirim <b>kode voucher</b> terlebih dahulu.\n\n"
-        "Contoh: <code>HEMAT10</code>\n\n"
-        "Setelah kode dikirim, semua pengaturan berikutnya dipilih lewat tombol.",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-    await call.answer()
+    await state.set_data({'voucher_nonce':secrets.token_hex(6),'voucher_started_at':time.time(),'voucher_step':'product'})
+    await voucher_wizard_menu(call,state)
+    await safe_callback_notice(call)
 
 
 @router.message(OwnerState.voucher_code)
-async def voucher_code_input(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-
-    code = (message.text or "").strip().upper()
-    if not code or len(code) > 30 or " " in code:
-        return await message.answer("❌ Kode voucher tidak valid. Gunakan huruf/angka tanpa spasi.")
-
-    conn = db()
-    exists = conn.execute("SELECT id FROM vouchers WHERE code=?", (code,)).fetchone()
-    conn.close()
-    if exists:
-        return await message.answer("❌ Kode voucher sudah ada.")
-
-    await state.update_data(voucher_code=code)
+async def voucher_code_input(message: Message,state: FSMContext):
+    if not await voucher_wizard_data(message,state,'code'):return
+    code=str(message.text or '').strip().upper()
+    if not re.fullmatch(r'[A-Z0-9][A-Z0-9_-]{0,29}',code):
+        return await message.answer('Kode tidak valid. Gunakan huruf/angka, - atau _, maksimal 30 karakter.')
+    conn=db()
+    try:exists=conn.execute('SELECT id FROM vouchers WHERE code=?',(code,)).fetchone()
+    finally:conn.close()
+    if exists:return await message.answer('Kode voucher sudah ada. Kirim kode lain.')
+    await state.update_data(voucher_code=code,voucher_step='discount')
     await state.set_state(None)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Rp5.000", callback_data="vbuild:discount:5000"),
-         InlineKeyboardButton(text="Rp10.000", callback_data="vbuild:discount:10000")],
-        [InlineKeyboardButton(text="Rp20.000", callback_data="vbuild:discount:20000"),
-         InlineKeyboardButton(text="Rp50.000", callback_data="vbuild:discount:50000")],
-        [InlineKeyboardButton(text="✏️ Nominal Lain", callback_data="vbuild:discount:custom")],
-        [InlineKeyboardButton(text="⬅️ Promo & Voucher", callback_data="owner:promo_menu")]
-    ])
-    await message.answer(
-        f"✅ Kode: <b>{html.escape(code)}</b>\n\n"
-        "Langkah 2 dari 7\n"
-        "Pilih nominal diskon:",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
+    await voucher_wizard_menu(message,state)
 
 
-@router.callback_query(F.data.startswith("vbuild:discount:"))
-async def voucher_build_discount(call: CallbackQuery, state: FSMContext):
-    value = call.data.split(":")[2]
-    if value == "custom":
-        await state.set_state(OwnerState.voucher_discount)
-        await safe_edit_or_answer(call, 
-            "✏️ <b>DISKON CUSTOM</b>\n\nKirim nominal diskon dalam angka.\nContoh: <code>15000</code>",
-            reply_markup=back_owner(),
-            parse_mode="HTML"
-        )
-        return await call.answer()
-
-    await state.update_data(voucher_discount=int(value))
-    await state.set_state(None)
-    await voucher_minimum_menu(call, state)
+@router.callback_query(F.data.startswith('vbuild:'))
+async def voucher_build_action(call: CallbackQuery,state: FSMContext):
+    if not await voucher_owner_guard(call):return
+    match=re.fullmatch(r'vbuild:([a-z]+):([a-z0-9]{1,19}):([a-f0-9]{12})',str(call.data or ''))
+    if not match:return await safe_callback_notice(call,'Tombol voucher lama/tidak valid. Buka Buat Voucher kembali.',show_alert=True)
+    action,value,token=match.groups()
+    step={'products':'product','pick':'product','save':'confirm'}.get(action,action)
+    data=await voucher_wizard_data(call,state,step,token)
+    if not data:return
+    try:
+        if action=='products':return await voucher_wizard_menu(call,state,int(value))
+        if action=='pick':
+            conn=db()
+            try:voucher_product_row(conn,int(value))
+            finally:conn.close()
+            await state.update_data(voucher_product_id=int(value),voucher_step='code')
+        elif action in {'discount','min','quota'}:
+            if value=='custom':
+                await state.set_state({'discount':OwnerState.voucher_discount,'min':OwnerState.voucher_min_spend,'quota':OwnerState.voucher_quota}[action])
+                text={'discount':'Kirim nominal diskon. Contoh: Rp15.000.','min':'Kirim minimum transaksi. Angka 0 berarti tanpa minimum.','quota':'Kirim kuota voucher. Angka 0 berarti tanpa batas.'}[action]
+                await safe_edit_or_answer(call,text,reply_markup=back_owner('owner:vouchers'))
+                return await safe_callback_notice(call)
+            allowed={'discount':{5000,10000,20000,50000},'min':{0,25000,50000,100000},'quota':{0,10,25,50,100}}
+            amount=int(value)
+            if amount not in allowed[action]:raise ValueError('Pilihan voucher tidak valid.')
+            field,next_step={'discount':('voucher_discount','min'),'min':('voucher_min_spend','quota'),'quota':('voucher_quota','peruser')}[action]
+            await state.update_data(**{field:amount,'voucher_step':next_step})
+            await state.set_state(None)
+        elif action=='peruser':
+            amount=int(value)
+            if amount not in {1,2,3,5}:raise ValueError('Batas per user tidak valid.')
+            await state.update_data(voucher_per_user=amount,voucher_step='days')
+        elif action=='days':
+            days=int(value)
+            if days not in {0,7,30,90}:raise ValueError('Masa aktif tidak valid.')
+            await state.update_data(voucher_days=days,voucher_step='new')
+        elif action=='new':
+            new_only=int(value)
+            if new_only not in {0,1}:raise ValueError('Target pelanggan tidak valid.')
+            until=(datetime.now(JAKARTA_TZ)+timedelta(days=data['voucher_days'])).isoformat(timespec='seconds') if data['voucher_days'] else ''
+            await state.update_data(voucher_new_only=new_only,voucher_expires_at=until,voucher_step='confirm')
+        elif action=='save':
+            conn=db()
+            try:
+                begin_immediate_retry(conn)
+                product=voucher_product_row(conn,int(data['voucher_product_id']))
+                conn.execute('''INSERT INTO vouchers(code,discount,min_spend,max_discount,usage_limit,
+                    per_user_limit,expires_at,active,product_id,variant_id,new_user_only)
+                    VALUES(?,?,?,0,?,?,?,1,?,0,?)''',(data['voucher_code'],data['voucher_discount'],data['voucher_min_spend'],
+                    data['voucher_quota'],data['voucher_per_user'],data['voucher_expires_at'],product['id'],data['voucher_new_only']))
+                ident=conn.execute('SELECT id FROM vouchers WHERE code=?',(data['voucher_code'],)).fetchone()[0]
+                conn.commit()
+            except Exception:conn.rollback();raise
+            finally:conn.close()
+            await state.clear()
+            await render_owner_voucher_detail(call,ident,created=True)
+            return await safe_callback_notice(call,'Voucher dibuat.')
+        else:raise ValueError('Pilihan voucher tidak valid.')
+        await voucher_wizard_menu(call,state)
+        await safe_callback_notice(call)
+    except (ValueError,KeyError,TypeError,OverflowError):
+        await safe_callback_notice(call,'Data atau produk voucher tidak valid. Buka Buat Voucher kembali.',show_alert=True)
+    except sqlite3.IntegrityError:
+        await safe_callback_notice(call,'Kode voucher sudah ada. Buat kembali dengan kode lain.',show_alert=True)
+    except sqlite3.Error:
+        logging.exception('Voucher owner storage failed')
+        await safe_callback_notice(call,'Voucher belum dapat disimpan. Periksa daftar voucher sebelum mencoba kembali.',show_alert=True)
 
 
 @router.message(OwnerState.voucher_discount)
-async def voucher_discount_input(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-    try:
-        value = int((message.text or "").replace(".", "").strip())
-        if value <= 0:
-            raise ValueError
-    except Exception:
-        return await message.answer("❌ Nominal diskon tidak valid.")
-
-    await state.update_data(voucher_discount=value)
-    await state.set_state(None)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Tanpa Minimum", callback_data="vbuild:min:0")],
-        [InlineKeyboardButton(text="Rp25.000", callback_data="vbuild:min:25000"),
-         InlineKeyboardButton(text="Rp50.000", callback_data="vbuild:min:50000")],
-        [InlineKeyboardButton(text="Rp100.000", callback_data="vbuild:min:100000"),
-         InlineKeyboardButton(text="Rp200.000", callback_data="vbuild:min:200000")],
-        [InlineKeyboardButton(text="✏️ Minimum Lain", callback_data="vbuild:min:custom")]
-    ])
-    await message.answer(
-        "Langkah 3 dari 7\nPilih minimum transaksi:",
-        reply_markup=kb
-    )
-
-
-async def voucher_minimum_menu(call: CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Tanpa Minimum", callback_data="vbuild:min:0")],
-        [InlineKeyboardButton(text="Rp25.000", callback_data="vbuild:min:25000"),
-         InlineKeyboardButton(text="Rp50.000", callback_data="vbuild:min:50000")],
-        [InlineKeyboardButton(text="Rp100.000", callback_data="vbuild:min:100000"),
-         InlineKeyboardButton(text="Rp200.000", callback_data="vbuild:min:200000")],
-        [InlineKeyboardButton(text="✏️ Minimum Lain", callback_data="vbuild:min:custom")]
-    ])
-    await call.message.edit_text(
-        "Langkah 3 dari 7\nPilih minimum transaksi:",
-        reply_markup=kb
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("vbuild:min:"))
-async def voucher_build_min(call: CallbackQuery, state: FSMContext):
-    value = call.data.split(":")[2]
-    if value == "custom":
-        await state.set_state(OwnerState.voucher_min_spend)
-        await safe_edit_or_answer(call, 
-            "✏️ <b>MINIMUM TRANSAKSI</b>\n\nKirim nominal minimum.",
-            reply_markup=back_owner(),
-            parse_mode="HTML"
-        )
-        return await call.answer()
-
-    await state.update_data(voucher_min_spend=int(value))
-    await state.set_state(None)
-    await voucher_quota_menu(call, state)
-
-
 @router.message(OwnerState.voucher_min_spend)
-async def voucher_min_input(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-    try:
-        value = max(0, int((message.text or "").replace(".", "").strip()))
-    except Exception:
-        return await message.answer("❌ Nominal tidak valid.")
-
-    await state.update_data(voucher_min_spend=value)
-    await state.set_state(None)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Tanpa Batas", callback_data="vbuild:quota:0")],
-        [InlineKeyboardButton(text="10x", callback_data="vbuild:quota:10"),
-         InlineKeyboardButton(text="25x", callback_data="vbuild:quota:25")],
-        [InlineKeyboardButton(text="50x", callback_data="vbuild:quota:50"),
-         InlineKeyboardButton(text="100x", callback_data="vbuild:quota:100")],
-        [InlineKeyboardButton(text="✏️ Kuota Lain", callback_data="vbuild:quota:custom")]
-    ])
-    await message.answer("Langkah 4 dari 7\nPilih kuota voucher:", reply_markup=kb)
-
-
-async def voucher_quota_menu(call: CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Tanpa Batas", callback_data="vbuild:quota:0")],
-        [InlineKeyboardButton(text="10x", callback_data="vbuild:quota:10"),
-         InlineKeyboardButton(text="25x", callback_data="vbuild:quota:25")],
-        [InlineKeyboardButton(text="50x", callback_data="vbuild:quota:50"),
-         InlineKeyboardButton(text="100x", callback_data="vbuild:quota:100")],
-        [InlineKeyboardButton(text="✏️ Kuota Lain", callback_data="vbuild:quota:custom")]
-    ])
-    await call.message.edit_text("Langkah 4 dari 7\nPilih kuota voucher:", reply_markup=kb)
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("vbuild:quota:"))
-async def voucher_build_quota(call: CallbackQuery, state: FSMContext):
-    value = call.data.split(":")[2]
-    if value == "custom":
-        await state.set_state(OwnerState.voucher_quota)
-        await safe_edit_or_answer(call, "Kirim jumlah kuota voucher.", reply_markup=back_owner())
-        return await call.answer()
-
-    await state.update_data(voucher_quota=int(value))
-    await state.set_state(None)
-    await voucher_peruser_menu(call, state)
-
-
 @router.message(OwnerState.voucher_quota)
-async def voucher_quota_input(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        return
-    try:
-        value = max(0, int((message.text or "").strip()))
-    except Exception:
-        return await message.answer("❌ Kuota tidak valid.")
-
-    await state.update_data(voucher_quota=value)
+async def voucher_custom_input(message: Message,state: FSMContext):
+    data=await voucher_wizard_data(message,state)
+    if not data:return
+    step=data.get('voucher_step')
+    if step not in {'discount','min','quota'}:return await message.answer('Form voucher sudah berubah. Buka menu Voucher kembali.')
+    raw=str(message.text or '').strip()
+    if not re.fullmatch(r'(?:rp\s*)?\d[\d.,\s]*',raw,re.I):return await message.answer('Gunakan nominal/kuota berupa angka, tanpa tanda minus.')
+    value=int(re.sub(r'\D','',raw))
+    maximum=1000000 if step=='quota' else 1000000000
+    if value>(maximum) or (value==0 and step=='discount'):
+        return await message.answer(f'Nilai harus antara {1 if step=="discount" else 0} dan {maximum:,}.')
+    field,next_step={'discount':('voucher_discount','min'),'min':('voucher_min_spend','quota'),'quota':('voucher_quota','peruser')}[step]
+    await state.update_data(**{field:value,'voucher_step':next_step})
     await state.set_state(None)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1x / User", callback_data="vbuild:peruser:1"),
-         InlineKeyboardButton(text="2x / User", callback_data="vbuild:peruser:2")],
-        [InlineKeyboardButton(text="3x / User", callback_data="vbuild:peruser:3"),
-         InlineKeyboardButton(text="5x / User", callback_data="vbuild:peruser:5")]
-    ])
-    await message.answer("Langkah 5 dari 7\nPilih limit per user:", reply_markup=kb)
+    await voucher_wizard_menu(message,state)
 
 
-async def voucher_peruser_menu(call: CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1x / User", callback_data="vbuild:peruser:1"),
-         InlineKeyboardButton(text="2x / User", callback_data="vbuild:peruser:2")],
-        [InlineKeyboardButton(text="3x / User", callback_data="vbuild:peruser:3"),
-         InlineKeyboardButton(text="5x / User", callback_data="vbuild:peruser:5")]
-    ])
-    await call.message.edit_text("Langkah 5 dari 7\nPilih limit per user:", reply_markup=kb)
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("vbuild:peruser:"))
-async def voucher_build_peruser(call: CallbackQuery, state: FSMContext):
-    value = int(call.data.split(":")[2])
-    await state.update_data(voucher_per_user=value)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="7 Hari", callback_data="vbuild:days:7"),
-         InlineKeyboardButton(text="30 Hari", callback_data="vbuild:days:30")],
-        [InlineKeyboardButton(text="90 Hari", callback_data="vbuild:days:90"),
-         InlineKeyboardButton(text="Tanpa Kedaluwarsa", callback_data="vbuild:days:0")]
-    ])
-    await safe_edit_or_answer(call, "Langkah 6 dari 7\nPilih masa aktif voucher:", reply_markup=kb)
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("vbuild:days:"))
-async def voucher_build_days(call: CallbackQuery, state: FSMContext):
-    days = int(call.data.split(":")[2])
-    await state.update_data(voucher_days=days)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Semua Pelanggan", callback_data="vbuild:new:0")],
-        [InlineKeyboardButton(text="🆕 Pelanggan Baru Saja", callback_data="vbuild:new:1")],
-    ])
-    await safe_edit_or_answer(call, 
-        "Langkah 7 dari 7\nPilih target pelanggan:",
-        reply_markup=kb
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("vbuild:new:"))
-async def voucher_build_finish(call: CallbackQuery, state: FSMContext):
-    new_only = int(call.data.split(":")[2])
-    data = await state.get_data()
-
-    code = data.get("voucher_code")
-    discount = int(data.get("voucher_discount", 0))
-    min_spend = int(data.get("voucher_min_spend", 0))
-    quota = int(data.get("voucher_quota", 0))
-    per_user = int(data.get("voucher_per_user", 1))
-    days = int(data.get("voucher_days", 0))
-
-    if not code or discount <= 0:
-        await state.clear()
-        return await call.answer("Data voucher tidak lengkap.", show_alert=True)
-
-    expires_at = ""
-    if days > 0:
-        expires_at = (datetime.now() + timedelta(days=days)).isoformat(timespec="seconds")
-
-    conn = db()
+async def render_owner_voucher_detail(call,ident,*,created=False):
+    conn=db()
     try:
-        conn.execute(
-            """INSERT INTO vouchers
-               (code, discount, min_spend, max_discount, usage_limit,
-                per_user_limit, expires_at, active, product_id, variant_id,
-                new_user_only)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                code, discount, min_spend, 0, quota,
-                per_user, expires_at, 1, 0, 0, new_only
-            )
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.rollback()
-        conn.close()
-        await state.clear()
-        return await call.answer("Kode voucher sudah ada.", show_alert=True)
-    conn.close()
-    await state.clear()
+        row=conn.execute('SELECT * FROM vouchers WHERE id=?',(ident,)).fetchone()
+        if not row:return await safe_callback_notice(call,'Voucher tidak ditemukan.',show_alert=True)
+        scope=voucher_scope_text(conn,row);used,_=voucher_usage_totals(conn,row)
+        try:until=payment_receipts.format_wib(row['expires_at']) if voucher_deadline(row['expires_at']) else 'Tanpa kedaluwarsa'
+        except (ValueError,TypeError):until='Masa aktif perlu diperiksa'
+    finally:conn.close()
+    text=('✅ <b>VOUCHER BERHASIL DIBUAT</b>' if created else '🎁 <b>DETAIL VOUCHER</b>')
+    text+=(f"\n\nKode: <code>{html.escape(row['code'])}</code>\n📦 Produk: <b>{html.escape(scope)}</b>\n"
+           f"Diskon: {rupiah(row['discount'])}\nMinimum: {rupiah(row['min_spend'])}\n"
+           f"Kuota terpakai/ditahan: {used} / {row['usage_limit'] or 'Tanpa batas'}\n"
+           f"Batas per user: {row['per_user_limit']}x\nBerakhir: {until}\n"
+           f"Status: {'Aktif' if row['active'] else 'Nonaktif'}\n"
+           'Produk yang tidak sesuai otomatis ditolak saat checkout.')
+    await safe_edit_or_answer(call,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📦 Atur Produk Voucher',callback_data=f'ownervoucher:products:{ident}:1')],
+        [InlineKeyboardButton(text='⬅️ Daftar Voucher',callback_data='ownervoucher:list:1')],
+        [InlineKeyboardButton(text='🏠 Menu Voucher',callback_data='owner:vouchers')]]),parse_mode='HTML')
 
-    await safe_edit_or_answer(call, 
-        "✅ <b>VOUCHER BERHASIL DIBUAT</b>\n\n"
-        f"Kode: <b>{html.escape(code)}</b>\n"
-        f"Diskon: <b>{rupiah(discount)}</b>\n"
-        f"Minimum: <b>{rupiah(min_spend)}</b>\n"
-        f"Kuota: <b>{quota or 'Tanpa batas'}</b>\n"
-        f"Per user: <b>{per_user}x</b>\n"
-        f"Masa aktif: <b>{days or 'Tanpa kedaluwarsa'}</b>\n"
-        f"Target: <b>{'Pelanggan baru' if new_only else 'Semua pelanggan'}</b>",
-        reply_markup=owner_menu(),
-        parse_mode="HTML"
-    )
-    await call.answer("Voucher dibuat.")
+
+@router.callback_query((F.data=='owner:vouchers') | F.data.startswith('ownervoucher:'))
+async def owner_voucher_management(call: CallbackQuery,state: FSMContext):
+    if not await voucher_owner_guard(call):return
+    parts=str(call.data or '').split(':')
+    try:
+        if call.data=='owner:vouchers':
+            clear_owner_input_session(call.from_user.id);await state.clear()
+            await safe_edit_or_answer(call,'🎁 <b>VOUCHER PRODUK</b>\n\nBuat voucher khusus produk atau tentukan produk untuk voucher yang sudah ada.',
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text='➕ Buat Voucher',callback_data='owner:add_voucher')],
+                    [InlineKeyboardButton(text='📋 Daftar & Atur Produk',callback_data='ownervoucher:list:1')],
+                    [InlineKeyboardButton(text='⬅️ Promo & Voucher',callback_data='owner:promo_menu')]]),parse_mode='HTML')
+        elif len(parts)==3 and parts[1]=='list':
+            page=max(1,min(100000,int(parts[2])));await state.clear();conn=db()
+            try:
+                count=conn.execute('SELECT COUNT(*) FROM vouchers').fetchone()[0];pages=max(1,(count+7)//8);page=min(page,pages)
+                rows=conn.execute('SELECT id,code FROM vouchers ORDER BY code COLLATE NOCASE,id LIMIT 8 OFFSET ?',((page-1)*8,)).fetchall()
+            finally:conn.close()
+            buttons=[[InlineKeyboardButton(text=row['code'],callback_data=f"ownervoucher:detail:{row['id']}")] for row in rows]
+            nav=[]
+            if page>1:nav.append(InlineKeyboardButton(text='⬅️',callback_data=f'ownervoucher:list:{page-1}'))
+            if page<pages:nav.append(InlineKeyboardButton(text='➡️',callback_data=f'ownervoucher:list:{page+1}'))
+            if nav:buttons.append(nav)
+            buttons.append([InlineKeyboardButton(text='⬅️ Menu Voucher',callback_data='owner:vouchers')])
+            await safe_edit_or_answer(call,f'🎁 <b>DAFTAR VOUCHER</b>\nHalaman {page}/{pages}\n\n'+('Pilih voucher.' if rows else 'Belum ada voucher.'),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),parse_mode='HTML')
+        elif len(parts)==3 and parts[1]=='detail':
+            await state.clear();await render_owner_voucher_detail(call,int(parts[2]))
+        elif len(parts)==4 and parts[1]=='products':
+            ident=int(parts[2]);page=max(1,min(100000,int(parts[3])));conn=db()
+            try:
+                row=conn.execute('SELECT code FROM vouchers WHERE id=?',(ident,)).fetchone()
+                if not row:raise ValueError('Voucher tidak ditemukan.')
+                where="active=1 AND COALESCE(product_type,'standard')!='tools_vip'"
+                count=conn.execute('SELECT COUNT(*) FROM products WHERE '+where).fetchone()[0];pages=max(1,(count+7)//8);page=min(page,pages)
+                products=conn.execute('SELECT id,name FROM products WHERE '+where+f' ORDER BY {product_list_order_sql(conn)} LIMIT 8 OFFSET ?',((page-1)*8,)).fetchall()
+            finally:conn.close()
+            buttons=[[InlineKeyboardButton(text=str(p['name'])[:55],callback_data=f"ownervoucher:pick:{ident}:{p['id']}")] for p in products]
+            nav=[]
+            if page>1:nav.append(InlineKeyboardButton(text='⬅️',callback_data=f'ownervoucher:products:{ident}:{page-1}'))
+            if page<pages:nav.append(InlineKeyboardButton(text='➡️',callback_data=f'ownervoucher:products:{ident}:{page+1}'))
+            if nav:buttons.append(nav)
+            buttons.append([InlineKeyboardButton(text='⬅️ Detail Voucher',callback_data=f'ownervoucher:detail:{ident}')])
+            await safe_edit_or_answer(call,f"📦 <b>PRODUK VOUCHER {html.escape(row['code'])}</b>\nHalaman {page}/{pages}\n\nPilih satu produk tujuan.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),parse_mode='HTML')
+        elif len(parts)==4 and parts[1]=='pick':
+            ident,product_id=int(parts[2]),int(parts[3]);conn=db()
+            try:
+                row=conn.execute('SELECT * FROM vouchers WHERE id=?',(ident,)).fetchone()
+                if not row:raise ValueError('Voucher tidak ditemukan.')
+                product=voucher_product_row(conn,product_id);old=voucher_scope_text(conn,row)
+                variant_id=int(row['variant_id'] or 0) if row['product_id']==product_id else 0
+            finally:conn.close()
+            token=secrets.token_hex(6)
+            await state.set_data({'voucher_assignment':{'id':ident,'old_product':row['product_id'],'old_variant':row['variant_id'],
+                'product_id':product_id,'variant_id':variant_id,'token':token,'created_at':time.time()}})
+            text=(f"📦 <b>KONFIRMASI PRODUK VOUCHER</b>\n\nKode: <code>{html.escape(row['code'])}</code>\n"
+                  f"Lama: {html.escape(old)}\nBaru: <b>{html.escape(product['name'])}</b>\n"
+                  +('Batas varian existing dipertahankan.' if variant_id else 'Berlaku untuk semua varian produk baru.')
+                  +'\n\nInvoice yang sudah dibuat tetap memakai harga dan voucher yang sudah tercatat.')
+            await safe_edit_or_answer(call,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='✅ Simpan Produk Voucher',callback_data='ownervoucher:save:'+token)],
+                [InlineKeyboardButton(text='❌ Batal',callback_data=f'ownervoucher:detail:{ident}')]]),parse_mode='HTML')
+        elif len(parts)==3 and parts[1]=='save':
+            draft=(await state.get_data()).get('voucher_assignment',{})
+            if not draft or parts[2]!=draft.get('token') or time.time()-draft['created_at']>VOUCHER_WIZARD_SECONDS:
+                raise ValueError('Konfirmasi sudah berubah/kedaluwarsa. Pilih produk voucher kembali.')
+            conn=db()
+            try:
+                begin_immediate_retry(conn)
+                row=conn.execute('SELECT * FROM vouchers WHERE id=?',(draft['id'],)).fetchone()
+                if not row or row['product_id']!=draft['old_product'] or row['variant_id']!=draft['old_variant']:
+                    raise ValueError('Voucher sudah berubah. Periksa detail sebelum menyimpan ulang.')
+                voucher_product_row(conn,draft['product_id'])
+                conn.execute('UPDATE vouchers SET product_id=?,variant_id=? WHERE id=?',(draft['product_id'],draft['variant_id'],draft['id']))
+                conn.commit()
+            except Exception:conn.rollback();raise
+            finally:conn.close()
+            await state.clear();await render_owner_voucher_detail(call,draft['id'])
+        else:raise ValueError('Pilihan voucher tidak valid.')
+        await safe_callback_notice(call)
+    except (ValueError,KeyError,TypeError,OverflowError) as exc:
+        await safe_callback_notice(call,str(exc) if isinstance(exc,ValueError) else 'Pilihan voucher tidak valid.',show_alert=True)
+    except sqlite3.Error:
+        logging.exception('Voucher management storage failed')
+        await safe_callback_notice(call,'Menu voucher belum dapat diproses. Periksa daftar voucher sebelum mencoba kembali.',show_alert=True)
 
 
 @router.callback_query(F.data == "owner:complete_order")
@@ -29286,18 +29395,9 @@ async def reply_menu_home(message: Message, bot: Bot, state: FSMContext):
 
 @router.message(F.text == "🎁 Voucher")
 async def reply_menu_voucher(message: Message, bot: Bot):
-    if not await is_channel_member(bot, message.from_user.id):
-        return await send_join_required(message)
-
-    await message.answer(
-        "🎁 <b>VOUCHER</b>\n\n"
-        "Voucher dapat digunakan saat checkout jika tersedia.\n"
-        "Pilih produk terlebih dahulu untuk memulai pesanan.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🏷️ Lihat Produk", callback_data="products")]
-        ]),
-        parse_mode="HTML"
-    )
+    if not await is_channel_member(bot,message.from_user.id):return await send_join_required(message)
+    text,keyboard=voucher_public_page()
+    await message.answer(text,reply_markup=keyboard,parse_mode='HTML')
 
 
 @router.message(F.text == "📁 Laporan Stok")
@@ -35624,7 +35724,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.18"
+EXPECTED_SOURCE_VERSION = "17.19"
 
 
 def source_integrity_self_test():

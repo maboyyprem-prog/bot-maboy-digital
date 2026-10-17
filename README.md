@@ -1,6 +1,25 @@
-# MaboyyDigital v17.18
+# MaboyyDigital v17.19
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+
+## Voucher khusus produk
+
+Buka **/owner → Pelanggan → Promo & Voucher → Voucher → Buat Voucher**.
+Pilih produk A–Z, isi kode dan ketentuan, lalu periksa dan **Simpan Voucher**.
+Voucher baru hanya berlaku pada produk terpilih, termasuk varian aktifnya.
+Produk lain ditolak sebelum invoice dibuat atau saldo dipotong.
+
+Voucher lama tetap tersimpan. Untuk menentukan produknya, buka **Daftar & Atur
+Produk → pilih kode → Atur Produk Voucher → pilih produk → konfirmasi**.
+Voucher lama yang global tetap global sampai owner memilih produknya; bot tidak
+menebak produk tujuan. Invoice yang sudah dibuat mempertahankan harga dan voucher
+yang telah tercatat. Pengaturan baru berlaku untuk checkout baru.
+
+Jika voucher ditolak, klik **Ganti Voucher** atau **Lanjut Tanpa Voucher**.
+Klik pembayaran berulang tidak otomatis mengubahnya menjadi harga penuh.
+Kuota ditahan oleh invoice pending dan dilepas saat dibatalkan/kedaluwarsa sesuai
+metode pembayaran; pemakaian dicatat sekali saat pembayaran sah. Masa aktif tampil
+dalam WIB. Tidak ada Variables, migration, atau file runtime baru; schema tetap 202.
 
 ## Daftar produk A–Z
 
@@ -98,7 +117,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.18 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.19 yang konsisten.
 
 ## Jalankan
 
@@ -301,7 +320,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.18; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.19; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -309,7 +328,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.18: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.19: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed
