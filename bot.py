@@ -230,7 +230,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.17"
+BOT_VERSION = "17.18"
 SCHEMA_VERSION = 202
 
 CHECKOUT_TERMS_SHORT = (
@@ -9466,7 +9466,7 @@ async def backup_loop(bot: Bot):
 
 def build_stock_text() -> str:
     conn = db()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT
             p.name AS product_name,
             v.name AS variant_name,
@@ -9478,7 +9478,7 @@ def build_stock_text() -> str:
         FROM product_variants v
         JOIN products p ON p.id=v.product_id
         WHERE p.active=1 AND v.active=1
-        ORDER BY p.id, v.id
+        ORDER BY {product_list_order_sql(conn,alias='p')}, {product_list_order_sql(conn,alias='v')}
     """).fetchall()
     conn.close()
 
@@ -9494,11 +9494,11 @@ def build_stock_text() -> str:
         for row in rows:
             if current_product != row["product_name"]:
                 current_product = row["product_name"]
-                lines.append(f"\n<b>{current_product}</b>")
+                lines.append(f"\n<b>{html.escape(current_product)}</b>")
             available = max(0, int(row["stock"]) - int(row["reserved_stock"] or 0))
             icon = "✅" if available > 0 else "❌"
             lines.append(
-                f"{icon} {row['variant_name']} — "
+                f"{icon} {html.escape(row['variant_name'])} — "
                 f"<b>{available}</b> stok • {rupiah(row['price'])}"
             )
 
@@ -10188,11 +10188,13 @@ def product_name_az_compare(left, right) -> int:
     return (left>right)-(left<right)
 
 
-def product_list_order_sql(conn, *, popular: bool = False) -> str:
-    """One alphabetical order for pages, global numbers and reply shortcuts."""
+def product_list_order_sql(conn, *, alias: str = "") -> str:
+    """One alphabetical order for catalog, variants, reports and owner selectors."""
+    if alias and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*",alias):
+        raise ValueError("Invalid catalog table alias")
     conn.create_collation("PRODUCT_NAME_AZ",product_name_az_compare)
-    prefix="sold DESC, " if popular else ""
-    return prefix+"COALESCE(name,'') COLLATE PRODUCT_NAME_AZ, id"
+    prefix=alias+"." if alias else ""
+    return f"COALESCE({prefix}name,'') COLLATE PRODUCT_NAME_AZ, {prefix}id"
 
 
 def user_reply_menu(view: str = "all", *, product_ids=None):
@@ -10200,7 +10202,7 @@ def user_reply_menu(view: str = "all", *, product_ids=None):
     if product_ids is None:
         conn=db()
         try:
-            order_sql=product_list_order_sql(conn,popular=view=="popular")
+            order_sql=product_list_order_sql(conn)
             rows=conn.execute(
                 f"SELECT id FROM products WHERE active=1 {product_view_filter(view)} "
                 f"ORDER BY {order_sql} LIMIT 25"
@@ -10921,7 +10923,7 @@ async def owner_product_error_view(call: CallbackQuery, feature: str, exc: Excep
 def owner_delete_products_keyboard():
     conn=db()
     rows=conn.execute(
-        "SELECT id,name FROM products WHERE active=1 ORDER BY id"
+        f"SELECT id,name FROM products WHERE active=1 ORDER BY {product_list_order_sql(conn)}"
     ).fetchall()
     conn.close()
 
@@ -10939,7 +10941,7 @@ def owner_delete_products_keyboard():
 def owner_stock_products_keyboard():
     conn=db()
     rows=conn.execute(
-        "SELECT id,name FROM products WHERE active=1 ORDER BY id"
+        f"SELECT id,name FROM products WHERE active=1 ORDER BY {product_list_order_sql(conn)}"
     ).fetchall()
     conn.close()
 
@@ -10957,10 +10959,10 @@ def owner_stock_products_keyboard():
 def owner_stock_variants_keyboard(product_id: int):
     conn=db()
     rows=conn.execute(
-        """SELECT id,name,stock,reserved_stock
+        f"""SELECT id,name,stock,reserved_stock
            FROM product_variants
            WHERE product_id=? AND active=1
-           ORDER BY id""",
+           ORDER BY {product_list_order_sql(conn)}""",
         (int(product_id),)
     ).fetchall()
     conn.close()
@@ -12815,10 +12817,10 @@ def flash_owner_products_keyboard():
     expire_finished_flash_sales(conn)
     conn.commit()
     rows=conn.execute(
-        """SELECT id,name,is_flash_sale,flash_sale_until_ts
+        f"""SELECT id,name,is_flash_sale,flash_sale_until_ts
            FROM products
            WHERE active=1
-           ORDER BY id"""
+           ORDER BY {product_list_order_sql(conn)}"""
     ).fetchall()
     conn.close()
 
@@ -12891,8 +12893,8 @@ def products_keyboard(page: int = 1, total_pages: int = 1, view: str = "all",
 def variants_keyboard(product_id):
     conn = db()
     rows = conn.execute(
-        """SELECT * FROM product_variants
-           WHERE product_id=? AND active=1 ORDER BY id""",
+        f"""SELECT * FROM product_variants
+           WHERE product_id=? AND active=1 ORDER BY {product_list_order_sql(conn)}""",
         (product_id,)
     ).fetchall()
     conn.close()
@@ -20412,7 +20414,7 @@ async def owner_free_claim_start(call: CallbackQuery):
 
     conn=db()
     products=conn.execute(
-        "SELECT * FROM products WHERE active=1 ORDER BY id"
+        f"SELECT * FROM products WHERE active=1 ORDER BY {product_list_order_sql(conn)}"
     ).fetchall()
     stock_map=product_stock_map(conn)
     conn.close()
@@ -20474,9 +20476,9 @@ async def owner_free_product_pick(call: CallbackQuery):
         (product_id,)
     ).fetchone()
     variants=conn.execute(
-        """SELECT * FROM product_variants
+        f"""SELECT * FROM product_variants
            WHERE product_id=? AND active=1
-           ORDER BY id""",
+           ORDER BY {product_list_order_sql(conn)}""",
         (product_id,)
     ).fetchall()
     conn.close()
@@ -20979,7 +20981,7 @@ async def render_owner_managed_products(call: CallbackQuery,state: FSMContext,pa
         where="p.active=1"+(" AND p.product_type='famhead'" if view=="famhead" else "")
         total=int(conn.execute("SELECT COUNT(*) FROM products p WHERE "+where).fetchone()[0])
         pages=max(1,(total+9)//10);page=max(1,min(page,pages))
-        rows=conn.execute(MANAGED_PRODUCTS_SELECT+" WHERE "+where+" ORDER BY p.id LIMIT 10 OFFSET ?",
+        rows=conn.execute(MANAGED_PRODUCTS_SELECT+" WHERE "+where+f" ORDER BY {product_list_order_sql(conn,alias='p')} LIMIT 10 OFFSET ?",
                           ((page-1)*10,)).fetchall()
     finally:conn.close()
     clear_owner_input_session(call.from_user.id)
@@ -21052,7 +21054,7 @@ async def render_owner_managed_variants(call: CallbackQuery,state: FSMContext,pr
         product=managed_edit_row(conn,"product",product_id)
         total=int(conn.execute("SELECT COUNT(*) FROM product_variants WHERE product_id=? AND active=1",(product_id,)).fetchone()[0])
         pages=max(1,(total+9)//10);page=max(1,min(page,pages))
-        rows=conn.execute("SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY id LIMIT 10 OFFSET ?",
+        rows=conn.execute(f"SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY {product_list_order_sql(conn)} LIMIT 10 OFFSET ?",
                           (product_id,(page-1)*10)).fetchall()
     finally:conn.close()
     if not product:
@@ -21575,7 +21577,7 @@ async def _show_product_list_locked(call, title, filter_sql="", *, page: int = 1
         if view=="flash":
             expire_finished_flash_sales(conn)
             conn.commit()
-        order_sql=product_list_order_sql(conn,popular=view=="popular")
+        order_sql=product_list_order_sql(conn)
         selected=conn.execute(
             f"SELECT id FROM products WHERE active=1 {filter_sql} ORDER BY {order_sql}"
         ).fetchall()
@@ -21745,7 +21747,7 @@ async def product_detail(call: CallbackQuery):
         conn=db()
         product=conn.execute("SELECT * FROM products WHERE id=? AND active=1",(product_id,)).fetchone()
         if not product_is_available(product):return await safe_callback_notice(call,"Produk tidak tersedia / masa Flash Sale telah berakhir.",show_alert=True)
-        variants=conn.execute("SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY id",(product_id,)).fetchall()
+        variants=conn.execute(f"SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY {product_list_order_sql(conn)}",(product_id,)).fetchall()
         sold=sync_product_sold_from_history(conn,product_id)
         conn.commit()
     except sqlite3.Error:
@@ -23900,12 +23902,12 @@ async def resend_order_delivery(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "stock_report")
 async def stock_report(call: CallbackQuery):
     conn = db()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT p.name AS product_name, v.name AS variant_name, v.stock, v.reserved_stock
         FROM product_variants v
         JOIN products p ON p.id=v.product_id
         WHERE p.active=1 AND v.active=1
-        ORDER BY p.id, v.id
+        ORDER BY {product_list_order_sql(conn,alias='p')}, {product_list_order_sql(conn,alias='v')}
     """).fetchall()
     conn.close()
 
@@ -23913,7 +23915,7 @@ async def stock_report(call: CallbackQuery):
     for row in rows:
         available = max(0, int(row["stock"]) - int(row["reserved_stock"] or 0))
         icon = "✅" if available > 0 else "❌"
-        lines.append(f"{icon} {row['product_name']} — {row['variant_name']}: <b>{available}</b>")
+        lines.append(f"{icon} {html.escape(row['product_name'])} — {html.escape(row['variant_name'])}: <b>{available}</b>")
     lines.append(f"\n<i>{STORE_FOOTER}</i>")
 
     await safe_edit_or_answer(call, "\n".join(lines), reply_markup=back_home(), parse_mode="HTML")
@@ -28047,7 +28049,7 @@ async def owner_stock_fulfill_pending(call: CallbackQuery, bot: Bot):
 def owner_variant_button_products_keyboard():
     conn = db()
     rows = conn.execute(
-        "SELECT id, name FROM products WHERE active=1 ORDER BY id"
+        f"SELECT id, name FROM products WHERE active=1 ORDER BY {product_list_order_sql(conn)}"
     ).fetchall()
     conn.close()
 
@@ -28095,9 +28097,9 @@ async def owner_variant_button_product(call: CallbackQuery):
         (product_id,)
     ).fetchone()
     rows = conn.execute(
-        """SELECT * FROM product_variants
+        f"""SELECT * FROM product_variants
            WHERE product_id=? AND active=1
-           ORDER BY id""",
+           ORDER BY {product_list_order_sql(conn)}""",
         (product_id,)
     ).fetchall()
     conn.close()
@@ -28238,7 +28240,7 @@ async def owner_set_price(call: CallbackQuery, state: FSMContext):
 
         conn=db()
         products=conn.execute(
-            "SELECT id,name FROM products WHERE active=1 ORDER BY id"
+            f"SELECT id,name FROM products WHERE active=1 ORDER BY {product_list_order_sql(conn)}"
         ).fetchall()
         conn.close()
 
@@ -28287,7 +28289,7 @@ async def owner_set_price_product(call: CallbackQuery,state: FSMContext):
     product_id=numbers[0];conn=db()
     try:
         product=conn.execute("SELECT id,name FROM products WHERE id=? AND active=1",(product_id,)).fetchone()
-        variants=conn.execute("SELECT id,name,price FROM product_variants WHERE product_id=? AND active=1 ORDER BY id",(product_id,)).fetchall()
+        variants=conn.execute(f"SELECT id,name,price FROM product_variants WHERE product_id=? AND active=1 ORDER BY {product_list_order_sql(conn)}",(product_id,)).fetchall()
     finally:conn.close()
     if not product:return await call.answer("Produk sudah tidak tersedia.",show_alert=True)
     clear_owner_input_session(call.from_user.id)
@@ -28475,10 +28477,10 @@ async def owner_delete_select(call: CallbackQuery):
         return await call.answer("Produk tidak ditemukan.", show_alert=True)
 
     variants = conn.execute(
-        """SELECT id, name, stock, reserved_stock
+        f"""SELECT id, name, stock, reserved_stock
            FROM product_variants
            WHERE product_id=? AND active=1
-           ORDER BY id""",
+           ORDER BY {product_list_order_sql(conn)}""",
         (product_id,)
     ).fetchall()
 
@@ -28613,7 +28615,7 @@ async def owner_mark_popular(call: CallbackQuery, state: FSMContext):
         await state.clear()
         conn=db()
         rows=conn.execute(
-            "SELECT id,name,is_popular FROM products WHERE active=1 ORDER BY id"
+            f"SELECT id,name,is_popular FROM products WHERE active=1 ORDER BY {product_list_order_sql(conn)}"
         ).fetchall()
         conn.close()
 
@@ -29202,7 +29204,7 @@ async def owner_search_products_input(message: Message, state: FSMContext):
     conn=db()
     rows=conn.execute(
         MANAGED_PRODUCTS_SELECT+
-        " WHERE LOWER(p.name) LIKE LOWER(?) ORDER BY p.active DESC,p.id DESC LIMIT 20",
+        f" WHERE LOWER(p.name) LIKE LOWER(?) ORDER BY {product_list_order_sql(conn,alias='p')} LIMIT 20",
         (f"%{q}%",)
     ).fetchall()
     conn.close()
@@ -29310,7 +29312,7 @@ async def reply_menu_stock(message: Message, bot: Bot, state: FSMContext = None)
            FROM product_variants v
            JOIN products p ON p.id=v.product_id
            WHERE p.active=1 AND v.active=1 AND {product_available_sql('p')}
-           ORDER BY p.id, v.id"""
+           ORDER BY {product_list_order_sql(conn,alias='p')}, {product_list_order_sql(conn,alias='v')}"""
     ).fetchall()
     conn.close()
 
@@ -29394,14 +29396,14 @@ async def reply_menu_product_number(message: Message, bot: Bot, state: FSMContex
                     (product_ids[index-1],)
                 ).fetchone()
         else:
-            order_sql=product_list_order_sql(conn,popular=view=="popular")
+            order_sql=product_list_order_sql(conn)
             product=conn.execute(
                 f"SELECT * FROM products WHERE active=1 {filter_sql} "
                 f"ORDER BY {order_sql} LIMIT 1 OFFSET ?",(index-1,)
             ).fetchone()
         if product:
             variants=conn.execute(
-                "SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY id",
+                f"SELECT * FROM product_variants WHERE product_id=? AND active=1 ORDER BY {product_list_order_sql(conn)}",
                 (int(product["id"]),)
             ).fetchall()
     except sqlite3.Error:
@@ -30357,7 +30359,7 @@ async def owner_bundles(call: CallbackQuery):
         return await call.answer("Akses ditolak.",show_alert=True)
 
     conn=db()
-    rows=conn.execute("SELECT * FROM products WHERE active=1 ORDER BY id LIMIT 30").fetchall()
+    rows=conn.execute(f"SELECT * FROM products WHERE active=1 ORDER BY {product_list_order_sql(conn)} LIMIT 30").fetchall()
     conn.close()
     kb=InlineKeyboardBuilder()
     for row in rows:
@@ -30377,7 +30379,7 @@ async def owner_bundle_first(call: CallbackQuery, state: FSMContext):
     first=int(call.data.split(":")[1])
     await state.update_data(bundle_first=first)
     conn=db()
-    rows=conn.execute("SELECT * FROM products WHERE active=1 AND id!=? ORDER BY id LIMIT 30",(first,)).fetchall()
+    rows=conn.execute(f"SELECT * FROM products WHERE active=1 AND id!=? ORDER BY {product_list_order_sql(conn)} LIMIT 30",(first,)).fetchall()
     conn.close()
     kb=InlineKeyboardBuilder()
     for row in rows:
@@ -31482,7 +31484,7 @@ async def owner_product_stats(call: CallbackQuery):
 
     conn=db()
     rows=conn.execute(
-        """SELECT p.id,p.name,p.sold,
+        f"""SELECT p.id,p.name,p.sold,
                   COUNT(DISTINCT v.id) AS variants,
                   COALESCE(SUM(CASE WHEN i.status='available' THEN 1 ELSE 0 END),0) AS available
            FROM products p
@@ -31490,7 +31492,7 @@ async def owner_product_stats(call: CallbackQuery):
            LEFT JOIN inventory_items i ON i.variant_id=v.id
            WHERE p.active=1
            GROUP BY p.id,p.name,p.sold
-           ORDER BY p.sold DESC,p.id
+           ORDER BY {product_list_order_sql(conn,alias='p')}
            LIMIT 20"""
     ).fetchall()
     conn.close()
@@ -31770,7 +31772,7 @@ async def owner_popular_toggle(call: CallbackQuery):
         fake_state=None
         conn=db()
         rows=conn.execute(
-            "SELECT id,name,is_popular FROM products WHERE active=1 ORDER BY id"
+            f"SELECT id,name,is_popular FROM products WHERE active=1 ORDER BY {product_list_order_sql(conn)}"
         ).fetchall()
         conn.close()
         kb=InlineKeyboardMarkup(inline_keyboard=[
@@ -32039,16 +32041,16 @@ async def render_owner_stock_delete_catalog(call: CallbackQuery, state: FSMConte
     page=max(1,min(100000,int(page)));conn=db()
     try:
         if product_id:
-            rows=conn.execute("""SELECT v.id,v.name FROM product_variants v JOIN products p ON p.id=v.product_id
+            rows=conn.execute(f"""SELECT v.id,v.name FROM product_variants v JOIN products p ON p.id=v.product_id
                 WHERE p.id=? AND p.active=1 AND v.active=1 AND LOWER(COALESCE(p.fulfillment_mode,'ready'))!='preorder'
-                AND LOWER(COALESCE(p.product_type,'standard'))!='famhead' ORDER BY v.id""",(product_id,)).fetchall()
+                AND LOWER(COALESCE(p.product_type,'standard'))!='famhead' ORDER BY {product_list_order_sql(conn,alias='v')}""",(product_id,)).fetchall()
             action='ownerstockdeletevariants:'+str(product_id)+':'
             pick='ownerstockdeletevar:';title='Pilih varian';back='owner:delete_stock'
         else:
-            rows=conn.execute("""SELECT p.id,p.name FROM products p WHERE p.active=1
+            rows=conn.execute(f"""SELECT p.id,p.name FROM products p WHERE p.active=1
                 AND LOWER(COALESCE(p.fulfillment_mode,'ready'))!='preorder'
                 AND LOWER(COALESCE(p.product_type,'standard'))!='famhead'
-                AND EXISTS(SELECT 1 FROM product_variants v WHERE v.product_id=p.id AND v.active=1) ORDER BY p.id""").fetchall()
+                AND EXISTS(SELECT 1 FROM product_variants v WHERE v.product_id=p.id AND v.active=1) ORDER BY {product_list_order_sql(conn,alias='p')}""").fetchall()
             action='ownerstockdeleteproducts:';pick='ownerstockdeleteproduct:';title='Pilih produk';back='owner:back_products'
     finally:conn.close()
     pages=max(1,(len(rows)+7)//8);page=min(page,pages)
@@ -35622,7 +35624,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.17"
+EXPECTED_SOURCE_VERSION = "17.18"
 
 
 def source_integrity_self_test():
