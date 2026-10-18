@@ -1,6 +1,37 @@
-# MaboyyDigital v17.19
+# MaboyyDigital v17.20
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+
+## Cek MLBB di /tools
+
+User membuka **/tools → 🎮 Cek MLBB → Mulai Cek**, lalu mengirim User ID dan Zone ID
+secara berurutan. VIP existing Rp20.000/bulan atau akses permanen dari owner berlaku;
+VIP habis diarahkan ke pembelian/perpanjangan existing. Owner dapat mengecek tanpa
+berlangganan. Tidak ada command, wallet, paket VIP, atau potongan saldo baru.
+
+Adapter memakai [ALU API — Name Check](https://aluu.in/docs): nickname/negara dan bonus
+top-up pertama dibaca melalui dua endpoint GET dengan header `x-api-key`.
+`reached_limit=true` berarti bonus sudah digunakan; field yang hilang, ambigu, atau
+gagal dibaca ditampilkan **⚠️**. Kontrak ini belum mendukung Weekly Elite/Monthly Epic;
+keduanya tetap ⚠️. Nama provider dan konfigurasi hanya tampil kepada owner.
+
+Railway: tambahkan **MLBB_API_KEY** dari akun ALU, whitelist IP keluar server pada
+dashboard API, lalu **/tools → Cek MLBB → Status API → Kembali → Aktifkan**.
+Jangan kirim key melalui Telegram atau masukkan ke GitHub. Default fitur nonaktif.
+Semua Variables baru ada di `.env.example`: `MLBB_ENABLED=false`,
+`MLBB_HTTP_TIMEOUT_SECONDS=12`, `MLBB_CACHE_SECONDS=60`, `MLBB_DAILY_LIMIT=20`,
+`MLBB_COOLDOWN_SECONDS=10`; selain key, nilainya opsional. Toggle/limit owner disimpan
+di SQLite dan mengutamakan pengaturan owner yang sudah tersimpan.
+
+Kuota API mengikuti akun provider, berbeda dari limit user bot. Satu cek memakai
+hingga dua request; menu Status API juga memakai kuota dan dicache 60 detik.
+Batas harian user reset pukul 00.00 WIB. Owner dapat mengatur limit, melihat statistik,
+dan menonaktifkan akses user. Cache hasil singkat, timeout dan batas request mencegah
+spam. User ID/Zone ID hanya diteruskan ke endpoint tetap, tanpa mengambil URL input.
+Schema **203** menambahkan pencatatan pemakaian checker; tabel VIP/wallet tidak diubah.
+
+Pengujian memakai mock API. Koneksi akun/kuota dan hasil akun MLBB nyata tetap harus
+divalidasi setelah key dan whitelist dipasang; rilis tidak mengklaim uji live.
 
 ## Voucher khusus produk
 
@@ -117,7 +148,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.19 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.20 yang konsisten.
 
 ## Jalankan
 
@@ -320,7 +351,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.19; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.20; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -328,7 +359,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.19: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.20: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed

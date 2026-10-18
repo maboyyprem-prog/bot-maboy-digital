@@ -76,6 +76,14 @@ TEMPMAIL_ENABLED = os.getenv("TEMPMAIL_ENABLED", "true").strip().lower() == "tru
 TEMPMAIL_PROVIDER = os.getenv("TEMPMAIL_PROVIDER", "grabmail").strip().lower() or "grabmail"
 TEMPMAIL_ENCRYPTION_KEY = os.getenv("TEMPMAIL_ENCRYPTION_KEY", "").strip()
 TEMPMAIL_TIMEOUT_SECONDS = env_int("TEMPMAIL_TIMEOUT_SECONDS", 12, 3, 30)
+# Documented read-only MLBB checker; credentials stay in Railway Variables.
+# Contract: https://aluu.in/docs (Name Check). No game purchase endpoints.
+MLBB_API_KEY = os.getenv("MLBB_API_KEY", "").strip()
+MLBB_ENABLED = os.getenv("MLBB_ENABLED", "false").strip().lower() == "true"
+MLBB_HTTP_TIMEOUT_SECONDS = env_int("MLBB_HTTP_TIMEOUT_SECONDS", 12, 3, 30)
+MLBB_CACHE_SECONDS = env_int("MLBB_CACHE_SECONDS", 60, 5, 120)
+MLBB_DAILY_LIMIT = env_int("MLBB_DAILY_LIMIT", 20, 1, 1000)
+MLBB_COOLDOWN_SECONDS = env_int("MLBB_COOLDOWN_SECONDS", 10, 3, 300)
 ADMIN_ID = env_int("ADMIN_ID",0)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").replace("@", "")
 DEFAULT_PAYMENT_NOTE = os.getenv("PAYMENT_NOTE", "QRIS Maboyy Digital").strip()
@@ -230,8 +238,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.19"
-SCHEMA_VERSION = 202
+BOT_VERSION = "17.20"
+SCHEMA_VERSION = 203
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1133,6 +1141,14 @@ def init_db():
         activated_at REAL,access_expires_at REAL,created_at REAL NOT NULL,updated_at REAL NOT NULL,
         FOREIGN KEY(order_id) REFERENCES orders(id))''')
     cur.execute('CREATE INDEX IF NOT EXISTS idx_tools_vip_buyer ON tools_vip_purchases(user_id,created_at)')
+    # Read-only checker usage only: existing VIP, wallet and payment tables stay intact.
+    cur.execute('''CREATE TABLE IF NOT EXISTS tools_mlbb_checks(
+        id TEXT PRIMARY KEY, user_id INTEGER NOT NULL CHECK(user_id>0),
+        created_at REAL NOT NULL, finished_at REAL,
+        outcome TEXT NOT NULL DEFAULT 'pending', error_code TEXT NOT NULL DEFAULT '',
+        http_status INTEGER NOT NULL DEFAULT 0,
+        cache_hit INTEGER NOT NULL DEFAULT 0 CHECK(cache_hit IN (0,1)))''')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_tools_mlbb_usage ON tools_mlbb_checks(user_id,created_at)')
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tools_user_reviews (
             correlation_id TEXT PRIMARY KEY,
@@ -9987,6 +10003,13 @@ class ToolsUserState(StatesGroup):
     magic_link = State()
 
 
+class CekMLBBState(StatesGroup):
+    user_id = State()
+    zone_id = State()
+    checking = State()
+    owner_limit = State()
+
+
 
 class OwnerState(StatesGroup):
     add_product = State()
@@ -10786,7 +10809,7 @@ class CommandKeyboardMiddleware(BaseMiddleware):
                 return await handler(CommandMenuMessage.wrap(event),data)
         elif isinstance(event,CallbackQuery) and (str(event.data or "").startswith(
                 (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,bank_accounts.PREFIX,klikqris_gateway.PREFIX,
-                 "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","toolsaccess","tm:"))
+                 "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","toolsaccess","tm:","cekml:"))
                 or getattr(getattr(data.get("handler"),"callback",None),"__name__","").startswith(
                     ("owner_","user_tools_"))):
             main_menu=False
@@ -13215,6 +13238,7 @@ def shopping_navigation_states() -> set:
         otp_smscode.OTPState.topup_amount.state, otp_smscode.OTPState.topup_proof.state,
         *(item.state for item in sosmed_ui.SosmedOrderState.__all_states__),
         *(item.state for item in bank_accounts.BankState.__all_states__),
+        *(item.state for item in CekMLBBState.__all_states__),
         CheckoutState.waiting_note.state, CheckoutState.waiting_voucher.state,
         CheckoutState.waiting_payment_proof.state, CheckoutState.waiting_family_gmail.state,
         ReviewState.waiting_comment.state, LoginProofState.waiting_photo.state,
@@ -15672,6 +15696,7 @@ async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str
 
 def owner_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎮 Cek MLBB", callback_data="cekml:menu")],
         [InlineKeyboardButton(text="⚡ AM Pro Otomatis • 1 Tahun", callback_data=auto_am_start_token())],
         [InlineKeyboardButton(text="✅ Magic Link / Verifikasi",callback_data="tools:verification")],
         [InlineKeyboardButton(text="🚀 Apply Premium",callback_data="tools:pro_license"),
@@ -17486,7 +17511,7 @@ async def render_tools_vip_menu(call: CallbackQuery):
           'Masa aktif: <b>1 bulan</b>\n'
           f"VIP Anda: <b>{html.escape(tools_vip_status_text(call.from_user.id))}</b>\n"
           f"Saldo Kamu: <b>{rupiah(get_balance(call.from_user.id))}</b>\n\n"
-          'Akses Magic Link dan aktivasi premium AM mengikuti batas penggunaan /tools.\n'
+          'Akses Magic Link, aktivasi premium AM, dan Cek MLBB mengikuti batas penggunaan /tools.\n'
           'Perpanjangan dibayar saat Anda memilih membelinya.')
     if access and access['enabled'] and access['vip_expires_at'] is None:
         return await safe_edit_or_answer(call,text+'\n\nAkses dari owner sudah aktif; tidak perlu membeli VIP.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ /tools',callback_data='utools:home')]]),parse_mode='HTML')
@@ -17786,7 +17811,8 @@ def tools_user_success_flow(user_id: int, correlation_id: str=""):
 
 
 def tools_user_menu(user_id: int):
-    rows=[[InlineKeyboardButton(text='👑 VIP • Rp20.000 / bulan',callback_data='utools:vip')]]
+    rows=[[InlineKeyboardButton(text="🎮 Cek MLBB", callback_data="cekml:menu")],
+          [InlineKeyboardButton(text='👑 VIP • Rp20.000 / bulan',callback_data='utools:vip')]]
     if tools_user_allowed(user_id):
         rows[0:0]=[
             [InlineKeyboardButton(text="📧 Magic Link",callback_data="utools:magic")],
@@ -17836,7 +17862,7 @@ def tools_user_welcome_text(user_id: int = 0) -> str:
          f"💰 Harga: <b>Rp20.000 / bulan</b>\n💵 Saldo Kamu: <b>{rupiah(get_balance(user_id))}</b>\n\n")
     if not tools_user_allowed(user_id):
         return ('🧰 <b>TOOLS MABOYY DIGITAL</b>\n\n'+vip+
-                'Pilih VIP untuk membeli akses Magic Link dan aktivasi premium AM selama satu bulan.\n'
+                'Pilih VIP untuk membeli akses Magic Link, aktivasi premium AM, dan Cek MLBB selama satu bulan.\n'
                 'Pembayaran tersedia melalui saldo bot atau ⚡ QRIS Otomatis.')
     stats=tools_stats_snapshot(user_id)
     return ("👑 <b>VIP KHUSUS /TOOLS</b>\n\n"
@@ -18208,6 +18234,527 @@ async def user_tools_rate_submit(call: CallbackQuery,state: FSMContext):
             [InlineKeyboardButton(text="⭐ Rating Toko",callback_data=f"utools:rating:{parts[2]}")],
         ]),parse_mode="HTML")
     await safe_callback_notice(call,"Rating tersimpan." if created else "Rating sebelumnya sudah tersimpan.")
+
+
+# =========================
+# /tools MLBB checker (isolated cekml: callbacks and FSM, no slash command)
+# =========================
+CEKML_API_BASE = "https://aluu.in/api/check"
+CEKML_TIERS = ("50+50", "150+150", "250+250", "500+500")
+_CEKML_CACHE = {}
+
+
+class CekMLBBError(Exception):
+    def __init__(self, code, http_status=0):
+        self.code = code
+        self.http_status = int(http_status)
+        super().__init__(code)  # Never retain/print a provider body or credential.
+
+
+def cekml_number(key, default, minimum, maximum):
+    try:
+        return max(minimum, min(maximum, int(get_setting("cekml:"+key, str(default)))))
+    except (ValueError, TypeError):
+        return default
+
+
+def cekml_enabled():
+    return get_setting("cekml:enabled", "1" if MLBB_ENABLED else "0") == "1"
+
+
+def cekml_configured():
+    return bool(MLBB_API_KEY and len(MLBB_API_KEY) <= 1024
+                and not any(ord(c) < 33 or ord(c) == 127 for c in MLBB_API_KEY))
+
+
+def cekml_access(user_id):
+    return not security_blocked(user_id) and (is_owner(user_id) or tools_user_allowed(user_id))
+
+
+def cekml_day_start():
+    return datetime.fromtimestamp(time.time(), payment_receipts.WIB).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def cekml_valid_id(value, *, zone=False):
+    # ASCII digits only; never strip punctuation into a different account ID.
+    return isinstance(value, str) and bool(re.fullmatch(
+        r"[1-9][0-9]{2,5}" if zone else r"[1-9][0-9]{4,15}", value))
+
+
+def cekml_provider_slot():
+    """Fail closed, using the existing durable rate-limit storage.
+
+    Both MLBB routes and the optional health read share a conservative 40/min
+    ceiling, below the documented endpoint limits. No retry loops.
+    """
+    now = int(time.time())
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        row = conn.execute("SELECT window_start,hit_count FROM rate_limit_buckets WHERE user_id=0 AND action='cekml:api'").fetchone()
+        if row and now-int(row["window_start"]) < 60 and row["hit_count"] >= 40:
+            raise CekMLBBError("RATE_LIMIT")
+        if not row or now-int(row["window_start"]) >= 60:
+            conn.execute("""INSERT INTO rate_limit_buckets(user_id,action,window_start,hit_count,updated_at)
+                VALUES(0,'cekml:api',?,1,?) ON CONFLICT(user_id,action) DO UPDATE SET
+                window_start=excluded.window_start,hit_count=1,updated_at=excluded.updated_at""",
+                (now, datetime.now().isoformat(timespec="seconds")))
+        else:
+            conn.execute("UPDATE rate_limit_buckets SET hit_count=hit_count+1 WHERE user_id=0 AND action='cekml:api'")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+async def cekml_api_read(session, endpoint, *, user_id=None, zone_id=None):
+    if not cekml_configured():
+        raise CekMLBBError("CONFIG")
+    if endpoint not in ("", "/mlbb-check", "/mlbb-bonus-check"):
+        raise CekMLBBError("CONFIG")
+    params = {}
+    if endpoint:
+        if not cekml_valid_id(user_id) or not cekml_valid_id(zone_id, zone=True):
+            raise CekMLBBError("INVALID_ID")
+        params = {"user_id": user_id, "server_id": zone_id}
+    cekml_provider_slot()
+    try:
+        async with session.get(CEKML_API_BASE+endpoint, params=params,
+                headers={"x-api-key": MLBB_API_KEY, "Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=MLBB_HTTP_TIMEOUT_SECONDS),
+                allow_redirects=False) as response:
+            status = response.status
+            if response.content_length is not None and response.content_length > 65536:
+                raise CekMLBBError("SCHEMA", status)
+            body = bytearray()
+            async for chunk in response.content.iter_chunked(8192):
+                body.extend(chunk)
+                if len(body) > 65536:
+                    raise CekMLBBError("SCHEMA", status)
+            try:
+                payload = json.loads(bytes(body))
+            except (ValueError, UnicodeError, RecursionError):
+                raise CekMLBBError("SCHEMA", status) from None
+            if not isinstance(payload, dict):
+                raise CekMLBBError("SCHEMA", status)
+            code = payload.get("code")
+            if code in ("FREE_DAILY_LIMIT_REACHED", "DAILY_LIMIT_REACHED"):
+                raise CekMLBBError("PROVIDER_QUOTA", status)
+            if code == "IP_NOT_ALLOWED":
+                raise CekMLBBError("IP_NOT_ALLOWED", status)
+            if status == 401:
+                raise CekMLBBError("AUTH", status)
+            if status == 403:
+                raise CekMLBBError("ACCESS", status)
+            if status == 429 or code == "RATE_LIMITED":
+                raise CekMLBBError("RATE_LIMIT", status)
+            if status in (400, 404) and endpoint:
+                raise CekMLBBError("INVALID_ID", status)
+            if status in (408, 504):
+                raise CekMLBBError("TIMEOUT", status)
+            if status != 200:
+                raise CekMLBBError("OFFLINE", status)
+            if payload.get("success") is not True:
+                raise CekMLBBError("UNVERIFIED", status)
+            for field, expected in (("user_id", user_id), ("server_id", zone_id)):
+                if endpoint and field in payload and str(payload[field]) != expected:
+                    raise CekMLBBError("IDENTITY", status)
+            return payload
+    except CekMLBBError:
+        raise
+    except (asyncio.TimeoutError, TimeoutError):
+        raise CekMLBBError("TIMEOUT") from None
+    except (aiohttp.ClientError, OSError):
+        raise CekMLBBError("OFFLINE") from None
+
+
+def cekml_public_value(value, limit=100):
+    if not isinstance(value, str):
+        return ""
+    value = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", value).split())
+    value = value.encode("utf-8", errors="replace").decode("utf-8")
+    if MLBB_API_KEY:
+        value = value.replace(MLBB_API_KEY, "[disembunyikan]")
+    value = re.sub(r"https?://\S+|www\.\S+|aluu\.in|ALU API", "[disembunyikan]", value, flags=re.I)
+    return html.escape(value[:limit])
+
+
+def cekml_map_bonus(payload):
+    result = {tier: None for tier in CEKML_TIERS}
+    rows = payload.get("bonus_limit")
+    if not isinstance(rows, list):
+        return result
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        title = row.get("title")
+        if not isinstance(title, str) or title not in result:
+            continue
+        # Duplicates, nulls and strings such as "false" are ambiguous.
+        if title in seen:
+            result[title] = None
+        elif type(row.get("reached_limit")) is bool:
+            result[title] = not row["reached_limit"]
+        seen.add(title)
+    return result
+
+
+async def cekml_lookup(telegram_id, user_id, zone_id):
+    if not cekml_access(telegram_id):
+        raise CekMLBBError("VIP")
+    if not is_owner(telegram_id) and not cekml_enabled():
+        raise CekMLBBError("DISABLED")
+    if not cekml_valid_id(user_id) or not cekml_valid_id(zone_id, zone=True):
+        raise CekMLBBError("INVALID_ID")
+    if not cekml_configured():
+        raise CekMLBBError("CONFIG")
+    fingerprint = hashlib.sha256(MLBB_API_KEY.encode()).hexdigest()
+    key = (fingerprint, user_id, zone_id)
+    now = time.time()
+    for old_key, cached in list(_CEKML_CACHE.items()):
+        if now-cached["checked_at"] >= MLBB_CACHE_SECONDS:
+            _CEKML_CACHE.pop(old_key, None)
+    cached = _CEKML_CACHE.get(key)
+    if cached:
+        return {**cached, "cache_hit": True}
+    async with aiohttp.ClientSession(trust_env=False) as session:
+        account = await cekml_api_read(session, "/mlbb-check", user_id=user_id, zone_id=zone_id)
+        nickname = cekml_public_value(account.get("username"))
+        if not nickname:
+            raise CekMLBBError("SCHEMA", 200)
+        country = account.get("country")
+        country = country.upper() if isinstance(country, str) and re.fullmatch(r"[A-Za-z]{2}", country) else None
+        result = {"nickname": nickname, "country": country, "bonus": {t: None for t in CEKML_TIERS},
+                  "checked_at": time.time(), "cache_hit": False, "bonus_error": ""}
+        if not cekml_access(telegram_id):
+            raise CekMLBBError("VIP")
+        if not is_owner(telegram_id) and not cekml_enabled():
+            raise CekMLBBError("DISABLED")
+        try:
+            bonus = await cekml_api_read(session, "/mlbb-bonus-check", user_id=user_id, zone_id=zone_id)
+            result["bonus"] = cekml_map_bonus(bonus)
+        except CekMLBBError as exc:
+            # A valid nickname does not prove bonus eligibility. No invented data.
+            result["bonus_error"] = exc.code
+    if not result["bonus_error"]:
+        if len(_CEKML_CACHE) >= 256:
+            _CEKML_CACHE.pop(next(iter(_CEKML_CACHE)))
+        _CEKML_CACHE[key] = dict(result)
+    return result
+
+
+def cekml_reserve_check(telegram_id, attempt):
+    if not re.fullmatch(r"[0-9a-f]{24}", str(attempt or "")):
+        raise CekMLBBError("SESSION")
+    if not cekml_access(telegram_id):
+        raise CekMLBBError("VIP")
+    daily = cekml_number("daily", MLBB_DAILY_LIMIT, 1, 1000)
+    cooldown = cekml_number("cooldown", MLBB_COOLDOWN_SECONDS, 3, 300)
+    conn = db()
+    try:
+        begin_immediate_retry(conn)
+        if conn.execute("SELECT 1 FROM tools_mlbb_checks WHERE id=?", (attempt,)).fetchone():
+            conn.rollback()
+            return False
+        if not is_owner(telegram_id):
+            if not cekml_enabled():
+                raise CekMLBBError("DISABLED")
+            count, latest = conn.execute("SELECT count(*),max(created_at) FROM tools_mlbb_checks WHERE user_id=? AND created_at>=?",
+                                        (telegram_id, cekml_day_start())).fetchone()
+            if count >= daily:
+                raise CekMLBBError("DAILY_LIMIT")
+            # Include yesterday's last check across the WIB midnight boundary.
+            latest = conn.execute("SELECT max(created_at) FROM tools_mlbb_checks WHERE user_id=?", (telegram_id,)).fetchone()[0]
+            if latest is not None and time.time()-latest < cooldown:
+                raise CekMLBBError("COOLDOWN")
+        conn.execute("INSERT INTO tools_mlbb_checks(id,user_id,created_at) VALUES(?,?,?)", (attempt, telegram_id, time.time()))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def cekml_finish(attempt, outcome, *, code="", http_status=0, cache_hit=False):
+    conn = db()
+    try:
+        conn.execute("""UPDATE tools_mlbb_checks SET outcome=?,error_code=?,http_status=?,cache_hit=?,finished_at=?
+            WHERE id=? AND outcome='pending'""", (outcome, code, http_status, int(cache_hit), time.time(), attempt))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def cekml_health():
+    fingerprint = hashlib.sha256(MLBB_API_KEY.encode()).hexdigest()
+    try:
+        last = json.loads(get_setting("cekml:health", "{}"))
+    except (ValueError, TypeError):
+        last = {}
+    if (isinstance(last, dict) and last.get("fingerprint") == fingerprint
+            and type(last.get("checked_at")) in (int, float)
+            and 0 <= time.time()-last["checked_at"] < 60):
+        return last
+    info = {"checked_at": time.time(), "fingerprint": fingerprint, "code": "OK", "http": 200}
+    try:
+        async with aiohttp.ClientSession(trust_env=False) as session:
+            data = await cekml_api_read(session, "")
+        for field in ("daily_limit", "daily_used", "daily_remaining"):
+            value = data.get(field)
+            if type(value) is int and 0 <= value <= 1000000000:
+                info[field] = value
+    except CekMLBBError as exc:
+        info.update(code=exc.code, http=exc.http_status)
+    set_setting("cekml:health", json.dumps(info))
+    return info
+
+
+def cekml_buttons(*rows):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=text, callback_data=data) for text, data in row] for row in rows])
+
+
+def cekml_back(user_id):
+    return cekml_buttons([("⬅️ Kembali", "cekml:menu")], [("🧰 Tools Owner" if is_owner(user_id) else "🧰 Tools", "cekml:tools")])
+
+
+async def cekml_guard(event, state):
+    if not await tools_vip_public_guard(event):
+        return False
+    if cekml_access(event.from_user.id):
+        return True
+    if str(await state.get_state() or "").startswith("CekMLBBState:"):
+        await state.set_state(None)
+    text = ("🔒 <b>CEK MLBB KHUSUS VIP</b>\n\n"
+            f"VIP Anda: <b>{html.escape(tools_vip_status_text(event.from_user.id))}</b>\n"
+            "Beli atau perpanjang VIP existing: <b>Rp20.000 / bulan</b>.\n"
+            "Cek MLBB tidak memotong saldo tambahan.")
+    keyboard = cekml_buttons([("👑 Beli / Perpanjang VIP", "utools:vip")], [("⬅️ Tools", "cekml:tools")])
+    if isinstance(event, CallbackQuery):
+        await safe_callback_notice(event)
+        await safe_edit_or_answer(event, text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await event.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    return False
+
+
+def cekml_error_text(code):
+    return {
+        "INVALID_ID": "User ID atau Zone ID tidak ditemukan. Periksa data dari profil MLBB Anda.",
+        "TIMEOUT": "Pengecekan melewati batas waktu. Coba lagi beberapa saat.",
+        "PROVIDER_QUOTA": "Kuota pengecekan sementara habis. Coba kembali nanti atau hubungi owner.",
+        "RATE_LIMIT": "Pengecekan sedang dibatasi. Coba kembali satu menit lagi.",
+        "DAILY_LIMIT": "Batas pengecekan Anda hari ini tercapai. Kuota kembali pukul 00.00 WIB.",
+        "COOLDOWN": "Tunggu beberapa detik sebelum melakukan pengecekan berikutnya.",
+        "SESSION": "Sesi pengecekan telah berakhir. Pilih Cek Lagi untuk memulai kembali.",
+    }.get(code, "Cek MLBB sementara belum tersedia. Coba kembali nanti atau hubungi owner.")
+
+
+async def cekml_render_home(call, state):
+    await state.set_state(None)
+    if is_owner(call.from_user.id):
+        return await cekml_render_admin(call)
+    access = tools_vip_access(call.from_user.id)
+    until = (payment_receipts.format_wib(access["vip_expires_at"]) if access and access["vip_expires_at"] is not None
+             else "Tanpa batas • pemberian owner")
+    text = ("🎮 <b>MABOYY DIGITAL — CEK MLBB</b>\n\n👑 VIP: <b>Aktif</b>\n"
+            f"📅 Masa Aktif: <b>{html.escape(until)}</b>\n\n"
+            "Masukkan User ID dan Zone ID untuk memeriksa akun Mobile Legends.\n"
+            "Tidak perlu password. Tidak ada potongan saldo per cek.")
+    rows = [[("🎮 Mulai Cek", "cekml:start")]] if cekml_enabled() and cekml_configured() else []
+    if not rows:
+        text += "\n\nPengecekan sementara belum tersedia."
+    rows.append([("⬅️ Kembali", "cekml:tools")])
+    await safe_edit_or_answer(call, text, reply_markup=cekml_buttons(*rows), parse_mode="HTML")
+
+
+async def cekml_render_admin(call):
+    if not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    text = ("👑 <b>CEK MLBB — OWNER</b>\n\n"
+            f"Status fitur: <b>{'AKTIF' if cekml_enabled() else 'NONAKTIF'}</b>\n"
+            f"Konfigurasi API: <b>{'Tersedia' if cekml_configured() else 'Isi MLBB_API_KEY di Railway'}</b>\n"
+            f"Limit user: <b>{cekml_number('daily', MLBB_DAILY_LIMIT, 1, 1000)} cek/hari</b>\n"
+            "Owner dapat mengecek saat fitur nonaktif untuk user.")
+    await safe_edit_or_answer(call, text, reply_markup=cekml_buttons(
+        [("🎮 Cek Akun", "cekml:start")],
+        [("🔌 Status API", "cekml:admin:status"), ("📊 Statistik Cek", "cekml:admin:stats")],
+        [("⚙️ Atur Limit", "cekml:admin:limits")],
+        [("🔴 Nonaktifkan" if cekml_enabled() else "🟢 Aktifkan", "cekml:admin:toggle")],
+        [("⬅️ Tools Owner", "cekml:tools")]), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("cekml:"))
+async def cekml_callback(call: CallbackQuery, state: FSMContext):
+    if not await tools_vip_public_guard(call):
+        return
+    action = str(call.data or "")[6:]
+    if action.startswith("admin:") and not is_owner(call.from_user.id):
+        return await deny_owner_callback(call)
+    await safe_callback_notice(call)
+    try:
+        if action == "tools":
+            await state.set_state(None)
+            if is_owner(call.from_user.id):
+                return await owner_tools_home(call, state)
+            return await user_tools_home(call, state)
+        if not await cekml_guard(call, state):
+            return
+        if action in ("menu", "admin:menu"):
+            return await cekml_render_home(call, state)
+        if action == "admin:status":
+            info = await cekml_health()
+            text = ("🔌 <b>STATUS API CEK MLBB — OWNER</b>\n\nProvider: ALU API\n"
+                    f"API: <b>{'Terhubung' if info['code']=='OK' else 'Belum siap'}</b>\n"
+                    f"Kode: <b>{html.escape(str(info['code']))}</b> • HTTP: {info['http']}\n"
+                    f"Diperiksa: {payment_receipts.format_wib(info['checked_at'])}\n")
+            if "daily_remaining" in info:
+                text += f"Sisa kuota API saat diperiksa: {info['daily_remaining']} request\n"
+            if info["code"] == "IP_NOT_ALLOWED":
+                text += "Tambahkan IP keluar server Railway ke whitelist akun API.\n"
+            text += ("\nNickname, negara dan bonus top-up pertama mengikuti API.\n"
+                     "Weekly Elite / Monthly Epic: belum didukung kontrak API ini.\n"
+                     "Satu cek memerlukan hingga dua request API. Status dicache 60 detik.")
+            return await safe_edit_or_answer(call, text, reply_markup=cekml_back(call.from_user.id), parse_mode="HTML")
+        if action == "admin:toggle":
+            if cekml_enabled():
+                set_setting("cekml:enabled", "0")
+            else:
+                info = await cekml_health()
+                if info["code"] != "OK":
+                    return await safe_edit_or_answer(call, "Fitur belum diaktifkan. Periksa Status API terlebih dahulu.\n"
+                        "Kode: "+html.escape(str(info["code"])), reply_markup=cekml_back(call.from_user.id))
+                set_setting("cekml:enabled", "1")
+            await state.set_state(None)
+            return await cekml_render_admin(call)
+        if action == "admin:stats":
+            conn = db()
+            try:
+                rows = [dict(row) for row in conn.execute("SELECT * FROM tools_mlbb_checks WHERE created_at>=?", (cekml_day_start(),))]
+                total = conn.execute("SELECT count(*) FROM tools_mlbb_checks").fetchone()[0]
+            finally:
+                conn.close()
+            pending = sum(r["outcome"] == "pending" for r in rows)
+            text = ("📊 <b>STATISTIK CEK MLBB — OWNER</b>\n\n"
+                    f"Total tercatat: <b>{total}</b>\nHari ini (WIB): <b>{len(rows)}</b>\n"
+                    f"Berhasil: {sum(r['outcome']=='success' for r in rows)}\n"
+                    f"Data sebagian: {sum(r['outcome']=='partial' for r in rows)}\n"
+                    f"Gagal / akses berakhir: {sum(r['outcome']=='error' for r in rows)}\n"
+                    f"Berjalan / terputus: {pending}\nCache: {sum(r['cache_hit'] for r in rows)}\n\n"
+                    "Pengecekan terputus tidak dikirim ulang otomatis. Tidak ada transaksi wallet pada fitur ini.")
+            return await safe_edit_or_answer(call, text, reply_markup=cekml_back(call.from_user.id))
+        if action == "admin:limits":
+            await state.set_state(None)
+            return await safe_edit_or_answer(call, "⚙️ <b>LIMIT CEK MLBB — OWNER</b>\n\n"
+                f"Batas harian per user: {cekml_number('daily', MLBB_DAILY_LIMIT, 1, 1000)} cek\n"
+                f"Jeda: {cekml_number('cooldown', MLBB_COOLDOWN_SECONDS, 3, 300)} detik\n"
+                "Reset harian pukul 00.00 WIB. Owner tetap mengikuti batas API.", reply_markup=cekml_buttons(
+                    [("📅 Batas Harian", "cekml:admin:limit:daily"), ("⏱ Jeda Cek", "cekml:admin:limit:cooldown")],
+                    [("⬅️ Kembali", "cekml:menu")]))
+        if action in ("admin:limit:daily", "admin:limit:cooldown"):
+            key = action.split(":")[-1]
+            await state.update_data(cekml_limit_key=key, cekml_owner_id=call.from_user.id, cekml_expires=time.time()+600)
+            await state.set_state(CekMLBBState.owner_limit)
+            return await safe_edit_or_answer(call, "Kirim batas cek per hari (1–1000)." if key == "daily" else
+                "Kirim jeda antarcek dalam detik (3–300).", reply_markup=cekml_back(call.from_user.id))
+        if action == "start":
+            if not cekml_configured() or (not is_owner(call.from_user.id) and not cekml_enabled()):
+                raise CekMLBBError("CONFIG")
+            await state.update_data(cekml_attempt=secrets.token_hex(12), cekml_owner_id=call.from_user.id,
+                                    cekml_user_id=None, cekml_expires=time.time()+600)
+            await state.set_state(CekMLBBState.user_id)
+            return await safe_edit_or_answer(call, "🎮 <b>CEK MLBB</b>\n\nMasukkan <b>User ID MLBB</b> (angka dari profil game).\n"
+                "Zone ID diminta pada langkah berikutnya. Jangan kirim password.", reply_markup=cekml_back(call.from_user.id))
+        raise CekMLBBError("SESSION")
+    except CekMLBBError as exc:
+        await safe_edit_or_answer(call, cekml_error_text(exc.code), reply_markup=cekml_back(call.from_user.id))
+    except sqlite3.Error:
+        await safe_edit_or_answer(call, "Pengecekan belum tersedia. Coba kembali sebentar lagi.", reply_markup=cekml_back(call.from_user.id))
+
+
+@router.message(StateFilter(CekMLBBState.user_id, CekMLBBState.zone_id, CekMLBBState.owner_limit),
+                F.text, ~F.text.startswith("/"))
+async def cekml_input(message: Message, state: FSMContext):
+    if not await cekml_guard(message, state):
+        return
+    current = await state.get_state()
+    data = await state.get_data()
+    attempt = data.get("cekml_attempt")
+    reserved = False
+    try:
+        if data.get("cekml_owner_id") != message.from_user.id or data.get("cekml_expires", 0) <= time.time():
+            raise CekMLBBError("SESSION")
+        value = str(message.text or "").strip()
+        if current == CekMLBBState.owner_limit.state:
+            if not is_owner(message.from_user.id):
+                raise CekMLBBError("VIP")
+            key = data.get("cekml_limit_key")
+            lower, upper = (1, 1000) if key == "daily" else (3, 300)
+            if key not in ("daily", "cooldown") or not re.fullmatch(r"[0-9]{1,4}", value) or not lower <= int(value) <= upper:
+                return await message.answer(f"Kirim angka {lower}–{upper}.", reply_markup=cekml_back(message.from_user.id))
+            set_setting("cekml:"+key, value)
+            await state.set_state(None)
+            return await message.answer("✅ Limit Cek MLBB disimpan: "+value+(" cek/hari." if key == "daily" else " detik."),
+                                        reply_markup=cekml_back(message.from_user.id))
+        if not cekml_configured() or (not is_owner(message.from_user.id) and not cekml_enabled()):
+            raise CekMLBBError("CONFIG")
+        if current == CekMLBBState.user_id.state:
+            if not cekml_valid_id(value):
+                return await message.answer("User ID harus 5–16 digit angka, tanpa spasi atau tanda baca.", reply_markup=cekml_back(message.from_user.id))
+            await state.update_data(cekml_user_id=value)
+            await state.set_state(CekMLBBState.zone_id)
+            return await message.answer("Masukkan <b>Zone ID</b> (3–6 digit angka dalam kurung di profil MLBB).",
+                                        reply_markup=cekml_back(message.from_user.id), parse_mode="HTML")
+        if not cekml_valid_id(value, zone=True):
+            return await message.answer("Zone ID harus 3–6 digit angka, tanpa tanda kurung.", reply_markup=cekml_back(message.from_user.id))
+        if not cekml_valid_id(data.get("cekml_user_id")):
+            raise CekMLBBError("SESSION")
+        reserved = cekml_reserve_check(message.from_user.id, attempt)
+        if not reserved:
+            raise CekMLBBError("SESSION")
+        await state.set_state(CekMLBBState.checking)
+        result = await cekml_lookup(message.from_user.id, data["cekml_user_id"], value)
+        if not cekml_access(message.from_user.id):
+            cekml_finish(attempt, "error", code="VIP")
+            return await cekml_guard(message, state)
+        if not is_owner(message.from_user.id) and not cekml_enabled():
+            raise CekMLBBError("DISABLED")
+        latest = await state.get_data()
+        if latest.get("cekml_attempt") != attempt or await state.get_state() != CekMLBBState.checking.state:
+            cekml_finish(attempt, "error", code="SESSION")
+            return
+        partial = bool(result["bonus_error"] or any(v is None for v in result["bonus"].values()))
+        cekml_finish(attempt, "partial" if partial else "success", code=result["bonus_error"], http_status=200,
+                     cache_hit=result["cache_hit"])
+        await state.set_state(None)
+        lines = ["✅ <b>VALIDASI BERHASIL</b>", f"👤 Nickname: <b>{result['nickname']}</b>",
+                 "🌍 Negara: "+(result["country"] or "⚠️ Tidak dapat diperiksa"),
+                 f"🆔 {data['cekml_user_id']} ({value})", "", "🎁 <b>FIRST TOP UP</b>"]
+        for tier in CEKML_TIERS:
+            available = result["bonus"][tier]
+            lines.append(f"• {tier}: "+("✅" if available is True else "❌" if available is False else "⚠️"))
+        lines += ["", "🎁 <b>BUNDLE</b>", "• Weekly Elite: ⚠️", "• Monthly Epic: ⚠️", "",
+                  "✅ Tersedia", "❌ Sudah digunakan", "⚠️ Tidak dapat diperiksa",
+                  "", "🕒 "+payment_receipts.format_wib(result["checked_at"])+(f" • cache ≤{MLBB_CACHE_SECONDS} dtk" if result["cache_hit"] else "")]
+        await message.answer("\n".join(lines), reply_markup=cekml_buttons(
+            [("🔄 Cek Lagi", "cekml:start")], [("⬅️ Tools Owner" if is_owner(message.from_user.id) else "⬅️ Tools", "cekml:tools")]), parse_mode="HTML")
+    except CekMLBBError as exc:
+        if reserved:
+            cekml_finish(attempt, "error", code=exc.code, http_status=exc.http_status)
+        await state.set_state(None)
+        if exc.code == "VIP":
+            return await cekml_guard(message, state)
+        await message.answer(cekml_error_text(exc.code), reply_markup=cekml_buttons(
+            [("🔄 Cek Lagi", "cekml:start")], [("⬅️ Kembali", "cekml:menu")]))
+    except sqlite3.Error:
+        await state.set_state(None)
+        await message.answer("Pengecekan belum tersedia. Coba kembali sebentar lagi.", reply_markup=cekml_back(message.from_user.id))
 
 
 @router.callback_query(F.data.startswith("utools:"))
@@ -35724,7 +36271,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.19"
+EXPECTED_SOURCE_VERSION = "17.20"
 
 
 def source_integrity_self_test():
