@@ -1,8 +1,58 @@
-# MaboyyDigital v17.25
+# MaboyyDigital v17.26
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
-## Pembaruan v17.25: invoice QRIS manual dan batas pembayaran
+## Pembaruan v17.26: invoice pembelian dan channel transaksi
+
+Pembelian **/otp dan /sosmed** sekarang mempunyai satu pesan foto invoice,
+caption detail pesanan, dan tombol. Notifikasi purchase, worker, pembayaran
+manual dan tombol Cek memakai invoice yang sama. Status/SMS memperbarui caption,
+bukan membuat invoice sukses lain. SMS lengkap tetap tersedia sebagai isi SMS,
+bukan invoice pembayaran kedua. Salin Nomor dan Salin OTP memakai satu tombol
+native masing-masing, tanpa ikon clipboard tambahan pada label.
+
+Tombol **Batalkan Pesanan** OTP tampil selama menunggu SMS. Jika provider belum
+mengizinkan pembatalan, bot menjelaskan jedanya dalam WIB. Pembatalan/refund
+hanya mengikuti respons nyata dan ledger existing. Pembatalan SOSMED tetap
+mengikuti kemampuan resmi provider; tombol owner untuk saldo tertahan tetap ada.
+
+Foto pembelian OTP/SOSMED dihapus ketika status provider terkonfirmasi batal,
+gagal atau kedaluwarsa. OTP juga memakai expires_at provider untuk masa berlaku
+foto pesanan yang belum selesai. Timer foto tidak menyatakan pembayaran gagal,
+tidak memotong saldo, dan tidak membuktikan refund provider. SOSMED tidak diberi
+deadline buatan karena kontrak API tidak menyediakannya. Partial tetap menampilkan
+status/refund sebenarnya; transaksi selesai tetap menyimpan invoice sukses.
+Jika Telegram menolak penghapusan foto lama, pesan yang sama diganti gambar
+**INVOICE HANGUS** tanpa tombol. Cleanup yang gagal dicoba ulang setelah restart.
+Invoice yang sudah ditutup tidak dikirim ulang sebagai sukses. Riwayat dan
+snapshot pembayaran tetap disimpan. Invoice sukses command lain mengikuti v17.25.
+
+**/owner → 📢 Notifikasi Transaksi** mengatur satu channel tersendiri. Owner
+memasukkan ID -100… atau @username, melihat konfirmasi lama/baru, menyimpan,
+memeriksa izin, lalu mengaktifkan. Bot wajib admin channel dengan izin kirim.
+Fitur nonaktif secara default dan tidak memerlukan Variables Railway baru.
+Setiap transaksi sukses dikirim sebagai **satu foto invoice + caption**:
+produk/VIP terkirim, deposit terverifikasi, OTP diterima, dan SOSMED selesai.
+Pending, gagal, batal, serta topup perantara pembayaran OTP/SOSMED tidak
+menghasilkan pengumuman sukses ganda. Transaksi lama dilewati saat aktivasi;
+ganti channel/nonaktif tidak mengirim ulang riwayat.
+
+Invoice channel hanya memuat branding toko, referensi invoice, produk, jumlah,
+nominal/metode, dan waktu WIB. Identitas pembeli, nomor, OTP/SMS, target sosial,
+data login, modal provider, dan API key tidak dipublikasikan. Setelan dan antrean
+tersimpan di SQLite. Unique source/entity, lease, dan penanda pengiriman mencegah
+pengulangan dari worker/restart. Jika Telegram mungkin menerima foto tetapi
+responsnya hilang, status UNKNOWN ditampilkan pada panel owner dan tidak diulang
+buta. Tidak ada klaim exactly-once transport pada respons yang tidak pasti.
+
+Migration **206** additive menambah payment_receipts.caption_hash dan outbox
+transaction_channel_events; sistem wallet, deposit dan pembayaran tetap memakai
+tabel existing. Hash caption menggunakan HMAC agar tidak menjadi kamus tebakan
+OTP. Tidak ada command, runtime file, dependency, callback pembayaran, atau ENV baru.
+Nama file runtime tetap sama; paket utama tetap 15 file langsung di root ZIP.
+
+## Aturan QRIS manual existing (v17.25)
+
 
 QRIS Manual pada /otp dan /sosmed ditampilkan dalam **satu foto beserta caption
 invoice dan tombol**. Cek Pembayaran, Pesanan Saya, dan Kembali dari pengiriman
@@ -37,7 +87,7 @@ provider yang belum pasti, riwayat, invoice gambar sukses tunggal dan perlindung
 approval ganda dari v17.24 dipertahankan. Kode unik tidak termasuk saldo/refund harga
 produk. Tidak ada transaksi provider live dalam pengujian rilis ini.
 
-Schema **205** hanya menambahkan pelacakan pesan QRIS checkout pada orders dan
+Migration **205** yang dipertahankan hanya menambahkan pelacakan pesan QRIS checkout pada orders dan
 mengisi deadline invoice QRIS manual pending lama yang belum mengirim bukti,
 berdasarkan tanggal pembuatan asal. Deadline/riwayat/bukti/saldo/ledger existing
 dipertahankan; invoice yang sudah final tidak dihidupkan kembali otomatis. Tidak
@@ -58,7 +108,7 @@ tanpa VIP**, termasuk user yang VIP-nya habis dan owner. Batas harian, jeda cek,
 pemeriksaan akun terblokir dan rate limit API tetap berlaku. Menu /tools kembali
 seperti sebelum Cek MLBB ditambahkan; VIP Rp20.000/bulan untuk tools lama,
 pembelian dan perpanjangannya tetap memakai alur existing. Tidak ada Variables, migration,
-dependency atau command baru pada pembaruan MLBB. Schema checker 203 dipertahankan dalam migration 205 rilis ini.
+dependency atau command baru pada pembaruan MLBB. Schema checker 203 dipertahankan dalam migration 206 rilis ini.
 
 ## Cek MLBB: satu pesan untuk kedua ID
 
@@ -255,7 +305,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.25 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.26 yang konsisten.
 
 ## Jalankan
 
@@ -279,7 +329,7 @@ untuk pembelian langsung kedua toko tersebut. Isi Saldo dan checkout produk lain
 mempertahankan QRIS Otomatis, QRIS Manual, transfer bank dan gateway existing.
 
 Invoice QRIS OTP lama tetap diproses sesuai status dan kebijakan sebelumnya.
-Khusus invoice manual baru v17.25, tidak ada deadline konfirmasi owner dan berlaku
+Khusus invoice manual baru v17.26, tidak ada deadline konfirmasi owner dan berlaku
 refund harga produk ke wallet jika gagal pasti; hasil timeout tidak dikreditkan
 ulang sebelum direkonsiliasi. Tidak ada pembelian provider sebelum pembayaran
 manual diverifikasi owner. API key dan saldo provider hanya tampil kepada owner.
@@ -356,7 +406,7 @@ User/owner tetap dapat membatalkan invoice yang belum dibayar lewat alur existin
 Payment gateway otomatis tetap mengikuti masa berlaku existing/provider.
 Quote harga, nomor/SMS OTP, draft pengaturan rekening dan konfirmasi Hapus Stok
 tetap menggunakan masa berlaku yang sesuai; perubahan ini hanya untuk pembayaran
-manual yang memerlukan owner. OTP/Sosmed juga menyediakan QRIS Manual di konfirmasi pembelian sejak v17.25.
+manual yang memerlukan owner. OTP/Sosmed juga menyediakan QRIS Manual di konfirmasi pembelian sejak v17.26.
 Tidak ada Variables/dependency/command baru.
 
 ## Hapus stok owner
@@ -435,7 +485,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.25; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.26; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -443,7 +493,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.25: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.26: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed

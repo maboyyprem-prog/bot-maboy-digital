@@ -238,8 +238,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.25"
-SCHEMA_VERSION = 205
+BOT_VERSION = "17.26"
+SCHEMA_VERSION = 206
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -10182,6 +10182,7 @@ class OwnerState(StatesGroup):
     tools_access_user_id = State()
     set_qris = State()
     set_payment_note = State()
+    transaction_channel = State()
     topup_amount = State()
     owner_wallet_add = State()
     owner_wallet_subtract = State()
@@ -11072,6 +11073,7 @@ def owner_menu():
     kb.button(text="⚙️ Sistem", callback_data="owner:menu_system")
     kb.button(text="🔎 Cari", callback_data="owner:global_search")
     kb.button(text="🎮 Pengaturan MLBB", callback_data="cekml:admin:menu")
+    kb.button(text="📢 Notifikasi Transaksi", callback_data="owner:txn_channel")
     kb.button(text="🏠 Menu User", callback_data="home")
     kb.adjust(2)
     return kb.as_markup()
@@ -25898,6 +25900,85 @@ async def owner_unique_info(call: CallbackQuery):
     )
 
 
+async def transaction_channel_panel(call, note=''):
+    with db() as conn:
+        target,enabled,title=PAYMENT_RECEIPTS.channel.configuration(conn)
+        counts=dict(conn.execute('SELECT status,count(*) FROM transaction_channel_events GROUP BY status').fetchall())
+        recent=conn.execute("SELECT snapshot_json,status FROM transaction_channel_events WHERE status!='SKIPPED' ORDER BY created_at DESC LIMIT 5").fetchall()
+    kb=InlineKeyboardBuilder()
+    kb.button(text='📢 Atur Channel',callback_data='owner:txn_channel:set')
+    kb.button(text='🔌 Periksa Channel',callback_data='owner:txn_channel:check')
+    kb.button(text='🔴 Nonaktifkan' if enabled else '🟢 Aktifkan',callback_data='owner:txn_channel:off' if enabled else 'owner:txn_channel:on')
+    kb.button(text='🔄 Refresh Status',callback_data='owner:txn_channel')
+    kb.button(text='🔙 Owner',callback_data='owner:panel');kb.adjust(2,2,1)
+    text=('📢 <b>NOTIFIKASI TRANSAKSI</b>\n\n'
+        +f"Channel: <b>{html.escape(title or 'Belum diatur')}</b>\nID: <code>{html.escape(target or '-')}</code>\n"
+        +f"Status: <b>{'AKTIF' if enabled else 'NONAKTIF'}</b>\n\n"
+        +'Setiap transaksi sukses dikirim sebagai satu foto invoice dengan ringkasan. '
+        +'Data akun, OTP, nomor telepon, dan identitas pembeli tidak ditampilkan.\n'
+        +'Meliputi produk terkirim, deposit terverifikasi, OTP diterima, dan SOSMED selesai. '
+        +'Transaksi lama tidak dikirim saat pertama diaktifkan.\n\n'
+        +f"Terkirim: {counts.get('SENT',0)} • Antrean: {counts.get('PENDING',0)+counts.get('SENDING',0)+counts.get('DISPATCHING',0)}\n"
+        +f"Izin bermasalah: {counts.get('BLOCKED',0)} • Hasil kirim belum pasti: {counts.get('UNKNOWN',0)}")
+    if counts.get('UNKNOWN'):text+='\nPengiriman belum pasti tidak diulang otomatis agar tidak ganda. Periksa channel.'
+    if recent:
+        labels={'SENT':'Terkirim','PENDING':'Antrean','SENDING':'Disiapkan','DISPATCHING':'Dikirim','BLOCKED':'Periksa izin bot','UNKNOWN':'Belum pasti'}
+        text+='\n\n<b>Riwayat terbaru</b>\n'+'\n'.join(html.escape(json.loads(row['snapshot_json']).get('reference','-'))+' • '+labels.get(row['status'],row['status']) for row in recent)
+    if note:text+='\n\n'+html.escape(note)
+    await safe_edit_or_answer(call,text,reply_markup=kb.as_markup(),parse_mode='HTML')
+
+
+@router.callback_query(F.data.startswith('owner:txn_channel'))
+async def owner_transaction_channel(call: CallbackQuery,state: FSMContext):
+    if not is_owner(call.from_user.id) or not call.message or call.message.chat.id!=call.from_user.id:
+        return await call.answer('Akses ditolak.',show_alert=True)
+    action=call.data.removeprefix('owner:txn_channel').removeprefix(':')
+    if action=='set':
+        await state.clear();await state.set_state(OwnerState.transaction_channel)
+        await safe_edit_or_answer(call,'📢 <b>ATUR CHANNEL TRANSAKSI</b>\n\nKirim ID channel (<code>-1001234567890</code>) atau <code>@username_channel</code>. Jadikan bot admin dengan izin mengirim pesan.\nChannel ini terpisah dari channel stok dan channel wajib.',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 Kembali',callback_data='owner:txn_channel')]]),parse_mode='HTML')
+    elif action=='save':
+        data=await state.get_data();target=data.get('transaction_channel_target')
+        if not target:return await call.answer('Buka Atur Channel terlebih dahulu.',show_alert=True)
+        try:
+            target,title=await PAYMENT_RECEIPTS.channel.verify(call.bot,target)
+        except Exception as exc:
+            return await call.answer(str(exc) if isinstance(exc,ValueError) else 'Channel belum dapat diperiksa. Periksa ID dan izin bot.',show_alert=True)
+        PAYMENT_RECEIPTS.channel.set_target(target,title);await state.clear()
+        await transaction_channel_panel(call,'Channel disimpan. Pilih Aktifkan untuk mulai mengirim transaksi baru.')
+    elif action in {'check','on'}:
+        with db() as conn:target,_,_=PAYMENT_RECEIPTS.channel.configuration(conn)
+        if not target:return await call.answer('Atur channel terlebih dahulu.',show_alert=True)
+        try:await PAYMENT_RECEIPTS.channel.verify(call.bot,target)
+        except Exception as exc:
+            return await call.answer(str(exc) if isinstance(exc,ValueError) else 'Channel belum dapat diperiksa. Periksa ID dan izin bot.',show_alert=True)
+        await state.clear()
+        if action=='on':PAYMENT_RECEIPTS.channel.enable(True)
+        await transaction_channel_panel(call,'Notifikasi transaksi baru aktif.' if action=='on' else 'Channel dapat diakses. Bot memiliki izin mengirim pesan.')
+    elif action=='off':
+        PAYMENT_RECEIPTS.channel.enable(False);await state.clear()
+        await transaction_channel_panel(call,'Notifikasi dinonaktifkan. Antrean yang belum dikirim dihentikan.')
+    elif not action:
+        await state.clear();await transaction_channel_panel(call)
+    else:return await call.answer('Tombol tidak tersedia.',show_alert=True)
+    await call.answer()
+
+
+@router.message(StateFilter(OwnerState.transaction_channel),F.text)
+async def owner_transaction_channel_input(message: Message,state: FSMContext):
+    if not is_owner(message.from_user.id) or message.chat.id!=message.from_user.id:return
+    try:target,title=await PAYMENT_RECEIPTS.channel.verify(message.bot,message.text)
+    except Exception as exc:
+        return await message.answer(str(exc) if isinstance(exc,ValueError) else 'Channel belum dapat diperiksa. Periksa ID dan izin bot.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔙 Kembali',callback_data='owner:txn_channel')]]))
+    with db() as conn:previous,_,old_title=PAYMENT_RECEIPTS.channel.configuration(conn)
+    await state.update_data(transaction_channel_target=target)
+    await message.answer('📢 <b>KONFIRMASI CHANNEL</b>\n\n'
+        +f"Lama: {html.escape(old_title or 'Belum diatur')} <code>{html.escape(previous or '-')}</code>\n"
+        +f"Baru: {html.escape(title)} <code>{html.escape(target)}</code>\n\n"
+        +'Setelah disimpan, pilih Aktifkan. Tidak ada pesan tes yang dikirim ke channel.',parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Simpan Channel',callback_data='owner:txn_channel:save')],[InlineKeyboardButton(text='🔙 Batal',callback_data='owner:txn_channel')]]))
+
+
 @router.callback_query(F.data == "owner:qris_settings")
 async def owner_qris_settings(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id):
@@ -36549,7 +36630,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.25"
+EXPECTED_SOURCE_VERSION = "17.26"
 
 
 def source_integrity_self_test():

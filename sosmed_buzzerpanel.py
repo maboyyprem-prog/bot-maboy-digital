@@ -1934,15 +1934,16 @@ class PaymentService(otp_smscode.PaymentService):
                     order = self.store.repo.one('SELECT * FROM sosmed_orders WHERE attempt_id=? AND user_id=?',(payment['attempt_id'],payment['user_id']))
                     if not order:
                         raise StoreError('NOT_FOUND')
-                    text = '✅ <b>PESANAN BERHASIL DIBUAT!</b>\n\n'+ui.order_text(order)
-                    keyboard = ui.order_keyboard(payment['user_id'],order)
+                    shown=await payment_receipts.notify(self.store.host,bot,'sosmed',order['id'])
                 else:
-                    text = (f"↩️ <b>DANA TERSEDIA DI SALDO BOT</b>\n🧾 {escape(payment['partner_reference'])}\n"
-                            f"💰 {money(payment['amount_idr'])}\nPesanan tidak dilanjutkan atau gagal terkonfirmasi. "
-                            'Gunakan saldo untuk membeli kembali; tidak perlu membayar QRIS lagi.')
-                    keyboard = ui.navigation(payment['user_id'])
-                sent = await bot.send_message(payment['user_id'],text,parse_mode='HTML',reply_markup=keyboard)
-                self.store.repo.execute("UPDATE sosmed_payments SET notice_state='SENT',notice_message_id=?,lease_owner=NULL,lease_until=0 WHERE payment_id=? AND lease_owner=?", (sent.message_id,payment['payment_id'],token))
+                    shown=await payment_receipts.notify(self.store.host,bot,'sosmed_payment',payment['payment_id'])
+                receipt=self.store.repo.one("SELECT status,message_id FROM payment_receipts WHERE source='sosmed_payment' AND entity_id=?",(payment['payment_id'],))
+                if not shown and not (receipt and receipt['status'] in {'LEGACY','RETIRING','RETIRED'}):
+                    if receipt and receipt['status']=='UNKNOWN':
+                        self.store.repo.execute("UPDATE sosmed_payments SET notice_state='UNKNOWN',lease_owner=NULL,lease_until=0 WHERE payment_id=? AND lease_owner=?",(payment['payment_id'],token))
+                        continue
+                    raise StoreError('PAYMENT_PENDING')
+                self.store.repo.execute("UPDATE sosmed_payments SET notice_state='SENT',notice_message_id=?,lease_owner=NULL,lease_until=0 WHERE payment_id=? AND lease_owner=?", (receipt['message_id'],payment['payment_id'],token))
             except asyncio.CancelledError:
                 raise
             except Exception:

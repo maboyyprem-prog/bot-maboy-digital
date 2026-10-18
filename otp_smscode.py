@@ -26,7 +26,7 @@ import aiohttp
 from aiohttp import web
 from Crypto.Cipher import AES
 from aiogram import F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
@@ -38,7 +38,7 @@ TERMINAL = {"COMPLETED", "CANCELED", "EXPIRED", "FAILED"}
 ACTIVE = {"ACTIVE", "OTP_RECEIVED"}
 # Browsing is not a purchase authorization. Keep navigation usable for a day;
 # quotes and all financial actions still validate their own expiry and owner.
-NAVIGATION_ACTIONS = {"home", "shop", "main_menu", "balance", "help", "help_commands", "countries", "services",
+NAVIGATION_ACTIONS = {"check", "read_sms", "confirm_cancel", "home", "shop", "main_menu", "balance", "help", "help_commands", "countries", "services",
                       "operators", "products", "orders", "history", "search", "admin", "admin_balance",
                       "admin_stats", "admin_profit", "admin_status", "admin_webhook", "admin_pending",
                       "admin_orders", "admin_prices_menu", "admin_prices", "admin_modes", "topup",
@@ -851,12 +851,7 @@ class PaymentService:
             # Late payment outcomes already have a durable wallet notification.
             return True
         await payment_receipts.notify(self.store.host, bot, self.receipt_source, payment["payment_id"])
-        if payment.get("shop_refund_policy"):
-            return True  # One durable receipt image; product outcome is separate.
-        await bot.send_message(payment["user_id"], f"🛍️ <b>{USER_BRAND}</b>\n✅ Pembayaran QRIS terkonfirmasi\n"
-            f"🧾 {escape(payment['partner_reference'])} • {money(payment['amount_idr'])}\nNomor sedang diproses; hasil dikirim otomatis.",
-            parse_mode="HTML", reply_markup=self.store.ui.keyboard(payment["user_id"], [[("📦 PESANAN OTP", "orders", {})]]))
-        return True
+        return True  # The same durable photo will receive the product outcome.
 
     def gateway_callback(self, payload):
         """The host verifies the existing gateway RSA signature before routing."""
@@ -1181,6 +1176,7 @@ class NotificationQueue:
 
     async def deliver(self, bot):
         now = time.time()
+        self.store.repo.execute("UPDATE otp_notifications SET status='UNKNOWN',error_code='DELIVERY_UNCERTAIN' WHERE status='DISPATCHING' AND lease_until<?",(now,))
         jobs = self.store.repo.rows("SELECT * FROM otp_notifications WHERE status IN ('PENDING','SENDING') AND next_retry_at<=? AND lease_until<? ORDER BY notification_id LIMIT 20", (now, now))
         for job in jobs:
             owner = secrets.token_hex(12)
@@ -1188,7 +1184,23 @@ class NotificationQueue:
                      (owner, time.time()+120, job["notification_id"], time.time())):
                 continue
             order = self.store.repo.one("SELECT * FROM otp_orders WHERE id=?", (job["order_id"],))
+            dispatching=False
             try:
+                if job['kind'] in {'PURCHASE','PAYMENT'}:
+                    if job['kind']=='PURCHASE' and (not order or order['buyer_user_id']!=job['user_id']):
+                        raise StoreError('FORBIDDEN')
+                    if job['kind']=='PAYMENT':self.store.payments.owned(job['user_id'],job['dedup_key'].removeprefix('PAYMENT:'))
+                    source,entity=('otp_order',job['order_id']) if job['kind']=='PURCHASE' else ('otp_payment',job['dedup_key'].removeprefix('PAYMENT:'))
+                    shown=await payment_receipts.notify(self.store.host,bot,source,entity)
+                    key=self.store.host.PAYMENT_RECEIPTS.store_key(source,entity,job['user_id'])
+                    receipt=self.store.repo.one('SELECT status,message_id FROM payment_receipts WHERE source=? AND entity_id=?',key) if key else None
+                    if shown or receipt and receipt['status'] in {'LEGACY','RETIRING','RETIRED'}:
+                        self.store.repo.execute("UPDATE otp_notifications SET status='SENT',sent_at=?,telegram_message_id=?,lease_until=0,lease_owner=NULL WHERE notification_id=? AND lease_owner=?",(time.time(),receipt['message_id'] if receipt else None,job['notification_id'],owner))
+                        continue
+                    if receipt and receipt['status']=='UNKNOWN':
+                        self.store.repo.execute("UPDATE otp_notifications SET status='UNKNOWN',error_code='INVOICE_UNCERTAIN',lease_until=0,lease_owner=NULL WHERE notification_id=? AND lease_owner=?",(job['notification_id'],owner))
+                        continue
+                    raise StoreError('LOCAL_DATABASE','Invoice sedang disiapkan; pesanan tetap tersimpan.')
                 payment, payload = None, {}
                 if job["kind"] == "PAYMENT":
                     payment = self.store.payments.owned(job["user_id"], job["dedup_key"].removeprefix("PAYMENT:"))
@@ -1202,6 +1214,7 @@ class NotificationQueue:
                     if not event or not event["encrypted_payload"]:
                         raise StoreError("RETENTION", "SMS melewati masa retensi.")
                     payload = self.store.decrypt(event["encrypted_payload"])
+                    await payment_receipts.notify(self.store.host,bot,'otp_order',order['id'])
                     texts = self.store.ui.sms_texts(order, payload, job["sms_revision"])
                 elif job["kind"] == "REFUND":
                     texts = [f"✅ Refund OTP #{order['id']} berhasil: <b>{money(order['refund_idr'])}</b> masuk ke saldo kamu."]
@@ -1211,20 +1224,24 @@ class NotificationQueue:
                     if not self.store.repo.execute("UPDATE otp_notifications SET lease_until=? WHERE notification_id=? AND lease_owner=?",
                             (time.time()+120, job["notification_id"], owner)):
                         raise StoreError("LEASE_LOST")
+                    self.store.repo.execute("UPDATE otp_notifications SET status='DISPATCHING' WHERE notification_id=? AND lease_owner=?",(job['notification_id'],owner))
+                    dispatching=True
                     sent = await bot.send_message(job["user_id"], texts[index], parse_mode="HTML",
-                         reply_markup=(self.store.ui.home_keyboard(job["user_id"]) if payment else self.store.ui.order_keyboard(order, job["user_id"], otp_code=payload.get("otp_code"))) if index == len(texts)-1 else None,
+                         reply_markup=self.store.ui.navigation(job['user_id'],'check',{'id':order['id']}) if index==len(texts)-1 and not payment else self.store.ui.home_keyboard(job['user_id']) if payment else None,
                          link_preview_options=LinkPreviewOptions(is_disabled=True))
-                    self.store.repo.execute("UPDATE otp_notifications SET part_index=?,telegram_message_id=? WHERE notification_id=? AND lease_owner=?",
+                    self.store.repo.execute("UPDATE otp_notifications SET status='SENDING',part_index=?,telegram_message_id=? WHERE notification_id=? AND lease_owner=?",
                            (index+1, getattr(sent, "message_id", None), job["notification_id"], owner))
+                    dispatching=False
                 self.store.repo.execute("UPDATE otp_notifications SET status='SENT',sent_at=?,lease_until=0,lease_owner=NULL WHERE notification_id=? AND lease_owner=?", (time.time(), job["notification_id"], owner))
             except asyncio.CancelledError:
+                if dispatching:self.store.repo.execute("UPDATE otp_notifications SET status='UNKNOWN',error_code='CANCELLED',lease_until=0,lease_owner=NULL WHERE notification_id=? AND lease_owner=?",(job['notification_id'],owner))
                 raise
             except Exception as exc:
                 # Exception strings may include request payloads. Store class only.
                 attempts = job["attempts"]+1
                 delay = max(getattr(exc, "retry_after", 0) or 0, min(3600, 5*2**min(attempts, 10)))
                 self.store.repo.execute("UPDATE otp_notifications SET status=?,attempts=?,next_retry_at=?,error_code=?,lease_until=0,lease_owner=NULL WHERE notification_id=? AND lease_owner=?",
-                    ("FAILED" if attempts >= self.store.config.retries else "PENDING", attempts, time.time()+delay, type(exc).__name__, job["notification_id"], owner))
+                    ("UNKNOWN" if dispatching and not isinstance(exc,(TelegramBadRequest,TelegramForbiddenError,TelegramRetryAfter)) else "FAILED" if attempts >= self.store.config.retries else "PENDING", attempts, time.time()+delay, type(exc).__name__, job["notification_id"], owner))
 
 
 class WebhookController:
@@ -1902,15 +1919,15 @@ class UIBuilder:
                 + (f"✅ Selesai: {payment_receipts.format_wib(order['completed_at'])}\n" if order.get('completed_at') else "")
                 + f"↩️ Refund: {money(order['refund_idr'])} • {UserFormatter.refund_status(order['refund_state'])}")
 
-    def order_keyboard(self, order, user, *, otp_code=None):
+    def order_keyboard(self, order, user, *, otp_code=None, copy_phone=True):
         oid = {"id": order["id"]}
         caps = json.loads(order["capabilities"])
         rows = [[("🔄 CEK OTP", "check", oid)]]
         if order["status"] in ACTIVE:
             if caps.get("can_resend"):
                 rows.append([("📨 RESEND", "resend", oid)])
-            if caps.get("can_cancel"):
-                rows.append([("❌ BATALKAN", "confirm_cancel", oid)])
+            if not order.get('last_sms_revision',0):
+                rows.append([("❌ Batalkan Pesanan", "confirm_cancel", oid)])
             if caps.get("can_finish"):
                 rows.append([("✅ SELESAI", "confirm_finish", oid)])
         elif caps.get("can_reactivate"):
@@ -1919,15 +1936,38 @@ class UIBuilder:
         keyboard = self.keyboard(user, rows)
         copies = []
         phone = str(order.get("phone_number") or "").strip()
-        if phone and len(phone) <= 256:
-            copies.append(InlineKeyboardButton(text="📋 SALIN NOMOR", copy_text=CopyTextButton(text=phone)))
+        if copy_phone and phone and len(phone) <= 256:
+            copies.append(InlineKeyboardButton(text="SALIN NOMOR", copy_text=CopyTextButton(text=phone)))
         # Copy only a real retained SMS code. Never infer a code from a phone
         # number/status or silently truncate codes exceeding Telegram's limit.
         if otp_code is not None and 0 < len(str(otp_code)) <= 256:
-            copies.append(InlineKeyboardButton(text="📋 SALIN OTP", copy_text=CopyTextButton(text=str(otp_code))))
+            copies.append(InlineKeyboardButton(text="SALIN OTP", copy_text=CopyTextButton(text=str(otp_code))))
         if copies:
             keyboard.inline_keyboard.insert(0, copies)
         return keyboard
+
+    def receipt_view(self, order, data):
+        """Compact single photo caption; full SMS remains encrypted in its store."""
+        label=lambda value,limit:escape(UserFormatter.label(str(value))[:limit])
+        phone=str(order.get('phone_number') or '')
+        text=(f"✅ <b>PEMBELIAN BERHASIL</b>\n🛍️ <b>{USER_BRAND}</b>\n"
+            +f"🧾 Invoice: <b>{escape(data['reference'])}</b>\n🆔 Order: #{order['id']}\n"
+            +f"🌍 {label(order['country_name'],45)} • 📶 {label(order['operator_name'],30)}\n"
+            +f"📱 {label(order['platform_name'],90)}\n📞 Nomor: <code>{escape(phone) if len(phone)<=40 else 'Gunakan Salin Nomor'}</code>\n"
+            +f"💰 Total: <b>{money(data['amount'])}</b>\n⏳ Status: {UserFormatter.status(order['status'])}\n"
+            +f"🕒 Beli: {payment_receipts.format_wib(order['created_at'])}\n⌛ Kedaluwarsa: {payment_receipts.format_wib(order['expires_at'])}\n")
+        if order.get('refund_idr'):text+=f"↩️ Refund ke saldo: {money(order['refund_idr'])}\n"
+        event=self.store.repo.one('SELECT * FROM otp_sms_events WHERE provider_order_id=? ORDER BY sms_revision DESC LIMIT 1',(order['provider_order_id'],))
+        payload=self.store.decrypt(event['encrypted_payload']) if event and event['encrypted_payload'] else {}
+        code=payload.get('otp_code')
+        if code:
+            text+=('🔐 OTP: <code>'+escape(str(code))+'</code>\n') if len(str(code))<=64 else '🔐 OTP tersedia melalui tombol / isi SMS lengkap.\n'
+        elif payload:text+='📩 SMS diterima tanpa kode verifikasi.\n'
+        else:text+='📩 SMS dikirim otomatis saat masuk.\n'
+        keyboard=self.order_keyboard(order,order['buyer_user_id'],otp_code=code)
+        if payload:
+            keyboard.inline_keyboard.insert(-1,[InlineKeyboardButton(text='📩 Baca SMS Lengkap',callback_data=self.callback(order['buyer_user_id'],'read_sms',{'id':order['id']}))])
+        return text,keyboard
 
     @staticmethod
     def sms_texts(order, payload, revision):
@@ -2170,6 +2210,8 @@ class UIBuilder:
         if payment["attempt_id"]:
             order = self.store.repo.one(f"SELECT * FROM {funding.order_table} WHERE attempt_id=? AND {funding.order_user}=?", (payment["attempt_id"], user))
             if order:
+                if await self.store.host.PAYMENT_RECEIPTS.present(message.bot,'otp_order' if funding.wallet_prefix=='OTP' else 'sosmed',order['id'],user=user,force=True):
+                    return
                 return await self.send(message, self.order_text(order), funding.order_card_keyboard(self,order,user))
         state, active = payment["state"], funding.pending(payment)
         if payment["method"] != "QRIS_MANUAL":
@@ -2281,7 +2323,7 @@ class UIBuilder:
         buttons.append([("⬅️ Kembali", "home", {}), ("🏠 Menu Awal", "home", {})])
         await self.send(message, "\n\n".join(text), self.admin_keyboard(user, buttons) if admin else self.keyboard(user, buttons))
 
-    async def check(self, message, user, order_id):
+    async def check(self, message, user, order_id, *, full_sms=False):
         order = self.store.repo.owned(user, order_id)
         self.store.repo.rate(user, "status", 10, 60)
         try:
@@ -2289,14 +2331,23 @@ class UIBuilder:
         except StoreError:
             pass
         order = self.store.repo.owned(user, order_id)
+        if not full_sms:
+            shown=await self.store.host.PAYMENT_RECEIPTS.present(message.bot,'otp_order',order_id,user=user,force=True)
+            if shown:
+                await self.store.host.PAYMENT_RECEIPTS.retire_source(message,user,'otp_order',order_id)
+                return
         text = self.order_text(order)
         event = self.store.repo.one("SELECT * FROM otp_sms_events WHERE provider_order_id=? ORDER BY sms_revision DESC LIMIT 1", (order["provider_order_id"],))
         if event and event["encrypted_payload"]:
             payload = self.store.decrypt(event["encrypted_payload"])
             parts = self.sms_texts(order, payload, event["sms_revision"])
+            if full_sms:
+                for index,part in enumerate(parts):
+                    await self.send(message,part,self.navigation(user,'check',{'id':order_id}) if index==len(parts)-1 else None,fresh=True)
+                return
             if len(text)+len(parts[0]) <= 3900:
                 text += "\n\n"+parts.pop(0)
-            await self.send(message, text, self.order_keyboard(order, user, otp_code=payload.get("otp_code")))
+            await self.send(message, text, self.navigation(user,'check',{'id':order_id}) if full_sms else self.order_keyboard(order, user, otp_code=payload.get("otp_code")))
             for part in parts:
                 await self.send(message, part, fresh=True)
         else:
@@ -2753,7 +2804,6 @@ def register(router, store):
             attempt = await store.purchase.buy(user, payload["quote"])
             if attempt["state"] == "CAPTURED":
                 order = store.repo.one("SELECT * FROM otp_orders WHERE attempt_id=?", (attempt["attempt_id"],))
-                await store.ui.send(message, "✅ Nomor berhasil dibeli. Detail akan dikirim otomatis. Order #"+str(order["id"])+".", store.ui.order_keyboard(order, user))
                 await payment_receipts.notify(store.host, message.bot, "otp_order", order["id"])
             elif attempt["state"] == "FAILED":
                 await store.ui.send(message, "❌ Pembelian gagal. Saldo yang ditahan telah dilepas. "+escape(UserFormatter.error(StoreError(attempt["error_code"]))))
@@ -2761,14 +2811,30 @@ def register(router, store):
                 await store.ui.send(message, "⏳ Pembelian belum terkonfirmasi. Dana untuk transaksi ini ditahan. Jangan membeli ulang; hasil dikirim otomatis.")
         elif action == "check":
             await store.ui.check(message, user, payload["id"])
+        elif action == 'read_sms':
+            await store.ui.check(message,user,payload['id'],full_sms=True)
         elif action in {"confirm_cancel", "confirm_finish"}:
             order = store.repo.owned(user, payload["id"])
             kind = action.removeprefix("confirm_")
+            if kind=='cancel':
+                await store.orders.refresh(order)
+                order=store.repo.owned(user,payload['id'])
+                caps=json.loads(order['capabilities'])
+                if order['status'] not in ACTIVE or order['last_sms_revision']>0:
+                    return await store.ui.send(message,'Pembatalan tidak tersedia: SMS sudah diterima atau pesanan sudah selesai.',store.ui.navigation(user,'check',{'id':order['id']}))
+                if caps.get('can_cancel') is not True:
+                    when=payment_receipts.format_wib(caps.get('cancel_available_at'))
+                    return await store.ui.send(message,'⏳ Pembatalan belum diizinkan untuk nomor ini.'+(f'\nDapat diperiksa lagi: {when}.' if when!='-' else '\nPeriksa status terbaru sebelum mencoba lagi.'),store.ui.keyboard(user,[[('🔄 Periksa Pembatalan','confirm_cancel',{'id':order['id']})],[('⬅️ Kembali','check',{'id':order['id']}),('🏠 Menu Awal','home',{})]]))
             await store.ui.send(message, "Konfirmasi "+("pembatalan" if kind == "cancel" else "penyelesaian")+f" order #{order['id']}?\n"
                 + ("Refund diproses setelah pembatalan dan pengembalian dana terkonfirmasi." if kind == "cancel" else "Order selesai tidak mendapat refund."),
                 store.ui.keyboard(user, [[("✅ KONFIRMASI", kind, {"id": order["id"]})], [("⬅️ Kembali", "check", {"id": order["id"]}), ("🏠 Menu Awal", "home", {})]]))
         elif action in {"cancel", "finish", "resend"}:
+            current=store.repo.owned(user,payload['id'])
+            if (action=='cancel' and current['status']=='CANCELED') or (action=='finish' and current['status']=='COMPLETED'):
+                await payment_receipts.notify(store.host,message.bot,'otp_order',payload['id'])
+                return
             await store.orders.action(user, payload["id"], action)
+            if await payment_receipts.notify(store.host,message.bot,'otp_order',payload['id']):return
             await store.ui.send(message, "✅ "+{"cancel": "Pembatalan diterima. Status refund tersedia di pesanan.", "finish": "Order selesai.", "resend": "Permintaan SMS baru diterima. Tunggu SMS berikutnya; SMS lama tidak dikirim ulang."}[action])
         elif action == "reactivate":
             parent = store.repo.owned(user, payload["id"])

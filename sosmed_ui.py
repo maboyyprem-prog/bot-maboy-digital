@@ -533,6 +533,23 @@ class UIBuilder:
                      f"Status asli: {esc(order.get('raw_provider_status') or '-')}\n")
         return text
 
+    def receipt_view(self, order, data):
+        name=esc(self.public_label(order['service_name_snapshot'],80))
+        target=esc(str(order['target'])[:100])+('…' if len(str(order['target']))>100 else '')
+        text=(f"✅ <b>PESANAN BERHASIL DIBUAT!</b>\n🧾 Invoice: <b>{esc(data['reference'])}</b>\n"
+            +f"🆔 Order: #{order['id']}\n📱 {name}\n🔗 Target: <code>{target}</code>\n"
+            +f"🔢 Jumlah: {order['quantity']}\n💰 Total: <b>{core.money(data['amount'])}</b>\n"
+            +f"📊 Status: {esc(UserFormatter.status(order['status']))}\n🕒 Beli: {instant(order['created_at'])}\n")
+        if order.get('remains') is not None:text+=f"📉 Belum terpenuhi: {order['remains']}\n"
+        if order.get('refund_amount'):text+=f"↩️ Refund ke saldo: {core.money(order['refund_amount'])}\n"
+        refill=self.store.repo.one('SELECT * FROM sosmed_refills WHERE order_id=? ORDER BY id DESC LIMIT 1',(order['id'],))
+        if refill:
+            text+='🔄 Refill: '+esc(refill_label(refill['status']))+'\n'
+            if refill.get('last_checked_at'):text+='🕒 Refill diperiksa: '+instant(refill['last_checked_at'])+'\n'
+            if refill.get('last_error'):text+='⚠️ Pemeriksaan belum berhasil; status terakhir dipertahankan.\n'
+            if refill['status']=='UNKNOWN' and not refill.get('provider_refill_id'):text+='Jangan mengajukan ulang; hubungi owner.\n'
+        return text,self.order_keyboard(order['user_id'],order)
+
     def order_keyboard(self, user, order, *, admin=False):
         oid = order.get("id", order.get("internal_order_id"))
         rows = [[("🔄 REFRESH STATUS", "admin_check" if admin else "check", {"id": oid})]]
@@ -541,6 +558,8 @@ class UIBuilder:
         if refill:
             rows.append([('🔎 CEK STATUS REFILL','admin_refill_check' if admin else 'refill_check',{'id':oid})])
         if not admin:
+            if self.store.config.cancel_verified and order['status'] in {'PENDING','PROCESSING','IN_PROGRESS'}:
+                rows.append([('❌ Batalkan Pesanan','confirm_cancel',{'id':oid})])
             if self.store.orders.refill_capability(order) is not False and order["status"] == "COMPLETED" and not order.get('refund_amount') and self.store.refill_contract_verified() and (not refill or refill['status'] in {'COMPLETED','REJECTED','FAILED'}):
                 rows.append([("🔄 REQUEST REFILL", "confirm_refill", {"id": oid})])
         rows.append([("⬅️ Kembali", "admin_orders" if admin else "orders", {}),
@@ -582,6 +601,9 @@ class UIBuilder:
                 refill = self.store.repo.one('SELECT * FROM sosmed_refills WHERE id=?',(refill['id'],))
         if refill:
             text += self.refill_text(refill,admin=admin)
+        if not admin and await self.store.host.PAYMENT_RECEIPTS.present(message.bot,'sosmed',order_id,user=user,force=True):
+            await self.store.host.PAYMENT_RECEIPTS.retire_source(message,user,'sosmed',order_id)
+            return
         await self.send(message, text, self.order_keyboard(user, order, admin=admin))
 
     async def orders(self, message, user, payload=None, *, history=False, admin=False):
@@ -1247,7 +1269,6 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         result = await store.purchase.buy(user, str(payload["quote"]))
         if result.get("state") in {"CAPTURED", "SUCCESS"} and result.get("order"):
             order = result["order"]
-            await ui.send(message, "✅ <b>PESANAN BERHASIL DIBUAT!</b>\n\n"+ui.order_text(order), ui.order_keyboard(user, order))
             await payment_receipts.notify(store.host, message.bot, "sosmed", order["id"])
             return
         if result.get("state") in {"FAILED", "RELEASED"}:
