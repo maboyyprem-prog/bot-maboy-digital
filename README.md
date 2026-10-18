@@ -1,11 +1,55 @@
-# MaboyyDigital v17.21
+# MaboyyDigital v17.23
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+
+## Lokasi Cek MLBB
+
+User: **/start → Belanja / List Produk → 🎮 Cek MLBB**.
+Owner: **/owner → 🎮 Pengaturan MLBB** untuk status API, statistik, limit dan
+aktif/nonaktif. Owner yang membuka lewat /start mendapat tampilan pemeriksaan
+akun biasa; pengaturan tetap berada di /owner.
+
+Tombol Cek MLBB dihapus dari menu /tools yang baru. Tombol pada pesan lama tetap
+ditangani, dengan tujuan kembali ke daftar produk atau panel owner. Tombol
+checker merupakan pintasan, tanpa menambah produk database, mengubah nomor
+produk, urutan A–Z, stok, harga, wallet atau invoice. **Semua user dapat mengecek
+tanpa VIP**, termasuk user yang VIP-nya habis dan owner. Batas harian, jeda cek,
+pemeriksaan akun terblokir dan rate limit API tetap berlaku. Menu /tools kembali
+seperti sebelum Cek MLBB ditambahkan; VIP Rp20.000/bulan untuk tools lama,
+pembelian dan perpanjangannya tetap memakai alur existing. Tidak ada Variables, migration,
+dependency atau command baru. Schema tetap 203.
+
+## Cek MLBB: satu pesan untuk kedua ID
+
+Buka **/start → Belanja → Cek MLBB → Mulai Cek**, lalu kirim **User ID dan Server ID sekaligus**:
+`12345678 1234`, `12345678 (1234)`, atau `12345678(1234)`.
+Bot langsung mengecek setelah kedua ID valid; tidak meminta Server ID lagi.
+Input yang belum lengkap ditolak dengan contoh format, tanpa memakai kuota API.
+Sesi versi lama yang sudah menunggu Server ID tetap dapat diselesaikan setelah
+update. Limit, whitelist API, wallet dan pembayaran tetap memakai alur existing.
+Tidak ada Variables, migration, dependency, command, atau file runtime baru.
+
+## Status Weekly Elite / Monthly Epic
+
+Status bundle tidak lagi ditetapkan selalu ⚠️ di tampilan. Jika respons resmi
+`/mlbb-bonus-check` memuat baris `bonus_limit` berjudul **Weekly Elite Bundle** atau
+**Monthly Epic Bundle** (nama tanpa akhiran Bundle juga dikenali), bot membaca
+`reached_limit` boolean: `false` → ✅ tersedia, `true` → ❌ sudah digunakan.
+Nilai hilang, bukan boolean, atau judul duplikat → ⚠️; status tiap paket berdiri
+sendiri. First Top Up atau Weekly Diamond Pass tidak membuktikan status bundle.
+
+[Dokumentasi ALU](https://aluu.in/docs), diperiksa 18 Oktober 2026, hanya menjelaskan
+empat paket First Top Up; dukungan bundle belum dapat dibuktikan dari dokumentasi
+atau akun live workspace. Pembacaan baris bundle tambahan diuji dengan **mock
+kondisional**, bukan hasil API nyata. Bila API akun hanya mengirim empat paket,
+kedua bundle tetap ⚠️ dengan keterangan data belum dapat diverifikasi. Centang
+pada bot lain tidak membuktikan API ALU menyediakan data yang sama. Tidak ada
+endpoint baru, request tambahan, atau pembelian game untuk mencoba eligibility.
 
 ## Perbaikan IP_NOT_ALLOWED pada ALU
 
 API Key saja belum cukup untuk Name Check: IP keluar server wajib masuk whitelist
-[profil akun ALU](https://aluu.in/docs). Buka **/tools → Cek MLBB → Status API**.
+[profil akun ALU](https://aluu.in/docs). Buka **/owner → Pengaturan MLBB → Status API**.
 Panel owner sekarang menampilkan IP yang benar-benar dilihat ALU, tombol **Salin IP
 Server**, **Periksa Ulang**, dan **Periksa & Aktifkan**. Tambahkan IP itu ke whitelist,
 simpan, lalu periksa ulang. Tidak ada Variables, schema, atau command baru.
@@ -22,21 +66,23 @@ koneksi kembali dengan jeda minimal tiga detik. Cache lama diperbarui setelah up
 Bot tidak membuka whitelist ALU secara otomatis dan tidak menebak IP jika provider
 tidak mengirimkannya. Alamat IP/diagnostik hanya terlihat di panel owner privat.
 
-## Cek MLBB di /tools
+## Cek MLBB di /start
 
-User membuka **/tools → 🎮 Cek MLBB → Mulai Cek**, lalu mengirim User ID dan Zone ID
-secara berurutan. VIP existing Rp20.000/bulan atau akses permanen dari owner berlaku;
-VIP habis diarahkan ke pembelian/perpanjangan existing. Owner dapat mengecek tanpa
-berlangganan. Tidak ada command, wallet, paket VIP, atau potongan saldo baru.
+User membuka **/start → Belanja → 🎮 Cek MLBB → Mulai Cek**, lalu mengirim User ID dan Server ID
+(Zone ID) dalam satu pesan. Pengecekan tersedia untuk semua user tanpa VIP,
+termasuk non-VIP dan VIP kedaluwarsa; tidak ada pembelian paket atau potongan
+saldo per cek. Pengaturan hanya dapat dibuka owner melalui /owner.
 
 Adapter memakai [ALU API — Name Check](https://aluu.in/docs): nickname/negara dan bonus
 top-up pertama dibaca melalui dua endpoint GET dengan header `x-api-key`.
 `reached_limit=true` berarti bonus sudah digunakan; field yang hilang, ambigu, atau
-gagal dibaca ditampilkan **⚠️**. Kontrak ini belum mendukung Weekly Elite/Monthly Epic;
-keduanya tetap ⚠️. Nama provider dan konfigurasi hanya tampil kepada owner.
+gagal dibaca ditampilkan **⚠️**. Status Weekly Elite/Monthly Epic dibaca jika baris
+bundle dikirim API; dokumentasi saat ini belum menjaminnya. Nama provider dan
+konfigurasi hanya tampil kepada owner. Validasi nickname yang berhasil tidak
+dianggap membuktikan bonus/bundle ketika pengecekan bonus gagal.
 
 Railway: tambahkan **MLBB_API_KEY** dari akun ALU, whitelist IP keluar server pada
-dashboard API, lalu **/tools → Cek MLBB → Status API → Kembali → Aktifkan**.
+dashboard API, lalu **/owner → Pengaturan MLBB → Status API → Kembali → Aktifkan**.
 Jangan kirim key melalui Telegram atau masukkan ke GitHub. Default fitur nonaktif.
 Semua Variables baru ada di `.env.example`: `MLBB_ENABLED=false`,
 `MLBB_HTTP_TIMEOUT_SECONDS=12`, `MLBB_CACHE_SECONDS=60`, `MLBB_DAILY_LIMIT=20`,
@@ -168,7 +214,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.21 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.23 yang konsisten.
 
 ## Jalankan
 
@@ -371,7 +417,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.21; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.23; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -379,7 +425,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.21: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.23: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed
