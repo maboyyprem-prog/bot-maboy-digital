@@ -238,8 +238,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.24"
-SCHEMA_VERSION = 204
+BOT_VERSION = "17.25"
+SCHEMA_VERSION = 205
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -1334,17 +1334,18 @@ def init_db():
     add_column_if_missing(conn, "topups", "verified_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "verified_by", "INTEGER NOT NULL DEFAULT 0")
     add_column_if_missing(conn, "topups", "expires_at", "TEXT DEFAULT ''")
-    # Manual invoices wait for an explicit owner decision, not a timer. Do not
-    # revive historical terminal rows or change gateway/provider deadlines.
+    # Bank transfers keep their owner-reviewed policy. QRIS manual has a
+    # persistent fifteen-minute deadline; never erase it on restart.
     conn.execute("""UPDATE orders SET reserved_until=''
-        WHERE UPPER(TRIM(COALESCE(payment_method,''))) IN ('QRIS','QRIS_MANUAL','BANK_TRANSFER')
+        WHERE UPPER(TRIM(COALESCE(payment_method,'')))='BANK_TRANSFER'
           AND payment_status!='paid' AND status NOT IN ('completed','cancelled','expired','rejected')
           AND COALESCE(reserved_until,'')!=''""")
     conn.execute("""UPDATE topups SET expires_at=''
-        WHERE UPPER(TRIM(COALESCE(payment_method,''))) IN ('QRIS','QRIS_MANUAL','BANK_TRANSFER')
+        WHERE UPPER(TRIM(COALESCE(payment_method,'')))='BANK_TRANSFER'
           AND status='pending' AND COALESCE(expires_at,'')!=''""")
     add_column_if_missing(conn, "topups", "updated_at", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "payment_message_ids", "TEXT DEFAULT '[]'")
+    add_column_if_missing(conn, "orders", "payment_message_ids", "TEXT DEFAULT '[]'")
     add_column_if_missing(conn, "topups", "payment_review_status", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "payment_proof_file_id", "TEXT DEFAULT ''")
     add_column_if_missing(conn, "topups", "payment_proof_type", "TEXT DEFAULT ''")
@@ -1587,6 +1588,7 @@ def init_db():
     bank_accounts.init_schema(conn)
     payment_receipts.init_schema(conn)
     klikqris_gateway.init_schema(conn)
+    backfill_manual_qris_deadlines(conn)
     init_purchase_rating_schema(conn)
     reconcile_all_inventory_stock(conn)
     sync_all_product_sold_from_history(conn)
@@ -4152,6 +4154,50 @@ async def cancel_pending_order(order_id: int, bot: Bot):
     return True, "Order berhasil dibatalkan dan reservasi stok dilepas."
 
 MANUAL_PAYMENT_METHODS = frozenset({'QRIS','QRIS_MANUAL','BANK_TRANSFER'})
+MANUAL_QRIS_MINUTES = 15
+
+
+def manual_qris_required(row) -> bool:
+    try:
+        return str(row['payment_method'] or '').strip().upper() in {'QRIS','QRIS_MANUAL'}
+    except (KeyError,IndexError,TypeError):
+        return False
+
+
+def manual_qris_awaiting_owner(row) -> bool:
+    """A saved proof waits for a human decision, never an automatic credit."""
+    if not row or not manual_qris_required(row):return False
+    keys=set(row.keys())
+    return (str(row['status'] or '')=='pending'
+        and 'payment_proof_file_id' in keys and bool(str(row['payment_proof_file_id'] or '').strip())
+        and 'payment_review_status' in keys
+        and str(row['payment_review_status'] or '') in {'submitted','reviewing','forward_failed'})
+
+
+def backfill_manual_qris_deadlines(conn):
+    """Adopt the new deadline for unpaid legacy QRIS without reviving any row."""
+    for table,field,condition in (
+        ('orders','reserved_until',"status='pending' AND payment_status!='paid'"),
+        ('topups','expires_at',"status='pending'"),
+    ):
+        conn.execute(f"""UPDATE {table} SET {field}=COALESCE(
+            strftime('%Y-%m-%dT%H:%M:%S+00:00',created_at,'+15 minutes'),?)
+            WHERE UPPER(TRIM(COALESCE(payment_method,''))) IN ('QRIS','QRIS_MANUAL')
+              AND {condition} AND COALESCE({field},'')=''
+              AND NOT (COALESCE(payment_proof_file_id,'')!=''
+                  AND COALESCE(payment_review_status,'') IN ('submitted','reviewing','forward_failed'))""",(topup_expiry_iso(MANUAL_QRIS_MINUTES),))
+    for table in ('otp_payments','sosmed_payments'):
+        conn.execute(f"""UPDATE {table} SET expires_at=(SELECT
+            CAST(strftime('%s',t.expires_at) AS REAL) FROM topups t WHERE t.id={table}.topup_id)
+            WHERE method='QRIS_MANUAL' AND state='PENDING' AND paid_at IS NULL AND expires_at=0
+              AND EXISTS(SELECT 1 FROM topups t WHERE t.id={table}.topup_id
+                  AND t.user_id={table}.user_id AND t.status='pending' AND t.expires_at!='')""")
+
+
+def deadline_payment_sql() -> str:
+    # Retention uses timed_payment_sql separately: expired manual proofs/history
+    # must remain available for an owner to investigate actual late transfers.
+    return "UPPER(TRIM(COALESCE(payment_method,''))) NOT IN ('BANK_TRANSFER','KLIKQRIS_AUTO')"
 
 
 def manual_confirmation_required(row) -> bool:
@@ -4171,6 +4217,8 @@ def timed_payment_sql(alias: str = '') -> str:
 def owner_confirmable_expired_manual(row) -> bool:
     if not row or not manual_confirmation_required(row) or str(row['status'] or '')!='expired':return False
     keys=set(row.keys())
+    if manual_qris_required(row) and 'reserved_until' in keys and row['reserved_until']:
+        return False  # A timed product invoice cannot be revived after expiry.
     return (('payment_status' not in keys or str(row['payment_status'] or '') in {'unpaid','expired'})
             and ('payment_review_status' not in keys or str(row['payment_review_status'] or '')!='rejected'))
 
@@ -4285,22 +4333,26 @@ def format_expiry_time(value: str) -> str:
 def order_expiry_text(order) -> str:
     if not order:
         return ""
-    if manual_confirmation_required(order):
+    if manual_confirmation_required(order) and not manual_qris_required(order):
         return "⏳ Verifikasi owner tanpa batas waktu.\n" if not order_payment_terminal(order) else ""
     expiry = order["reserved_until"] if "reserved_until" in order.keys() else ""
+    if manual_qris_awaiting_owner(order):
+        return '⏳ Bukti tersimpan • konfirmasi owner tanpa batas waktu.\n'
     if expiry:
-        return f"⏳ Kedaluwarsa: <b>{format_expiry_time(expiry)}</b>\n"
+        return f"⏳ Kedaluwarsa: <b>{format_expiry_time(expiry)}</b>" + (' (15 menit)\n' if manual_qris_required(order) else '\n')
     return ""
 
 
 def topup_expiry_text(topup) -> str:
     if not topup:
         return ""
-    if manual_confirmation_required(topup):
+    if manual_confirmation_required(topup) and not manual_qris_required(topup):
         return "⏳ Verifikasi owner tanpa batas waktu.\n" if not topup_payment_terminal(topup) else ""
     expiry = topup["expires_at"] if "expires_at" in topup.keys() else ""
+    if manual_qris_awaiting_owner(topup):
+        return '⏳ Bukti tersimpan • konfirmasi owner tanpa batas waktu.\n'
     if expiry:
-        return f"⏳ Kedaluwarsa: <b>{format_expiry_time(expiry)}</b>\n"
+        return f"⏳ Kedaluwarsa: <b>{format_expiry_time(expiry)}</b>" + (' (15 menit)\n' if manual_qris_required(topup) else '\n')
     return ""
 
 
@@ -4734,13 +4786,14 @@ async def cleanup_expired_orders(bot: Bot):
             rows = conn.execute(
                 f"""SELECT * FROM orders
                    WHERE status='pending'
-                     AND stock_reserved=1
-                     AND {timed_payment_sql()}
+                     AND payment_status!='paid'
+                     AND {deadline_payment_sql()}
                      AND reserved_until!=''
-                     AND reserved_until < ?""",
+                     AND julianday(reserved_until) <= julianday(?)""",
                 (now_iso,)
             ).fetchall()
 
+            rows=[row for row in rows if not manual_qris_awaiting_owner(row)]
             notify_orders = []
             for order in rows:
                 release_order_reservation(conn, order)
@@ -4748,8 +4801,7 @@ async def cleanup_expired_orders(bot: Bot):
                     """UPDATE orders
                        SET status='expired',
                            payment_status='expired',
-                           payment_review_status='',
-                           reserved_until=''
+                           reserved_until=CASE WHEN payment_method IN ('QRIS','QRIS_MANUAL') THEN reserved_until ELSE '' END
                        WHERE id=?""",
                     (order["id"],)
                 )
@@ -4759,12 +4811,13 @@ async def cleanup_expired_orders(bot: Bot):
             stale_topups = conn.execute(
                 f"""SELECT * FROM topups
                    WHERE status='pending'
-                     AND {timed_payment_sql()}
+                     AND {deadline_payment_sql()}
                      AND expires_at!=''
-                     AND expires_at < ?""",
+                     AND julianday(expires_at) <= julianday(?)""",
                 (now_iso,)
             ).fetchall()
 
+            stale_topups=[row for row in stale_topups if not manual_qris_awaiting_owner(row)]
             for row in stale_topups:
                 conn.execute(
                     "UPDATE topups SET status='expired' WHERE id=? AND status='pending'",
@@ -4773,6 +4826,22 @@ async def cleanup_expired_orders(bot: Bot):
 
             conn.commit()
             conn.close()
+
+            # Retry persisted QR cleanup even if a previous deletion or process
+            # stopped after the expiry transaction committed.
+            with db() as cleanup_conn:
+                final_orders=cleanup_conn.execute("""SELECT id,user_id FROM orders
+                    WHERE payment_method IN ('QRIS','QRIS_MANUAL')
+                      AND (status IN ('expired','cancelled','completed') OR payment_status='paid')
+                      AND payment_message_ids!='[]' LIMIT 100""").fetchall()
+                final_topups=cleanup_conn.execute("""SELECT id,user_id FROM topups
+                    WHERE payment_method IN ('QRIS','QRIS_MANUAL')
+                      AND status IN ('expired','cancelled','completed','rejected')
+                      AND payment_message_ids!='[]' LIMIT 100""").fetchall()
+            for item in final_orders:
+                await retire_saved_order_payment_messages(bot,item['id'],item['user_id'])
+            for item in final_topups:
+                await retire_saved_topup_payment_messages(bot,item['id'],item['user_id'])
 
             for user_id, order_id in notify_orders:
                 record_payment_event(
@@ -5930,9 +5999,9 @@ def save_topup_payment_message(topup_id: int, user_id: int, message_id: int) -> 
     conn = db()
     try:
         begin_immediate_retry(conn)
-        row = conn.execute("SELECT status,payment_message_ids FROM topups WHERE id=? AND user_id=?",
+        row = conn.execute("SELECT * FROM topups WHERE id=? AND user_id=?",
                            (topup_id, user_id)).fetchone()
-        if not row or row["status"] != "pending":
+        if not row or row["status"] != "pending" or topup_reservation_expired(row):
             conn.rollback()
             return False
         ids = topup_saved_payment_message_ids(row["payment_message_ids"])
@@ -5962,7 +6031,7 @@ async def retire_topup_payment_message(bot: Bot, user_id: int, message_id: int) 
         pass
     try:
         await bot.edit_message_caption(chat_id=user_id, message_id=message_id,
-            caption="⛔ QRIS isi saldo ini sudah tidak aktif. Jangan lakukan pembayaran.",
+            caption="⛔ Invoice QRIS ini sudah tidak aktif. Jangan lakukan pembayaran.",
             reply_markup=None, parse_mode="HTML")
         return True
     except Exception:
@@ -6005,6 +6074,60 @@ async def retire_saved_topup_payment_messages(bot: Bot, topup_id: int, user_id: 
             raise
         finally:
             conn.close()
+
+
+def save_order_payment_message(order_id: int, user_id: int, message_id: int) -> bool:
+    if type(message_id) is not int or not 0 < message_id <= 9223372036854775807:
+        raise ValueError('Invalid payment message ID')
+    with db() as conn:
+        begin_immediate_retry(conn)
+        row=conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?',(order_id,user_id)).fetchone()
+        if (not row or not manual_qris_required(row) or row['status']!='pending'
+                or row['payment_status']=='paid' or order_reservation_expired(row)):
+            return False
+        ids=topup_saved_payment_message_ids(row['payment_message_ids'])
+        if message_id not in ids:ids.append(message_id)
+        conn.execute('UPDATE orders SET payment_message_ids=? WHERE id=?',(json.dumps(ids),order_id))
+        return True
+
+
+async def retire_saved_order_payment_messages(bot: Bot, order_id: int, user_id: int):
+    with db() as conn:
+        row=conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?',(order_id,user_id)).fetchone()
+    if (not row or not manual_qris_required(row) or
+            (row['payment_status']!='paid' and row['status'] not in {'expired','cancelled','completed'})):
+        return
+    retired=set()
+    for message_id in topup_saved_payment_message_ids(row['payment_message_ids']):
+        if await retire_topup_payment_message(bot,user_id,message_id):retired.add(message_id)
+    if retired:
+        with db() as conn:
+            begin_immediate_retry(conn)
+            current=conn.execute('SELECT payment_message_ids FROM orders WHERE id=? AND user_id=?',(order_id,user_id)).fetchone()
+            if current:
+                ids=[value for value in topup_saved_payment_message_ids(current['payment_message_ids']) if value not in retired]
+                conn.execute('UPDATE orders SET payment_message_ids=? WHERE id=?',(json.dumps(ids),order_id))
+
+
+async def refresh_manual_qris_deadline(client, entity, row):
+    """Enforce the deadline on old buttons too, without waiting for a worker."""
+    if not row or not manual_qris_required(row):return row
+    table='orders' if entity=='order' else 'topups'
+    with db() as conn:
+        begin_immediate_retry(conn)
+        current=conn.execute(f'SELECT * FROM {table} WHERE id=? AND user_id=?',(row['id'],row['user_id'])).fetchone()
+        expired=(order_reservation_expired(current) if entity=='order' else topup_reservation_expired(current))
+        if current and current['status']=='pending' and expired:
+            if entity=='order' and current['payment_status']!='paid':
+                release_order_reservation(conn,current)
+                conn.execute("UPDATE orders SET status='expired',payment_status='expired' WHERE id=?",(row['id'],))
+                sync_variant_reserved_stock(conn,int(current['variant_id'] or 0))
+            elif entity=='topup':
+                conn.execute("UPDATE topups SET status='expired' WHERE id=?",(row['id'],))
+        result=conn.execute(f'SELECT * FROM {table} WHERE id=? AND user_id=?',(row['id'],row['user_id'])).fetchone()
+    if entity=='order':await retire_saved_order_payment_messages(client,row['id'],row['user_id'])
+    else:await retire_saved_topup_payment_messages(client,row['id'],row['user_id'])
+    return {**dict(row),**dict(result)} if result else result
 
 
 def cancel_topup_atomic(topup_id: int, user_id: int):
@@ -8590,6 +8713,7 @@ async def process_payment_proof_message(
 
     conn = db() if entity == "order" else None
     if entity == "order":
+        begin_immediate_retry(conn)
         row = conn.execute(
             "SELECT * FROM orders WHERE id=? AND user_id=?",
             (entity_id, message.from_user.id)
@@ -8699,12 +8823,14 @@ def order_payment_terminal(order) -> bool:
 def order_reservation_expired(order) -> bool:
     if not order:
         return True
-    if manual_confirmation_required(order) or klikqris_gateway.managed(order):return False
+    if str(order['payment_status'] or '')=='paid':return False
+    if manual_qris_awaiting_owner(order):return False
+    if (manual_confirmation_required(order) and not manual_qris_required(order)) or klikqris_gateway.managed(order):return False
     expiry = str(order["reserved_until"] or "").strip()
     if not expiry:
         return False
     try:
-        return datetime.fromisoformat(expiry) <= datetime.now(timezone.utc).astimezone()
+        return parse_stored_datetime(expiry) <= datetime.now(timezone.utc)
     except Exception:
         return False
 
@@ -8712,7 +8838,9 @@ def order_reservation_expired(order) -> bool:
 def topup_reservation_expired(row) -> bool:
     if not row:
         return True
-    if manual_confirmation_required(row) or klikqris_gateway.managed(row):return False
+    if str(row['status'] or '')=='completed':return False
+    if manual_qris_awaiting_owner(row):return False
+    if (manual_confirmation_required(row) and not manual_qris_required(row)) or klikqris_gateway.managed(row):return False
     keys = set(row.keys()) if hasattr(row, "keys") else set()
     raw = str(row["expires_at"] or "").strip() if "expires_at" in keys else ""
     if not raw:
@@ -8883,6 +9011,8 @@ def order_user_status_label(order) -> str:
         return "✅ Selesai • Akun Terkirim"
     if payment_status=="paid" and fulfillment!="delivered":
         return "💰 Pembayaran Dikonfirmasi • Menunggu Akun"
+    if status=='expired' or (payment_status!='paid' and status=='pending' and order_reservation_expired(order)):
+        return '⌛ Kedaluwarsa'
     if review_status=="reviewing":
         return "⏳ Bukti Sedang Diperiksa"
     if review_status=="submitted":
@@ -9027,7 +9157,7 @@ def order_detail_keyboard(order, *, include_history: bool = True):
         if payment_status=="paid" and str(order["delivery_text"] or "").strip():
             actions.append(InlineKeyboardButton(text="📩 Kirim Ulang Akun",callback_data=f"resendorder:{order['id']}"))
         rows.append(actions)
-    elif payment_status!="paid" and status not in {"expired","cancelled","completed"}:
+    elif payment_status!="paid" and status not in {"expired","cancelled","completed"} and not order_reservation_expired(order):
         if not proof_used:
             rows.append([
                 InlineKeyboardButton(
@@ -9191,6 +9321,7 @@ def owner_payment_proof_keyboard(entity: str, entity_id: int):
 
 def payment_proof_caption(entity: str, row) -> str:
     bank_tail = ""
+    owner_tail='\n\n⏳ Konfirmasi owner tanpa batas waktu. Bukti tersimpan; verifikasi transfer sebelum menyetujui.' if manual_qris_required(row) else ''
     if row["payment_method"] == "BANK_TRANSFER":
         snapshot = BANK_ACCOUNTS.snapshot(entity, row["id"])
         if snapshot:
@@ -9206,7 +9337,7 @@ def payment_proof_caption(entity: str, row) -> str:
             f"Kode unik: <b>+{int(row['unique_code'] or 0)}</b>\n"
             f"Catatan: <b>{proof_note}</b>\n\n"
             "Periksa bukti sebelum konfirmasi."
-        ) + bank_tail
+        ) + bank_tail + owner_tail
 
     return (
         "💰 <b>BUKTI PEMBAYARAN TOP UP</b>\n\n"
@@ -9219,7 +9350,7 @@ def payment_proof_caption(entity: str, row) -> str:
         "Periksa bukti sebelum konfirmasi.\n"
         "Nominal bukti harus sesuai Total transfer, termasuk kode unik. "
         "Jika berbeda, gunakan Kirim Catatan untuk memberi tahu user."
-    ) + bank_tail
+    ) + bank_tail + owner_tail
 
 
 def get_min_topup() -> int:
@@ -9902,7 +10033,9 @@ def confirm_order_payment_atomic(order_id: int, paid_amount: int | None = None, 
             if order_payment_terminal(order) and not recovered:return None,False
             if order_reservation_expired(order):
                 release_order_reservation(conn,order)
-                conn.execute("UPDATE orders SET status='expired',payment_status='expired',payment_review_status='',reserved_until='' WHERE id=? AND payment_status!='paid'",(order_id,))
+                conn.execute("""UPDATE orders SET status='expired',payment_status='expired',
+                    reserved_until=CASE WHEN payment_method IN ('QRIS','QRIS_MANUAL') THEN reserved_until ELSE '' END
+                    WHERE id=? AND payment_status!='paid'""",(order_id,))
                 sync_variant_reserved_stock(conn,int(order['variant_id'] or 0))
                 return None,False
             if recovered:
@@ -9935,8 +10068,14 @@ async def mark_order_paid(
 ):
     order, first_payment = confirm_order_payment_atomic(order_id,paid_amount,verified_by)
     if not order:
+        with db() as conn:
+            expired=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+        if expired and manual_qris_required(expired) and expired['status']=='expired':
+            await retire_saved_order_payment_messages(bot,order_id,expired['user_id'])
         return False
 
+    if manual_qris_required(order):
+        await retire_saved_order_payment_messages(bot,order_id,order['user_id'])
     if first_payment:
         # Voucher is consumed only on the first successful payment transition.
         record_voucher_usage(
@@ -13787,6 +13926,8 @@ async def payment_proof_back(call: CallbackQuery, state: FSMContext):
             if conn is not None:
                 conn.close()
     else:
+        if await render_store_manual_qris(call,row):
+            return await safe_callback_notice(call)
         text, keyboard = topup_status_view(row)
         await safe_edit_or_answer(call, text, reply_markup=keyboard, parse_mode="HTML")
     await safe_callback_notice(call)
@@ -13829,6 +13970,7 @@ async def payment_proof_start(call: CallbackQuery, state: FSMContext):
     if not row:
         return await call.answer("Invoice tidak ditemukan.", show_alert=True)
 
+    row=await refresh_manual_qris_deadline(call.bot,entity,row)
     if row['payment_method']==klikqris_gateway.METHOD:
         return await safe_callback_notice(call,'QRIS Otomatis diperiksa otomatis. Gunakan Cek Status tanpa mengirim bukti.',show_alert=True)
 
@@ -23743,7 +23885,7 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
                 unique_code,
                 payment_total,
                 1,
-                "",
+                topup_expiry_iso(MANUAL_QRIS_MINUTES),
                 datetime.now().isoformat(timespec="seconds"),
                 voucher_code,
                 discount_amount
@@ -23804,7 +23946,7 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             f"💵 <b>TOTAL TRANSFER: {rupiah(payment_total)}</b>\n"
             f"{note_text}\n"
             f"{expiry_text}"
-            "⏳ Stok tetap direservasi sampai konfirmasi atau pembatalan.\n"
+            "⏳ Stok direservasi selama 15 menit.\n"
             "⚠️ Transfer harus sesuai total hingga kode unik.\n"
             f"📝 {payment_note}\n\n"
             "Setelah pembayaran, kirim bukti pembayaran melalui tombol di bawah.\n\n"
@@ -23815,13 +23957,15 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         if qris_file_id:
             try:
                 await call.message.delete()
-                await bot.send_photo(
+                sent = await bot.send_photo(
                     call.from_user.id,
                     photo=qris_file_id,
                     caption=payment_text,
                     reply_markup=payment_kb,
                     parse_mode="HTML"
                 )
+                if not save_order_payment_message(order_id,call.from_user.id,sent.message_id):
+                    await retire_topup_payment_message(bot,call.from_user.id,sent.message_id)
             except Exception:
                 await bot.send_message(
                     call.from_user.id,
@@ -23855,7 +23999,7 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
                     f"🔢 Kode unik: +{unique_code}\n"
                     f"💵 Transfer: {rupiah(payment_total)}\n"
                     f"📝 Catatan: {checkout_note or '-'}\n"
-                    "⏳ Konfirmasi owner: tanpa batas waktu\n\n"
+                    f"{expiry_text}\n"
                     "⏳ Menunggu bukti pembayaran dari user.\n"
                     "Jika user mengirim bukti, bot akan mengirimkannya ke PM owner "
                     "dengan tombol ✅ Konfirmasi / ❌ Tolak / ⏳ Pending.",
@@ -24356,6 +24500,26 @@ async def user_order_detail(call: CallbackQuery, state: FSMContext = None):
 
 
 
+async def render_store_manual_qris(call, topup):
+    """Return a linked OTP/SOSMED invoice to its existing photo without
+    changing confirmation, credit, purchase or refund state.
+    """
+    if topup['payment_method'] != 'QRIS_MANUAL' or topup['user_id'] != call.from_user.id:
+        return False
+    for store in (OTP_STORE,SOSMED_STORE):
+        store.payments.expire_manual_due()
+        payment = store.repo.one(f'SELECT * FROM {store.payments.table} WHERE topup_id=? AND user_id=?',
+                                 (topup['id'],call.from_user.id))
+        if payment:
+            if topup['status'] != 'pending' and payment['state']=='PENDING':
+                # The worker may still be reconciling a legacy final topup.
+                await retire_saved_topup_payment_messages(call.bot,topup['id'],call.from_user.id)
+                return False
+            await store.ui.payment(otp_smscode.MenuMessage(call.message),call.from_user.id,payment['payment_id'])
+            return True
+    return False
+
+
 @router.callback_query(F.data.startswith("statuscheck:"))
 async def user_check_transaction_status(call: CallbackQuery):
     target=payment_transaction_callback(call.data,"statuscheck")
@@ -24409,6 +24573,7 @@ async def user_check_transaction_status(call: CallbackQuery):
     if not row:
         return await call.answer("Transaksi tidak ditemukan.",show_alert=True)
 
+    row=await refresh_manual_qris_deadline(call.bot,entity,row)
     if row['payment_method']==klikqris_gateway.METHOD:
         automatic=KLIKQRIS_GATEWAY.linked(entity,entity_id)
         if automatic:
@@ -24424,6 +24589,8 @@ async def user_check_transaction_status(call: CallbackQuery):
         except sqlite3.Error:
             return await safe_callback_notice(call,"Status belum bisa dibuka. Coba lagi.",show_alert=True)
     else:
+        if await render_store_manual_qris(call,row):
+            return await safe_callback_notice(call,'Status diperbarui.')
         text, keyboard = topup_status_view(row)
         await safe_edit_or_answer(call, text, reply_markup=keyboard, parse_mode="HTML")
 
@@ -24988,7 +25155,7 @@ def create_or_reuse_manual_topup(user_id, username, amount, method, bank_account
             (user_id, amount, method, selected_bank["id"] if selected_bank else None, selected_bank["id"] if selected_bank else None)
         ).fetchone()
         if recent:
-            if manual_confirmation_required(recent):
+            if manual_confirmation_required(recent) and not manual_qris_required(recent):
                 conn.execute("UPDATE topups SET expires_at='' WHERE id=? AND status='pending'",(recent['id'],))
                 recent=conn.execute('SELECT * FROM topups WHERE id=?',(recent['id'],)).fetchone()
                 conn.commit()
@@ -24996,7 +25163,7 @@ def create_or_reuse_manual_topup(user_id, username, amount, method, bank_account
             expiry = parse_stored_datetime(recent["expires_at"])
             if not expiry:
                 created = parse_stored_datetime(recent["created_at"])
-                expiry = created + timedelta(minutes=30) if created else None
+                expiry = created + timedelta(minutes=MANUAL_QRIS_MINUTES if manual_qris_required(recent) else 30) if created else None
             if expiry and expiry > datetime.now(timezone.utc):
                 conn.commit()
                 return recent, False
@@ -25013,7 +25180,7 @@ def create_or_reuse_manual_topup(user_id, username, amount, method, bank_account
                VALUES(?,?,?,?,?,?,'pending',?,?)""",
             (user_id, username or "", amount, unique_code, amount + unique_code,
              method, datetime.now().isoformat(timespec="seconds"),
-             "" if str(method).strip().upper() in MANUAL_PAYMENT_METHODS else topup_expiry_iso())
+             topup_expiry_iso(MANUAL_QRIS_MINUTES) if str(method).strip().upper() in {'QRIS','QRIS_MANUAL'} else "" if str(method).strip().upper() in MANUAL_PAYMENT_METHODS else topup_expiry_iso())
         )
         if selected_bank:
             BANK_ACCOUNTS.capture(conn, "topup", cur.lastrowid, selected_bank["id"])
@@ -25053,7 +25220,7 @@ def manual_topup_invoice_text(topup, *, bank=False):
             note = note[:-1]
         if note:
             text += f"📝 {html.escape(note)}\n\n"
-    if manual_confirmation_required(topup):
+    if manual_confirmation_required(topup) and not manual_qris_required(topup):
         return text + "📎 Setelah transfer, kirim bukti pembayaran ke bot untuk konfirmasi owner."
     return text + "⏳ Setelah transfer, kirim bukti pembayaran ke bot sebelum invoice kedaluwarsa."
 
@@ -36382,7 +36549,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.24"
+EXPECTED_SOURCE_VERSION = "17.25"
 
 
 def source_integrity_self_test():

@@ -1,47 +1,47 @@
-# MaboyyDigital v17.24
+# MaboyyDigital v17.25
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
-## Pembaruan v17.24: salin OTP dan QRIS manual
+## Pembaruan v17.25: invoice QRIS manual dan batas pembayaran
 
-Pada detail OTP, **Salin Nomor** tersedia saat nomor sudah dibeli. **Salin OTP**
-muncul setelah kode SMS yang sebenarnya diterima, juga pada notifikasi SMS.
-Kode dengan nol di depan tetap utuh. Jika SMS belum ada atau data retensinya
-sudah dihapus, bot tidak membuat kode/tombol salin OTP palsu.
+QRIS Manual pada /otp dan /sosmed ditampilkan dalam **satu foto beserta caption
+invoice dan tombol**. Cek Pembayaran, Pesanan Saya, dan Kembali dari pengiriman
+bukti membuka foto invoice yang sama. Pengiriman yang hasilnya belum pasti
+tidak diulang otomatis. Nama file runtime dan paket ringkas tetap sama.
 
-Konfirmasi pembelian **/otp dan /sosmed** menyediakan **Saldo Bot** dan
-**QRIS Manual** jika owner sudah memasang gambar QRIS existing. QRIS otomatis
-untuk pembelian langsung kedua toko ini tetap tidak dibuka; deposit dan checkout
-produk lain tetap memakai metode existing. Tidak ada Variables atau file runtime baru.
+Semua QRIS manual — checkout /start, deposit, /otp, dan /sosmed — berlaku
+**15 menit sejak invoice dibuat**. Tanggal ditampilkan dalam WIB. Tanpa bukti,
+invoice kedaluwarsa, tombol pembayaran ditolak, stok checkout dilepas, dan QRIS
+tercatat dihapus/dinonaktifkan. Worker membersihkan QRIS setiap siklus; tombol
+lama juga memeriksa deadline di server. Restart dan klik ulang tidak memperpanjang
+waktu atau mengganti kode unik invoice yang masih aktif.
 
-Alur manual: pilih produk/layanan → konfirmasi → QRIS Manual → bayar tepat sesuai
-invoice → Kirim Bukti → owner memeriksa transfer dan mengonfirmasi melalui tombol
-existing. Mengirim screenshot saja tidak menambah saldo/membeli produk. Invoice
-manual baru **tanpa kedaluwarsa**. Sesudah konfirmasi, kredit dan reservasi harga
-produk dilakukan dalam satu transaksi wallet, kemudian worker memproses satu
-purchase attempt. Harga/stok diperiksa ulang; harga tidak dinaikkan diam-diam.
+**Bukti yang dikirim sebelum batas 15 menit menunggu konfirmasi owner tanpa
+kedaluwarsa**, termasuk tombol di PM owner dan setelah restart. Reservasi stok
+checkout tetap ditahan sampai keputusan/pembatalan. Kirim bukti bukan bukti
+pembayaran sah secara otomatis: owner wajib memeriksa transfer sebelum menyetujui;
+sebelumnya saldo tidak bertambah dan produk tidak diproses. Bukti terlambat ditolak.
+Rekening transfer dan deadline gateway otomatis tetap mengikuti alur existing.
 
-Penolakan pembelian yang pasti, stok/harga berubah, atau penutupan toko sebelum
-order dikirim mengembalikan harga produk ke **saldo bot**. OTP manual baru yang
-sudah dibuat tetapi kemudian berstatus Failed/Canceled/Expired tanpa SMS juga
-mendapat refund saldo sekali, walaupun pengembalian dana akun provider belum
-terbukti. Provider refund dicatat terpisah, tidak diasumsikan. Nomor yang telah
-menerima SMS/selesai tidak direfund otomatis. SOSMED gagal direfund penuh; Partial
-menggunakan harga dibayar × remains / jumlah, dibulatkan ke bawah. Kode unik
-invoice tidak menjadi saldo dan tidak termasuk refund harga produk; ditampilkan
-sebelum user membayar, mengikuti kebijakan pembayaran existing.
+Pembelian langsung /otp dan /sosmed tetap menawarkan Saldo Bot dan QRIS Manual;
+wallet existing dipakai bersama. Konfirmasi manual memakai topups dan ledger
+existing secara atomik, dengan satu reservasi dan purchase attempt. Dana terlambat
+yang diverifikasi owner untuk invoice OTP/SOSMED kedaluwarsa masuk ke saldo,
+tanpa memesan produk dari invoice tersebut. Checkout produk yang kedaluwarsa
+tanpa bukti tidak boleh dihidupkan kembali dari tombol lama. Jika uang sudah
+terlanjur ditransfer, owner perlu memeriksa dan menyelesaikannya lewat saldo/refund
+existing; uang tidak dihapus oleh timer.
 
-Timeout atau hasil order yang belum pasti tetap ditahan untuk rekonsiliasi,
-bukan dianggap gagal. SOSMED tidak mengirim ulang order yang tidak pasti. OTP
-mempertahankan recovery dengan idempotency key yang sama sesuai API existing.
-QRIS yang tercatat dibersihkan setelah pembayaran final, dengan **satu invoice
-gambar pembayaran berhasil**. Riwayat pembayaran tertunda dapat dibuka melalui
-Pesanan Saya. Klik/approval ganda dan restart tidak mengulang kredit/order.
+Salin Nomor/OTP nyata, refund kegagalan definitif ke saldo, rekonsiliasi hasil
+provider yang belum pasti, riwayat, invoice gambar sukses tunggal dan perlindungan
+approval ganda dari v17.24 dipertahankan. Kode unik tidak termasuk saldo/refund harga
+produk. Tidak ada transaksi provider live dalam pengujian rilis ini.
 
-Schema **204** bersifat additive: penanda kebijakan refund pada otp_payments dan
-sosmed_payments yang menghubungkan quote, invoice topups existing dan attempt.
-Tidak ada wallet/deposit kedua. Tabel/saldo existing dipertahankan. Backup dan
-panduan pemulihan tersedia pada laporan rilis dan paket source lengkap terpisah.
+Schema **205** hanya menambahkan pelacakan pesan QRIS checkout pada orders dan
+mengisi deadline invoice QRIS manual pending lama yang belum mengirim bukti,
+berdasarkan tanggal pembuatan asal. Deadline/riwayat/bukti/saldo/ledger existing
+dipertahankan; invoice yang sudah final tidak dihidupkan kembali otomatis. Tidak
+ada wallet, deposit, command, dependency atau Railway Variables baru.
 
 ## Lokasi Cek MLBB
 
@@ -58,7 +58,7 @@ tanpa VIP**, termasuk user yang VIP-nya habis dan owner. Batas harian, jeda cek,
 pemeriksaan akun terblokir dan rate limit API tetap berlaku. Menu /tools kembali
 seperti sebelum Cek MLBB ditambahkan; VIP Rp20.000/bulan untuk tools lama,
 pembelian dan perpanjangannya tetap memakai alur existing. Tidak ada Variables, migration,
-dependency atau command baru pada pembaruan MLBB. Schema checker 203 dipertahankan dalam migration 204 rilis ini.
+dependency atau command baru pada pembaruan MLBB. Schema checker 203 dipertahankan dalam migration 205 rilis ini.
 
 ## Cek MLBB: satu pesan untuk kedua ID
 
@@ -255,7 +255,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.24 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.25 yang konsisten.
 
 ## Jalankan
 
@@ -279,7 +279,7 @@ untuk pembelian langsung kedua toko tersebut. Isi Saldo dan checkout produk lain
 mempertahankan QRIS Otomatis, QRIS Manual, transfer bank dan gateway existing.
 
 Invoice QRIS OTP lama tetap diproses sesuai status dan kebijakan sebelumnya.
-Khusus invoice manual baru v17.24, tidak ada deadline konfirmasi owner dan berlaku
+Khusus invoice manual baru v17.25, tidak ada deadline konfirmasi owner dan berlaku
 refund harga produk ke wallet jika gagal pasti; hasil timeout tidak dikreditkan
 ulang sebelum direkonsiliasi. Tidak ada pembelian provider sebelum pembayaran
 manual diverifikasi owner. API key dan saldo provider hanya tampil kepada owner.
@@ -356,7 +356,7 @@ User/owner tetap dapat membatalkan invoice yang belum dibayar lewat alur existin
 Payment gateway otomatis tetap mengikuti masa berlaku existing/provider.
 Quote harga, nomor/SMS OTP, draft pengaturan rekening dan konfirmasi Hapus Stok
 tetap menggunakan masa berlaku yang sesuai; perubahan ini hanya untuk pembayaran
-manual yang memerlukan owner. OTP/Sosmed juga menyediakan QRIS Manual di konfirmasi pembelian sejak v17.24.
+manual yang memerlukan owner. OTP/Sosmed juga menyediakan QRIS Manual di konfirmasi pembelian sejak v17.25.
 Tidak ada Variables/dependency/command baru.
 
 ## Hapus stok owner
@@ -435,7 +435,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.24; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.25; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -443,7 +443,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.24: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.25: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed

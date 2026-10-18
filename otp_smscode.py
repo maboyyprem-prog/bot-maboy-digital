@@ -749,9 +749,16 @@ class PaymentService:
     def manual_ready(self):
         return bool(str(self.store.host.get_setting("qris_file_id", "") or "").strip())
 
-    @staticmethod
-    def pending(payment):
-        return payment['state'] in {'PENDING','CREATING','CREATE_UNKNOWN'} and (not payment['expires_at'] or payment['expires_at']>time.time())
+    def awaiting_owner(self, payment, conn=None):
+        if payment['method']!='QRIS_MANUAL' or not payment['topup_id']:return False
+        if conn is None:
+            topup=self.store.repo.one('SELECT * FROM topups WHERE id=? AND user_id=?',(payment['topup_id'],payment['user_id']))
+        else:
+            topup=conn.execute('SELECT * FROM topups WHERE id=? AND user_id=?',(payment['topup_id'],payment['user_id'])).fetchone()
+        return self.store.host.manual_qris_awaiting_owner(topup)
+
+    def pending(self, payment):
+        return payment['state'] in {'PENDING','CREATING','CREATE_UNKNOWN'} and (not payment['expires_at'] or payment['expires_at']>time.time() or self.awaiting_owner(payment))
 
     @staticmethod
     def order_card_keyboard(ui, order, user):
@@ -790,17 +797,19 @@ class PaymentService:
                 raise self.error_class("PAYMENT_UNAVAILABLE", "Selesaikan atau batalkan invoice pembayaran sebelumnya dahulu.")
             code = self.store.host.unique_code_for_order(conn)
             stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            expires = now + self.store.host.MANUAL_QRIS_MINUTES*60
             cursor = conn.execute("""INSERT INTO topups(user_id,username,amount,unique_code,payment_total,
-                payment_method,status,created_at,expires_at) VALUES(?,'',?,?,?,'QRIS_MANUAL','pending',?,'')""",
-                (user, amount, code, amount+code, stamp))
+                payment_method,status,created_at,expires_at) VALUES(?,'',?,?,?,'QRIS_MANUAL','pending',?,?)""",
+                (user, amount, code, amount+code, stamp,datetime.fromtimestamp(expires,timezone.utc).isoformat(timespec='seconds')))
             topup_id = cursor.lastrowid
-            # Manual invoices wait for owner confirmation, without expiry.
+            # Approval must arrive before this persisted invoice deadline to
+            # fund a product purchase. Later verified money goes to the wallet.
             # Snapshot the QR image so later QR settings do not alter invoices.
             conn.execute(f"""INSERT INTO {self.table}(payment_id,quote_id,user_id,method,state,amount_idr,
                 payment_total_idr,topup_id,partner_reference,qr_url,created_at,expires_at,updated_at,shop_refund_policy)
-                VALUES(?,?,?,'QRIS_MANUAL','PENDING',?,?,?,?,?,?,0,?,1)""",
+                VALUES(?,?,?,'QRIS_MANUAL','PENDING',?,?,?,?,?,?,?,?,1)""",
                 (payment_id, quote_id, user, amount, amount+code, topup_id,
-                 self.store.host.topup_invoice(topup_id), self.store.host.get_setting("qris_file_id", ""), now, now))
+                 self.store.host.topup_invoice(topup_id), self.store.host.get_setting("qris_file_id", ""), now, expires, now))
             conn.execute(f"UPDATE {self.quote_table} SET {self.quote_state}='PAYMENT_PENDING' WHERE quote_id=?", (quote_id,))
         return self.owned(user, payment_id)
 
@@ -808,13 +817,13 @@ class PaymentService:
         # OTP capture already enqueues its existing PURCHASE notification.
         pass
 
-    def settle(self, conn, payment, *, already_credited=False):
+    def settle(self, conn, payment, *, already_credited=False, owner_reviewed=False):
         if payment["paid_at"] is not None:
             return
         reference, amount, now = self.wallet_prefix+"QRIS:"+payment["payment_id"], payment["amount_idr"], time.time()
         if not already_credited:
             self.wallet_change(conn, payment["user_id"], "TOPUP", amount, reference)
-        eligible = payment["state"] in {"PENDING", "CREATING", "CREATE_UNKNOWN"} and (not payment["expires_at"] or now <= payment["expires_at"])
+        eligible = payment["state"] in {"PENDING", "CREATING", "CREATE_UNKNOWN"} and (not payment["expires_at"] or now < payment["expires_at"] or owner_reviewed or self.awaiting_owner(payment,conn))
         if eligible:
             self.wallet_change(conn, payment["user_id"], self.wallet_prefix+"_QRIS_HOLD", -amount, reference)
         state = "PAID" if eligible else "WALLET_CREDITED"
@@ -830,7 +839,8 @@ class PaymentService:
             return False
         if payment["method"] != "QRIS_MANUAL" or payment["user_id"] != topup["user_id"] or payment["amount_idr"] != topup["amount"] or payment["payment_total_idr"] != topup["payment_total"]:
             raise sqlite3.IntegrityError("OTP payment mapping mismatch")
-        self.settle(conn, dict(payment), already_credited=True)
+        self.settle(conn, dict(payment), already_credited=True,
+                    owner_reviewed=self.store.host.manual_qris_awaiting_owner(topup))
         return True
 
     async def notify_topup_receipt(self, bot, topup_id):
@@ -883,7 +893,24 @@ class PaymentService:
             conn.execute(f"UPDATE {self.quote_table} SET {self.quote_state}='PAYMENT_CLOSED' WHERE quote_id=? AND {self.quote_state}='PAYMENT_PENDING'", (row["quote_id"],))
             self.queue_notice(conn, dict(row))
 
+    def expire_manual_due(self):
+        """Unpaid only, same write lock as owner credit; never expire held funds."""
+        now=time.time()
+        with self.store.repo.connection(True) as conn:
+            due=conn.execute(f"""SELECT * FROM {self.table}
+                WHERE method='QRIS_MANUAL' AND state='PENDING' AND paid_at IS NULL
+                  AND expires_at>0 AND expires_at<=?""",(now,)).fetchall()
+            for payment in due:
+                if self.awaiting_owner(payment,conn):continue
+                conn.execute("UPDATE topups SET status='expired' WHERE id=? AND user_id=? AND status='pending'",
+                    (payment['topup_id'],payment['user_id']))
+                conn.execute(f"""UPDATE {self.table} SET state='EXPIRED',updated_at=?
+                    WHERE payment_id=? AND paid_at IS NULL AND state='PENDING'
+                      AND EXISTS(SELECT 1 FROM topups t WHERE t.id={self.table}.topup_id AND t.status='expired')""",
+                    (now,payment['payment_id']))
+
     async def reconcile(self):
+        self.expire_manual_due()
         if not self.store.lease("payments", max(60, self.store.config.timeout+30)):
             return
         now = time.time()
@@ -900,7 +927,7 @@ class PaymentService:
                         self.queue_notice(conn, row)
                 continue
             closed = topup and topup["status"] in {"cancelled", "rejected", "expired"}
-            if closed or (row["expires_at"] and row["expires_at"] <= now):
+            if closed or (row["expires_at"] and row["expires_at"] <= now and not self.awaiting_owner(row)):
                 state = "CANCELLED" if topup and topup["status"] in {"cancelled", "rejected"} else "EXPIRED"
                 self.store.repo.execute(f"UPDATE {self.table} SET state=?,updated_at=? WHERE payment_id=? AND paid_at IS NULL AND state IN ('CREATING','CREATE_UNKNOWN','PENDING')",
                                         (state, now, row["payment_id"]))
@@ -2052,52 +2079,136 @@ class UIBuilder:
                                      "operator": product.get('operator_id'), "operator_name": product.get('operator_name')})] if not quote["parent_order_id"] else [("⬅️ Kembali", "check", {"id": quote["parent_order_id"]})],
                                  [("🏠 Menu Awal", "home", {})]]))
 
+    async def manual_payment_photo(self, message, user, payment, caption, keyboard):
+        """One owned manual invoice = one photo with its caption and buttons.
+
+        Refresh edits the recorded photo. Only a confirmed missing photo may be
+        sent again; an uncertain Telegram delivery never creates another copy.
+        The purchase/payment/wallet lifecycle is deliberately not involved.
+        """
+        funding, payment_id = self.store.payments, payment['payment_id']
+        funding.expire_manual_due()
+        payment=funding.owned(user,payment_id)
+        if not funding.pending(payment):
+            return await UIBuilder.payment(self,message,user,payment_id)
+        native = getattr(message,'message',message)
+        if payment['qr_delivery_state']=='SENT' and payment['qr_message_id']:
+            try:
+                sent = await message.bot.edit_message_caption(chat_id=user,message_id=payment['qr_message_id'],
+                    caption=caption,reply_markup=keyboard,parse_mode='HTML')
+            except TelegramBadRequest as exc:
+                reason = exc.message.lower()
+                if 'message is not modified' in reason:
+                    sent = native
+                elif 'message to edit not found' in reason:
+                    changed = self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='PENDING',qr_message_id=NULL WHERE payment_id=? AND qr_delivery_state='SENT' AND qr_message_id=? AND state='PENDING' AND paid_at IS NULL",(payment_id,payment['qr_message_id']))
+                    if not changed:
+                        return
+                    payment = funding.owned(user,payment_id)
+                    return await UIBuilder.manual_payment_photo(self,message,user,payment,caption,keyboard)
+                else:
+                    raise
+            # Network failures escape; the known photo can be edited on the next
+            # click. They must never fall through to send_photo.
+        else:
+            claimed = self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='SENDING' WHERE payment_id=? AND user_id=? AND state='PENDING' AND paid_at IS NULL AND qr_delivery_state='PENDING'",(payment_id,user))
+            if not claimed:
+                # A concurrent click must not replace an in-flight delivery.
+                current = funding.owned(user,payment_id)
+                if current['qr_delivery_state']=='SENT' and current['qr_message_id']:
+                    return await UIBuilder.manual_payment_photo(self,message,user,current,caption,keyboard)
+                if current['qr_delivery_state']=='UNKNOWN':
+                    return await self.send(message,'⚠️ Pengiriman gambar QRIS belum dapat dipastikan. Periksa foto pada chat ini atau hubungi owner; jangan membayar dua kali.',self.navigation(user))
+                return
+            image = payment['qr_url'] or self.store.host.get_setting('qris_file_id','')
+            if not image:
+                self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='PENDING' WHERE payment_id=? AND qr_delivery_state='SENDING'",(payment_id,))
+                return await self.send(message,'⚠️ Gambar QRIS belum tersedia. Jangan membayar sebelum gambar muncul; hubungi owner.',self.navigation(user))
+            try:
+                sent = await message.bot.send_photo(user,photo=image,caption=caption,reply_markup=keyboard,parse_mode='HTML')
+            except TelegramBadRequest:
+                self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='PENDING' WHERE payment_id=? AND qr_delivery_state='SENDING'",(payment_id,))
+                return await self.send(message,'⚠️ Gambar QRIS belum dapat ditampilkan. Coba buka invoice kembali atau hubungi owner.',self.navigation(user))
+            except asyncio.CancelledError:
+                self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='UNKNOWN' WHERE payment_id=? AND qr_delivery_state='SENDING'",(payment_id,))
+                raise
+            except Exception:
+                self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='UNKNOWN' WHERE payment_id=? AND qr_delivery_state='SENDING'",(payment_id,))
+                raise
+            self.store.repo.execute(f"UPDATE {funding.table} SET qr_message_id=?,qr_delivery_state='SENT' WHERE payment_id=? AND qr_delivery_state='SENDING'",(sent.message_id,payment_id))
+            if payment['topup_id']:
+                self.store.host.save_topup_payment_message(payment['topup_id'],user,sent.message_id)
+        # Migrate an older split text invoice only when this exact owned reference
+        # is visible in the source. Never delete a home menu, quote or receipt.
+        old_text = getattr(native,'text',None) or ''
+        source_id = getattr(message,'target_id',None) or getattr(native,'message_id',None)
+        funding.expire_manual_due()
+        current = funding.owned(user,payment_id)
+        if (source_id and source_id!=current['qr_message_id'] and getattr(native.chat,'id',None)==user
+                and payment['partner_reference'] in old_text and 'QRIS MANUAL' in old_text
+                and 'Invoice:' in old_text and 'Total bayar:' in old_text):
+            await self.store.host.retire_topup_payment_message(message.bot,user,source_id)
+        # Owner approval may race the Telegram request. Retire the QR promptly;
+        # do not leave fresh payment controls on an already-final invoice.
+        if not funding.pending(current):
+            if await self.store.host.retire_topup_payment_message(message.bot,user,current['qr_message_id']):
+                self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='RETIRED' WHERE payment_id=? AND qr_message_id=?",(payment_id,current['qr_message_id']))
+        return sent
+
     async def payment(self, message, user, payment_id):
         # Shared invoice presentation; each store keeps its own namespace and
         # order UI while using the same owner proof/confirmation flow.
         funding = self.store.payments
+        funding.expire_manual_due()
         brand, subject = funding.brand, funding.subject
         callback = lambda action: self.store.token(user,action,{},ttl=86400)
         payment = self.store.payments.owned(user, payment_id)
+        if payment["method"] == "QRIS_MANUAL" and payment["state"] in {'PAID','BUYING','COMPLETED','WALLET_CREDITED','CANCELLED','EXPIRED'}:
+            if payment['qr_message_id'] and payment['qr_delivery_state']=='SENT':
+                if await self.store.host.retire_topup_payment_message(message.bot,user,payment['qr_message_id']):
+                    self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='RETIRED' WHERE payment_id=? AND qr_message_id=?",(payment_id,payment['qr_message_id']))
         if payment["attempt_id"]:
             order = self.store.repo.one(f"SELECT * FROM {funding.order_table} WHERE attempt_id=? AND {funding.order_user}=?", (payment["attempt_id"], user))
             if order:
                 return await self.send(message, self.order_text(order), funding.order_card_keyboard(self,order,user))
         state, active = payment["state"], funding.pending(payment)
-        if active and state == "PENDING":
-            claimed = self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='SENDING' WHERE payment_id=? AND qr_delivery_state='PENDING'", (payment_id,))
-            if claimed:
-                try:
-                    image = payment["qr_url"] or (self.store.host.get_setting("qris_file_id", "") if payment["method"] != "AUTO_QRIS" else '')
-                    if not image and payment["qr_payload"]:
-                        content = self.store.decrypt(payment["qr_payload"])["qr_content"]
-                        image = BufferedInputFile(await asyncio.to_thread(qr_image, content), filename="MaboyyOTPQRIS.png")
-                    if not image:
-                        raise StoreError("PAYMENT_UNAVAILABLE")
-                    sent = await message.bot.send_photo(user, photo=image,
-                        caption=f"🛍️ {brand}\n🧾 {payment['partner_reference']}\n💳 Total: {money(payment['payment_total_idr'])}\n"
-                                +('Tanpa kedaluwarsa. Kirim bukti untuk konfirmasi owner.' if not payment['expires_at'] else 'Bayar satu kali sesuai total invoice sebelum kedaluwarsa.'))
-                    self.store.repo.execute(f"UPDATE {funding.table} SET qr_message_id=?,qr_delivery_state='SENT' WHERE payment_id=?", (sent.message_id, payment_id))
-                    if payment["topup_id"]:
-                        self.store.host.save_topup_payment_message(payment["topup_id"], user, sent.message_id)
-                except (TelegramBadRequest, StoreError):
-                    self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='PENDING' WHERE payment_id=?", (payment_id,))
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='UNKNOWN' WHERE payment_id=?", (payment_id,))
+        if payment["method"] != "QRIS_MANUAL":
+            if active and state == "PENDING":
+                claimed = self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='SENDING' WHERE payment_id=? AND qr_delivery_state='PENDING'", (payment_id,))
+                if claimed:
+                    try:
+                        image = payment["qr_url"] or (self.store.host.get_setting("qris_file_id", "") if payment["method"] != "AUTO_QRIS" else '')
+                        if not image and payment["qr_payload"]:
+                            content = self.store.decrypt(payment["qr_payload"])["qr_content"]
+                            image = BufferedInputFile(await asyncio.to_thread(qr_image, content), filename="MaboyyOTPQRIS.png")
+                        if not image:
+                            raise StoreError("PAYMENT_UNAVAILABLE")
+                        sent = await message.bot.send_photo(user, photo=image,
+                            caption=f"🛍️ {brand}\n🧾 {payment['partner_reference']}\n💳 Total: {money(payment['payment_total_idr'])}\n"
+                                    +('Tanpa kedaluwarsa. Kirim bukti untuk konfirmasi owner.' if not payment['expires_at'] else 'Bayar satu kali sesuai total invoice sebelum kedaluwarsa.'))
+                        self.store.repo.execute(f"UPDATE {funding.table} SET qr_message_id=?,qr_delivery_state='SENT' WHERE payment_id=?", (sent.message_id, payment_id))
+                        if payment["topup_id"]:
+                            self.store.host.save_topup_payment_message(payment["topup_id"], user, sent.message_id)
+                    except (TelegramBadRequest, StoreError):
+                        self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='PENDING' WHERE payment_id=?", (payment_id,))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='UNKNOWN' WHERE payment_id=?", (payment_id,))
         payment = self.store.payments.owned(user, payment_id)
         state = payment["state"]
         active = funding.pending(payment)
+        awaiting = active and funding.awaiting_owner(payment)
         label = {"CREATING":"QRIS sedang disiapkan", "CREATE_UNKNOWN":"Hasil pembuatan QRIS sedang diperiksa",
                  "PENDING":"Menunggu pembayaran", "PAID":f"Pembayaran diterima, {subject} sedang diproses",
                  "BUYING":f"Pembelian {subject} sedang diproses", "COMPLETED":f"{subject.capitalize()} berhasil dibeli",
                  "WALLET_CREDITED":"Dana tersedia di saldo bot", "CANCELLED":"Invoice dibatalkan",
                  "EXPIRED":"Invoice kedaluwarsa"}.get(state, "Sedang diperiksa")
+        if awaiting:label='Bukti tersimpan • menunggu konfirmasi owner'
         rows = []
-        if active and payment["topup_id"]:
+        if active and not awaiting and payment["topup_id"]:
             rows.append([InlineKeyboardButton(text="📤 KIRIM BUKTI PEMBAYARAN", callback_data=f"proofsubmit:topup:{payment['topup_id']}")])
-        ttl = max(300, min(3600, int(payment["expires_at"]-time.time())+300)) if payment['expires_at'] else 86400
+        ttl = max(300, min(3600, int(payment["expires_at"]-time.time())+300)) if payment['expires_at'] and not awaiting else 86400
         token = lambda action: self.store.token(user, action, {"payment": payment_id}, ttl=ttl)
         rows.append([InlineKeyboardButton(text="🔄 CEK PEMBAYARAN", callback_data=token("payment_status"))])
         if active:
@@ -2109,14 +2220,14 @@ class UIBuilder:
                 f"💰 Harga {subject}: {money(payment['amount_idr'])}\n"
                 f"🔢 Kode unik: {money(payment['payment_total_idr']-payment['amount_idr'])}\n"
                 f"💳 Total bayar: <b>{money(payment['payment_total_idr'])}</b>\n"
-                + (f"⌛ Berlaku sampai: {payment_receipts.format_wib(payment['expires_at'])}\n" if payment['expires_at'] else '⌛ Tanpa kedaluwarsa • konfirmasi owner\n')
+                + ('⌛ Konfirmasi owner tanpa batas waktu\n' if awaiting else f"⌛ Berlaku sampai: {payment_receipts.format_wib(payment['expires_at'])} (15 menit)\n" if payment['expires_at'] and payment['method']=='QRIS_MANUAL' else f"⌛ Berlaku sampai: {payment_receipts.format_wib(payment['expires_at'])}\n" if payment['expires_at'] else '⌛ Tanpa kedaluwarsa • konfirmasi owner\n')
                 +
                 f"⏳ Status: {label}\n\n")
         if active:
-            text += ("Pembayaran QRIS diperiksa otomatis. " if payment["method"] == "AUTO_QRIS"
+            text += ('Bukti sudah tersimpan; tidak perlu transfer atau mengirim bukti lagi. ' if awaiting else "Pembayaran QRIS diperiksa otomatis. " if payment["method"] == "AUTO_QRIS"
                      else "Kirim bukti pembayaran untuk verifikasi owner. ")
             text += f"{subject.capitalize()} diproses otomatis setelah pembayaran terkonfirmasi. Bayar satu kali sesuai total invoice.\n"
-            if payment["qr_delivery_state"] != "SENT":
+            if payment["method"] != "QRIS_MANUAL" and payment["qr_delivery_state"] != "SENT":
                 text += "⚠️ Gambar QRIS belum berhasil ditampilkan. Jangan membayar sebelum QRIS tersedia; hubungi owner.\n"
         elif state in {"CANCELLED", "EXPIRED"}:
             text += "Jangan bayar invoice ini. Jika pembayaran terlambat terkonfirmasi, dana masuk ke saldo bot.\n"
@@ -2125,7 +2236,10 @@ class UIBuilder:
         text += 'Pembelian gagal terkonfirmasi dikembalikan ke saldo bot. Hasil yang belum pasti diperiksa dahulu.'
         if payment['payment_total_idr'] > payment['amount_idr']:
             text += " Kode unik tidak dikembalikan sebagai saldo."
-        return await self.send(message, text, InlineKeyboardMarkup(inline_keyboard=rows))
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        if payment["method"] == "QRIS_MANUAL" and active and state == 'PENDING':
+            return await UIBuilder.manual_payment_photo(self,message,user,payment,text,keyboard)
+        return await self.send(message, text, keyboard)
 
     async def history(self, message, user, history=False, page=0, admin=False):
         if admin and not self.store.host.is_owner(user):
