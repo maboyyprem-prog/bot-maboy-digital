@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.20"
+BOT_VERSION = "17.21"
 SCHEMA_VERSION = 203
 
 CHECKOUT_TERMS_SHORT = (
@@ -18244,10 +18244,27 @@ CEKML_TIERS = ("50+50", "150+150", "250+250", "500+500")
 _CEKML_CACHE = {}
 
 
+def cekml_observed_ip(value):
+    """Only a numeric IP reported by ALU; never resolve/guess a server address."""
+    if not isinstance(value, str) or len(value) > 64:
+        return ""
+    value = value.strip()
+    if "%" in value or (MLBB_API_KEY and MLBB_API_KEY in value):
+        return ""
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return ""
+    if address.is_unspecified or address.is_loopback or address.is_multicast or address.is_link_local:
+        return ""
+    return str(address)
+
+
 class CekMLBBError(Exception):
-    def __init__(self, code, http_status=0):
+    def __init__(self, code, http_status=0, *, observed_ip=None):
         self.code = code
         self.http_status = int(http_status)
+        self.observed_ip = cekml_observed_ip(observed_ip)
         super().__init__(code)  # Never retain/print a provider body or credential.
 
 
@@ -18344,7 +18361,7 @@ async def cekml_api_read(session, endpoint, *, user_id=None, zone_id=None):
             if code in ("FREE_DAILY_LIMIT_REACHED", "DAILY_LIMIT_REACHED"):
                 raise CekMLBBError("PROVIDER_QUOTA", status)
             if code == "IP_NOT_ALLOWED":
-                raise CekMLBBError("IP_NOT_ALLOWED", status)
+                raise CekMLBBError("IP_NOT_ALLOWED", status, observed_ip=payload.get("ip"))
             if status == 401:
                 raise CekMLBBError("AUTH", status)
             if status == 403:
@@ -18491,26 +18508,30 @@ def cekml_finish(attempt, outcome, *, code="", http_status=0, cache_hit=False):
         conn.close()
 
 
-async def cekml_health():
+async def cekml_health(*, force=False):
     fingerprint = hashlib.sha256(MLBB_API_KEY.encode()).hexdigest()
     try:
         last = json.loads(get_setting("cekml:health", "{}"))
     except (ValueError, TypeError):
         last = {}
-    if (isinstance(last, dict) and last.get("fingerprint") == fingerprint
+    # Old cache entries lacked the observed IP. Refresh them once after update.
+    # An explicit owner retry bypasses the 60s display cache with a 3s cooldown.
+    if (isinstance(last, dict) and last.get("format") == 1 and last.get("fingerprint") == fingerprint
             and type(last.get("checked_at")) in (int, float)
-            and 0 <= time.time()-last["checked_at"] < 60):
-        return last
-    info = {"checked_at": time.time(), "fingerprint": fingerprint, "code": "OK", "http": 200}
+            and 0 <= time.time()-last["checked_at"] < (3 if force else 60)):
+        return {**last, "observed_ip": cekml_observed_ip(last.get("observed_ip"))}
+    info = {"format": 1, "checked_at": time.time(), "fingerprint": fingerprint,
+            "code": "OK", "http": 200, "observed_ip": ""}
     try:
         async with aiohttp.ClientSession(trust_env=False) as session:
             data = await cekml_api_read(session, "")
+        info["observed_ip"] = cekml_observed_ip(data.get("client_ip"))
         for field in ("daily_limit", "daily_used", "daily_remaining"):
             value = data.get(field)
             if type(value) is int and 0 <= value <= 1000000000:
                 info[field] = value
     except CekMLBBError as exc:
-        info.update(code=exc.code, http=exc.http_status)
+        info.update(code=exc.code, http=exc.http_status, observed_ip=exc.observed_ip)
     set_setting("cekml:health", json.dumps(info))
     return info
 
@@ -18590,6 +18611,48 @@ async def cekml_render_admin(call):
         [("⬅️ Tools Owner", "cekml:tools")]), parse_mode="HTML")
 
 
+async def cekml_render_api_status(call, info, *, activation_failed=False):
+    if not await tools_cleanup_require_owner(call):
+        return
+    text = ("🔌 <b>STATUS API CEK MLBB — OWNER</b>\n\nProvider: ALU API\n"
+            f"API: <b>{'Terhubung' if info['code']=='OK' else 'Belum siap'}</b>\n"
+            f"Kode: <b>{html.escape(str(info['code']))}</b> • HTTP: {info['http']}\n"
+            f"Diperiksa: {payment_receipts.format_wib(info['checked_at'])}\n")
+    if activation_failed:
+        text += "\nFitur belum diaktifkan. Selesaikan kendala di bawah, lalu Periksa & Aktifkan.\n"
+    address = cekml_observed_ip(info.get("observed_ip"))
+    if address:
+        text += "\n🌐 IP server yang dilihat ALU:\n<code>"+html.escape(address)+"</code>\n"
+    if "daily_remaining" in info:
+        text += f"Sisa kuota API saat diperiksa: {info['daily_remaining']} request\n"
+    if info["code"] == "IP_NOT_ALLOWED":
+        text += ("\n🔒 <b>IP server belum masuk whitelist ALU.</b>\n"
+                 "1. Buka profil akun ALU → IP whitelist.\n"
+                 +("2. Tambahkan IP server di atas, lalu simpan.\n" if address else
+                   "2. Tambahkan Static Outbound IP service Railway, lalu simpan.\n")+
+                 "3. Pilih Periksa Ulang atau Periksa & Aktifkan di bawah.\n"
+                 "\nDi Railway → service bot → Settings → Networking, jika ada beberapa "
+                 "Static Outbound IP, daftarkan semuanya di ALU. IP keluar yang berubah "
+                 "memerlukan pembaruan whitelist.")
+        if not address:
+            text += ("\n\nALU belum menyertakan IP pada respons ini. Periksa Ulang, atau lihat "
+                     "Static Outbound IP pada service Railway dan bantuan akun ALU.")
+    else:
+        text += ("\nNickname, negara dan bonus top-up pertama mengikuti API.\n"
+                 "Weekly Elite / Monthly Epic: belum didukung kontrak API ini.")
+    text += ("\n\nSatu cek memerlukan hingga dua request API. Status biasa dicache 60 detik; "
+             "Periksa Ulang / aktivasi memakai pemeriksaan baru dengan jeda minimal 3 detik.")
+    rows = []
+    if address:
+        rows.append([InlineKeyboardButton(text="📋 Salin IP Server", copy_text=CopyTextButton(text=address))])
+    rows.append([InlineKeyboardButton(text="🔄 Periksa Ulang", callback_data="cekml:admin:status:refresh")])
+    if not cekml_enabled():
+        rows.append([InlineKeyboardButton(text="🟢 Periksa & Aktifkan", callback_data="cekml:admin:toggle")])
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="cekml:menu"),
+                 InlineKeyboardButton(text="🧰 Tools Owner", callback_data="cekml:tools")])
+    await safe_edit_or_answer(call, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+
+
 @router.callback_query(F.data.startswith("cekml:"))
 async def cekml_callback(call: CallbackQuery, state: FSMContext):
     if not await tools_vip_public_guard(call):
@@ -18608,28 +18671,16 @@ async def cekml_callback(call: CallbackQuery, state: FSMContext):
             return
         if action in ("menu", "admin:menu"):
             return await cekml_render_home(call, state)
-        if action == "admin:status":
-            info = await cekml_health()
-            text = ("🔌 <b>STATUS API CEK MLBB — OWNER</b>\n\nProvider: ALU API\n"
-                    f"API: <b>{'Terhubung' if info['code']=='OK' else 'Belum siap'}</b>\n"
-                    f"Kode: <b>{html.escape(str(info['code']))}</b> • HTTP: {info['http']}\n"
-                    f"Diperiksa: {payment_receipts.format_wib(info['checked_at'])}\n")
-            if "daily_remaining" in info:
-                text += f"Sisa kuota API saat diperiksa: {info['daily_remaining']} request\n"
-            if info["code"] == "IP_NOT_ALLOWED":
-                text += "Tambahkan IP keluar server Railway ke whitelist akun API.\n"
-            text += ("\nNickname, negara dan bonus top-up pertama mengikuti API.\n"
-                     "Weekly Elite / Monthly Epic: belum didukung kontrak API ini.\n"
-                     "Satu cek memerlukan hingga dua request API. Status dicache 60 detik.")
-            return await safe_edit_or_answer(call, text, reply_markup=cekml_back(call.from_user.id), parse_mode="HTML")
+        if action in ("admin:status", "admin:status:refresh"):
+            info = await cekml_health(force=action.endswith(":refresh"))
+            return await cekml_render_api_status(call, info)
         if action == "admin:toggle":
             if cekml_enabled():
                 set_setting("cekml:enabled", "0")
             else:
-                info = await cekml_health()
+                info = await cekml_health(force=True)
                 if info["code"] != "OK":
-                    return await safe_edit_or_answer(call, "Fitur belum diaktifkan. Periksa Status API terlebih dahulu.\n"
-                        "Kode: "+html.escape(str(info["code"])), reply_markup=cekml_back(call.from_user.id))
+                    return await cekml_render_api_status(call, info, activation_failed=True)
                 set_setting("cekml:enabled", "1")
             await state.set_state(None)
             return await cekml_render_admin(call)
@@ -36271,7 +36322,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.20"
+EXPECTED_SOURCE_VERSION = "17.21"
 
 
 def source_integrity_self_test():

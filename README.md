@@ -1,6 +1,26 @@
-# MaboyyDigital v17.20
+# MaboyyDigital v17.21
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+
+## Perbaikan IP_NOT_ALLOWED pada ALU
+
+API Key saja belum cukup untuk Name Check: IP keluar server wajib masuk whitelist
+[profil akun ALU](https://aluu.in/docs). Buka **/tools → Cek MLBB → Status API**.
+Panel owner sekarang menampilkan IP yang benar-benar dilihat ALU, tombol **Salin IP
+Server**, **Periksa Ulang**, dan **Periksa & Aktifkan**. Tambahkan IP itu ke whitelist,
+simpan, lalu periksa ulang. Tidak ada Variables, schema, atau command baru.
+
+Jika memakai [Static Outbound IP Railway](https://docs.railway.com/networking/static-outbound-ips),
+daftarkan seluruh IP yang ditampilkan pada **service → Settings → Networking**;
+Railway dapat memakai beberapa IP. Static Outbound IP tersedia pada plan Pro;
+perubahan konfigurasi tersebut memerlukan redeploy. Pada koneksi dengan IP dinamis,
+whitelist perlu diperbarui saat IP keluar berubah. Domain bot/IP perangkat pengguna
+tidak menentukan IP keluar request API server.
+
+Pemeriksaan biasa tetap dicache 60 detik; tombol Periksa Ulang dan aktivasi memeriksa
+koneksi kembali dengan jeda minimal tiga detik. Cache lama diperbarui setelah update.
+Bot tidak membuka whitelist ALU secara otomatis dan tidak menebak IP jika provider
+tidak mengirimkannya. Alamat IP/diagnostik hanya terlihat di panel owner privat.
 
 ## Cek MLBB di /tools
 
@@ -148,7 +168,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.20 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.21 yang konsisten.
 
 ## Jalankan
 
@@ -351,7 +371,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.20; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.21; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -359,7 +379,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.20: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.21: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed
