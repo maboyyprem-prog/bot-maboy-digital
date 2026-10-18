@@ -17,7 +17,7 @@ from aiogram.types import BufferedInputFile
 from PIL import Image, ImageDraw, ImageFont
 
 WIB = ZoneInfo("Asia/Jakarta")
-SOURCES = ("order", "topup", "otp_payment", "otp_order", "sosmed", "qris_review")
+SOURCES = ("order", "topup", "otp_payment", "otp_order", "sosmed", "sosmed_payment", "qris_review")
 
 
 def display_datetime(value):
@@ -205,10 +205,11 @@ class ReceiptService:
         # canceled invoices, failed purchases and unknown outcomes are excluded.
         return {
             "order": "SELECT o.id AS entity_id FROM orders o WHERE o.payment_status='paid' AND o.payment_method!='OWNER_FREE' AND COALESCE(NULLIF(o.payment_total,0),o.total)>0 AND NOT EXISTS(SELECT 1 FROM tools_vip_purchases v WHERE v.order_id=o.id AND v.activated_at IS NULL)",
-            "topup": "SELECT t.id AS entity_id FROM topups t WHERE t.status='completed' AND NOT EXISTS(SELECT 1 FROM otp_payments p WHERE p.topup_id=t.id)",
+            "topup": "SELECT t.id AS entity_id FROM topups t WHERE t.status='completed' AND NOT EXISTS(SELECT 1 FROM otp_payments p WHERE p.topup_id=t.id) AND NOT EXISTS(SELECT 1 FROM sosmed_payments p WHERE p.topup_id=t.id)",
             "otp_payment": "SELECT p.payment_id AS entity_id FROM otp_payments p WHERE p.paid_at IS NOT NULL",
             "otp_order": "SELECT o.id AS entity_id FROM otp_orders o JOIN otp_purchase_attempts a ON a.attempt_id=o.attempt_id WHERE a.state='CAPTURED' AND NOT EXISTS(SELECT 1 FROM otp_payments p WHERE p.attempt_id=o.attempt_id AND p.paid_at IS NOT NULL)",
-            "sosmed": "SELECT o.id AS entity_id FROM sosmed_orders o JOIN sosmed_purchase_attempts a ON a.attempt_id=o.attempt_id WHERE a.state='SUCCESS'",
+            "sosmed": "SELECT o.id AS entity_id FROM sosmed_orders o JOIN sosmed_purchase_attempts a ON a.attempt_id=o.attempt_id WHERE a.state='SUCCESS' AND NOT EXISTS(SELECT 1 FROM sosmed_payments p WHERE p.attempt_id=o.attempt_id AND p.paid_at IS NOT NULL)",
+            "sosmed_payment": "SELECT p.payment_id AS entity_id FROM sosmed_payments p WHERE p.paid_at IS NOT NULL",
             "qris_review": "SELECT t.id AS entity_id FROM klikqris_transactions t JOIN wallet_ledger w ON w.id=t.review_ledger_id WHERE t.state='SETTLED_BALANCE' AND t.sandbox=0 AND w.user_id=t.user_id AND w.amount=t.amount AND w.type='TOPUP' AND w.reference='AQ-REVIEW-'||t.id",
         }[source]
 
@@ -261,6 +262,12 @@ class ReceiptService:
             result = dict(reference=row["partner_reference"], category="Nomor OTP", item=public_text(product.get("service_name") or product.get("platform_name") or "Nomor OTP"),
                 variant=public_text(product.get("country_name", "")), quantity=1, amount=row["payment_total_idr"],
                 subtotal=row["amount_idr"], unique_code=row["payment_total_idr"]-row["amount_idr"], method=row["method"], paid_at=row["paid_at"])
+        elif source == "sosmed_payment":
+            row = dict(conn.execute('SELECT p.*,q.service_snapshot,q.quantity FROM sosmed_payments p JOIN sosmed_quotes q ON q.quote_id=p.quote_id WHERE p.payment_id=?',(entity_id,)).fetchone())
+            service, user = json.loads(row['service_snapshot']), row['user_id']
+            result = dict(reference=row['partner_reference'],category='Layanan Sosmed',item=public_text(service.get('name') or 'Layanan Sosmed'),
+                quantity=row['quantity'],amount=row['payment_total_idr'],subtotal=row['amount_idr'],
+                unique_code=row['payment_total_idr']-row['amount_idr'],method=row['method'],paid_at=row['paid_at'])
         elif source == "otp_order":
             row = dict(conn.execute("SELECT * FROM otp_orders WHERE id=?", (entity_id,)).fetchone())
             user = row["buyer_user_id"]

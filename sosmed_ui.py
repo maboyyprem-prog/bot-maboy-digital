@@ -495,8 +495,9 @@ class UIBuilder:
         text += (f"\n💰 Harga: <b>{core.money(sale)}</b>\n💳 Saldo: {core.money(balance)}\n"
                  f"Sisa saldo: {core.money(balance-sale) if balance >= sale else 'Saldo belum cukup'}\n"
                  f"⏳ Konfirmasi hingga: {instant(quote['expires_at'])}\n\n"
-                 "Pembayaran memakai saldo bot. Periksa target dan input sebelum konfirmasi.")
+                 "Pilih saldo bot atau QRIS manual. Periksa target dan input sebelum konfirmasi.")
         rows = [[("✅ BAYAR SALDO", "pay", {"quote": quote["quote_id"]})],
+                *([[('📱 QRIS MANUAL','pay_manual',{'quote':quote['quote_id']})]] if self.store.payments.manual_ready() else []),
                 [("✏️ Ubah Input", "buy", {"id": service["provider_service_id"], "drip": bool(parameters.get("runs"))}),
                  ("❌ Batal", "detail", {"id": service["provider_service_id"]})]]
         if balance < sale:
@@ -505,6 +506,9 @@ class UIBuilder:
         else:
             keyboard = self.keyboard(user, rows)
         await self.send(message, text, keyboard)
+
+    async def payment(self, message, user, payment_id):
+        return await core.otp_smscode.UIBuilder.payment(self,message,user,payment_id)
 
     def order_text(self, order, *, admin=False):
         name = self.provider_label(order["service_name_snapshot"])[:220] if admin else self.public_label(order["service_name_snapshot"], 220)
@@ -611,6 +615,12 @@ class UIBuilder:
         if any(order["kind"] == "ATTEMPT" and order["state"] not in {"FAILED","CANCELED"} for order in orders):
             lines.append("Dana transaksi yang belum pasti tetap ditahan. Jangan membeli ulang; owner akan memeriksanya.")
         rows += self.pages(user, action, {}, page, total)
+        if not admin:
+            payments = self.store.repo.all("SELECT * FROM sosmed_payments WHERE user_id=? AND state IN ('PENDING','PAID','BUYING') ORDER BY created_at DESC LIMIT 5",(user,))
+            for payment in payments:
+                lines.append(f"🧾 QRIS {esc(payment['partner_reference'])} • {core.money(payment['payment_total_idr'])}\n"
+                             +('Menunggu pembayaran / konfirmasi owner.' if payment['state']=='PENDING' else 'Pembayaran diterima, pesanan sedang diproses.'))
+                rows.append([('🧾 '+payment['partner_reference'],'payment_status',{'payment':payment['payment_id']})])
         rows.append([("⬅️ Kembali", "admin_menu" if admin else "home", {})])
         title = "SEMUA PESANAN" if admin else "RIWAYAT PEMBELIAN" if history else "PESANAN SAYA"
         await self.send(message, f"📦 <b>{title}</b>\nHalaman {page+1}/{max(1, math.ceil(total/PAGE_SIZE))}\n\n"
@@ -1197,7 +1207,7 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
                              "Hasil menampilkan pilihan kategori yang cocok.",
                              ui.navigation(user, back, context, admin=admin_search))
     if action == "help":
-        text = ("❓ <b>PANDUAN SOSMED</b>\n\nPilih kategori dan layanan, baca detail, isi parameter, lalu konfirmasi pembayaran saldo.\n"
+        text = ("❓ <b>PANDUAN SOSMED</b>\n\nPilih kategori dan layanan, baca detail, isi parameter, lalu pilih pembayaran saldo atau QRIS Manual jika tersedia.\n"
                 "Saldo dipakai bersama fitur belanja dan OTP. Isi Saldo memakai pembayaran bot yang sudah tersedia.\n"
                 "Jika hasil pembelian belum pasti, jangan membeli ulang. Cek Pesanan Saya dan hubungi owner.\n"
                 "Gagal terkonfirmasi: harga dibayar kembali penuh ke saldo. Partial: harga dibayar × jumlah belum terpenuhi ÷ jumlah pesanan, dibulatkan ke bawah.\n"
@@ -1223,6 +1233,16 @@ async def register_dispatch(store, ui, admin, message, user, action, payload, st
         return await ui.send(message, "🛒 <b>ISI PESANAN</b>\n"+esc(ui.public_label(service['name'], 220))+"\n\n"
                              +(core.FormAdapter.target_prompt(service) if fields[0]=='link' else FIELD_LABELS[fields[0]])+f"\nMin {service['min_quantity']} • Max {service['max_quantity']}",
                              ui.navigation(user, "detail", {"id": service["provider_service_id"]}))
+    if action == 'pay_manual':
+        payment = await store.payments.create_manual(user,str(payload['quote']))
+        return await ui.payment(message,user,payment['payment_id'])
+    if action in {'payment_status','payment_cancel'}:
+        store.payments.owned(user,payload['payment'])
+        if action=='payment_cancel':
+            store.payments.cancel(user,payload['payment'])
+        else:
+            await store.payments.reconcile()
+        return await ui.payment(message,user,payload['payment'])
     if action == "pay":
         result = await store.purchase.buy(user, str(payload["quote"]))
         if result.get("state") in {"CAPTURED", "SUCCESS"} and result.get("order"):

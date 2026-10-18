@@ -238,8 +238,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.23"
-SCHEMA_VERSION = 203
+BOT_VERSION = "17.24"
+SCHEMA_VERSION = 204
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -5809,7 +5809,10 @@ def verify_topup_atomic(topup_id: int, actor_id: int):
         )
         # OTP QRIS invoices use the same topup and ledger. Reserve their credit
         # before commit so it cannot be spent by another concurrent checkout.
-        if OTP_STORE.payments.accept_topup(conn, row):
+        otp_funding = OTP_STORE.payments.accept_topup(conn, row)
+        if otp_funding and conn.execute('SELECT 1 FROM sosmed_payments WHERE topup_id=?',(topup_id,)).fetchone():
+            raise sqlite3.IntegrityError('Ambiguous store payment mapping')
+        if otp_funding or SOSMED_STORE.payments.accept_topup(conn, row):
             new_balance = int(conn.execute("SELECT balance FROM wallets WHERE user_id=?", (row["user_id"],)).fetchone()[0])
         conn.commit()
         return (row, new_balance), "completed"
@@ -24978,6 +24981,7 @@ def create_or_reuse_manual_topup(user_id, username, amount, method, bank_account
             """SELECT * FROM topups
                WHERE user_id=? AND amount=? AND payment_method=? AND status='pending'
                  AND NOT EXISTS (SELECT 1 FROM otp_payments p WHERE p.topup_id=topups.id)
+                 AND NOT EXISTS (SELECT 1 FROM sosmed_payments p WHERE p.topup_id=topups.id)
                  AND (? IS NULL OR EXISTS(SELECT 1 FROM bank_invoice_snapshots s
                      WHERE s.entity='topup' AND s.entity_id=topups.id AND s.bank_id=?))
                ORDER BY id DESC LIMIT 1""",
@@ -25498,7 +25502,7 @@ async def owner_wallet_verify_button(call: CallbackQuery, bot: Bot):
 
     await payment_receipts.notify(_otp_sys.modules[__name__], bot, "topup", topup_id)
     try:
-        if not await OTP_STORE.payments.notify_topup_receipt(bot, topup_id):
+        if not (await OTP_STORE.payments.notify_topup_receipt(bot, topup_id) or await SOSMED_STORE.payments.notify_topup_receipt(bot, topup_id)):
             await bot.send_message(
                 row["user_id"],
                 "✅ <b>TOP UP BERHASIL</b>\n\n"
@@ -31668,7 +31672,7 @@ async def owner_proof_approve(call: CallbackQuery, bot: Bot, state: FSMContext =
         await owner_proof_result_screen(call,text,alert_text="Top up dikonfirmasi.",reply_markup=keyboard)
         await payment_receipts.notify(_otp_sys.modules[__name__], bot, "topup", entity_id)
         try:
-            if status=="completed" and not await OTP_STORE.payments.notify_topup_receipt(bot, entity_id):
+            if status=="completed" and not (await OTP_STORE.payments.notify_topup_receipt(bot, entity_id) or await SOSMED_STORE.payments.notify_topup_receipt(bot, entity_id)):
                 await bot.send_message(
                     row["user_id"],
                     "✅ <b>TOP UP DIKONFIRMASI</b>\n\n"
@@ -36378,7 +36382,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.23"
+EXPECTED_SOURCE_VERSION = "17.24"
 
 
 def source_integrity_self_test():

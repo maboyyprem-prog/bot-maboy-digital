@@ -29,7 +29,7 @@ from aiogram import F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
+from aiogram.types import BufferedInputFile, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 PREFIX = "smscode_otp:"
 USER_BRAND = "MABOYY OTP STORE"
@@ -250,6 +250,8 @@ def init_schema(conn):
         conn.execute("ALTER TABLE otp_orders ADD COLUMN provider_refund_idr INTEGER NOT NULL DEFAULT 0")
     if "qr_payload" not in {row[1] for row in conn.execute("PRAGMA table_info(otp_payments)")}:
         conn.execute("ALTER TABLE otp_payments ADD COLUMN qr_payload TEXT NOT NULL DEFAULT ''")
+    if "shop_refund_policy" not in {row[1] for row in conn.execute("PRAGMA table_info(otp_payments)")}:
+        conn.execute("ALTER TABLE otp_payments ADD COLUMN shop_refund_policy INTEGER NOT NULL DEFAULT 0")
 
 
 class APIClient:
@@ -697,15 +699,27 @@ class PurchaseService:
 
 
 class PaymentService:
-    """Reconcile pre-update QRIS invoices; new OTP purchases use the wallet."""
+    """Shared manual-QRIS funding lifecycle; original gateway recovery is kept.
+
+    Subclasses only select their quote/attempt tables and notifications. All
+    money still uses the host's topups, owner approval and existing wallet.
+    SQL identifiers below are class constants, never callback/user input.
+    """
+    table = "otp_payments"
+    quote_table, quote_user, quote_state, quote_sale = "otp_quotes", "buyer_user_id", "status", "selling_price_idr"
+    attempt_table, success_state = "otp_purchase_attempts", "CAPTURED"
+    wallet_prefix, receipt_source = "OTP", "otp_payment"
+    order_table, order_user, brand, subject = 'otp_orders', 'buyer_user_id', USER_BRAND, 'nomor'
+    error_class, errors = StoreError, (StoreError,)
+    wallet_change = staticmethod(WalletAdapter.change)
 
     def __init__(self, store):
         self.store = store
 
     def owned(self, user, payment_id):
-        row = self.store.repo.one("SELECT * FROM otp_payments WHERE payment_id=? AND user_id=?", (payment_id, user))
+        row = self.store.repo.one(f"SELECT * FROM {self.table} WHERE payment_id=? AND user_id=?", (payment_id, user))
         if not row:
-            raise StoreError("NOT_FOUND")
+            raise self.error_class("NOT_FOUND")
         return row
 
     @staticmethod
@@ -715,39 +729,103 @@ class PaymentService:
 
     def require_checkout(self, user):
         self.store.require_ready()
+        if getattr(self.store.host,'security_blocked',lambda uid:False)(user):
+            raise self.error_class('FORBIDDEN','Akun kamu dibatasi owner.')
         if not self.store.host.is_owner(user) and (self.store.host.safe_mode_enabled() or self.store.host.maintenance_enabled()):
-            raise StoreError("PAYMENT_UNAVAILABLE", "Pembayaran sementara ditahan. Coba kembali nanti.")
+            raise self.error_class("PAYMENT_UNAVAILABLE", "Pembayaran sementara ditahan. Coba kembali nanti.")
 
     async def create(self, user, quote_id):
         # Keep the old entry point to reject previously rendered pay_qris
         # callbacks server-side. Legacy settlement/status/worker paths remain
         # intact so already-issued invoices and paid funds are not orphaned.
         self.require_checkout(user)
-        quote = self.store.repo.one("SELECT * FROM otp_quotes WHERE quote_id=? AND buyer_user_id=?", (quote_id, user))
+        quote = self.store.repo.one(f"SELECT * FROM {self.quote_table} WHERE quote_id=? AND {self.quote_user}=?", (quote_id, user))
         if not quote:
-            raise StoreError("NOT_FOUND")
+            raise self.error_class("NOT_FOUND")
         if quote["status"] == "OPEN" and quote["expires_at"] <= time.time():
-            raise StoreError("QUOTE_EXPIRED")
-        raise StoreError("WALLET_ONLY", "Pembelian OTP memakai saldo bot. Pilih Buy Saldo atau Isi Saldo.")
+            raise self.error_class("QUOTE_EXPIRED")
+        raise self.error_class("WALLET_ONLY", "Pembelian OTP memakai saldo bot. Pilih Buy Saldo atau Isi Saldo.")
+
+    def manual_ready(self):
+        return bool(str(self.store.host.get_setting("qris_file_id", "") or "").strip())
+
+    @staticmethod
+    def pending(payment):
+        return payment['state'] in {'PENDING','CREATING','CREATE_UNKNOWN'} and (not payment['expires_at'] or payment['expires_at']>time.time())
+
+    @staticmethod
+    def order_card_keyboard(ui, order, user):
+        return ui.order_keyboard(order,user)
+
+    def manual_guard(self, user):
+        self.require_checkout(user)
+        if not self.store.settings()["enabled"]:
+            raise self.error_class("DISABLED", "Pembelian baru sedang ditutup owner.")
+        if not self.manual_ready():
+            raise self.error_class("PAYMENT_UNAVAILABLE", "QRIS manual belum dipasang owner. Gunakan saldo bot.")
+
+    async def create_manual(self, user, quote_id):
+        # A quote can fund exactly one purchase. Repeated clicks return the same
+        # invoice, including after its quote TTL or a later shop closure.
+        existing = self.store.repo.one(f"SELECT * FROM {self.table} WHERE quote_id=? AND user_id=?", (quote_id, user))
+        if existing:
+            return existing
+        self.manual_guard(user)
+        now, payment_id = time.time(), secrets.token_hex(12)
+        with self.store.repo.connection(True) as conn:
+            duplicate = conn.execute(f"SELECT * FROM {self.table} WHERE quote_id=? AND user_id=?", (quote_id, user)).fetchone()
+            if duplicate:
+                return dict(duplicate)
+            self.manual_guard(user)
+            quote = conn.execute(f"SELECT * FROM {self.quote_table} WHERE quote_id=? AND {self.quote_user}=?", (quote_id, user)).fetchone()
+            if not quote:
+                raise self.error_class("NOT_FOUND")
+            if quote[self.quote_state] != "OPEN" or quote["expires_at"] <= now:
+                raise self.error_class("QUOTE_EXPIRED")
+            amount = quote[self.quote_sale]
+            if type(amount) is not int or not 0 < amount <= 10**12:
+                raise self.error_class("PRICE_LIMIT")
+            pending = conn.execute("SELECT count(*) FROM topups WHERE user_id=? AND status IN ('pending','processing')", (user,)).fetchone()[0]
+            if pending >= 5:
+                raise self.error_class("PAYMENT_UNAVAILABLE", "Selesaikan atau batalkan invoice pembayaran sebelumnya dahulu.")
+            code = self.store.host.unique_code_for_order(conn)
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            cursor = conn.execute("""INSERT INTO topups(user_id,username,amount,unique_code,payment_total,
+                payment_method,status,created_at,expires_at) VALUES(?,'',?,?,?,'QRIS_MANUAL','pending',?,'')""",
+                (user, amount, code, amount+code, stamp))
+            topup_id = cursor.lastrowid
+            # Manual invoices wait for owner confirmation, without expiry.
+            # Snapshot the QR image so later QR settings do not alter invoices.
+            conn.execute(f"""INSERT INTO {self.table}(payment_id,quote_id,user_id,method,state,amount_idr,
+                payment_total_idr,topup_id,partner_reference,qr_url,created_at,expires_at,updated_at,shop_refund_policy)
+                VALUES(?,?,?,'QRIS_MANUAL','PENDING',?,?,?,?,?,?,0,?,1)""",
+                (payment_id, quote_id, user, amount, amount+code, topup_id,
+                 self.store.host.topup_invoice(topup_id), self.store.host.get_setting("qris_file_id", ""), now, now))
+            conn.execute(f"UPDATE {self.quote_table} SET {self.quote_state}='PAYMENT_PENDING' WHERE quote_id=?", (quote_id,))
+        return self.owned(user, payment_id)
+
+    def queue_result(self, conn, payment):
+        # OTP capture already enqueues its existing PURCHASE notification.
+        pass
 
     def settle(self, conn, payment, *, already_credited=False):
         if payment["paid_at"] is not None:
             return
-        reference, amount, now = "OTPQRIS:"+payment["payment_id"], payment["amount_idr"], time.time()
+        reference, amount, now = self.wallet_prefix+"QRIS:"+payment["payment_id"], payment["amount_idr"], time.time()
         if not already_credited:
-            WalletAdapter.change(conn, payment["user_id"], "TOPUP", amount, reference)
-        eligible = payment["state"] in {"PENDING", "CREATING", "CREATE_UNKNOWN"} and now <= payment["expires_at"]
+            self.wallet_change(conn, payment["user_id"], "TOPUP", amount, reference)
+        eligible = payment["state"] in {"PENDING", "CREATING", "CREATE_UNKNOWN"} and (not payment["expires_at"] or now <= payment["expires_at"])
         if eligible:
-            WalletAdapter.change(conn, payment["user_id"], "OTP_QRIS_HOLD", -amount, reference)
+            self.wallet_change(conn, payment["user_id"], self.wallet_prefix+"_QRIS_HOLD", -amount, reference)
         state = "PAID" if eligible else "WALLET_CREDITED"
-        conn.execute("UPDATE otp_payments SET state=?,paid_at=?,updated_at=?,error_code=?,next_retry_at=0 WHERE payment_id=?",
+        conn.execute(f"UPDATE {self.table} SET state=?,paid_at=?,updated_at=?,error_code=?,next_retry_at=0 WHERE payment_id=?",
                      (state, now, now, "" if eligible else "LATE_PAYMENT", payment["payment_id"]))
         if not eligible:
             self.queue_notice(conn, payment)
 
     def accept_topup(self, conn, topup):
         """Called inside the host's successful TOPUP credit transaction only."""
-        payment = conn.execute("SELECT * FROM otp_payments WHERE topup_id=?", (topup["id"],)).fetchone()
+        payment = conn.execute(f"SELECT * FROM {self.table} WHERE topup_id=?", (topup["id"],)).fetchone()
         if not payment:
             return False
         if payment["method"] != "QRIS_MANUAL" or payment["user_id"] != topup["user_id"] or payment["amount_idr"] != topup["amount"] or payment["payment_total_idr"] != topup["payment_total"]:
@@ -756,13 +834,15 @@ class PaymentService:
         return True
 
     async def notify_topup_receipt(self, bot, topup_id):
-        payment = self.store.repo.one("SELECT * FROM otp_payments WHERE topup_id=?", (topup_id,))
+        payment = self.store.repo.one(f"SELECT * FROM {self.table} WHERE topup_id=?", (topup_id,))
         if not payment:
             return False
         if payment["state"] != "PAID":
             # Late payment outcomes already have a durable wallet notification.
             return True
-        await payment_receipts.notify(self.store.host, bot, "otp_payment", payment["payment_id"])
+        await payment_receipts.notify(self.store.host, bot, self.receipt_source, payment["payment_id"])
+        if payment.get("shop_refund_policy"):
+            return True  # One durable receipt image; product outcome is separate.
         await bot.send_message(payment["user_id"], f"🛍️ <b>{USER_BRAND}</b>\n✅ Pembayaran QRIS terkonfirmasi\n"
             f"🧾 {escape(payment['partner_reference'])} • {money(payment['amount_idr'])}\nNomor sedang diproses; hasil dikirim otomatis.",
             parse_mode="HTML", reply_markup=self.store.ui.keyboard(payment["user_id"], [[("📦 PESANAN OTP", "orders", {})]]))
@@ -779,7 +859,7 @@ class PaymentService:
             if not value.is_finite() or value != value.to_integral_value() or not 0 < value <= 10**12:
                 raise ValueError
             with self.store.repo.connection(True) as conn:
-                row = conn.execute("SELECT * FROM otp_payments WHERE partner_reference=? AND method='AUTO_QRIS'", (reference,)).fetchone()
+                row = conn.execute(f"SELECT * FROM {self.table} WHERE partner_reference=? AND method='AUTO_QRIS'", (reference,)).fetchone()
                 if not row:
                     return web.json_response({"responseCode":"4045600","responseMessage":"Invoice Not Found"}, status=404)
                 if int(value) != row["payment_total_idr"]:
@@ -794,81 +874,84 @@ class PaymentService:
 
     def release_to_wallet(self, payment_id, code):
         with self.store.repo.connection(True) as conn:
-            row = conn.execute("SELECT * FROM otp_payments WHERE payment_id=?", (payment_id,)).fetchone()
+            row = conn.execute(f"SELECT * FROM {self.table} WHERE payment_id=?", (payment_id,)).fetchone()
             if not row or row["state"] != "PAID":
                 return
-            WalletAdapter.change(conn, row["user_id"], "OTP_QRIS_RELEASE", row["amount_idr"], "OTPQRIS:"+payment_id)
-            conn.execute("UPDATE otp_payments SET state='WALLET_CREDITED',error_code=?,updated_at=?,lease_owner=NULL,lease_until=0 WHERE payment_id=?",
+            self.wallet_change(conn, row["user_id"], self.wallet_prefix+"_QRIS_RELEASE", row["amount_idr"], self.wallet_prefix+"QRIS:"+payment_id)
+            conn.execute(f"UPDATE {self.table} SET state='WALLET_CREDITED',error_code=?,updated_at=?,lease_owner=NULL,lease_until=0 WHERE payment_id=?",
                          (code, time.time(), payment_id))
-            conn.execute("UPDATE otp_quotes SET status='PAYMENT_CLOSED' WHERE quote_id=? AND status='PAYMENT_PENDING'", (row["quote_id"],))
+            conn.execute(f"UPDATE {self.quote_table} SET {self.quote_state}='PAYMENT_CLOSED' WHERE quote_id=? AND {self.quote_state}='PAYMENT_PENDING'", (row["quote_id"],))
             self.queue_notice(conn, dict(row))
 
     async def reconcile(self):
         if not self.store.lease("payments", max(60, self.store.config.timeout+30)):
             return
         now = time.time()
-        waiting = self.store.repo.rows("SELECT * FROM otp_payments WHERE state IN ('CREATING','CREATE_UNKNOWN','PENDING') ORDER BY created_at LIMIT 100")
+        waiting = self.store.repo.rows(f"SELECT * FROM {self.table} WHERE state IN ('CREATING','CREATE_UNKNOWN','PENDING') ORDER BY created_at LIMIT 100")
         for row in waiting:
             topup = self.store.repo.one("SELECT * FROM topups WHERE id=?", (row["topup_id"],)) if row["topup_id"] else None
             if topup and topup["status"] == "completed":
                 # Compatibility with a host deployed without the atomic bridge:
                 # money is already available in its wallet, so do not debit it.
                 with self.store.repo.connection(True) as conn:
-                    changed = conn.execute("UPDATE otp_payments SET state='WALLET_CREDITED',paid_at=?,updated_at=?,error_code='CREDIT_ALREADY_AVAILABLE' WHERE payment_id=? AND paid_at IS NULL",
+                    changed = conn.execute(f"UPDATE {self.table} SET state='WALLET_CREDITED',paid_at=?,updated_at=?,error_code='CREDIT_ALREADY_AVAILABLE' WHERE payment_id=? AND paid_at IS NULL",
                                            (now, now, row["payment_id"])).rowcount
                     if changed:
                         self.queue_notice(conn, row)
                 continue
             closed = topup and topup["status"] in {"cancelled", "rejected", "expired"}
-            if closed or row["expires_at"] <= now:
+            if closed or (row["expires_at"] and row["expires_at"] <= now):
                 state = "CANCELLED" if topup and topup["status"] in {"cancelled", "rejected"} else "EXPIRED"
-                self.store.repo.execute("UPDATE otp_payments SET state=?,updated_at=? WHERE payment_id=? AND paid_at IS NULL AND state IN ('CREATING','CREATE_UNKNOWN','PENDING')",
+                self.store.repo.execute(f"UPDATE {self.table} SET state=?,updated_at=? WHERE payment_id=? AND paid_at IS NULL AND state IN ('CREATING','CREATE_UNKNOWN','PENDING')",
                                         (state, now, row["payment_id"]))
-        for payment in self.store.repo.rows("SELECT * FROM otp_payments WHERE state='PAID' AND next_retry_at<=? ORDER BY paid_at LIMIT 20", (now,)):
+        for payment in self.store.repo.rows(f"SELECT * FROM {self.table} WHERE state='PAID' AND next_retry_at<=? ORDER BY paid_at LIMIT 20", (now,)):
             try:
                 await self.store.purchase.buy(payment["user_id"], payment["quote_id"], payment_id=payment["payment_id"])
-            except StoreError as exc:
+            except self.errors as exc:
                 # No provider POST has happened until the existing purchase
                 # attempt commits. A temporary catalog error keeps funds held.
-                if exc.code in {"PRICE_CHANGED", "NO_OFFER_AVAILABLE", "NOT_FOUND", "DISABLED", "ORDER_LIMIT", "PRICE_LIMIT", "CONFLICT", "BELOW_COST", "CONFIG", "NOT_CONFIGURED", "UNAUTHORIZED", "ENCRYPTION", "PAYMENT_UNAVAILABLE"}:
+                if exc.code in {"PRICE_CHANGED", "NO_OFFER_AVAILABLE", "NOT_FOUND", "DISABLED", "ORDER_LIMIT", "PRICE_LIMIT", "CONFLICT", "BELOW_COST", "CONFIG", "NOT_CONFIGURED", "UNAUTHORIZED", "ENCRYPTION", "PAYMENT_UNAVAILABLE", "CLOSED", "ACTIVE_LIMIT", "TYPE", "CURRENCY", "INPUT", "MIN_MAX", "MAINTENANCE", "QUOTE_EXPIRED", "FORBIDDEN"}:
                     self.release_to_wallet(payment["payment_id"], exc.code)
                 elif exc.code == "PAYMENT_PENDING":
                     pass
                 else:
                     delay = max(getattr(exc, "retry_after", 0) or 0, min(900, 10*2**min(payment["retries"], 6)))
-                    self.store.repo.execute("UPDATE otp_payments SET next_retry_at=?,retries=retries+1,error_code=? WHERE payment_id=? AND state='PAID'",
+                    self.store.repo.execute(f"UPDATE {self.table} SET next_retry_at=?,retries=retries+1,error_code=? WHERE payment_id=? AND state='PAID'",
                                             (now+delay, exc.code, payment["payment_id"]))
             except Exception as exc:
                 # Preserve held funds and any committed attempt. A failure for
                 # one invoice must not block other buyers in this batch.
                 logging.warning("OTP payment reconciliation: %s", type(exc).__name__)
                 delay = min(900, 10*2**min(payment["retries"], 6))
-                self.store.repo.execute("UPDATE otp_payments SET next_retry_at=?,retries=retries+1,error_code='INTERNAL_ERROR' WHERE payment_id=? AND state='PAID'",
+                self.store.repo.execute(f"UPDATE {self.table} SET next_retry_at=?,retries=retries+1,error_code='INTERNAL_ERROR' WHERE payment_id=? AND state='PAID'",
                                         (now+delay, payment["payment_id"]))
-        for payment in self.store.repo.rows("SELECT p.*,a.state attempt_state FROM otp_payments p JOIN otp_purchase_attempts a ON a.attempt_id=p.attempt_id WHERE p.state='BUYING'"):
-            if payment["attempt_state"] in {"CAPTURED", "FAILED"}:
-                state = "COMPLETED" if payment["attempt_state"] == "CAPTURED" else "WALLET_CREDITED"
+        for payment in self.store.repo.rows(f"SELECT p.*,a.state attempt_state FROM {self.table} p JOIN {self.attempt_table} a ON a.attempt_id=p.attempt_id WHERE p.state='BUYING'"):
+            if payment["attempt_state"] in {self.success_state, "FAILED", "CANCELED"}:
+                state = "COMPLETED" if payment["attempt_state"] == self.success_state else "WALLET_CREDITED"
                 with self.store.repo.connection(True) as conn:
-                    updated = conn.execute("UPDATE otp_payments SET state=?,updated_at=? WHERE payment_id=? AND state='BUYING'", (state, now, payment["payment_id"])).rowcount
-                    if updated and state == "WALLET_CREDITED":
-                        self.queue_notice(conn, payment)
+                    updated = conn.execute(f"UPDATE {self.table} SET state=?,updated_at=? WHERE payment_id=? AND state='BUYING'", (state, now, payment["payment_id"])).rowcount
+                    if updated:
+                        if state == "COMPLETED":
+                            self.queue_result(conn, payment)
+                        elif payment["attempt_state"] != "CANCELED":
+                            self.queue_notice(conn, payment)
 
     def cancel(self, user, payment_id):
         payment = self.owned(user, payment_id)
         if payment["paid_at"] is not None or payment["state"] == "BUYING":
-            raise StoreError("PAYMENT_PAID")
+            raise self.error_class("PAYMENT_PAID")
         if payment["topup_id"]:
             _, status = self.store.host.cancel_topup_atomic(payment["topup_id"], user)
             if status not in {"cancelled", "already_cancelled", "invalid_status"}:
-                raise StoreError("PAYMENT_PAID")
-        self.store.repo.execute("UPDATE otp_payments SET state='CANCELLED',updated_at=? WHERE payment_id=? AND user_id=? AND paid_at IS NULL AND state IN ('CREATING','CREATE_UNKNOWN','PENDING')",
+                raise self.error_class("PAYMENT_PAID")
+        self.store.repo.execute(f"UPDATE {self.table} SET state='CANCELLED',updated_at=? WHERE payment_id=? AND user_id=? AND paid_at IS NULL AND state IN ('CREATING','CREATE_UNKNOWN','PENDING')",
                                 (time.time(), payment_id, user))
         return self.owned(user, payment_id)
 
     async def retire_qr(self, bot):
-        for row in self.store.repo.rows("SELECT * FROM otp_payments WHERE qr_message_id IS NOT NULL AND qr_delivery_state='SENT' AND state IN ('PAID','BUYING','COMPLETED','WALLET_CREDITED','CANCELLED','EXPIRED') LIMIT 20"):
+        for row in self.store.repo.rows(f"SELECT * FROM {self.table} WHERE qr_message_id IS NOT NULL AND qr_delivery_state='SENT' AND state IN ('PAID','BUYING','COMPLETED','WALLET_CREDITED','CANCELLED','EXPIRED') LIMIT 20"):
             if await self.store.host.retire_topup_payment_message(bot, row["user_id"], row["qr_message_id"]):
-                self.store.repo.execute("UPDATE otp_payments SET qr_delivery_state='RETIRED' WHERE payment_id=?", (row["payment_id"],))
+                self.store.repo.execute(f"UPDATE {self.table} SET qr_delivery_state='RETIRED' WHERE payment_id=?", (row["payment_id"],))
 
 
 class SMSEventProcessor:
@@ -906,13 +989,45 @@ class RefundService:
     def __init__(self, store):
         self.store = store
 
+    def shop_failure(self, order, status):
+        """Return a new manual invoice's sale to the buyer, independently of
+        reimbursement to the provider account. Never refund an unknown create
+        result, a completed number, or an order that has received an SMS.
+        """
+        if status not in {'FAILED', 'CANCELED', 'EXPIRED'}:
+            return False
+        with self.store.repo.connection(True) as conn:
+            current = conn.execute('SELECT * FROM otp_orders WHERE id=?',(order['id'],)).fetchone()
+            if not current or current['status']=='COMPLETED' or current['last_sms_revision']>0:
+                return False
+            funded = conn.execute("SELECT 1 FROM otp_payments WHERE attempt_id=? AND user_id=? AND paid_at IS NOT NULL AND method='QRIS_MANUAL' AND shop_refund_policy=1",(current['attempt_id'],current['buyer_user_id'])).fetchone()
+            if not funded:
+                return False
+            if current['refund_state']=='REFUNDED':
+                return True
+            WalletAdapter.change(conn,current['buyer_user_id'],'REFUND',current['selling_price_idr'],'OTP:ORDER:'+str(current['id']))
+            conn.execute("UPDATE otp_orders SET status=?,refund_idr=selling_price_idr,refund_state='REFUNDED',updated_at=? WHERE id=?",(status,time.time(),current['id']))
+            self.store.queue(conn,current['id'],current['provider_order_id'],current['buyer_user_id'],'REFUND',0)
+        return True
+
+    def recover_shop_failures(self):
+        for order in self.store.repo.rows("""SELECT o.* FROM otp_orders o JOIN otp_payments p ON p.attempt_id=o.attempt_id
+            WHERE p.shop_refund_policy=1 AND p.paid_at IS NOT NULL AND p.method='QRIS_MANUAL'
+              AND o.status IN ('FAILED','CANCELED','EXPIRED') AND o.last_sms_revision=0 AND o.refund_state!='REFUNDED' LIMIT 100"""):
+            self.shop_failure(order,order['status'])
+
     def confirm(self, order, response):
         if not isinstance(response, dict) or response.get("order_id") != order["provider_order_id"] or response.get("status") not in {"CANCELED", "EXPIRED"}:
             raise StoreError("INVALID_RESPONSE", uncertain=True)
+        if 'refund_amount' not in response and self.shop_failure(order,response['status']):
+            return
         try:
             amount = integer(response.get("refund_amount"))
         except StoreError:
             raise StoreError("INVALID_RESPONSE", uncertain=True) from None
+        if self.shop_failure(order,response['status']):
+            self.store.repo.execute('UPDATE otp_orders SET provider_refund_idr=MAX(provider_refund_idr,?) WHERE id=?',(amount,order['id']))
+            return
         with self.store.repo.connection(True) as conn:
             current = conn.execute("SELECT * FROM otp_orders WHERE id=?", (order["id"],)).fetchone()
             if current["refund_state"] == "REFUNDED":
@@ -953,10 +1068,12 @@ class OrderService:
         if data["status"] in {"CANCELED", "EXPIRED"}:
             if "refund_amount" in data:
                 self.store.refund.confirm(order, {**data, "order_id": data["id"]})
-            else:
+            elif not self.store.refund.shop_failure(order,data['status']):
                 # The official GET schema has no refund_amount. A terminal status
                 # alone is insufficient evidence of a credit to the provider wallet.
                 self.store.repo.execute("UPDATE otp_orders SET refund_state='AWAITING_PROVIDER_PROOF' WHERE id=? AND refund_state='NONE'", (order["id"],))
+        elif data['status']=='FAILED':
+            self.store.refund.shop_failure(order,data['status'])
 
     async def action(self, user, order_id, action):
         order = self.store.repo.owned(user, order_id)
@@ -1019,6 +1136,9 @@ class OrderService:
                 if row["action"] == "finish" and data["status"] == "COMPLETED":
                     self.complete(row["id"], order, "finish", {"order_id": order["provider_order_id"], "status": "COMPLETED"})
                 elif row["action"] == "cancel":
+                    if data['status'] in {'CANCELED','EXPIRED','FAILED'} and self.store.refund.shop_failure(order,data['status']):
+                        self.store.repo.execute("UPDATE otp_actions SET state='DONE',lease_owner=NULL,lease_until=0,updated_at=? WHERE id=?",(time.time(),row['id']))
+                        continue
                     # GET lacks money proof. Don't infer refund or repeat a money mutation.
                     self.store.repo.execute("UPDATE otp_orders SET refund_state='AWAITING_PROVIDER_PROOF' WHERE id=? AND refund_state!='REFUNDED'", (order["id"],))
                     self.store.repo.execute("UPDATE otp_actions SET next_retry_at=?,state='PENDING_RECONCILIATION',lease_until=0 WHERE id=?", (time.time()+300, row["id"]))
@@ -1042,7 +1162,7 @@ class NotificationQueue:
                 continue
             order = self.store.repo.one("SELECT * FROM otp_orders WHERE id=?", (job["order_id"],))
             try:
-                payment = None
+                payment, payload = None, {}
                 if job["kind"] == "PAYMENT":
                     payment = self.store.payments.owned(job["user_id"], job["dedup_key"].removeprefix("PAYMENT:"))
                     texts = [f"🛍️ <b>{USER_BRAND}</b>\n💰 Pembayaran QRIS {money(payment['amount_idr'])} tersedia di saldo kamu.\n"
@@ -1065,7 +1185,7 @@ class NotificationQueue:
                             (time.time()+120, job["notification_id"], owner)):
                         raise StoreError("LEASE_LOST")
                     sent = await bot.send_message(job["user_id"], texts[index], parse_mode="HTML",
-                         reply_markup=(self.store.ui.home_keyboard(job["user_id"]) if payment else self.store.ui.order_keyboard(order, job["user_id"])) if index == len(texts)-1 else None,
+                         reply_markup=(self.store.ui.home_keyboard(job["user_id"]) if payment else self.store.ui.order_keyboard(order, job["user_id"], otp_code=payload.get("otp_code"))) if index == len(texts)-1 else None,
                          link_preview_options=LinkPreviewOptions(is_disabled=True))
                     self.store.repo.execute("UPDATE otp_notifications SET part_index=?,telegram_message_id=? WHERE notification_id=? AND lease_owner=?",
                            (index+1, getattr(sent, "message_id", None), job["notification_id"], owner))
@@ -1330,6 +1450,7 @@ class Store:
                         await self.polling_cycle()
                 elif kind == "reconciliation":
                     await self.payments.reconcile()
+                    self.refund.recover_shop_failures()
                     if self.config.token and not self.config.error:
                         for row in self.repo.rows("SELECT attempt_id FROM otp_purchase_attempts WHERE state IN ('RESERVED','REQUESTING','PENDING_RECONCILIATION') AND next_retry_at<=? AND lease_until<? LIMIT 10", (time.time(), time.time())):
                             await self.purchase.process(row["attempt_id"])
@@ -1735,6 +1856,7 @@ class UIBuilder:
         invoices = self.store.repo.rows("""SELECT t.id,t.amount FROM topups t
             WHERE t.user_id=? AND t.status IN ('pending','processing')
               AND NOT EXISTS (SELECT 1 FROM otp_payments p WHERE p.topup_id=t.id)
+              AND NOT EXISTS (SELECT 1 FROM sosmed_payments p WHERE p.topup_id=t.id)
             ORDER BY t.id DESC LIMIT 5""", (user,))
         for row in invoices:
             rows.append([(f"🧾 Isi Saldo #{row['id']} • {money(row['amount'])}", "topup_status", {"id": row["id"]})])
@@ -1753,7 +1875,7 @@ class UIBuilder:
                 + (f"✅ Selesai: {payment_receipts.format_wib(order['completed_at'])}\n" if order.get('completed_at') else "")
                 + f"↩️ Refund: {money(order['refund_idr'])} • {UserFormatter.refund_status(order['refund_state'])}")
 
-    def order_keyboard(self, order, user):
+    def order_keyboard(self, order, user, *, otp_code=None):
         oid = {"id": order["id"]}
         caps = json.loads(order["capabilities"])
         rows = [[("🔄 CEK OTP", "check", oid)]]
@@ -1767,7 +1889,18 @@ class UIBuilder:
         elif caps.get("can_reactivate"):
             rows.append([("♻️ AKTIFKAN LAGI", "reactivate", oid)])
         rows.append([("⬅️ Kembali", "orders", {}), ("🏠 Menu Awal", "home", {})])
-        return self.keyboard(user, rows)
+        keyboard = self.keyboard(user, rows)
+        copies = []
+        phone = str(order.get("phone_number") or "").strip()
+        if phone and len(phone) <= 256:
+            copies.append(InlineKeyboardButton(text="📋 SALIN NOMOR", copy_text=CopyTextButton(text=phone)))
+        # Copy only a real retained SMS code. Never infer a code from a phone
+        # number/status or silently truncate codes exceeding Telegram's limit.
+        if otp_code is not None and 0 < len(str(otp_code)) <= 256:
+            copies.append(InlineKeyboardButton(text="📋 SALIN OTP", copy_text=CopyTextButton(text=str(otp_code))))
+        if copies:
+            keyboard.inline_keyboard.insert(0, copies)
+        return keyboard
 
     @staticmethod
     def sms_texts(order, payload, revision):
@@ -1910,8 +2043,9 @@ class UIBuilder:
             f"💰 Harga: <b>{money(quote['selling_price_idr'])}</b>\n💳 Saldo: {money(balance)}\n"
             f"{after}\n"
             f"⏳ Harga berlaku {self.store.config.quote_ttl} detik sebelum konfirmasi.\n"
-            "Pembayaran memakai saldo bot. Refund yang terkonfirmasi masuk ke saldo bot.",
+            "Pilih saldo bot atau QRIS manual. Pembelian gagal terkonfirmasi dikembalikan ke saldo bot.",
             self.keyboard(user, [[("💰 BUY SALDO", "buy", {"quote": quote["quote_id"]})],
+                                 *([[('📱 QRIS MANUAL', 'pay_manual', {'quote':quote['quote_id']})]] if self.store.payments.manual_ready() else []),
                                  [("➕ Isi Saldo", "topup", {})],
                                  [("⬅️ Kembali", "products", {"country": product['country_id'], "platform": product['platform_id'],
                                      "country_name": product['country_name'], "platform_name": product['platform_name'],
@@ -1919,69 +2053,76 @@ class UIBuilder:
                                  [("🏠 Menu Awal", "home", {})]]))
 
     async def payment(self, message, user, payment_id):
+        # Shared invoice presentation; each store keeps its own namespace and
+        # order UI while using the same owner proof/confirmation flow.
+        funding = self.store.payments
+        brand, subject = funding.brand, funding.subject
+        callback = lambda action: self.store.token(user,action,{},ttl=86400)
         payment = self.store.payments.owned(user, payment_id)
         if payment["attempt_id"]:
-            order = self.store.repo.one("SELECT * FROM otp_orders WHERE attempt_id=? AND buyer_user_id=?", (payment["attempt_id"], user))
+            order = self.store.repo.one(f"SELECT * FROM {funding.order_table} WHERE attempt_id=? AND {funding.order_user}=?", (payment["attempt_id"], user))
             if order:
-                return await self.send(message, self.order_text(order), self.order_keyboard(order, user))
-        state, active = payment["state"], payment["state"] in {"PENDING", "CREATING", "CREATE_UNKNOWN"} and payment["expires_at"] > time.time()
+                return await self.send(message, self.order_text(order), funding.order_card_keyboard(self,order,user))
+        state, active = payment["state"], funding.pending(payment)
         if active and state == "PENDING":
-            claimed = self.store.repo.execute("UPDATE otp_payments SET qr_delivery_state='SENDING' WHERE payment_id=? AND qr_delivery_state='PENDING'", (payment_id,))
+            claimed = self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='SENDING' WHERE payment_id=? AND qr_delivery_state='PENDING'", (payment_id,))
             if claimed:
                 try:
-                    image = payment["qr_url"] if payment["method"] == "AUTO_QRIS" else self.store.host.get_setting("qris_file_id", "")
+                    image = payment["qr_url"] or (self.store.host.get_setting("qris_file_id", "") if payment["method"] != "AUTO_QRIS" else '')
                     if not image and payment["qr_payload"]:
                         content = self.store.decrypt(payment["qr_payload"])["qr_content"]
                         image = BufferedInputFile(await asyncio.to_thread(qr_image, content), filename="MaboyyOTPQRIS.png")
                     if not image:
                         raise StoreError("PAYMENT_UNAVAILABLE")
                     sent = await message.bot.send_photo(user, photo=image,
-                        caption=f"🛍️ {USER_BRAND}\n🧾 {payment['partner_reference']}\n💳 Total: {money(payment['payment_total_idr'])}\nBayar satu kali sesuai total invoice sebelum kedaluwarsa.")
-                    self.store.repo.execute("UPDATE otp_payments SET qr_message_id=?,qr_delivery_state='SENT' WHERE payment_id=?", (sent.message_id, payment_id))
+                        caption=f"🛍️ {brand}\n🧾 {payment['partner_reference']}\n💳 Total: {money(payment['payment_total_idr'])}\n"
+                                +('Tanpa kedaluwarsa. Kirim bukti untuk konfirmasi owner.' if not payment['expires_at'] else 'Bayar satu kali sesuai total invoice sebelum kedaluwarsa.'))
+                    self.store.repo.execute(f"UPDATE {funding.table} SET qr_message_id=?,qr_delivery_state='SENT' WHERE payment_id=?", (sent.message_id, payment_id))
                     if payment["topup_id"]:
                         self.store.host.save_topup_payment_message(payment["topup_id"], user, sent.message_id)
                 except (TelegramBadRequest, StoreError):
-                    self.store.repo.execute("UPDATE otp_payments SET qr_delivery_state='PENDING' WHERE payment_id=?", (payment_id,))
+                    self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='PENDING' WHERE payment_id=?", (payment_id,))
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    self.store.repo.execute("UPDATE otp_payments SET qr_delivery_state='UNKNOWN' WHERE payment_id=?", (payment_id,))
+                    self.store.repo.execute(f"UPDATE {funding.table} SET qr_delivery_state='UNKNOWN' WHERE payment_id=?", (payment_id,))
         payment = self.store.payments.owned(user, payment_id)
         state = payment["state"]
-        active = state in {"PENDING", "CREATING", "CREATE_UNKNOWN"} and payment["expires_at"] > time.time()
+        active = funding.pending(payment)
         label = {"CREATING":"QRIS sedang disiapkan", "CREATE_UNKNOWN":"Hasil pembuatan QRIS sedang diperiksa",
-                 "PENDING":"Menunggu pembayaran", "PAID":"Pembayaran diterima, nomor sedang diproses",
-                 "BUYING":"Pembelian nomor sedang diproses", "COMPLETED":"Nomor berhasil dibeli",
+                 "PENDING":"Menunggu pembayaran", "PAID":f"Pembayaran diterima, {subject} sedang diproses",
+                 "BUYING":f"Pembelian {subject} sedang diproses", "COMPLETED":f"{subject.capitalize()} berhasil dibeli",
                  "WALLET_CREDITED":"Dana tersedia di saldo bot", "CANCELLED":"Invoice dibatalkan",
                  "EXPIRED":"Invoice kedaluwarsa"}.get(state, "Sedang diperiksa")
         rows = []
         if active and payment["topup_id"]:
             rows.append([InlineKeyboardButton(text="📤 KIRIM BUKTI PEMBAYARAN", callback_data=f"proofsubmit:topup:{payment['topup_id']}")])
-        ttl = max(300, min(3600, int(payment["expires_at"]-time.time())+300))
+        ttl = max(300, min(3600, int(payment["expires_at"]-time.time())+300)) if payment['expires_at'] else 86400
         token = lambda action: self.store.token(user, action, {"payment": payment_id}, ttl=ttl)
         rows.append([InlineKeyboardButton(text="🔄 CEK PEMBAYARAN", callback_data=token("payment_status"))])
         if active:
             rows.append([InlineKeyboardButton(text="❌ BATALKAN INVOICE", callback_data=token("payment_cancel"))])
-        rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=self.callback(user, "orders")),
-                     InlineKeyboardButton(text="🏠 Menu Awal", callback_data=self.callback(user, "home"))])
-        text = (f"🛍️ <b>{USER_BRAND}</b>\n💳 <b>BUY NOW • QRIS</b>\n\n"
+        rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=callback("orders")),
+                     InlineKeyboardButton(text="🏠 Menu Awal", callback_data=callback("home"))])
+        text = (f"🛍️ <b>{brand}</b>\n💳 <b>QRIS {'MANUAL' if payment['method']=='QRIS_MANUAL' else 'OTOMATIS'}</b>\n\n"
                 f"🧾 Invoice: <b>{escape(payment['partner_reference'])}</b>\n"
-                f"💰 Harga nomor: {money(payment['amount_idr'])}\n"
+                f"💰 Harga {subject}: {money(payment['amount_idr'])}\n"
                 f"🔢 Kode unik: {money(payment['payment_total_idr']-payment['amount_idr'])}\n"
                 f"💳 Total bayar: <b>{money(payment['payment_total_idr'])}</b>\n"
-                f"⌛ Berlaku sampai: {payment_receipts.format_wib(payment['expires_at'])}\n"
+                + (f"⌛ Berlaku sampai: {payment_receipts.format_wib(payment['expires_at'])}\n" if payment['expires_at'] else '⌛ Tanpa kedaluwarsa • konfirmasi owner\n')
+                +
                 f"⏳ Status: {label}\n\n")
         if active:
             text += ("Pembayaran QRIS diperiksa otomatis. " if payment["method"] == "AUTO_QRIS"
                      else "Kirim bukti pembayaran untuk verifikasi owner. ")
-            text += "Nomor diproses otomatis setelah pembayaran terkonfirmasi. Bayar satu kali sesuai total invoice.\n"
+            text += f"{subject.capitalize()} diproses otomatis setelah pembayaran terkonfirmasi. Bayar satu kali sesuai total invoice.\n"
             if payment["qr_delivery_state"] != "SENT":
                 text += "⚠️ Gambar QRIS belum berhasil ditampilkan. Jangan membayar sebelum QRIS tersedia; hubungi owner.\n"
         elif state in {"CANCELLED", "EXPIRED"}:
             text += "Jangan bayar invoice ini. Jika pembayaran terlambat terkonfirmasi, dana masuk ke saldo bot.\n"
         elif state == "WALLET_CREDITED":
-            text += "Nomor belum dibeli. Gunakan Buy Saldo untuk membeli kembali; tidak perlu membayar QRIS lagi.\n"
-        text += "Refund OTP yang terkonfirmasi masuk ke saldo bot."
+            text += f"{subject.capitalize()} belum dibeli. Gunakan saldo untuk membeli kembali; tidak perlu membayar QRIS lagi.\n"
+        text += 'Pembelian gagal terkonfirmasi dikembalikan ke saldo bot. Hasil yang belum pasti diperiksa dahulu.'
         if payment['payment_total_idr'] > payment['amount_idr']:
             text += " Kode unik tidak dikembalikan sebagai saldo."
         return await self.send(message, text, InlineKeyboardMarkup(inline_keyboard=rows))
@@ -2037,20 +2178,21 @@ class UIBuilder:
         text = self.order_text(order)
         event = self.store.repo.one("SELECT * FROM otp_sms_events WHERE provider_order_id=? ORDER BY sms_revision DESC LIMIT 1", (order["provider_order_id"],))
         if event and event["encrypted_payload"]:
-            parts = self.sms_texts(order, self.store.decrypt(event["encrypted_payload"]), event["sms_revision"])
+            payload = self.store.decrypt(event["encrypted_payload"])
+            parts = self.sms_texts(order, payload, event["sms_revision"])
             if len(text)+len(parts[0]) <= 3900:
                 text += "\n\n"+parts.pop(0)
-            await self.send(message, text, self.order_keyboard(order, user))
+            await self.send(message, text, self.order_keyboard(order, user, otp_code=payload.get("otp_code")))
             for part in parts:
                 await self.send(message, part, fresh=True)
         else:
-            await self.send(message, text+"\n\n📩 SMS belum diterima atau sudah melewati masa retensi.", self.order_keyboard(order, user))
+            await self.send(message, text+"\n\n📩 SMS belum diterima atau sudah melewati masa retensi. Tombol Salin OTP muncul setelah kode tersedia.", self.order_keyboard(order, user))
 
 
 HELP = (f"🛍️ <b>{USER_BRAND}</b>\n❓ CARA BELI OTP\n\n"
         "1. Pilih negara, layanan, dan nomor.\n"
-        "2. Isi Saldo jika belum cukup, lalu pilih <b>Buy Saldo</b>.\n"
-        "3. Saldo ditagihkan setelah nomor terkonfirmasi dan nomor dikirim.\n"
+        "2. Pilih <b>Buy Saldo</b> atau <b>QRIS Manual</b> jika tersedia.\n"
+        "3. QRIS manual diproses setelah owner mengonfirmasi pembayaran; saldo memakai wallet bot.\n"
         "4. SMS dan kode OTP masuk otomatis ke chat ini.\n\n"
         "Cek, resend, selesai, dan batal tersedia di Pesanan Saya sesuai status nomor. "
         "Refund yang terkonfirmasi masuk ke saldo bot. Buka /otp untuk kembali.")
@@ -2483,6 +2625,9 @@ def register(router, store):
         elif action == "pay_qris":
             payment = await store.payments.create(user, payload["quote"])
             await store.ui.payment(message, user, payment["payment_id"])
+        elif action == "pay_manual":
+            payment = await store.payments.create_manual(user,payload['quote'])
+            await store.ui.payment(message,user,payment['payment_id'])
         elif action in {"payment_status", "payment_cancel"}:
             store.payments.owned(user, payload["payment"])
             if action == "payment_cancel":

@@ -26,6 +26,8 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from urllib.parse import urlparse
 
 import aiohttp
+import otp_smscode
+import payment_receipts
 
 PREFIX = "sosmed:"
 USER_BRAND = "MABOYY SOSMED STORE"
@@ -321,6 +323,19 @@ def init_schema(conn):
           hold_amount INTEGER NOT NULL CHECK(hold_amount>0),provider_order_id INTEGER UNIQUE,
           reconciliation_status TEXT NOT NULL DEFAULT 'NONE',error_code TEXT NOT NULL DEFAULT '',
           created_at REAL NOT NULL,updated_at REAL NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS sosmed_payments(payment_id TEXT PRIMARY KEY,quote_id TEXT NOT NULL UNIQUE,
+          user_id INTEGER NOT NULL,method TEXT NOT NULL CHECK(method='QRIS_MANUAL'),state TEXT NOT NULL,
+          amount_idr INTEGER NOT NULL CHECK(amount_idr>0),payment_total_idr INTEGER NOT NULL CHECK(payment_total_idr>=amount_idr),
+          topup_id INTEGER NOT NULL UNIQUE,partner_reference TEXT NOT NULL UNIQUE,
+          qr_url TEXT NOT NULL DEFAULT '',qr_payload TEXT NOT NULL DEFAULT '',qr_message_id INTEGER,
+          qr_delivery_state TEXT NOT NULL DEFAULT 'PENDING',attempt_id TEXT UNIQUE,created_at REAL NOT NULL,
+          expires_at REAL NOT NULL DEFAULT 0,paid_at REAL,updated_at REAL NOT NULL,next_retry_at REAL NOT NULL DEFAULT 0,
+          retries INTEGER NOT NULL DEFAULT 0,error_code TEXT,lease_owner TEXT,lease_until REAL NOT NULL DEFAULT 0,
+          shop_refund_policy INTEGER NOT NULL DEFAULT 1,notice_kind TEXT NOT NULL DEFAULT '',
+          notice_state TEXT NOT NULL DEFAULT 'NONE',notice_attempts INTEGER NOT NULL DEFAULT 0,
+          notice_next_retry_at REAL NOT NULL DEFAULT 0,notice_message_id INTEGER,
+          FOREIGN KEY(quote_id) REFERENCES sosmed_quotes(quote_id),FOREIGN KEY(topup_id) REFERENCES topups(id),
+          FOREIGN KEY(attempt_id) REFERENCES sosmed_purchase_attempts(attempt_id))""",
         """CREATE TABLE IF NOT EXISTS sosmed_orders(id INTEGER PRIMARY KEY AUTOINCREMENT,
           provider_order_id INTEGER NOT NULL UNIQUE,attempt_id TEXT NOT NULL UNIQUE,
           user_id INTEGER NOT NULL,service_id INTEGER NOT NULL,service_name_snapshot TEXT NOT NULL,
@@ -368,6 +383,8 @@ def init_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_sosmed_order_poll ON sosmed_orders(status,next_poll_at)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_attempt_state ON sosmed_purchase_attempts(state)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_attempt_user ON sosmed_purchase_attempts(user_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sosmed_payment_due ON sosmed_payments(state,next_retry_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sosmed_payment_user ON sosmed_payments(user_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_notification_due ON sosmed_notifications(status,next_retry_at,lease_until)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_hold_notice_due ON sosmed_hold_cancellations(notification_status,next_retry_at,lease_until)",
         "CREATE INDEX IF NOT EXISTS idx_sosmed_services_category ON sosmed_services(category,enabled)",
@@ -423,6 +440,12 @@ class Repository:
             if prepare:
                 prepare(conn)
             return [dict(row) for row in conn.execute(sql, args).fetchall()]
+
+    rows = all  # Shared QRIS funding worker uses the same repository interface.
+
+    def execute(self, sql, args=()):
+        with self.connection(True) as conn:
+            return conn.execute(sql, args).rowcount
 
     def order(self, user, order_id):
         row = self.one("SELECT * FROM sosmed_orders WHERE id=? AND user_id=?", (number(order_id, 1), user))
@@ -1372,7 +1395,7 @@ class PurchaseService:
             row["internal_order_id"] = row["id"]
         return {"state": attempt["state"], "attempt_id": attempt["attempt_id"], "order": row}
 
-    async def buy(self, user, quote_id):
+    async def buy(self, user, quote_id, *, payment_id=None):
         # Existing attempt lookup precedes guard/TTL: a stale double click may
         # show its settled order even if the owner closed new purchases.
         existing = self.store.repo.one("SELECT * FROM sosmed_purchase_attempts WHERE quote_id=? AND user_id=?", (str(quote_id), user))
@@ -1380,7 +1403,13 @@ class PurchaseService:
             return self.result(existing)
         self.store.purchase_guard(user)
         quote = self.get_quote(user, quote_id)
-        if quote["expires_at"]<time.time() or quote["state"]!="OPEN":
+        funded = self.store.payments.owned(user, payment_id) if payment_id else None
+        if funded:
+            if funded['quote_id'] != quote_id or funded['state'] != 'PAID' or quote['state'] != 'PAYMENT_PENDING':
+                raise StoreError('PAYMENT_PENDING', 'Pembayaran sedang diproses. Periksa invoice pembayaran.')
+        elif quote['state'] == 'PAYMENT_PENDING':
+            raise StoreError('PAYMENT_PENDING', 'Invoice QRIS sudah dibuat. Selesaikan pembayaran invoice tersebut.')
+        elif quote["expires_at"]<time.time() or quote["state"]!="OPEN":
             raise StoreError("QUOTE_EXPIRED")
         service = await self.store.catalog.live(quote["service_id"])
         self.store.purchase_guard(user)
@@ -1402,7 +1431,14 @@ class PurchaseService:
                     raise StoreError("NOT_FOUND")
                 return self.result(dict(attempt))
             current = conn.execute("SELECT * FROM sosmed_quotes WHERE quote_id=? AND user_id=?", (quote_id, user)).fetchone()
-            if not current or current["state"]!="OPEN" or current["expires_at"]<now:
+            if funded:
+                payment = conn.execute('SELECT * FROM sosmed_payments WHERE payment_id=? AND user_id=? AND quote_id=?', (payment_id,user,quote_id)).fetchone()
+                if (not current or not payment or payment['state']!='PAID' or payment['amount_idr']!=sale
+                        or current['state']!='PAYMENT_PENDING'):
+                    raise StoreError('PAYMENT_PENDING')
+            elif current and current['state']=='PAYMENT_PENDING':
+                raise StoreError('PAYMENT_PENDING')
+            elif not current or current["state"]!="OPEN" or current["expires_at"]<now:
                 raise StoreError("QUOTE_EXPIRED")
             # Owner/user guards and catalogue availability must be checked
             # AFTER all asynchronous work, under the same wallet write lock.
@@ -1428,10 +1464,14 @@ class PurchaseService:
             if recent and now-recent[0]<3:
                 raise StoreError("RATE_LIMIT")
             ident = secrets.token_hex(12)
+            if funded:
+                WalletAdapter.change(conn, user, 'SOSMED_QRIS_RESERVE_RELEASE', sale, 'SOSMEDQRIS:'+payment_id)
             WalletAdapter.change(conn, user, "SOSMED_HOLD", -sale, ident)
             conn.execute("INSERT INTO sosmed_purchase_attempts(attempt_id,quote_id,user_id,state,request_body,request_hash,hold_amount,created_at,updated_at) VALUES(?,?,?,'REQUESTING',?,?,?,?,?)",
                          (ident, quote_id, user, encoded(body), hashlib.sha256(encoded(body).encode()).hexdigest(), sale, now, now))
             conn.execute("UPDATE sosmed_quotes SET state='PROCESSING' WHERE quote_id=?", (quote_id,))
+            if funded:
+                conn.execute("UPDATE sosmed_payments SET state='BUYING',attempt_id=?,updated_at=? WHERE payment_id=?", (ident,now,payment_id))
         try:
             response = await self.store.api.request("add", **body)
             if not isinstance(response, dict) or "order" not in response:
@@ -1852,6 +1892,64 @@ class OrderService:
             conn.execute("UPDATE sosmed_orders SET cancel_state='UNKNOWN' WHERE cancel_state='REQUESTING' AND updated_at<?", (now-self.store.config.timeout-10,))
 
 
+class PaymentService(otp_smscode.PaymentService):
+    """SOSMED adapter for the existing manual payment/owner/wallet lifecycle."""
+
+    table = 'sosmed_payments'
+    quote_table, quote_user, quote_state, quote_sale = 'sosmed_quotes', 'user_id', 'state', 'sale'
+    attempt_table, success_state = 'sosmed_purchase_attempts', 'SUCCESS'
+    wallet_prefix, receipt_source = 'SOSMED', 'sosmed_payment'
+    order_table, order_user, brand, subject = 'sosmed_orders', 'user_id', USER_BRAND, 'layanan'
+    error_class, errors = StoreError, (StoreError, otp_smscode.StoreError)
+    wallet_change = staticmethod(WalletAdapter.change)
+
+    @staticmethod
+    def order_card_keyboard(ui, order, user):
+        return ui.order_keyboard(user,order)
+
+    def require_checkout(self, user):
+        self.store.purchase_guard(user)
+        if not self.store.owner(user) and (self.store.host.safe_mode_enabled() or self.store.host.maintenance_enabled()):
+            raise StoreError('PAYMENT_UNAVAILABLE', 'Pembayaran sementara ditahan. Coba kembali nanti.')
+
+    @staticmethod
+    def queue_notice(conn, payment):
+        conn.execute("UPDATE sosmed_payments SET notice_kind='WALLET',notice_state='PENDING',notice_next_retry_at=0 WHERE payment_id=? AND notice_state='NONE'", (payment['payment_id'],))
+
+    @staticmethod
+    def queue_result(conn, payment):
+        conn.execute("UPDATE sosmed_payments SET notice_kind='ORDER',notice_state='PENDING',notice_next_retry_at=0 WHERE payment_id=? AND notice_state='NONE'", (payment['payment_id'],))
+
+    async def deliver(self, bot):
+        if not bot:
+            return
+        for payment in self.store.repo.all("SELECT * FROM sosmed_payments WHERE notice_state IN ('PENDING','SENDING') AND notice_next_retry_at<=? AND lease_until<? ORDER BY created_at LIMIT 20", (time.time(),time.time())):
+            token = secrets.token_hex(12)
+            claimed = self.store.repo.execute("UPDATE sosmed_payments SET notice_state='SENDING',lease_owner=?,lease_until=? WHERE payment_id=? AND notice_state IN ('PENDING','SENDING') AND lease_until<?", (token,time.time()+120,payment['payment_id'],time.time()))
+            if not claimed:
+                continue
+            try:
+                ui = self.store.ui
+                if payment['notice_kind']=='ORDER':
+                    order = self.store.repo.one('SELECT * FROM sosmed_orders WHERE attempt_id=? AND user_id=?',(payment['attempt_id'],payment['user_id']))
+                    if not order:
+                        raise StoreError('NOT_FOUND')
+                    text = '✅ <b>PESANAN BERHASIL DIBUAT!</b>\n\n'+ui.order_text(order)
+                    keyboard = ui.order_keyboard(payment['user_id'],order)
+                else:
+                    text = (f"↩️ <b>DANA TERSEDIA DI SALDO BOT</b>\n🧾 {escape(payment['partner_reference'])}\n"
+                            f"💰 {money(payment['amount_idr'])}\nPesanan tidak dilanjutkan atau gagal terkonfirmasi. "
+                            'Gunakan saldo untuk membeli kembali; tidak perlu membayar QRIS lagi.')
+                    keyboard = ui.navigation(payment['user_id'])
+                sent = await bot.send_message(payment['user_id'],text,parse_mode='HTML',reply_markup=keyboard)
+                self.store.repo.execute("UPDATE sosmed_payments SET notice_state='SENT',notice_message_id=?,lease_owner=NULL,lease_until=0 WHERE payment_id=? AND lease_owner=?", (sent.message_id,payment['payment_id'],token))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                delay = min(3600,10*2**min(payment['notice_attempts'],8))
+                self.store.repo.execute("UPDATE sosmed_payments SET notice_state='PENDING',notice_attempts=notice_attempts+1,notice_next_retry_at=?,lease_owner=NULL,lease_until=0 WHERE payment_id=? AND lease_owner=?", (time.time()+delay,payment['payment_id'],token))
+
+
 class Store:
     def __init__(self, host, config=None):
         self.host, self.config = host, config or Config.environment()
@@ -1861,6 +1959,7 @@ class Store:
         self.api.refill_validator = self.refill_contract_verified
         self.catalog, self.pricing = CatalogService(self), PricingService(self)
         self.purchase, self.orders = PurchaseService(self), OrderService(self)
+        self.payments = PaymentService(self)
         self.refunds = RefundService(self)
         self._tasks, self._bot, self._owner_token = [], None, secrets.token_hex(12)
         self._started = False
@@ -2384,6 +2483,10 @@ class Store:
             return True
 
     async def _batch(self):
+        # Funding/refunds continue even while new catalogue purchases are closed.
+        await self.payments.reconcile()
+        await self.payments.deliver(self._bot)
+        await self.payments.retire_qr(self._bot)
         await self.orders.poll_once()
         await self.refunds.deliver(self._bot)
         if self.settings()["enabled"] and self.config.token:
