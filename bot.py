@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.26"
+BOT_VERSION = "17.27"
 SCHEMA_VERSION = 206
 
 CHECKOUT_TERMS_SHORT = (
@@ -10546,19 +10546,22 @@ def shop_reply_keyboard_removal_record(value,scope):
 
 
 async def retire_shop_reply_keyboard_removals(target,context,data):
-    """Retry only saved removal notices, without touching menus or invoices."""
+    """Keep the latest typing-keyboard anchor until /start is delivered."""
     scope=SQLiteFSMStorage._storage_key(context.key)
     source=target if isinstance(target,Message) else getattr(target,"message",None)
     source_id=getattr(source,"message_id",None)
     queued=data.get("removals",[])
     queued=queued if isinstance(queued,list) else []
+    valid=[record for value in queued
+           if (record:=shop_reply_keyboard_removal_record(value,scope)) is not None]
+    anchor=valid[-1]['message_id'] if valid and data.get('mode')=='command' else None
     remaining=[]
     attempts=0
     for value in queued:
         record=shop_reply_keyboard_removal_record(value,scope)
         if record is None:
             continue
-        if record["message_id"]==source_id or record.get("next_retry_at",0)>time.time() or attempts>=3:
+        if record["message_id"] in {source_id,anchor} or record.get("next_retry_at",0)>time.time() or attempts>=3:
             remaining.append(record)
             continue
         attempts+=1
@@ -10762,6 +10765,8 @@ async def _refresh_shop_reply_keyboard_locked(target,keyboard,context,*,force=Fa
         logging.warning("Shop keyboard delivery could not be recorded")
         return rendered
     ready=await retire_shop_reply_keyboard_prompts(target,context,ready)
+    # Only a confirmed new /start keyboard may retire the last removal notice.
+    ready=await retire_shop_reply_keyboard_removals(target,context,ready)
     lock._shop_reply_data=ready
     return rendered
 
@@ -10916,8 +10921,8 @@ class CommandMenuMessage(Message):
         return rendered
 
 
-async def hide_shop_keyboard_for_callback(call):
-    """Old OTP/admin buttons can be opened again after returning to /start."""
+async def hide_shop_keyboard_for_callback(call,*,force=False):
+    """Remove shop markup before commands or an old feature callback runs."""
     context=shop_reply_keyboard_context(call)
     if context is None:
         return
@@ -10931,7 +10936,10 @@ async def hide_shop_keyboard_for_callback(call):
         if isinstance(cached,dict) and cached.get("generation")==data.get("generation"):
             data=cached
         lock._shop_reply_data=data
-        if not (data.get("mode")=="command" and data.get("hidden_confirmed")):
+        scope=SQLiteFSMStorage._storage_key(context.key)
+        removals=data.get('removals',[])
+        anchored=isinstance(removals,list) and any(shop_reply_keyboard_removal_record(value,scope) for value in removals)
+        if force or not (data.get("mode")=="command" and data.get("hidden_confirmed") and anchored):
             await _remove_shop_reply_keyboard_locked(
                 call,"⌨️ Keyboard mengetik aktif.",context,command_mode=True)
         lock._shop_reply_data=await retire_shop_reply_keyboard_removals(
@@ -10947,12 +10955,21 @@ class CommandKeyboardMiddleware(BaseMiddleware):
             return await handler(event,data)
         if isinstance(event,Message):
             command=data.get("command")
-            if command is not None and (command.command!="start" or re.fullmatch(
-                    r"am_mail_[1-9][0-9]{0,9}",str(command.args or "").strip())):
-                return await handler(CommandMenuMessage.wrap(event),data)
+            raw=re.match(r'^/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s|$)',str(event.text or ''))
+            name=str(getattr(command,'command','') or (raw.group(1) if raw else '')).lower()
+            args=getattr(command,'args',None)
+            if args is None and raw:args=str(event.text or '')[raw.end():]
+            if name and (name!='start' or re.fullmatch(r'am_mail_[1-9][0-9]{0,9}',str(args or '').strip())):
+                if not isinstance(event,CommandMenuMessage):
+                    # Photo-only/status/denied handlers may never call answer.
+                    # Do this before the handler, including fallback commands
+                    # that matched without aiogram's Command filter metadata.
+                    await hide_shop_keyboard_for_callback(event,force=True)
+                    event=CommandMenuMessage.wrap(event)
+                return await handler(event,data)
         elif isinstance(event,CallbackQuery) and (str(event.data or "").startswith(
                 (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,bank_accounts.PREFIX,klikqris_gateway.PREFIX,
-                 "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","toolsaccess","tm:","cekml:"))
+                 "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","toolsaccess","tm:","cekml:","userdemo:"))
                 or getattr(getattr(data.get("handler"),"callback",None),"__name__","").startswith(
                     ("owner_","user_tools_"))):
             main_menu=False
@@ -36630,7 +36647,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.26"
+EXPECTED_SOURCE_VERSION = "17.27"
 
 
 def source_integrity_self_test():
