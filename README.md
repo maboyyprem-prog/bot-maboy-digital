@@ -1,30 +1,34 @@
-# MaboyyDigital v17.27
+# MaboyyDigital v17.28
 
 Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
-## Pembaruan v17.27: keyboard tetap hanya untuk /start
+## Pembaruan v17.28: perpindahan command tanpa teks keyboard
 
 Keyboard tetap berisi List Produk, Voucher, Laporan Stok dan nomor produk hanya
 aktif di menu /start beserta katalog dan tombol kembali ke menu tersebut.
 Saat /otp, /sosmed, /tools, /owner, /demo, /ping atau command lain dibuka,
-keyboard toko dilepas **sebelum handler berjalan**. Keyboard mengetik normal
-tersedia dan tombol inline fitur tetap utuh. Command berakhiran @nama_bot dan
-command yang masuk fallback tanpa metadata Command ikut ditangani. Status yang
-langsung mengedit foto invoice tidak perlu membuat pesan invoice baru untuk
-melepas keyboard. /start am_mail_… tetap menjadi alur tools dengan keyboard normal.
+**balasan asli dikirim lebih dulu dengan tombol inline tetap utuh**. Pesan
+“Keyboard mengetik aktif” tidak lagi dikirim. Pelepasan keyboard terpisah tidak
+memuat teks yang terlihat, tanpa notifikasi, dan langsung dibersihkan bersama
+prompt keyboard /start lama yang tercatat. Balasan teks tanpa tombol inline
+dapat melepas keyboard dalam pesan balasan itu sendiri, tanpa pesan tambahan.
 
-Pesan pelepas keyboard terbaru dipertahankan selama berada di command lain;
-pesan pelepas yang lebih lama dirapikan agar tidak menumpuk. Pesan terakhir baru
-dihapus setelah keyboard /start berhasil dikirim kembali. Ini menghindari
-menyisakan pesan keyboard toko lama setelah riwayat dimuat ulang. Keyboard lama
-tanpa tracking dan state tersembunyi setelah restart diperbarui pada command
-berikutnya. Tombol OTP/tools/owner/demo lama yang dibuka dari /start juga melepas
-keyboard; tombol lama Perbarui Keyboard tidak mengaktifkan keyboard toko di fitur lain.
+Pembersihan Telegram dibatasi dua detik setelah respons, tidak menahan menu,
+dan tidak mengulangi handler/transaksi jika gagal. Keyboard yang sudah dilepas
+tidak direset lagi setiap berpindah command. Kontrol yang gagal dibersihkan
+dicoba kembali pada navigasi berikutnya. Pesan keyboard lama v17.27 yang
+tercatat ikut dibersihkan; identitas invoice/pesan lain tidak dijadikan target.
 
-Perubahan hanya pada empat definisi keyboard di bot.py dan penanda versi
-main.py. Handler/command, katalog A–Z dan pemetaan nomor, FSM fitur, invoice,
-channel transaksi, wallet, pembayaran, provider, refund dan migration tetap
-memakai implementasi sebelumnya. Schema tetap **206**; tidak ada migration,
+Command @nama_bot, fallback tanpa metadata Command, status yang hanya mengedit
+foto, deep link /start am_mail_…, rating dan tombol fitur dari pesan lama ikut
+ditangani. Tidak ada foto invoice atau pesan sukses kedua untuk pergantian
+keyboard. Kembali ke /start memulihkan keyboard produk; tombol Perbarui Keyboard
+lama tidak mengaktifkannya di command lain. Scope user/chat tetap terpisah.
+
+Perubahan runtime hanya pada UI keyboard/navigasi di bot.py dan penanda versi
+main.py. Registrasi handler/command, katalog A–Z, pemetaan nomor, FSM fitur,
+invoice, channel transaksi, wallet, pembayaran, provider, refund dan migration
+tetap memakai implementasi sebelumnya. Schema tetap **206**; tidak ada migration,
 Variables Railway, dependency, callback pembayaran atau file runtime baru.
 Paket utama tetap 15 file langsung di root ZIP, tanpa mengganti nama runtime.
 
@@ -331,7 +335,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.27 yang konsisten.
+untuk fitur rating; gunakan seluruh 15 file rilis v17.28 yang konsisten.
 
 ## Jalankan
 
@@ -355,7 +359,7 @@ untuk pembelian langsung kedua toko tersebut. Isi Saldo dan checkout produk lain
 mempertahankan QRIS Otomatis, QRIS Manual, transfer bank dan gateway existing.
 
 Invoice QRIS OTP lama tetap diproses sesuai status dan kebijakan sebelumnya.
-Khusus invoice manual baru v17.27, tidak ada deadline konfirmasi owner dan berlaku
+Khusus invoice manual baru v17.28, tidak ada deadline konfirmasi owner dan berlaku
 refund harga produk ke wallet jika gagal pasti; hasil timeout tidak dikreditkan
 ulang sebelum direkonsiliasi. Tidak ada pembelian provider sebelum pembayaran
 manual diverifikasi owner. API key dan saldo provider hanya tampil kepada owner.
@@ -432,7 +436,7 @@ User/owner tetap dapat membatalkan invoice yang belum dibayar lewat alur existin
 Payment gateway otomatis tetap mengikuti masa berlaku existing/provider.
 Quote harga, nomor/SMS OTP, draft pengaturan rekening dan konfirmasi Hapus Stok
 tetap menggunakan masa berlaku yang sesuai; perubahan ini hanya untuk pembayaran
-manual yang memerlukan owner. OTP/Sosmed juga menyediakan QRIS Manual di konfirmasi pembelian sejak v17.27.
+manual yang memerlukan owner. OTP/Sosmed juga menyediakan QRIS Manual di konfirmasi pembelian sejak v17.28.
 Tidak ada Variables/dependency/command baru.
 
 ## Hapus stok owner
@@ -511,7 +515,7 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.27; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.28; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -519,7 +523,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.27: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.28: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed

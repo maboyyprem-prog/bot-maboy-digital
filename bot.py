@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.27"
+BOT_VERSION = "17.28"
 SCHEMA_VERSION = 206
 
 CHECKOUT_TERMS_SHORT = (
@@ -3039,7 +3039,6 @@ def purchase_rating_text(request):
 async def render_purchase_rating(event,request):
     text=purchase_rating_text(request);keyboard=purchase_rating_keyboard(request)
     if isinstance(event,CallbackQuery) or (getattr(event,'message',None) is not None and getattr(event,'data',None) is not None):
-        await hide_shop_keyboard_for_callback(event)
         sent=await safe_edit_or_answer(event,text,reply_markup=keyboard,parse_mode='HTML')
         await safe_callback_notice(event,'Pilih rating pembelian terlebih dahulu.' if isinstance(event,CallbackQuery) else '')
     else:
@@ -3061,6 +3060,16 @@ async def render_purchase_rating(event,request):
             (message_id,time.time(),request['id']))
         conn.commit()
     finally:conn.close()
+    # A rating may intercept a /start product callback outside the command
+    # namespaces. Deliver its card first, then release that keyboard too.
+    context=shop_reply_keyboard_context(event)
+    if context is not None:
+        try:
+            if (await context.get_data()).get('mode')!='command':
+                await prepare_command_keyboard(event)
+                await asyncio.wait_for(hide_shop_keyboard_for_callback(event),timeout=2)
+        except Exception as exc:
+            logging.warning('Rating keyboard cleanup deferred (%s)',type(exc).__name__)
     return sent
 
 
@@ -10535,7 +10544,7 @@ def shop_reply_keyboard_record(value,scope):
 def shop_reply_keyboard_removal_record(value,scope):
     """Cleanup IDs belong only to confirmed bot keyboard-removal notices."""
     if (not isinstance(value,dict) or value.get("kind")!="shop_reply_keyboard_removal"
-            or value.get("scope")!=scope or value.get("text")!="⌨️ Keyboard mengetik aktif."
+            or value.get("scope")!=scope or value.get("text") not in {"⌨️ Keyboard mengetik aktif.","\u2063"}
             or type(value.get("message_id")) is not int
             or not 0<value["message_id"]<=9223372036854775807
             or type(value.get("next_retry_at",0)) not in (int,float)
@@ -10546,22 +10555,19 @@ def shop_reply_keyboard_removal_record(value,scope):
 
 
 async def retire_shop_reply_keyboard_removals(target,context,data):
-    """Keep the latest typing-keyboard anchor until /start is delivered."""
+    """Retire only acknowledged keyboard control messages, including old notices."""
     scope=SQLiteFSMStorage._storage_key(context.key)
     source=target if isinstance(target,Message) else getattr(target,"message",None)
     source_id=getattr(source,"message_id",None)
     queued=data.get("removals",[])
     queued=queued if isinstance(queued,list) else []
-    valid=[record for value in queued
-           if (record:=shop_reply_keyboard_removal_record(value,scope)) is not None]
-    anchor=valid[-1]['message_id'] if valid and data.get('mode')=='command' else None
     remaining=[]
     attempts=0
     for value in queued:
         record=shop_reply_keyboard_removal_record(value,scope)
         if record is None:
             continue
-        if record["message_id"] in {source_id,anchor} or record.get("next_retry_at",0)>time.time() or attempts>=3:
+        if record["message_id"]==source_id or record.get("next_retry_at",0)>time.time() or attempts>=3:
             remaining.append(record)
             continue
         attempts+=1
@@ -10765,7 +10771,6 @@ async def _refresh_shop_reply_keyboard_locked(target,keyboard,context,*,force=Fa
         logging.warning("Shop keyboard delivery could not be recorded")
         return rendered
     ready=await retire_shop_reply_keyboard_prompts(target,context,ready)
-    # Only a confirmed new /start keyboard may retire the last removal notice.
     ready=await retire_shop_reply_keyboard_removals(target,context,ready)
     lock._shop_reply_data=ready
     return rendered
@@ -10774,6 +10779,7 @@ async def _refresh_shop_reply_keyboard_locked(target,keyboard,context,*,force=Fa
 async def _remove_shop_reply_keyboard_locked(target,text,context,*,parse_mode=None,
                                                command_mode=False,send_options=None,raise_on_error=False):
     data=None
+    current=None
     if context is not None:
         try:
             data=await context.get_data()
@@ -10824,10 +10830,13 @@ async def _remove_shop_reply_keyboard_locked(target,text,context,*,parse_mode=No
             raise
         return False
     if rendered and context is not None and data is not None:
-        data={**data,"hidden_confirmed":True}
+        data={**data,"hidden_confirmed":True,"command_keyboard_version":2}
+        if current:
+            data["retire"]=[*data.get("retire",[]),current][-10:]
+            data["current"]=None
         sender=getattr(rendered,"from_user",None)
         rendered_id=getattr(rendered,"message_id",None)
-        if (text=="⌨️ Keyboard mengetik aktif." and isinstance(rendered,Message)
+        if (text=="\u2063" and isinstance(rendered,Message)
                 and rendered.text==text and rendered.chat.type=="private"
                 and rendered.chat.id==context.key.chat_id==context.key.user_id
                 and type(rendered_id) is int and 0<rendered_id<=9223372036854775807
@@ -10861,42 +10870,16 @@ async def remove_shop_reply_keyboard(target,text,*,parse_mode=None):
 
 
 async def answer_command_without_shop_keyboard(message,text,**options):
-    """Send inline menus with their buttons, after removing the /start keyboard."""
+    """Deliver the real reply first; an inline menu must keep all its buttons."""
     context=shop_reply_keyboard_context(message)
-    if context is None:
+    if context is None or isinstance(options.get("reply_markup"),InlineKeyboardMarkup):
         return await message.answer(text,**options)
-    keyboard=options.get("reply_markup")
-    menu_options=dict(options)
-    if context.key.thread_id is not None:
-        menu_options.setdefault("message_thread_id",context.key.thread_id)
-    if context.key.business_connection_id is not None:
-        menu_options.setdefault("business_connection_id",context.key.business_connection_id)
-    lock=shop_reply_keyboard_lock(context)
-    async with lock:
-        try:
-            data=await context.get_data()
-        except sqlite3.Error:
-            data={}
-        cached=getattr(lock,"_shop_reply_data",None)
-        if isinstance(cached,dict) and cached.get("generation")==data.get("generation"):
-            data=cached
-        lock._shop_reply_data=data
-        try:
-            if data.get("mode")=="command" and data.get("hidden_confirmed"):
-                return await message.bot.send_message(context.key.chat_id,text,**menu_options)
-            if isinstance(keyboard,InlineKeyboardMarkup):
-                # Telegram accepts only one reply_markup per SendMessage and
-                # cannot reliably edit a message sent with ReplyKeyboardRemove.
-                # Use a disposable removal notice, then send the actual menu
-                # with its inline keyboard in the same API request.
-                await _remove_shop_reply_keyboard_locked(
-                    message,"⌨️ Keyboard mengetik aktif.",context,command_mode=True)
-                return await message.bot.send_message(context.key.chat_id,text,**menu_options)
-            return await _remove_shop_reply_keyboard_locked(
-                message,text,context,command_mode=True,send_options=options,raise_on_error=True)
-        finally:
-            pending=getattr(lock,"_shop_reply_data",data)
-            lock._shop_reply_data=await retire_shop_reply_keyboard_removals(message,context,pending)
+    # Plain replies can remove the keyboard in the actual response, without an
+    # extra message. Telegram cannot combine Remove and inline markup or edit
+    # a message that carried Remove, so inline/photo replies are left intact.
+    async with shop_reply_keyboard_lock(context):
+        return await _remove_shop_reply_keyboard_locked(
+            message,text,context,command_mode=True,send_options=options,raise_on_error=True)
 
 
 class CommandMenuMessage(Message):
@@ -10921,8 +10904,35 @@ class CommandMenuMessage(Message):
         return rendered
 
 
+async def prepare_command_keyboard(target):
+    """Change only keyboard scope before a handler; never await Telegram here."""
+    context=shop_reply_keyboard_context(target)
+    if context is None:
+        return
+    async with shop_reply_keyboard_lock(context):
+        try:
+            data=await context.get_data()
+        except sqlite3.Error:
+            data={}
+        data=data if isinstance(data,dict) else {}
+        lock=shop_reply_keyboard_lock(context)
+        cached=getattr(lock,"_shop_reply_data",None)
+        if isinstance(cached,dict) and cached.get("generation")==data.get("generation"):
+            data=cached
+        if data.get("mode")=="command" and data.get("command_keyboard_version")==2:
+            lock._shop_reply_data=data
+            return
+        prepared={**data,"generation":secrets.token_hex(12),"mode":"command","hidden":True,
+                  "hidden_confirmed":False,"command_keyboard_version":2}
+        lock._shop_reply_data=prepared
+        try:
+            await context.set_data(prepared)
+        except sqlite3.Error:
+            logging.warning("Command keyboard scope could not be recorded")
+
+
 async def hide_shop_keyboard_for_callback(call,*,force=False):
-    """Remove shop markup before commands or an old feature callback runs."""
+    """Best-effort keyboard cleanup after the real menu/photo is delivered."""
     context=shop_reply_keyboard_context(call)
     if context is None:
         return
@@ -10936,14 +10946,27 @@ async def hide_shop_keyboard_for_callback(call,*,force=False):
         if isinstance(cached,dict) and cached.get("generation")==data.get("generation"):
             data=cached
         lock._shop_reply_data=data
-        scope=SQLiteFSMStorage._storage_key(context.key)
-        removals=data.get('removals',[])
-        anchored=isinstance(removals,list) and any(shop_reply_keyboard_removal_record(value,scope) for value in removals)
-        if force or not (data.get("mode")=="command" and data.get("hidden_confirmed") and anchored):
+        # A feature's Back/Home handler may deliberately restore /start and
+        # its catalog. Respect that acknowledged navigation instead of hiding
+        # the keyboard it has just restored.
+        if not force and data.get("mode")=="start":
+            return
+        if force or not (data.get("mode")=="command" and data.get("hidden_confirmed")
+                         and data.get("command_keyboard_version")==2):
+            # Bot API requires a separate message to remove a reply keyboard
+            # while keeping an existing inline menu/photo unchanged. A silent
+            # control is deleted below; no keyboard-status text is displayed.
             await _remove_shop_reply_keyboard_locked(
-                call,"⌨️ Keyboard mengetik aktif.",context,command_mode=True)
+                call,"\u2063",context,command_mode=True,
+                send_options={"disable_notification":True,"parse_mode":None})
+        data=getattr(lock,"_shop_reply_data",data)
+        if not data.get("hidden_confirmed"):
+            return
+        # Retire the tracked /start prompt before deleting the reset so that
+        # reopening history cannot restore that old fixed keyboard.
+        lock._shop_reply_data=await retire_shop_reply_keyboard_prompts(call,context,data)
         lock._shop_reply_data=await retire_shop_reply_keyboard_removals(
-            call,context,getattr(lock,"_shop_reply_data",data))
+            call,context,lock._shop_reply_data)
 
 
 class CommandKeyboardMiddleware(BaseMiddleware):
@@ -10953,6 +10976,7 @@ class CommandKeyboardMiddleware(BaseMiddleware):
         if (message is None or str(getattr(message.chat,"type",""))!="private"
                 or message.chat.id!=user_id):
             return await handler(event,data)
+        command_context=False
         if isinstance(event,Message):
             command=data.get("command")
             raw=re.match(r'^/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s|$)',str(event.text or ''))
@@ -10961,12 +10985,10 @@ class CommandKeyboardMiddleware(BaseMiddleware):
             if args is None and raw:args=str(event.text or '')[raw.end():]
             if name and (name!='start' or re.fullmatch(r'am_mail_[1-9][0-9]{0,9}',str(args or '').strip())):
                 if not isinstance(event,CommandMenuMessage):
-                    # Photo-only/status/denied handlers may never call answer.
-                    # Do this before the handler, including fallback commands
-                    # that matched without aiogram's Command filter metadata.
-                    await hide_shop_keyboard_for_callback(event,force=True)
+                    command_context=True
                     event=CommandMenuMessage.wrap(event)
-                return await handler(event,data)
+                else:
+                    return await handler(event,data)
         elif isinstance(event,CallbackQuery) and (str(event.data or "").startswith(
                 (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,bank_accounts.PREFIX,klikqris_gateway.PREFIX,
                  "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","toolsaccess","tm:","cekml:","userdemo:"))
@@ -10980,8 +11002,24 @@ class CommandKeyboardMiddleware(BaseMiddleware):
                 except (otp_smscode.StoreError,sqlite3.Error,ValueError):
                     pass
             if not main_menu:
-                await hide_shop_keyboard_for_callback(event)
-        return await handler(event,data)
+                command_context=True
+        if not command_context:
+            return await handler(event,data)
+        # Some host fixtures/routers install the middleware more than once.
+        # Claim this event before the inner middleware to avoid duplicate API
+        # calls; never mark a later user event as already handled.
+        if data.get("command_keyboard_handled"):
+            return await handler(event,data)
+        data["command_keyboard_handled"]=True
+        await prepare_command_keyboard(event)
+        result=await handler(event,data)
+        try:
+            # A slow/rejected auxiliary reset/delete must not hide a command's
+            # response, delay it behind Telegram cleanup, or replay its handler.
+            await asyncio.wait_for(hide_shop_keyboard_for_callback(event),timeout=2)
+        except Exception as exc:
+            logging.warning("Command keyboard cleanup deferred (%s)",type(exc).__name__)
+        return result
 
 
 # Inner middleware runs only after an existing handler matches; no catch-all
@@ -36647,7 +36685,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.27"
+EXPECTED_SOURCE_VERSION = "17.28"
 
 
 def source_integrity_self_test():
