@@ -238,8 +238,8 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.28"
-SCHEMA_VERSION = 206
+BOT_VERSION = "17.29"
+SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
     "📜 <b>Syarat Singkat</b>\n"
@@ -328,6 +328,8 @@ import payment_receipts
 PAYMENT_RECEIPTS = payment_receipts.ReceiptService(_otp_sys.modules[__name__])
 import klikqris_gateway
 KLIKQRIS_GATEWAY = klikqris_gateway.register(router, klikqris_gateway.Gateway(_otp_sys.modules[__name__]))
+import bot_api
+PARTNER_API = bot_api.register(router, bot_api.Manager(_otp_sys.modules[__name__]))
 START_TIME = time.time()
 JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
 
@@ -1588,6 +1590,7 @@ def init_db():
     bank_accounts.init_schema(conn)
     payment_receipts.init_schema(conn)
     klikqris_gateway.init_schema(conn)
+    bot_api.init_schema(conn)
     backfill_manual_qris_deadlines(conn)
     init_purchase_rating_schema(conn)
     reconcile_all_inventory_stock(conn)
@@ -4708,6 +4711,46 @@ def get_checkout_note_from_state(data: dict) -> str:
     if note:
         parts.append(note[:500])
     return "\n".join(parts)[:700]
+
+
+class WalletProductOrderError(Exception):
+    def __init__(self,code,message):
+        self.code=code
+        super().__init__(message)
+
+
+def commit_wallet_product_order(conn,user_id,username,product,variant,qty,unit,subtotal,total,
+                                checkout_note='',voucher_code='',discount_amount=0):
+    """Shared checkout commit; caller owns BEGIN IMMEDIATE, mapping and commit.
+
+    Telegram and the partner API use the same stock reservation, order, ledger
+    reference, voucher consumption and fulfillment. No Telegram I/O occurs here.
+    """
+    wallet=conn.execute('SELECT balance FROM wallets WHERE user_id=?',(user_id,)).fetchone()
+    balance=int(wallet['balance']) if wallet else 0
+    if balance<total:raise WalletProductOrderError('INSUFFICIENT_BALANCE','Saldo tidak cukup.')
+    if not reserve_stock_for_order(conn,variant['id'],qty):
+        raise WalletProductOrderError('OUT_OF_STOCK','Stok baru saja berubah. Silakan coba lagi.')
+    cur=conn.execute("""INSERT INTO orders
+        (user_id,username,product_id,variant_id,qty,unit_price,total,status,payment_method,payment_status,
+         note,unique_code,payment_total,stock_reserved,reserved_until,fulfillment_status,created_at,voucher_code,discount_amount)
+        VALUES(?,?,?,?,?,?,?,'paid_pending_delivery','WALLET','paid',?,0,?,1,'','pending',?,?,?)""",
+        (user_id,username,product['id'],variant['id'],qty,unit,subtotal,checkout_note,total,
+         datetime.now().isoformat(timespec='seconds'),voucher_code,discount_amount))
+    order_id=cur.lastrowid
+    if not verify_saved_payment_method(conn,order_id,'WALLET'):
+        raise WalletProductOrderError('PAYMENT_METHOD','Metode pembayaran tidak sesuai. Pesanan dibatalkan demi keamanan. Silakan coba lagi.')
+    ref=invoice(order_id)
+    if conn.execute("SELECT 1 FROM wallet_ledger WHERE user_id=? AND type='PURCHASE' AND reference=?",(user_id,ref)).fetchone():
+        raise WalletProductOrderError('DUPLICATE','Transaksi yang sama sedang diproses. Cek Riwayat.')
+    new_balance=balance-total;now=datetime.now().isoformat(timespec='seconds')
+    conn.execute('INSERT OR IGNORE INTO wallets(user_id,balance,updated_at) VALUES(?,?,?)',(user_id,balance,now))
+    conn.execute('UPDATE wallets SET balance=?,updated_at=? WHERE user_id=?',(new_balance,now,user_id))
+    conn.execute("""INSERT INTO wallet_ledger(user_id,type,amount,balance_after,reference,note,created_at)
+        VALUES(?,'PURCHASE',?,?,?,?,?)""",
+        (user_id,-total,new_balance,ref,f"Pembelian {product['name']} - {variant['name']}",now))
+    record_voucher_usage(voucher_code,user_id,order_id,discount_amount,conn=conn)
+    return order_id,new_balance
 
 
 def purchase_lock(user_id: int):
@@ -9446,6 +9489,7 @@ PROJECT_BACKUP_REQUIRED_FILES = (
     "bank_accounts.py",
     "payment_receipts.py",
     "klikqris_gateway.py",
+    "bot_api.py",
 )
 
 PROJECT_BACKUP_OPTIONAL_FILES = (
@@ -9457,6 +9501,7 @@ PROJECT_BACKUP_OPTIONAL_FILES = (
     "OTP_OPERATIONS.md",
     "RAILWAY_RESTORE.md",
     "SOSMED_OPERATIONS.md",
+    "API_BOT_GUIDE.md",
     "railway.json",
 )
 
@@ -11129,6 +11174,7 @@ def owner_menu():
     kb.button(text="🔎 Cari", callback_data="owner:global_search")
     kb.button(text="🎮 Pengaturan MLBB", callback_data="cekml:admin:menu")
     kb.button(text="📢 Notifikasi Transaksi", callback_data="owner:txn_channel")
+    kb.button(text="🔑 API Bot", callback_data="owner:api:menu")
     kb.button(text="🏠 Menu User", callback_data="home")
     kb.adjust(2)
     return kb.as_markup()
@@ -23329,103 +23375,19 @@ async def process_wallet_order(call: CallbackQuery, bot: Bot, state: FSMContext)
                 show_alert=True
             )
 
-        if not reserve_stock_for_order(conn, variant_id, qty):
-            conn.rollback()
-            conn.close()
-            return await call.answer("Stok baru saja berubah. Silakan coba lagi.", show_alert=True)
-
-        cur = conn.execute(
-            """INSERT INTO orders
-               (user_id, username, product_id, variant_id, qty, unit_price, total,
-                status, payment_method, payment_status, note, unique_code,
-                payment_total, stock_reserved, reserved_until,
-                fulfillment_status, created_at, voucher_code, discount_amount)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                call.from_user.id,
-                call.from_user.username or "",
-                product["id"],
-                variant_id,
-                qty,
-                unit,
-                subtotal,
-                "paid_pending_delivery",
-                "WALLET",
-                "paid",
-                checkout_note,
-                0,
-                total,
-                1,
-                "",
-                "pending",
-                datetime.now().isoformat(timespec="seconds"),
-                voucher_code,
-                discount_amount
-            )
-        )
-        order_id = cur.lastrowid
-
-        if not verify_saved_payment_method(conn, order_id, "WALLET"):
-            conn.rollback()
-            conn.close()
-            logging.error(
-                "Payment method mismatch order=%s expected=WALLET",
-                order_id
-            )
-            return await call.answer(
-                "Metode pembayaran tidak sesuai. Pesanan dibatalkan demi keamanan. Silakan coba lagi.",
-                show_alert=True
-            )
-
-        ref = invoice(order_id)
-
-        existing_ledger = conn.execute(
-            """SELECT 1 FROM wallet_ledger
-               WHERE user_id=? AND type='PURCHASE' AND reference=?
-               LIMIT 1""",
-            (call.from_user.id, ref)
-        ).fetchone()
-        if existing_ledger:
-            release_order_reservation(conn, conn.execute(
-                "SELECT * FROM orders WHERE id=?",
-                (order_id,)
-            ).fetchone())
-            conn.execute("DELETE FROM orders WHERE id=?", (order_id,))
-            conn.rollback()
-            conn.close()
-            return await call.answer(
-                "Transaksi yang sama sedang diproses. Cek Riwayat.",
-                show_alert=True
-            )
-
-        new_balance = balance - total
-
-        conn.execute(
-            """INSERT OR IGNORE INTO wallets(user_id, balance, updated_at)
-               VALUES(?,?,?)""",
-            (call.from_user.id, balance, datetime.now().isoformat(timespec="seconds"))
-        )
-        conn.execute(
-            "UPDATE wallets SET balance=?, updated_at=? WHERE user_id=?",
-            (new_balance, datetime.now().isoformat(timespec="seconds"), call.from_user.id)
-        )
-        conn.execute(
-            """INSERT INTO wallet_ledger
-               (user_id, type, amount, balance_after, reference, note, created_at)
-               VALUES(?,?,?,?,?,?,?)""",
-            (
-                call.from_user.id, "PURCHASE", -total, new_balance, ref,
-                f"Pembelian {product['name']} - {variant['name']}",
-                datetime.now().isoformat(timespec="seconds")
-            )
-        )
         try:
-            record_voucher_usage(voucher_code,call.from_user.id,order_id,discount_amount,conn=conn)
+            order_id,new_balance=commit_wallet_product_order(
+                conn,call.from_user.id,call.from_user.username or '',product,variant,qty,unit,subtotal,total,
+                checkout_note,voucher_code,discount_amount)
             conn.commit()
+        except WalletProductOrderError as exc:
+            conn.rollback();conn.close()
+            return await call.answer(str(exc),show_alert=True)
         except sqlite3.Error:
-            conn.rollback(); conn.close()
+            conn.rollback();conn.close()
             logging.exception('Voucher wallet checkout storage failed user=%s',call.from_user.id)
             return await safe_callback_notice(call,'Pembayaran belum diproses; saldo tidak dipotong. Coba kembali nanti.',show_alert=True)
+        ref=invoice(order_id)
         conn.close()
 
         record_payment_event(
@@ -36633,8 +36595,9 @@ async def start_web_server(bot: Bot):
     app.router.add_post("/shopeepay/callback", shopeepay_callback)
     app.router.add_post("/webhooks/klikqris", KLIKQRIS_GATEWAY.webhook)
     app.router.add_post("/webhooks/smscode/otp", OTP_STORE.webhook.handle)
+    PARTNER_API.add_routes(app)
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app,access_log_class=bot_api.PartnerAccessLogger)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
@@ -36685,7 +36648,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.28"
+EXPECTED_SOURCE_VERSION = "17.29"
 
 
 def source_integrity_self_test():
@@ -36753,6 +36716,7 @@ def runtime_dependency_self_test():
     checks.append(("payment_method_label", callable(payment_method_label)))
     checks.append(("verify_saved_payment_method", callable(verify_saved_payment_method)))
     checks.append(("CopyTextButton", CopyTextButton is not None))
+    checks.append(("partner_api", callable(PARTNER_API.handle) and callable(PARTNER_API.add_routes)))
 
     failed=[name for name,ok in checks if not ok]
     if failed:

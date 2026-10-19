@@ -1,8 +1,47 @@
-# MaboyyDigital v17.28
+# MaboyyDigital v17.29
 
-Paket ringkas: **15 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+Paket ringkas: **16 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
 
-## Pembaruan v17.28: perpindahan command tanpa teks keyboard
+## Pembaruan v17.29: API Bot untuk mitra
+
+**/owner → 🔑 API Bot** mengelola key integrasi untuk produk /start, OTP dan
+SOSMED. Owner membuat key dengan Nama Mitra | User ID Telegram terdaftar,
+mengonfirmasi, menyimpan key sekali, memilih akses/limit, mengganti atau mencabut
+key. Key memakai saldo akun tersebut dan harga jual existing; bukan BOT_TOKEN.
+Key disimpan sebagai hash, quote sensitif terenkripsi, dan riwayat memakai WIB.
+
+API berada pada **PUBLIC_BASE_URL/api/v1** di webserver aiohttp existing.
+Gunakan Authorization: Bearer API_KEY_MITRA dan JSON. Pembelian API awalnya OFF;
+isi PUBLIC_BASE_URL HTTPS existing lalu Buka Pembelian di panel owner. Tidak ada
+Variables baru pada bot Maboyy. Bot mitra menyimpan base URL/key sebagai secrets
+miliknya sendiri. OTP/SOSMED dan saldo/stok existing tetap harus tersedia.
+
+Alur: GET /products, /otp/services atau /sosmed/services → POST /quotes →
+POST /orders dengan quote_id dan header Idempotency-Key → GET /orders/ORDER_ID.
+Simpan quote_id dan idempotency key sebelum membeli; setelah timeout gunakan
+keduanya yang sama. GET /balance membaca saldo yang sama dengan /start /otp
+/sosmed. API tidak membuka approval pembayaran, topup/kredit saldo atau refund
+paksa. Batal OTP memakai izin/refund existing; gagal/partial SOSMED mengikuti
+refund native. Daftar order hanya memuat ringkasan; hasil akun/SMS ada di detail
+order yang berhak. Harga SOSMED per 1.000; total final dihitung server.
+
+Contoh POST /quotes produk: {"kind":"products","variant_id":12,"quantity":1}.
+Contoh POST /orders: {"quote_id":"Q-..."}, header Idempotency-Key: order-mitra-000001.
+Produk tetap quantity 1 per checkout. Famhead memerlukan family_gmail; preorder
+menunggu owner. OTP memakai offer_id dari katalog, SOSMED memakai service_id dan
+parameters sesuai form native. Layanan yang belum didukung tetap ditolak.
+
+Paket runtime kini **16 file**, termasuk modul baru **bot_api.py**. Semua nama
+file lama dipertahankan. Backup project dari panel owner ikut menyertakan modul
+API. Panduan lengkap dan contoh client async tersedia di **API_BOT_GUIDE.md** pada
+paket SourceLengkap serta file panduan API tersendiri yang menyertai rilis.
+
+Schema **207** additive hanya menambah metadata API: hash key, quote, mapping
+order/idempotensi dan audit. Wallet/deposit, provider, pembayaran, invoice foto,
+keyboard, channel transaksi dan command existing tetap memakai alur sebelumnya.
+Tidak ada command baru, server kedua, reset database atau pembelian live saat QA.
+
+## Fitur v17.28: perpindahan command tanpa teks keyboard
 
 Keyboard tetap berisi List Produk, Voucher, Laporan Stok dan nomor produk hanya
 aktif di menu /start beserta katalog dan tombol kembali ke menu tersebut.
@@ -30,7 +69,7 @@ main.py. Registrasi handler/command, katalog A–Z, pemetaan nomor, FSM fitur,
 invoice, channel transaksi, wallet, pembayaran, provider, refund dan migration
 tetap memakai implementasi sebelumnya. Schema tetap **206**; tidak ada migration,
 Variables Railway, dependency, callback pembayaran atau file runtime baru.
-Paket utama tetap 15 file langsung di root ZIP, tanpa mengganti nama runtime.
+Paket utama tetap 16 file langsung di root ZIP, tanpa mengganti nama runtime.
 
 ## Fitur v17.26 yang dipertahankan: invoice pembelian dan channel transaksi
 
@@ -79,7 +118,7 @@ Migration **206** additive menambah payment_receipts.caption_hash dan outbox
 transaction_channel_events; sistem wallet, deposit dan pembayaran tetap memakai
 tabel existing. Hash caption menggunakan HMAC agar tidak menjadi kamus tebakan
 OTP. Tidak ada command, runtime file, dependency, callback pembayaran, atau ENV baru.
-Nama file runtime tetap sama; paket utama tetap 15 file langsung di root ZIP.
+Nama file runtime tetap sama; paket utama tetap 16 file langsung di root ZIP.
 
 ## Aturan QRIS manual existing (v17.25)
 
@@ -335,7 +374,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 15 file rilis v17.28 yang konsisten.
+untuk fitur rating; gunakan seluruh 16 file rilis v17.29 yang konsisten.
 
 ## Jalankan
 
@@ -359,7 +398,7 @@ untuk pembelian langsung kedua toko tersebut. Isi Saldo dan checkout produk lain
 mempertahankan QRIS Otomatis, QRIS Manual, transfer bank dan gateway existing.
 
 Invoice QRIS OTP lama tetap diproses sesuai status dan kebijakan sebelumnya.
-Khusus invoice manual baru v17.28, tidak ada deadline konfirmasi owner dan berlaku
+Khusus invoice manual baru v17.29, tidak ada deadline konfirmasi owner dan berlaku
 refund harga produk ke wallet jika gagal pasti; hasil timeout tidak dikreditkan
 ulang sebelum direkonsiliasi. Tidak ada pembelian provider sebelum pembayaran
 manual diverifikasi owner. API key dan saldo provider hanya tampil kepada owner.
@@ -436,7 +475,7 @@ User/owner tetap dapat membatalkan invoice yang belum dibayar lewat alur existin
 Payment gateway otomatis tetap mengikuti masa berlaku existing/provider.
 Quote harga, nomor/SMS OTP, draft pengaturan rekening dan konfirmasi Hapus Stok
 tetap menggunakan masa berlaku yang sesuai; perubahan ini hanya untuk pembayaran
-manual yang memerlukan owner. OTP/Sosmed juga menyediakan QRIS Manual di konfirmasi pembelian sejak v17.28.
+manual yang memerlukan owner. OTP/Sosmed juga menyediakan QRIS Manual di konfirmasi pembelian sejak v17.29.
 Tidak ada Variables/dependency/command baru.
 
 ## Hapus stok owner
@@ -507,15 +546,15 @@ OTP tetap memakai Variables existing; jika webhook digunakan, alamatnya
 
 ## Isi paket
 
-Sembilan file Python aktif: `main.py`, `bot.py`, `otp_smscode.py`,
+Sepuluh file Python aktif: `main.py`, `bot.py`, `otp_smscode.py`,
 `sosmed_buzzerpanel.py`, `sosmed_ui.py`, `project_backup.py`, `bank_accounts.py`,
-`payment_receipts.py`, `klikqris_gateway.py`.
+`payment_receipts.py`, `klikqris_gateway.py`, `bot_api.py`.
 File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 `.python-version`, `railway.json`.
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
 tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.28; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+v17.29; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -523,7 +562,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.28: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.29: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed
